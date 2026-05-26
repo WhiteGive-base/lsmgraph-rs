@@ -175,6 +175,14 @@ impl EdgeProp {
             Self::Empty => 0,
         }
     }
+
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::I32(v) => v as i64,
+            Self::I64(v) => v,
+            Self::Empty => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,8 +266,57 @@ impl SnbGraph {
         }
     }
 
+    pub fn forum(&self, vid: VertexId) -> Option<&ForumProps> {
+        match self.vertices.get(&vid)? {
+            VertexData::Forum(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn tag(&self, vid: VertexId) -> Option<&TagProps> {
+        match self.vertices.get(&vid)? {
+            VertexData::Tag(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn tag_class(&self, vid: VertexId) -> Option<&TagClassProps> {
+        match self.vertices.get(&vid)? {
+            VertexData::TagClass(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn vertex_label(&self, vid: VertexId) -> Option<VertexLabel> {
+        self.vertex(vid).map(VertexData::label)
+    }
+
+    pub fn vertices_by_label(&self, label: VertexLabel) -> impl Iterator<Item = VertexId> + '_ {
+        self.vertices.iter().filter_map(move |(&vid, data)| {
+            if data.label() == label {
+                Some(vid)
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn place_name(&self, vid: VertexId) -> String {
         self.place(vid).map(|p| p.name.clone()).unwrap_or_default()
+    }
+
+    pub fn out_neighbors_cached(&self, vid: VertexId, edge_label: EdgeLabel) -> Vec<VertexId> {
+        self.adjacency
+            .get(&(vid, edge_label.as_i32()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn in_neighbors_cached(&self, vid: VertexId, edge_label: EdgeLabel) -> Vec<VertexId> {
+        self.adjacency
+            .get(&(vid, -edge_label.as_i32()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub async fn out_neighbors(
@@ -267,11 +324,7 @@ impl SnbGraph {
         vid: VertexId,
         edge_label: EdgeLabel,
     ) -> Result<Vec<VertexId>> {
-        Ok(self
-            .adjacency
-            .get(&(vid, edge_label.as_i32()))
-            .cloned()
-            .unwrap_or_default())
+        Ok(self.out_neighbors_cached(vid, edge_label))
     }
 
     pub async fn in_neighbors(
@@ -279,11 +332,7 @@ impl SnbGraph {
         vid: VertexId,
         edge_label: EdgeLabel,
     ) -> Result<Vec<VertexId>> {
-        Ok(self
-            .adjacency
-            .get(&(vid, -edge_label.as_i32()))
-            .cloned()
-            .unwrap_or_default())
+        Ok(self.in_neighbors_cached(vid, edge_label))
     }
 
     pub async fn knows_neighbors(&self, vid: VertexId) -> Result<Vec<VertexId>> {
@@ -291,10 +340,38 @@ impl SnbGraph {
     }
 
     pub async fn edge_prop(&self, src: VertexId, edge_label: EdgeLabel, dst: VertexId) -> EdgeProp {
+        self.edge_prop_by_type(src, edge_label.as_i32(), dst)
+    }
+
+    pub fn edge_prop_by_type(&self, src: VertexId, edge_type: EdgeType, dst: VertexId) -> EdgeProp {
         self.edge_props
-            .get(&(src, edge_label.as_i32(), dst))
+            .get(&(src, edge_type, dst))
             .copied()
             .unwrap_or(EdgeProp::Empty)
+    }
+
+    pub fn out_edges_with_prop(
+        &self,
+        vid: VertexId,
+        edge_label: EdgeLabel,
+    ) -> Vec<(VertexId, EdgeProp)> {
+        let edge_type = edge_label.as_i32();
+        self.out_neighbors_cached(vid, edge_label)
+            .into_iter()
+            .map(|dst| (dst, self.edge_prop_by_type(vid, edge_type, dst)))
+            .collect()
+    }
+
+    pub fn in_edges_with_prop(
+        &self,
+        vid: VertexId,
+        edge_label: EdgeLabel,
+    ) -> Vec<(VertexId, EdgeProp)> {
+        let edge_type = -edge_label.as_i32();
+        self.in_neighbors_cached(vid, edge_label)
+            .into_iter()
+            .map(|src| (src, self.edge_prop_by_type(vid, edge_type, src)))
+            .collect()
     }
 
     pub async fn build_adjacency_cache(engine: Arc<Engine>, store_dir: &Path) -> Result<usize> {

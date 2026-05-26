@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use lsmgraph::config::{IoBackendKind, LsmGraphConfig};
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
-use lsmgraph::snb::{import_snb_full, validate_ic1_ic2, SnbGraph};
+use lsmgraph::snb::{import_snb_full, validate_ic1_ic14, SnbGraph};
 
 const DEFAULT_DATA: &str = "/data/WorkSpace/dgs/data/social_network_tugraph";
 const DEFAULT_STORE: &str = "/data/WorkSpace/lsmgraph-rs/store/sf1";
@@ -172,7 +172,8 @@ async fn main() -> Result<()> {
         } => {
             let engine =
                 Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
-            let report = validate_ic1_ic2(engine, &data_dir, &validation_params, max_lines).await?;
+            let report =
+                validate_ic1_ic14(engine, &data_dir, &validation_params, max_lines).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::SnbCache { data_dir } => {

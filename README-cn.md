@@ -1,66 +1,64 @@
 # lsmgraph-rs
 
-LSMGraph prototype for reproducing the storage-engine core on the LDBC SNB SF1
-data under `/data/WorkSpace/dgs/data/social_network_tugraph`.
+LSMGraph 原型，用于在 LDBC SNB SF1 数据集
+（位于 `/data/WorkSpace/dgs/data/social_network_tugraph`）
+上复现存储引擎核心。
 
-This project intentionally does not read or depend on the existing DGS
-`dgs_db`. DGS is used only as a schema and query-reference implementation.
+本项目有意不读取或依赖现有 DGS 的 `dgs_db`。DGS 仅用作架构和查询参考实现。
 
-## Implemented
+## 已实现功能
 
-- Tokio-based engine shell.
-- `IoBackend` abstraction with bounded blocking `pread`/`pwrite`.
-- MemGraph with active/frozen rotation, low-degree inline segments and
-  high-degree `BTreeMap` overflow.
-- CSR writer/reader with sparse per-source offsets and fixed binary edge
-  bodies.
-- Manifest replay for reopening a persisted store.
-- L0 version chain and visible-neighbor merge.
-- L0 to L1 compaction.
-- Simple multi-level index for L1+ lookup.
-- `person_knows` CSV import and validation against the raw CSV.
+- 基于 Tokio 的引擎外壳。
+- `IoBackend` 抽象层，支持有界阻塞 `pread`/`pwrite`。
+- MemGraph，支持活跃/冻结轮换、低出度内联段和高出度 `BTreeMap` 溢出。
+- CSR 写入器/读取器，采用稀疏按源偏移量和固定二进制边体。
+- Manifest 重放，用于重新打开持久化存储。
+- L0 版本链和可见邻居合并。
+- L0 到 L1 的压缩。
+- L1+ 的简单多级索引。
+- `person_knows` CSV 导入和原始 CSV 验证。
 
-## Commands
+## 命令
 
 ```bash
 cd /data/WorkSpace/lsmgraph-rs
 
-# Build/test
+# 构建/测试
 /home/ydl/.cargo/bin/cargo test
 /home/ydl/.cargo/bin/cargo build --release
 
-# Optional I/O backends
+# 可选的 I/O 后端
 /home/ydl/.cargo/bin/cargo build --release --features direct-io,uring
 
-# Import SF1 person_knows into a fresh store
+# 将 SF1 person_knows 导入全新的存储
 target/release/lsmgraph import \
   --input /data/WorkSpace/dgs/data/social_network_tugraph \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1 \
   --relation person_knows
 
-# Or import all currently supported SNB topology relations
+# 或导入当前支持的所有 SNB 拓扑关系
 target/release/lsmgraph import \
   --input /data/WorkSpace/dgs/data/social_network_tugraph \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-topology \
   --relation all-topology
 
-# Import label-encoded SNB topology plus vertex/edge properties for IC validation
+# 导入标签编码的 SNB 拓扑及顶点/边属性，用于 IC 验证
 target/release/lsmgraph import \
   --input /data/WorkSpace/dgs/data/social_network_tugraph \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full \
   --relation snb-full
 
-# Validate all person_knows adjacency lists against the raw CSV
+# 验证所有 person_knows 邻接表与原始 CSV
 target/release/lsmgraph validate-knows \
   --input /data/WorkSpace/dgs/data/social_network_tugraph \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1 \
   --max-vertices 100000
 
-# Scan current snapshot
+# 扫描当前快照
 target/release/lsmgraph scan \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1
 
-# Compact L0 into L1 and validate again
+# 将 L0 压缩到 L1 并再次验证
 target/release/lsmgraph compact \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1
 
@@ -68,18 +66,18 @@ target/release/lsmgraph neighbors \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1 \
   --src 933
 
-# Validate the migrated IC1-IC14 adapter against LDBC validation_params.csv.
-# The validator uses the persisted SNB adjacency cache when present.
+# 针对 LDBC validation_params.csv 验证迁移后的 IC1-IC14 适配器。
+# 验证器在存在持久化 SNB 邻接缓存时优先使用它。
 target/release/lsmgraph snb-validate \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full \
   --validation-params /data/WorkSpace/dgs/deps/ldbc_snb_interactive_impls/dgs/validation_params.csv \
   --max-lines 100
 
-# Rebuild the persisted SNB adjacency cache for an existing snb-full store
+# 为现有 snb-full 存储重建持久化 SNB 邻接缓存
 target/release/lsmgraph snb-cache \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full
 
-# Select a storage I/O backend. blocking is the default.
+# 选择存储 I/O 后端。blocking 为默认后端。
 target/release/lsmgraph --io-backend direct scan \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-direct-smoke
 
@@ -87,40 +85,40 @@ target/release/lsmgraph --io-backend uring scan \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-uring-smoke
 ```
 
-Expected SF1 `person_knows` result:
+预期 SF1 `person_knows` 结果：
 
-- CSV data rows: `180623`
-- Directed records after bidirectional import: `361246`
-- Vertices with at least one knows edge in this file: `9163`
+- CSV 数据行数：`180623`
+- 双向导入后的有向记录数：`361246`
+- 在该文件中至少有 1 条 knows 边的顶点数：`9163`
 
-Observed SF1 `all-topology` smoke result:
+SF1 `all-topology` 烟雾测试结果：
 
-- Input rows visited across supported CSV sources: `19308214`
-- Directed topology edge records: `17436661`
-- Default 64 MiB MemGraph produced `9` L0 CSR files before compaction.
+- 遍历的输入行数（跨所有支持的 CSV 源）：`19308214`
+- 有向拓扑边记录数：`17436661`
+- 默认 64 MiB MemGraph 压缩前产生了 `9` 个 L0 CSR 文件。
 
-Observed SF1 `snb-full` result:
+SF1 `snb-full` 结果：
 
-- Directed topology edge records including reverse lookup edges: `34692699`
-- Default 64 MiB MemGraph produced `17` L0 CSR files before compaction.
-- `snb-validate --max-lines 100` checked `100` IC1-IC14 rows and passed `100`.
-- `snb-validate --max-lines 500` checked `500` IC1-IC14 rows and passed `500`.
-- Persisted SNB adjacency cache: `snb_adjacency.bin`, `11330230` groups, about `611M`.
-- With the persisted cache, `snb-validate --max-lines 100` passed `100/100` in about `31s`.
+- 包括反向查找边在内的有向拓扑边记录数：`34692699`
+- 默认 64 MiB MemGraph 压缩前产生了 `17` 个 L0 CSR 文件。
+- `snb-validate --max-lines 100` 检查了 `100` 条 IC1-IC14 记录，全部通过。
+- `snb-validate --max-lines 500` 检查了 `500` 条 IC1-IC14 记录，全部通过。
+- 持久化 SNB 邻接缓存：`snb_adjacency.bin`，`11330230` 个组，约 `611M`。
+- 使用持久化缓存后，`snb-validate --max-lines 100` 在约 `31s` 内全部通过 `100/100`。
 
-Observed I/O backend smoke results:
+I/O 后端烟雾测试结果：
 
-- `--io-backend direct` imported and validated SF1 `person_knows`: `361246/361246`.
-- `--io-backend uring` imported SF1 `person_knows`; scan returned `361246`.
-- `uring` currently creates a ring per operation for correctness testing. Full random-neighbor validation is much slower than the blocking backend until a persistent ring worker is added.
+- `--io-backend direct` 导入并验证了 SF1 `person_knows`：`361246/361246`。
+- `--io-backend uring` 导入了 SF1 `person_knows`；scan 返回了 `361246`。
+- `uring` 目前每次操作创建一个 ring 用于正确性测试。在添加持久化 ring worker 之前，完全随机邻居验证比 blocking 后端慢得多。
 
-## Next Work
+## 下一步工作
 
-- Add a persistent HTTP endpoint compatible with the LDBC interactive driver.
-- mmap the SNB adjacency cache to reduce validator startup memory copy cost.
-- Replace the functional `uring` backend with persistent ring workers and batched submissions.
+- 添加兼容 LDBC interactive driver 的持久化 HTTP 端点。
+- mmap SNB 邻接缓存，以减少验证器启动时的内存拷贝开销。
+- 将功能性的 `uring` 后端替换为持久化 ring worker 和批量提交。
 
-## Linux Server Quick Commands
+## Linux 服务器快速命令
 
 下面这些命令都在服务器上执行：
 
@@ -129,14 +127,14 @@ cd /data/WorkSpace/lsmgraph-rs
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
-### Build
+### 构建
 
 ```bash
 cargo test
 cargo build --release --features direct-io,uring
 ```
 
-### Service-Style Startup
+### 后台服务式启动
 
 当前版本还是 CLI storage/query prototype，没有常驻 HTTP LDBC driver server。
 如果要把一次导入、验证或性能测试当后台任务跑，可以这样启动：
@@ -153,55 +151,52 @@ nohup target/release/lsmgraph snb-validate \
 tail -f logs/snb-validate-500.log
 ```
 
-### Result Validation
+### 结果验证
 
 ```bash
-# Storage smoke test
+# 存储烟雾测试
 target/release/lsmgraph scan \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full
 
-# IC1-IC14 quick validation
+# IC1-IC14 快速验证
 target/release/lsmgraph snb-validate \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full \
   --validation-params /data/WorkSpace/dgs/deps/ldbc_snb_interactive_impls/dgs/validation_params.csv \
   --max-lines 100
 
-# Broader validation sample
+# 更广的验证样本
 target/release/lsmgraph snb-validate \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full \
   --validation-params /data/WorkSpace/dgs/deps/ldbc_snb_interactive_impls/dgs/validation_params.csv \
   --max-lines 500
 
-# Full validation, long running
+# 完整验证，运行时间较长
 target/release/lsmgraph snb-validate \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full \
   --validation-params /data/WorkSpace/dgs/deps/ldbc_snb_interactive_impls/dgs/validation_params.csv \
   --max-lines 19992
 ```
 
-Observed on the existing SF1 store: `snb-validate --max-lines 500` passed
-`500/500` for IC1-IC14. IC14 validation compares equal-weight shortest paths
-semantically because LDBC orders by `pathWeight` and does not define a
-tie-break for equal weights.
+现有 SF1 存储上观察到：`snb-validate --max-lines 500` 在 IC1-IC14 上全部通过 `500/500`。IC14 验证在语义上比较等权最短路径，因为 LDBC 按 `pathWeight` 排序且未定义等权情况下的打破规则。
 
-### Performance Tests
+### 性能测试
 
 ```bash
-# Query validation wall time and memory
+# 查询验证 wall time 和内存
 /usr/bin/time -v target/release/lsmgraph snb-validate \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full \
   --validation-params /data/WorkSpace/dgs/deps/ldbc_snb_interactive_impls/dgs/validation_params.csv \
   --max-lines 500
 
-# Storage scan throughput smoke
+# 存储扫描吞吐量烟雾测试
 /usr/bin/time -v target/release/lsmgraph scan \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full
 
-# Check manifest/file-level metrics
+# 检查 manifest/文件级指标
 target/release/lsmgraph stats \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full
 
-# Blocking/direct/io_uring backend smoke comparisons
+# Blocking/direct/io_uring 后端烟雾对比
 /usr/bin/time -v target/release/lsmgraph --io-backend blocking scan \
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full
 
