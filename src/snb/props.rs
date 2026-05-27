@@ -231,6 +231,42 @@ impl SnbGraph {
         self.vertices.get(&vid)
     }
 
+    pub fn insert_vertex(&mut self, data: VertexData) {
+        let vid = encode_vid(data.label(), data.external_id());
+        self.vertices.insert(vid, data);
+    }
+
+    pub fn insert_edge_cached(
+        &mut self,
+        src: VertexId,
+        dst: VertexId,
+        edge_label: EdgeLabel,
+        prop: EdgeProp,
+        include_reverse: bool,
+    ) {
+        let edge_type = edge_label.as_i32();
+        self.insert_edge_by_type(src, dst, edge_type, prop);
+        if include_reverse {
+            self.insert_edge_by_type(dst, src, -edge_type, prop);
+        }
+    }
+
+    pub fn insert_edge_by_type(
+        &mut self,
+        src: VertexId,
+        dst: VertexId,
+        edge_type: EdgeType,
+        prop: EdgeProp,
+    ) {
+        let dsts = self.adjacency.entry((src, edge_type)).or_default();
+        if !dsts.contains(&dst) {
+            dsts.push(dst);
+        }
+        if !matches!(prop, EdgeProp::Empty) {
+            self.edge_props.insert((src, edge_type, dst), prop);
+        }
+    }
+
     pub fn person(&self, vid: VertexId) -> Option<&PersonProps> {
         match self.vertices.get(&vid)? {
             VertexData::Person(p) => Some(p),

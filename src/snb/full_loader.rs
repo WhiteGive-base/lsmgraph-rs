@@ -1,5 +1,5 @@
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -46,7 +46,7 @@ pub async fn import_snb_full(
             true,
             ColRef::Index(0),
             ColRef::Index(1),
-            PropSpec::None,
+            PropSpec::I64Col(2),
         )
         .await?,
     );
@@ -290,6 +290,127 @@ pub async fn import_snb_full(
     Ok(stats)
 }
 
+pub fn rebuild_snb_edge_props(csv_root: &Path, store_dir: &Path) -> Result<u64> {
+    fs::create_dir_all(store_dir)?;
+    let path = store_dir.join("snb_edge_props.jsonl");
+    let tmp_path = path.with_extension("jsonl.tmp");
+    let mut edge_props = BufWriter::new(File::create(&tmp_path)?);
+    let dynamic = csv_root.join("dynamic");
+    let mut rows = 0u64;
+
+    rows += write_edge_prop_file(
+        &mut edge_props,
+        &dynamic.join("person_knows_person_0_0.csv"),
+        VertexLabel::Person,
+        VertexLabel::Person,
+        EdgeLabel::Knows,
+        true,
+        ColRef::Index(0),
+        ColRef::Index(1),
+        PropSpec::I64Col(2),
+    )?;
+    rows += write_edge_prop_file(
+        &mut edge_props,
+        &dynamic.join("person_likes_comment_0_0.csv"),
+        VertexLabel::Person,
+        VertexLabel::Comment,
+        EdgeLabel::LikesComment,
+        false,
+        ColRef::Index(0),
+        ColRef::Index(1),
+        PropSpec::I64Col(2),
+    )?;
+    rows += write_edge_prop_file(
+        &mut edge_props,
+        &dynamic.join("person_likes_post_0_0.csv"),
+        VertexLabel::Person,
+        VertexLabel::Post,
+        EdgeLabel::LikesPost,
+        false,
+        ColRef::Index(0),
+        ColRef::Index(1),
+        PropSpec::I64Col(2),
+    )?;
+    rows += write_edge_prop_file(
+        &mut edge_props,
+        &dynamic.join("person_studyAt_organisation_0_0.csv"),
+        VertexLabel::Person,
+        VertexLabel::Organisation,
+        EdgeLabel::StudyAt,
+        false,
+        ColRef::Index(0),
+        ColRef::Index(1),
+        PropSpec::I32Col(2),
+    )?;
+    rows += write_edge_prop_file(
+        &mut edge_props,
+        &dynamic.join("person_workAt_organisation_0_0.csv"),
+        VertexLabel::Person,
+        VertexLabel::Organisation,
+        EdgeLabel::WorkAt,
+        false,
+        ColRef::Index(0),
+        ColRef::Index(1),
+        PropSpec::I32Col(2),
+    )?;
+    rows += write_edge_prop_file(
+        &mut edge_props,
+        &dynamic.join("forum_hasMember_person_0_0.csv"),
+        VertexLabel::Forum,
+        VertexLabel::Person,
+        EdgeLabel::HasMember,
+        false,
+        ColRef::Index(0),
+        ColRef::Index(1),
+        PropSpec::I64Col(2),
+    )?;
+
+    edge_props.flush()?;
+    fs::rename(tmp_path, path)?;
+    Ok(rows)
+}
+
+pub async fn import_snb_updates(
+    engine: Arc<Engine>,
+    csv_root: &Path,
+    store_dir: &Path,
+) -> Result<ImportStats> {
+    fs::create_dir_all(store_dir)?;
+    let mut vertices = BufWriter::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(store_dir.join("snb_vertices.jsonl"))?,
+    );
+    let mut edge_props = BufWriter::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(store_dir.join("snb_edge_props.jsonl"))?,
+    );
+    let mut stats = ImportStats {
+        input_rows: 0,
+        directed_edges: 0,
+    };
+    let mut files = update_stream_files(csv_root)?;
+    files.sort();
+    for path in files {
+        import_update_stream_file(
+            engine.clone(),
+            &mut vertices,
+            &mut edge_props,
+            &path,
+            &mut stats,
+        )
+        .await?;
+    }
+    vertices.flush()?;
+    edge_props.flush()?;
+    engine.flush_active().await?;
+    SnbGraph::build_adjacency_cache(engine, store_dir).await?;
+    Ok(stats)
+}
+
 fn import_vertices(csv_root: &Path, out: &mut BufWriter<File>) -> Result<()> {
     let dynamic = csv_root.join("dynamic");
     let static_dir = csv_root.join("static");
@@ -442,6 +563,88 @@ where
     Ok(())
 }
 
+async fn import_update_stream_file(
+    engine: Arc<Engine>,
+    vertices: &mut BufWriter<File>,
+    edge_props: &mut BufWriter<File>,
+    path: &Path,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        stats.input_rows += 1;
+        match parts[2] {
+            "1" => apply_add_person(engine.clone(), vertices, edge_props, &parts, stats).await?,
+            "2" => {
+                apply_binary_update_edge(
+                    engine.clone(),
+                    edge_props,
+                    &parts,
+                    VertexLabel::Person,
+                    VertexLabel::Post,
+                    EdgeLabel::LikesPost,
+                    false,
+                )
+                .await?;
+                stats.directed_edges += 2;
+            }
+            "3" => {
+                apply_binary_update_edge(
+                    engine.clone(),
+                    edge_props,
+                    &parts,
+                    VertexLabel::Person,
+                    VertexLabel::Comment,
+                    EdgeLabel::LikesComment,
+                    false,
+                )
+                .await?;
+                stats.directed_edges += 2;
+            }
+            "4" => apply_add_forum(engine.clone(), vertices, edge_props, &parts, stats).await?,
+            "5" => {
+                apply_binary_update_edge(
+                    engine.clone(),
+                    edge_props,
+                    &parts,
+                    VertexLabel::Forum,
+                    VertexLabel::Person,
+                    EdgeLabel::HasMember,
+                    false,
+                )
+                .await?;
+                stats.directed_edges += 2;
+            }
+            "6" => apply_add_post(engine.clone(), vertices, edge_props, &parts, stats).await?,
+            "7" => apply_add_comment(engine.clone(), vertices, edge_props, &parts, stats).await?,
+            "8" => {
+                apply_binary_update_edge(
+                    engine.clone(),
+                    edge_props,
+                    &parts,
+                    VertexLabel::Person,
+                    VertexLabel::Person,
+                    EdgeLabel::Knows,
+                    true,
+                )
+                .await?;
+                stats.directed_edges += 3;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 async fn import_edge_file(
     engine: Arc<Engine>,
     edge_props: &mut BufWriter<File>,
@@ -522,6 +725,355 @@ async fn import_named_edge(
         PropSpec::None,
     )
     .await
+}
+
+fn write_edge_prop_file(
+    edge_props: &mut BufWriter<File>,
+    path: &Path,
+    src_label: VertexLabel,
+    dst_label: VertexLabel,
+    edge_label: EdgeLabel,
+    bidirectional_positive: bool,
+    src_col: ColRef,
+    dst_col: ColRef,
+    prop: PropSpec,
+) -> Result<u64> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .delimiter(b'|')
+        .has_headers(true)
+        .from_path(path)?;
+    let headers = rdr.headers()?.clone();
+    let mut input_rows = 0u64;
+    for rec in rdr.records() {
+        let rec = rec?;
+        input_rows += 1;
+        let Some(src_ext) = src_col.get(&headers, &rec)? else {
+            continue;
+        };
+        let Some(dst_ext) = dst_col.get(&headers, &rec)? else {
+            continue;
+        };
+        let src = encode_vid(src_label, src_ext);
+        let dst = encode_vid(dst_label, dst_ext);
+        let prop_value = prop.read(&headers, &rec)?;
+        let label = edge_label.as_i32();
+        write_edge_prop(edge_props, src, dst, label, prop_value)?;
+        write_edge_prop(edge_props, dst, src, -label, prop_value)?;
+        if bidirectional_positive {
+            write_edge_prop(edge_props, dst, src, label, prop_value)?;
+        }
+    }
+    Ok(input_rows)
+}
+
+async fn apply_add_person(
+    engine: Arc<Engine>,
+    vertices: &mut BufWriter<File>,
+    edge_props: &mut BufWriter<File>,
+    p: &[&str],
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let id = parse_field_i64(p, 3)?;
+    let vid = encode_vid(VertexLabel::Person, id);
+    write_vertex(
+        vertices,
+        vid,
+        VertexData::Person(PersonProps {
+            id,
+            first_name: field(p, 4).to_string(),
+            last_name: field(p, 5).to_string(),
+            gender: field(p, 6).to_string(),
+            birthday: parse_field_i64(p, 7)?,
+            creation_date: parse_field_i64(p, 8)?,
+            location_ip: field(p, 9).to_string(),
+            browser_used: field(p, 10).to_string(),
+            place: parse_field_i64(p, 11)?,
+            language: field(p, 12).to_string(),
+            email: field(p, 13).to_string(),
+        }),
+    )?;
+    insert_forward_reverse(
+        engine.clone(),
+        edge_props,
+        vid,
+        encode_vid(VertexLabel::Place, parse_field_i64(p, 11)?),
+        EdgeLabel::IsLocatedIn,
+        EdgeProp::Empty,
+        true,
+    )
+    .await?;
+    stats.directed_edges += 2;
+    for tag in parse_id_list(field(p, 14)) {
+        insert_forward_reverse(
+            engine.clone(),
+            edge_props,
+            vid,
+            encode_vid(VertexLabel::Tag, tag),
+            EdgeLabel::HasInterest,
+            EdgeProp::Empty,
+            true,
+        )
+        .await?;
+        stats.directed_edges += 2;
+    }
+    for (org, year) in parse_org_year_list(field(p, 15)) {
+        insert_forward_reverse(
+            engine.clone(),
+            edge_props,
+            vid,
+            encode_vid(VertexLabel::Organisation, org),
+            EdgeLabel::StudyAt,
+            EdgeProp::I32(year),
+            true,
+        )
+        .await?;
+        stats.directed_edges += 2;
+    }
+    for (org, year) in parse_org_year_list(field(p, 16)) {
+        insert_forward_reverse(
+            engine.clone(),
+            edge_props,
+            vid,
+            encode_vid(VertexLabel::Organisation, org),
+            EdgeLabel::WorkAt,
+            EdgeProp::I32(year),
+            true,
+        )
+        .await?;
+        stats.directed_edges += 2;
+    }
+    Ok(())
+}
+
+async fn apply_add_forum(
+    engine: Arc<Engine>,
+    vertices: &mut BufWriter<File>,
+    edge_props: &mut BufWriter<File>,
+    p: &[&str],
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let id = parse_field_i64(p, 3)?;
+    let vid = encode_vid(VertexLabel::Forum, id);
+    write_vertex(
+        vertices,
+        vid,
+        VertexData::Forum(ForumProps {
+            id,
+            title: field(p, 4).to_string(),
+            creation_date: parse_field_i64(p, 5)?,
+            moderator: parse_field_i64(p, 6)?,
+        }),
+    )?;
+    insert_forward_reverse(
+        engine.clone(),
+        edge_props,
+        vid,
+        encode_vid(VertexLabel::Person, parse_field_i64(p, 6)?),
+        EdgeLabel::HasModerator,
+        EdgeProp::Empty,
+        true,
+    )
+    .await?;
+    stats.directed_edges += 2;
+    for tag in parse_id_list(field(p, 7)) {
+        insert_forward_reverse(
+            engine.clone(),
+            edge_props,
+            vid,
+            encode_vid(VertexLabel::Tag, tag),
+            EdgeLabel::HasTag,
+            EdgeProp::Empty,
+            true,
+        )
+        .await?;
+        stats.directed_edges += 2;
+    }
+    Ok(())
+}
+
+async fn apply_add_post(
+    engine: Arc<Engine>,
+    vertices: &mut BufWriter<File>,
+    edge_props: &mut BufWriter<File>,
+    p: &[&str],
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let id = parse_field_i64(p, 3)?;
+    let vid = encode_vid(VertexLabel::Post, id);
+    write_vertex(
+        vertices,
+        vid,
+        VertexData::Post(PostProps {
+            id,
+            image_file: field(p, 4).to_string(),
+            creation_date: parse_field_i64(p, 5)?,
+            location_ip: field(p, 6).to_string(),
+            browser_used: field(p, 7).to_string(),
+            language: field(p, 8).to_string(),
+            content: field(p, 9).to_string(),
+            length: parse_field_i64(p, 10)?,
+            creator: parse_field_i64(p, 11)?,
+            forum_id: parse_field_i64(p, 12)?,
+            place: parse_field_i64(p, 13)?,
+        }),
+    )?;
+    insert_forward_reverse(
+        engine.clone(),
+        edge_props,
+        vid,
+        encode_vid(VertexLabel::Person, parse_field_i64(p, 11)?),
+        EdgeLabel::HasCreator,
+        EdgeProp::Empty,
+        true,
+    )
+    .await?;
+    stats.directed_edges += 2;
+    insert_forward_reverse(
+        engine.clone(),
+        edge_props,
+        encode_vid(VertexLabel::Forum, parse_field_i64(p, 12)?),
+        vid,
+        EdgeLabel::ContainerOf,
+        EdgeProp::Empty,
+        true,
+    )
+    .await?;
+    stats.directed_edges += 2;
+    insert_forward_reverse(
+        engine.clone(),
+        edge_props,
+        vid,
+        encode_vid(VertexLabel::Place, parse_field_i64(p, 13)?),
+        EdgeLabel::IsLocatedIn,
+        EdgeProp::Empty,
+        true,
+    )
+    .await?;
+    stats.directed_edges += 2;
+    for tag in parse_id_list(field(p, 14)) {
+        insert_forward_reverse(
+            engine.clone(),
+            edge_props,
+            vid,
+            encode_vid(VertexLabel::Tag, tag),
+            EdgeLabel::HasTag,
+            EdgeProp::Empty,
+            true,
+        )
+        .await?;
+        stats.directed_edges += 2;
+    }
+    Ok(())
+}
+
+async fn apply_add_comment(
+    engine: Arc<Engine>,
+    vertices: &mut BufWriter<File>,
+    edge_props: &mut BufWriter<File>,
+    p: &[&str],
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let id = parse_field_i64(p, 3)?;
+    let vid = encode_vid(VertexLabel::Comment, id);
+    let reply_of_post = parse_optional_i64(field(p, 11))?;
+    let reply_of_comment = parse_optional_i64(field(p, 12))?;
+    write_vertex(
+        vertices,
+        vid,
+        VertexData::Comment(CommentProps {
+            id,
+            creation_date: parse_field_i64(p, 4)?,
+            location_ip: field(p, 5).to_string(),
+            browser_used: field(p, 6).to_string(),
+            content: field(p, 7).to_string(),
+            length: parse_field_i64(p, 8)?,
+            creator: parse_field_i64(p, 9)?,
+            place: parse_field_i64(p, 10)?,
+            reply_of_post,
+            reply_of_comment,
+        }),
+    )?;
+    insert_forward_reverse(
+        engine.clone(),
+        edge_props,
+        vid,
+        encode_vid(VertexLabel::Person, parse_field_i64(p, 9)?),
+        EdgeLabel::HasCreator,
+        EdgeProp::Empty,
+        true,
+    )
+    .await?;
+    stats.directed_edges += 2;
+    insert_forward_reverse(
+        engine.clone(),
+        edge_props,
+        vid,
+        encode_vid(VertexLabel::Place, parse_field_i64(p, 10)?),
+        EdgeLabel::IsLocatedIn,
+        EdgeProp::Empty,
+        true,
+    )
+    .await?;
+    stats.directed_edges += 2;
+    if let Some(post) = reply_of_post {
+        insert_forward_reverse(
+            engine.clone(),
+            edge_props,
+            vid,
+            encode_vid(VertexLabel::Post, post),
+            EdgeLabel::ReplyOfPost,
+            EdgeProp::Empty,
+            true,
+        )
+        .await?;
+        stats.directed_edges += 2;
+    }
+    if let Some(comment) = reply_of_comment {
+        insert_forward_reverse(
+            engine.clone(),
+            edge_props,
+            vid,
+            encode_vid(VertexLabel::Comment, comment),
+            EdgeLabel::ReplyOfComment,
+            EdgeProp::Empty,
+            true,
+        )
+        .await?;
+        stats.directed_edges += 2;
+    }
+    for tag in parse_id_list(field(p, 13)) {
+        insert_forward_reverse(
+            engine.clone(),
+            edge_props,
+            vid,
+            encode_vid(VertexLabel::Tag, tag),
+            EdgeLabel::HasTag,
+            EdgeProp::Empty,
+            true,
+        )
+        .await?;
+        stats.directed_edges += 2;
+    }
+    Ok(())
+}
+
+async fn apply_binary_update_edge(
+    engine: Arc<Engine>,
+    edge_props: &mut BufWriter<File>,
+    p: &[&str],
+    src_label: VertexLabel,
+    dst_label: VertexLabel,
+    edge_label: EdgeLabel,
+    bidirectional_positive: bool,
+) -> Result<()> {
+    let src = encode_vid(src_label, parse_field_i64(p, 3)?);
+    let dst = encode_vid(dst_label, parse_field_i64(p, 4)?);
+    let prop = EdgeProp::I64(parse_field_i64(p, 5)?);
+    insert_forward_reverse(engine.clone(), edge_props, src, dst, edge_label, prop, true).await?;
+    if bidirectional_positive {
+        insert_forward_reverse(engine, edge_props, dst, src, edge_label, prop, false).await?;
+    }
+    Ok(())
 }
 
 async fn insert_forward_reverse(
@@ -647,4 +1199,55 @@ fn parse_optional_i64(raw: &str) -> Result<Option<i64>> {
     } else {
         Ok(Some(raw.parse()?))
     }
+}
+
+fn update_stream_files(csv_root: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(csv_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with("updateStream_0_")
+            && (name.ends_with("_person.csv") || name.ends_with("_forum.csv"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+fn write_vertex(out: &mut BufWriter<File>, vid: u64, data: VertexData) -> Result<()> {
+    serde_json::to_writer(out.by_ref(), &VertexRow { vid, data })?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+fn field<'a>(parts: &'a [&str], idx: usize) -> &'a str {
+    parts.get(idx).copied().unwrap_or("")
+}
+
+fn parse_field_i64(parts: &[&str], idx: usize) -> Result<i64> {
+    Ok(field(parts, idx).parse()?)
+}
+
+fn parse_id_list(raw: &str) -> Vec<i64> {
+    raw.split(';')
+        .filter_map(|s| {
+            let s = s.trim();
+            (!s.is_empty() && s != "-1")
+                .then(|| s.parse::<i64>().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+fn parse_org_year_list(raw: &str) -> Vec<(i64, i32)> {
+    raw.split(';')
+        .filter_map(|item| {
+            let (org, year) = item.trim().split_once(',')?;
+            Some((org.parse().ok()?, year.parse().ok()?))
+        })
+        .collect()
 }

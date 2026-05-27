@@ -8,7 +8,9 @@ use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::graph::Engine;
-use crate::snb::props::{encode_vid, SnbGraph};
+use crate::snb::props::{
+    encode_vid, CommentProps, EdgeProp, ForumProps, PersonProps, PostProps, SnbGraph, VertexData,
+};
 use crate::types::{EdgeLabel, VertexId, VertexLabel};
 
 const DAY_MS: i64 = 86_400_000;
@@ -19,6 +21,31 @@ pub struct ValidationReport {
     pub max_lines: usize,
     pub checked: usize,
     pub passed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub supported_queries: Vec<&'static str>,
+    pub first_failure: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchValidationReport {
+    pub validation_dir: String,
+    pub max_lines_per_query: usize,
+    pub reports: Vec<ValidationReport>,
+    pub checked: usize,
+    pub passed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MixedValidationReport {
+    pub validation_params: String,
+    pub max_lines: usize,
+    pub processed: usize,
+    pub reads_checked: usize,
+    pub reads_passed: usize,
+    pub updates_applied: usize,
     pub skipped: usize,
     pub failed: usize,
     pub supported_queries: Vec<&'static str>,
@@ -187,6 +214,78 @@ struct Ic14Row {
     path_weight: f64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Is1Row {
+    first_name: String,
+    last_name: String,
+    birthday: i64,
+    location_ip: String,
+    browser_used: String,
+    city_id: i64,
+    gender: String,
+    creation_date: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Is2Row {
+    message_id: i64,
+    message_content: String,
+    message_creation_date: i64,
+    original_post_id: i64,
+    original_post_author_id: i64,
+    original_post_author_first_name: String,
+    original_post_author_last_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Is3Row {
+    person_id: i64,
+    first_name: String,
+    last_name: String,
+    friendship_creation_date: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Is4Row {
+    message_creation_date: i64,
+    message_content: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Is5Row {
+    person_id: i64,
+    first_name: String,
+    last_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Is6Row {
+    forum_id: i64,
+    forum_title: String,
+    moderator_id: i64,
+    moderator_first_name: String,
+    moderator_last_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Is7Row {
+    comment_id: i64,
+    comment_content: String,
+    comment_creation_date: i64,
+    reply_author_id: i64,
+    reply_author_first_name: String,
+    reply_author_last_name: String,
+    #[serde(rename = "isReplyAuthorKnowsOriginalMessageAuthor")]
+    reply_author_knows_original_message_author: bool,
+}
+
 pub async fn validate_ic1_ic14(
     engine: Arc<Engine>,
     store_dir: &Path,
@@ -194,6 +293,157 @@ pub async fn validate_ic1_ic14(
     max_lines: usize,
 ) -> Result<ValidationReport> {
     let snb = SnbGraph::open(engine, store_dir).await?;
+    validate_file_with_snb(&snb, validation_params, max_lines, None)
+}
+
+pub async fn validate_ic_batch(
+    engine: Arc<Engine>,
+    store_dir: &Path,
+    validation_dir: &Path,
+    queries: &[String],
+    max_lines_per_query: usize,
+) -> Result<BatchValidationReport> {
+    let snb = SnbGraph::open(engine, store_dir).await?;
+    let mut reports = Vec::new();
+    for query in queries {
+        let query = query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            continue;
+        }
+        let path = validation_dir.join(format!("validation_params_{query}.csv"));
+        if !path.exists() {
+            reports.push(ValidationReport {
+                validation_params: path.display().to_string(),
+                max_lines: max_lines_per_query,
+                checked: 0,
+                passed: 0,
+                skipped: 0,
+                failed: 1,
+                supported_queries: supported_query_names(),
+                first_failure: Some(json!({
+                    "error": "validation split file not found",
+                    "query": query,
+                    "path": path,
+                })),
+            });
+            continue;
+        }
+        reports.push(validate_file_with_snb(
+            &snb,
+            &path,
+            max_lines_per_query,
+            Some(&query),
+        )?);
+    }
+
+    let checked = reports.iter().map(|r| r.checked).sum();
+    let passed = reports.iter().map(|r| r.passed).sum();
+    let skipped = reports.iter().map(|r| r.skipped).sum();
+    let failed = reports.iter().map(|r| r.failed).sum();
+    Ok(BatchValidationReport {
+        validation_dir: validation_dir.display().to_string(),
+        max_lines_per_query,
+        reports,
+        checked,
+        passed,
+        skipped,
+        failed,
+    })
+}
+
+pub async fn validate_mixed_tugraph(
+    engine: Arc<Engine>,
+    store_dir: &Path,
+    validation_params: &Path,
+    max_lines: usize,
+) -> Result<MixedValidationReport> {
+    let mut snb = SnbGraph::open(engine, store_dir).await?;
+    validate_mixed_file_with_snb(&mut snb, validation_params, max_lines)
+}
+
+fn validate_mixed_file_with_snb(
+    snb: &mut SnbGraph,
+    validation_params: &Path,
+    max_lines: usize,
+) -> Result<MixedValidationReport> {
+    let text = std::fs::read_to_string(validation_params)?;
+    let mut processed = 0usize;
+    let mut reads_checked = 0usize;
+    let mut reads_passed = 0usize;
+    let mut updates_applied = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut first_failure = None;
+
+    for (line_no, line) in text.lines().enumerate() {
+        if max_lines != 0 && processed >= max_lines {
+            break;
+        }
+        let Some((params_raw, expected_raw)) = line.split_once('|') else {
+            continue;
+        };
+        processed += 1;
+        let params: Value = serde_json::from_str(params_raw)?;
+        let expected: Value = serde_json::from_str(expected_raw)?;
+        if expected.as_str() == Some("-1") {
+            match update_endpoint_for_params(&params) {
+                Some(endpoint) => {
+                    run_dgs_http_update(snb, endpoint, &params)?;
+                    updates_applied += 1;
+                }
+                None => {
+                    skipped += 1;
+                }
+            }
+            continue;
+        }
+
+        let (query_name, actual) = match dispatch_query(snb, &params, None)? {
+            Some((query_name, value)) => {
+                reads_checked += 1;
+                (query_name, value)
+            }
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        if values_equal(query_name, &actual, &expected) {
+            reads_passed += 1;
+        } else {
+            failed += 1;
+            if first_failure.is_none() {
+                first_failure = Some(json!({
+                    "line": line_no + 1,
+                    "params": params,
+                    "expected": expected,
+                    "actual": actual,
+                }));
+            }
+        }
+    }
+
+    Ok(MixedValidationReport {
+        validation_params: validation_params.display().to_string(),
+        max_lines,
+        processed,
+        reads_checked,
+        reads_passed,
+        updates_applied,
+        skipped,
+        failed,
+        supported_queries: supported_query_names(),
+        first_failure,
+    })
+}
+
+fn validate_file_with_snb(
+    snb: &SnbGraph,
+    validation_params: &Path,
+    max_lines: usize,
+    query_hint: Option<&str>,
+) -> Result<ValidationReport> {
     let text = std::fs::read_to_string(validation_params)?;
     let mut checked = 0usize;
     let mut passed = 0usize;
@@ -202,7 +452,7 @@ pub async fn validate_ic1_ic14(
     let mut first_failure = None;
 
     for (line_no, line) in text.lines().enumerate() {
-        if checked >= max_lines {
+        if max_lines != 0 && checked >= max_lines {
             break;
         }
         let Some((params_raw, expected_raw)) = line.split_once('|') else {
@@ -210,7 +460,7 @@ pub async fn validate_ic1_ic14(
         };
         let params: Value = serde_json::from_str(params_raw)?;
         let expected: Value = serde_json::from_str(expected_raw)?;
-        let (query_name, actual) = match dispatch_query(&snb, &params)? {
+        let (query_name, actual) = match dispatch_query(&snb, &params, query_hint)? {
             Some((query_name, value)) => {
                 checked += 1;
                 (query_name, value)
@@ -243,17 +493,115 @@ pub async fn validate_ic1_ic14(
         passed,
         skipped,
         failed,
-        supported_queries: vec![
-            "IC1", "IC2", "IC3", "IC4", "IC5", "IC6", "IC7", "IC8", "IC9", "IC10", "IC11", "IC12",
-            "IC13", "IC14",
-        ],
+        supported_queries: supported_query_names(),
         first_failure,
     })
 }
 
-fn dispatch_query(snb: &SnbGraph, params: &Value) -> Result<Option<(&'static str, Value)>> {
+pub fn supported_query_names() -> Vec<&'static str> {
+    vec![
+        "IC1", "IC2", "IC3", "IC4", "IC5", "IC6", "IC7", "IC8", "IC9", "IC10", "IC11", "IC12",
+        "IC13", "IC14", "IS1", "IS2", "IS3", "IS4", "IS5", "IS6", "IS7", "IU1", "IU2", "IU3",
+        "IU4", "IU5", "IU6", "IU7", "IU8",
+    ]
+}
+
+fn update_endpoint_for_params(params: &Value) -> Option<&'static str> {
+    if params.get("firstName").is_some()
+        && params.get("lastName").is_some()
+        && params.get("birthday").is_some()
+    {
+        Some("/query/interactive_update_1")
+    } else if params.get("postId").is_some() && params.get("personId").is_some() {
+        Some("/query/interactive_update_2")
+    } else if params.get("commentId").is_some()
+        && params.get("personId").is_some()
+        && params.get("creationDate").is_some()
+    {
+        Some("/query/interactive_update_3")
+    } else if params.get("forumTitle").is_some() {
+        Some("/query/interactive_update_4")
+    } else if params.get("forumId").is_some()
+        && params.get("personId").is_some()
+        && params.get("joinDate").is_some()
+    {
+        Some("/query/interactive_update_5")
+    } else if params.get("postId").is_some() && params.get("authorPersonId").is_some() {
+        Some("/query/interactive_update_6")
+    } else if params.get("commentId").is_some() && params.get("authorPersonId").is_some() {
+        Some("/query/interactive_update_7")
+    } else if params.get("person1Id").is_some() && params.get("person2Id").is_some() {
+        Some("/query/interactive_update_8")
+    } else {
+        None
+    }
+}
+
+fn dispatch_query(
+    snb: &SnbGraph,
+    params: &Value,
+    query_hint: Option<&str>,
+) -> Result<Option<(&'static str, Value)>> {
     let limit = || params["limit"].as_u64().unwrap_or(20) as usize;
-    let item = if params.get("personIdQ1").is_some() {
+    let hint = query_hint.unwrap_or_default().to_ascii_lowercase();
+    let item = if hint == "is1" || params.get("personIdSQ1").is_some() {
+        (
+            "IS1",
+            serde_json::to_value(is1(
+                snb,
+                req_i64_any(params, &["personIdSQ1", "personIdQ1", "personId"]),
+            ))?,
+        )
+    } else if hint == "is2" || params.get("personIdSQ2").is_some() {
+        (
+            "IS2",
+            serde_json::to_value(is2(
+                snb,
+                req_i64_any(params, &["personIdSQ2", "personIdQ2", "personId"]),
+                limit().min(10),
+            ))?,
+        )
+    } else if hint == "is3" || params.get("personIdSQ3").is_some() {
+        (
+            "IS3",
+            serde_json::to_value(is3(
+                snb,
+                req_i64_any(params, &["personIdSQ3", "personIdQ3", "personId"]),
+            ))?,
+        )
+    } else if hint == "is4" || params.get("messageIdContent").is_some() {
+        (
+            "IS4",
+            serde_json::to_value(is4(
+                snb,
+                req_i64_any(params, &["messageIdContent", "messageIdQ4", "messageId"]),
+            ))?,
+        )
+    } else if hint == "is5" || params.get("messageIdCreator").is_some() {
+        (
+            "IS5",
+            serde_json::to_value(is5(
+                snb,
+                req_i64_any(params, &["messageIdCreator", "messageIdQ5", "messageId"]),
+            ))?,
+        )
+    } else if hint == "is6" || params.get("messageForumId").is_some() {
+        (
+            "IS6",
+            serde_json::to_value(is6(
+                snb,
+                req_i64_any(params, &["messageForumId", "messageIdQ6", "messageId"]),
+            ))?,
+        )
+    } else if hint == "is7" || params.get("messageRepliesId").is_some() {
+        (
+            "IS7",
+            serde_json::to_value(is7(
+                snb,
+                req_i64_any(params, &["messageRepliesId", "messageIdQ7", "messageId"]),
+            ))?,
+        )
+    } else if params.get("personIdQ1").is_some() {
         (
             "IC1",
             serde_json::to_value(ic1(
@@ -390,6 +738,547 @@ fn dispatch_query(snb: &SnbGraph, params: &Value) -> Result<Option<(&'static str
         return Ok(None);
     };
     Ok(Some(item))
+}
+
+pub fn run_dgs_http_query(snb: &SnbGraph, endpoint: &str, params: &Value) -> Result<Value> {
+    let value = match endpoint {
+        "/query/interactive_complex_read_1" => {
+            let rows = ic1(
+                snb,
+                req_i64(params, "personIdQ1"),
+                req_str(params, "firstName"),
+                20,
+            );
+            Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        json!({
+                            "personId": r.friend_id,
+                            "lastName": r.friend_last_name,
+                            "distance": r.distance_from_person,
+                            "birthday": r.friend_birthday,
+                            "creationDate": r.friend_creation_date,
+                            "gender": r.friend_gender,
+                            "browserUsed": r.friend_browser_used,
+                            "locationIp": r.friend_location_ip,
+                            "email": r.friend_emails.join(";"),
+                            "language": r.friend_languages.join(";"),
+                            "cityName": r.friend_city_name,
+                            "universities": org_tuples(r.friend_universities),
+                            "companies": org_tuples(r.friend_companies),
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "/query/interactive_complex_read_2" => {
+            let rows = ic2(
+                snb,
+                req_i64(params, "personIdQ2"),
+                req_i64(params, "maxDate"),
+                20,
+            );
+            Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        json!({
+                            "friendId": r.person_id,
+                            "firstName": r.person_first_name,
+                            "lastName": r.person_last_name,
+                            "messageId": r.message_id,
+                            "content": r.message_content,
+                            "creationDate": r.message_creation_date,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "/query/interactive_complex_read_3" => {
+            let rows = ic3(
+                snb,
+                req_i64(params, "personIdQ3"),
+                req_str(params, "countryXName"),
+                req_str(params, "countryYName"),
+                req_i64(params, "startDate"),
+                req_i64(params, "durationDays"),
+                20,
+            );
+            Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        json!({
+                            "personId": r.person_id,
+                            "firstName": r.person_first_name,
+                            "lastName": r.person_last_name,
+                            "xCount": r.x_count,
+                            "yCount": r.y_count,
+                            "count": r.count,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "/query/interactive_complex_read_4" => serde_json::to_value(ic4(
+            snb,
+            req_i64(params, "personIdQ4"),
+            req_i64(params, "startDate"),
+            req_i64(params, "durationDays"),
+            10,
+        ))?,
+        "/query/interactive_complex_read_5" => serde_json::to_value(ic5(
+            snb,
+            req_i64(params, "personIdQ5"),
+            req_i64(params, "minDate"),
+            20,
+        ))?,
+        "/query/interactive_complex_read_6" => serde_json::to_value(ic6(
+            snb,
+            req_i64(params, "personIdQ6"),
+            req_str(params, "tagName"),
+            10,
+        ))?,
+        "/query/interactive_complex_read_7" => {
+            let rows = ic7(snb, req_i64(params, "personIdQ7"), 20);
+            Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        json!({
+                            "personId": r.person_id,
+                            "firstName": r.person_first_name,
+                            "lastName": r.person_last_name,
+                            "likeTime": r.like_creation_date,
+                            "messageId": r.message_id,
+                            "messageContent": r.message_content,
+                            "minutesLatency": r.minutes_latency,
+                            "isNew": r.is_new,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "/query/interactive_complex_read_8" => {
+            let rows = ic8(snb, req_i64(params, "personIdQ8"), 20);
+            Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        json!({
+                            "personId": r.person_id,
+                            "firstName": r.person_first_name,
+                            "lastName": r.person_last_name,
+                            "commentCreationDate": r.comment_creation_date,
+                            "commentId": r.comment_id,
+                            "commentContent": r.comment_content,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "/query/interactive_complex_read_9" => {
+            let rows = ic9(
+                snb,
+                req_i64(params, "personIdQ9"),
+                req_i64(params, "maxDate"),
+                20,
+            );
+            Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        json!({
+                            "friendId": r.person_id,
+                            "firstName": r.person_first_name,
+                            "lastName": r.person_last_name,
+                            "messageId": r.message_id,
+                            "content": r.message_content,
+                            "creationDate": r.message_creation_date,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "/query/interactive_complex_read_10" => {
+            let rows = ic10(
+                snb,
+                req_i64(params, "personIdQ10"),
+                req_i64(params, "month") as u32,
+                10,
+            );
+            Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        json!({
+                            "personId": r.person_id,
+                            "firstName": r.person_first_name,
+                            "lastName": r.person_last_name,
+                            "score": r.common_interest_score,
+                            "gender": r.person_gender,
+                            "cityName": r.person_city_name,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "/query/interactive_complex_read_11" => {
+            let rows = ic11(
+                snb,
+                req_i64(params, "personIdQ11"),
+                req_str(params, "countryName"),
+                req_i64(params, "workFromYear") as i32,
+                10,
+            );
+            Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        json!({
+                            "personId": r.person_id,
+                            "firstName": r.person_first_name,
+                            "lastName": r.person_last_name,
+                            "organizationName": r.organization_name,
+                            "workFromYear": r.organization_work_from_year,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "/query/interactive_complex_read_12" => {
+            let rows = ic12(
+                snb,
+                req_i64(params, "personIdQ12"),
+                req_str(params, "tagClassName"),
+                20,
+            );
+            Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        json!({
+                            "personId": r.person_id,
+                            "firstName": r.person_first_name,
+                            "lastName": r.person_last_name,
+                            "tagNames": r.tag_names,
+                            "count": r.reply_count,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "/query/interactive_complex_read_13" => serde_json::to_value(ic13(
+            snb,
+            req_i64(params, "person1IdQ13StartNode"),
+            req_i64(params, "person2IdQ13EndNode"),
+        ))?,
+        "/query/interactive_complex_read_14" => serde_json::to_value(ic14(
+            snb,
+            req_i64(params, "person1IdQ14StartNode"),
+            req_i64(params, "person2IdQ14EndNode"),
+        ))?,
+        "/query/interactive_short_read_1" => serde_json::to_value(is1(
+            snb,
+            req_i64_any(params, &["personIdSQ1", "personIdQ1", "personId"]),
+        ))?,
+        "/query/interactive_short_read_2" => Value::Array(
+            is2(
+                snb,
+                req_i64_any(params, &["personIdSQ2", "personIdQ2", "personId"]),
+                10,
+            )
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "messageId": r.message_id,
+                    "content": r.message_content,
+                    "creationDate": r.message_creation_date,
+                    "originalPostId": r.original_post_id,
+                    "originalPostAuthorId": r.original_post_author_id,
+                    "firstName": r.original_post_author_first_name,
+                    "lastName": r.original_post_author_last_name,
+                })
+            })
+            .collect(),
+        ),
+        "/query/interactive_short_read_3" => serde_json::to_value(is3(
+            snb,
+            req_i64_any(params, &["personIdSQ3", "personIdQ3", "personId"]),
+        ))?,
+        "/query/interactive_short_read_4" => match is4(
+            snb,
+            req_i64_any(params, &["messageIdContent", "messageIdQ4", "messageId"]),
+        ) {
+            Some(r) => json!({
+                "content": r.message_content,
+                "creationDate": r.message_creation_date,
+            }),
+            None => Value::Null,
+        },
+        "/query/interactive_short_read_5" => serde_json::to_value(is5(
+            snb,
+            req_i64_any(params, &["messageIdCreator", "messageIdQ5", "messageId"]),
+        ))?,
+        "/query/interactive_short_read_6" => match is6(
+            snb,
+            req_i64_any(params, &["messageForumId", "messageIdQ6", "messageId"]),
+        ) {
+            Some(r) => json!({
+                "forumId": r.forum_id,
+                "forumTitle": r.forum_title,
+                "moderatorPersonId": r.moderator_id,
+                "moderatorFirstName": r.moderator_first_name,
+                "moderatorLastName": r.moderator_last_name,
+            }),
+            None => Value::Null,
+        },
+        "/query/interactive_short_read_7" => Value::Array(
+            is7(
+                snb,
+                req_i64_any(params, &["messageRepliesId", "messageIdQ7", "messageId"]),
+            )
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "commentId": r.comment_id,
+                    "content": r.comment_content,
+                    "creationDate": r.comment_creation_date,
+                    "replyAuthorId": r.reply_author_id,
+                    "firstName": r.reply_author_first_name,
+                    "lastName": r.reply_author_last_name,
+                    "isKnown": r.reply_author_knows_original_message_author,
+                })
+            })
+            .collect(),
+        ),
+        _ => anyhow::bail!("unsupported DGS HTTP endpoint: {endpoint}"),
+    };
+    Ok(value)
+}
+
+pub fn run_dgs_http_update(snb: &mut SnbGraph, endpoint: &str, params: &Value) -> Result<Value> {
+    match endpoint {
+        "/query/interactive_update_1" => {
+            let person_id = req_i64(params, "personId");
+            let person_vid = encode_vid(VertexLabel::Person, person_id);
+            snb.insert_vertex(VertexData::Person(PersonProps {
+                id: person_id,
+                first_name: req_str(params, "firstName").to_string(),
+                last_name: req_str(params, "lastName").to_string(),
+                gender: req_str(params, "gender").to_string(),
+                birthday: req_i64(params, "birthday"),
+                creation_date: req_i64(params, "creationDate"),
+                location_ip: req_str(params, "locationIp").to_string(),
+                browser_used: req_str(params, "browserUsed").to_string(),
+                place: req_i64(params, "cityId"),
+                language: req_str(params, "language").to_string(),
+                email: req_str(params, "email").to_string(),
+            }));
+            snb.insert_edge_cached(
+                person_vid,
+                encode_vid(VertexLabel::Place, req_i64(params, "cityId")),
+                EdgeLabel::IsLocatedIn,
+                EdgeProp::Empty,
+                true,
+            );
+            for tag_id in req_i64_array(params, "tagIds") {
+                snb.insert_edge_cached(
+                    person_vid,
+                    encode_vid(VertexLabel::Tag, tag_id),
+                    EdgeLabel::HasInterest,
+                    EdgeProp::Empty,
+                    true,
+                );
+            }
+            for org in req_object_array(params, "studyAt") {
+                snb.insert_edge_cached(
+                    person_vid,
+                    encode_vid(VertexLabel::Organisation, req_i64(org, "organizationId")),
+                    EdgeLabel::StudyAt,
+                    EdgeProp::I32(req_i64(org, "classYear") as i32),
+                    true,
+                );
+            }
+            for org in req_object_array(params, "workAt") {
+                snb.insert_edge_cached(
+                    person_vid,
+                    encode_vid(VertexLabel::Organisation, req_i64(org, "organizationId")),
+                    EdgeLabel::WorkAt,
+                    EdgeProp::I32(req_i64(org, "workFromYear") as i32),
+                    true,
+                );
+            }
+        }
+        "/query/interactive_update_2" => {
+            insert_update_edge(
+                snb,
+                encode_vid(VertexLabel::Person, req_i64(params, "personId")),
+                encode_vid(VertexLabel::Post, req_i64(params, "postId")),
+                EdgeLabel::LikesPost,
+                EdgeProp::I64(req_i64(params, "creationDate")),
+                false,
+            );
+        }
+        "/query/interactive_update_3" => {
+            insert_update_edge(
+                snb,
+                encode_vid(VertexLabel::Person, req_i64(params, "personId")),
+                encode_vid(VertexLabel::Comment, req_i64(params, "commentId")),
+                EdgeLabel::LikesComment,
+                EdgeProp::I64(req_i64(params, "creationDate")),
+                false,
+            );
+        }
+        "/query/interactive_update_4" => {
+            let forum_id = req_i64(params, "forumId");
+            let forum_vid = encode_vid(VertexLabel::Forum, forum_id);
+            snb.insert_vertex(VertexData::Forum(ForumProps {
+                id: forum_id,
+                title: req_str(params, "forumTitle").to_string(),
+                creation_date: req_i64(params, "creationDate"),
+                moderator: req_i64(params, "moderatorPersonId"),
+            }));
+            snb.insert_edge_cached(
+                forum_vid,
+                encode_vid(VertexLabel::Person, req_i64(params, "moderatorPersonId")),
+                EdgeLabel::HasModerator,
+                EdgeProp::Empty,
+                true,
+            );
+            for tag_id in req_i64_array(params, "tagIds") {
+                snb.insert_edge_cached(
+                    forum_vid,
+                    encode_vid(VertexLabel::Tag, tag_id),
+                    EdgeLabel::HasTag,
+                    EdgeProp::Empty,
+                    true,
+                );
+            }
+        }
+        "/query/interactive_update_5" => {
+            insert_update_edge(
+                snb,
+                encode_vid(VertexLabel::Forum, req_i64(params, "forumId")),
+                encode_vid(VertexLabel::Person, req_i64(params, "personId")),
+                EdgeLabel::HasMember,
+                EdgeProp::I64(req_i64(params, "joinDate")),
+                false,
+            );
+        }
+        "/query/interactive_update_6" => {
+            let post_id = req_i64(params, "postId");
+            let post_vid = encode_vid(VertexLabel::Post, post_id);
+            snb.insert_vertex(VertexData::Post(PostProps {
+                id: post_id,
+                image_file: req_str(params, "imageFile").to_string(),
+                creation_date: req_i64(params, "creationDate"),
+                location_ip: req_str(params, "locationIp").to_string(),
+                browser_used: req_str(params, "browserUsed").to_string(),
+                language: req_str(params, "language").to_string(),
+                content: req_str(params, "content").to_string(),
+                length: req_i64(params, "length"),
+                creator: req_i64(params, "authorPersonId"),
+                forum_id: req_i64(params, "forumId"),
+                place: req_i64(params, "countryId"),
+            }));
+            snb.insert_edge_cached(
+                post_vid,
+                encode_vid(VertexLabel::Person, req_i64(params, "authorPersonId")),
+                EdgeLabel::HasCreator,
+                EdgeProp::Empty,
+                true,
+            );
+            snb.insert_edge_cached(
+                encode_vid(VertexLabel::Forum, req_i64(params, "forumId")),
+                post_vid,
+                EdgeLabel::ContainerOf,
+                EdgeProp::Empty,
+                true,
+            );
+            snb.insert_edge_cached(
+                post_vid,
+                encode_vid(VertexLabel::Place, req_i64(params, "countryId")),
+                EdgeLabel::IsLocatedIn,
+                EdgeProp::Empty,
+                true,
+            );
+            for tag_id in req_i64_array(params, "tagIds") {
+                snb.insert_edge_cached(
+                    post_vid,
+                    encode_vid(VertexLabel::Tag, tag_id),
+                    EdgeLabel::HasTag,
+                    EdgeProp::Empty,
+                    true,
+                );
+            }
+        }
+        "/query/interactive_update_7" => {
+            let comment_id = req_i64(params, "commentId");
+            let comment_vid = encode_vid(VertexLabel::Comment, comment_id);
+            let reply_to_post = optional_positive_i64(params, "replyToPostId");
+            let reply_to_comment = optional_positive_i64(params, "replyToCommentId");
+            snb.insert_vertex(VertexData::Comment(CommentProps {
+                id: comment_id,
+                creation_date: req_i64(params, "creationDate"),
+                location_ip: req_str(params, "locationIp").to_string(),
+                browser_used: req_str(params, "browserUsed").to_string(),
+                content: req_str(params, "content").to_string(),
+                length: req_i64(params, "length"),
+                creator: req_i64(params, "authorPersonId"),
+                place: req_i64(params, "countryId"),
+                reply_of_post: reply_to_post,
+                reply_of_comment: reply_to_comment,
+            }));
+            snb.insert_edge_cached(
+                comment_vid,
+                encode_vid(VertexLabel::Person, req_i64(params, "authorPersonId")),
+                EdgeLabel::HasCreator,
+                EdgeProp::Empty,
+                true,
+            );
+            snb.insert_edge_cached(
+                comment_vid,
+                encode_vid(VertexLabel::Place, req_i64(params, "countryId")),
+                EdgeLabel::IsLocatedIn,
+                EdgeProp::Empty,
+                true,
+            );
+            if let Some(post_id) = reply_to_post {
+                snb.insert_edge_cached(
+                    comment_vid,
+                    encode_vid(VertexLabel::Post, post_id),
+                    EdgeLabel::ReplyOfPost,
+                    EdgeProp::Empty,
+                    true,
+                );
+            }
+            if let Some(parent_id) = reply_to_comment {
+                snb.insert_edge_cached(
+                    comment_vid,
+                    encode_vid(VertexLabel::Comment, parent_id),
+                    EdgeLabel::ReplyOfComment,
+                    EdgeProp::Empty,
+                    true,
+                );
+            }
+            for tag_id in req_i64_array(params, "tagIds") {
+                snb.insert_edge_cached(
+                    comment_vid,
+                    encode_vid(VertexLabel::Tag, tag_id),
+                    EdgeLabel::HasTag,
+                    EdgeProp::Empty,
+                    true,
+                );
+            }
+        }
+        "/query/interactive_update_8" => {
+            let person1 = encode_vid(VertexLabel::Person, req_i64(params, "person1Id"));
+            let person2 = encode_vid(VertexLabel::Person, req_i64(params, "person2Id"));
+            let prop = EdgeProp::I64(req_i64(params, "creationDate"));
+            insert_update_edge(snb, person1, person2, EdgeLabel::Knows, prop, true);
+        }
+        _ => anyhow::bail!("unsupported DGS HTTP endpoint: {endpoint}"),
+    }
+    Ok(json!({}))
+}
+
+fn org_tuples(rows: Vec<OrgJson>) -> Vec<Value> {
+    rows.into_iter()
+        .map(|r| json!([r.organization_name, r.year, r.place_name]))
+        .collect()
 }
 
 fn values_equal(query_name: &str, actual: &Value, expected: &Value) -> bool {
@@ -1153,12 +2042,199 @@ fn ic14_topk_order(paths: Vec<(Vec<VertexId>, f64)>) -> Vec<(Vec<VertexId>, f64)
         .collect()
 }
 
+fn is1(snb: &SnbGraph, person_id: i64) -> Option<Is1Row> {
+    let vid = encode_vid(VertexLabel::Person, person_id);
+    let person = snb.person(vid)?;
+    Some(Is1Row {
+        first_name: person.first_name.clone(),
+        last_name: person.last_name.clone(),
+        birthday: person.birthday,
+        location_ip: person.location_ip.clone(),
+        browser_used: person.browser_used.clone(),
+        city_id: person.place,
+        gender: person.gender.clone(),
+        creation_date: person.creation_date,
+    })
+}
+
+fn is2(snb: &SnbGraph, person_id: i64, limit: usize) -> Vec<Is2Row> {
+    let person_vid = encode_vid(VertexLabel::Person, person_id);
+    if snb.person(person_vid).is_none() {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for msg_vid in in_messages_creators(snb, person_vid) {
+        let Some((message_id, creation_date, content)) = message_summary(snb, msg_vid) else {
+            continue;
+        };
+        let Some(post_vid) = root_post_vid(snb, msg_vid) else {
+            continue;
+        };
+        let Some(post) = snb.post(post_vid) else {
+            continue;
+        };
+        let Some(author_vid) = message_creator_vid(snb, post_vid) else {
+            continue;
+        };
+        let Some(author) = snb.person(author_vid) else {
+            continue;
+        };
+        rows.push(Is2Row {
+            message_id,
+            message_content: content,
+            message_creation_date: creation_date,
+            original_post_id: post.id,
+            original_post_author_id: author.id,
+            original_post_author_first_name: author.first_name.clone(),
+            original_post_author_last_name: author.last_name.clone(),
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.message_creation_date
+            .cmp(&a.message_creation_date)
+            .then_with(|| a.message_id.cmp(&b.message_id))
+    });
+    rows.truncate(limit);
+    rows
+}
+
+fn is3(snb: &SnbGraph, person_id: i64) -> Vec<Is3Row> {
+    let person_vid = encode_vid(VertexLabel::Person, person_id);
+    if snb.person(person_vid).is_none() {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for (friend_vid, prop) in snb.out_edges_with_prop(person_vid, EdgeLabel::Knows) {
+        let Some(friend) = snb.person(friend_vid) else {
+            continue;
+        };
+        rows.push(Is3Row {
+            person_id: friend.id,
+            first_name: friend.first_name.clone(),
+            last_name: friend.last_name.clone(),
+            friendship_creation_date: prop.as_i64(),
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.friendship_creation_date
+            .cmp(&a.friendship_creation_date)
+            .then_with(|| a.person_id.cmp(&b.person_id))
+    });
+    rows
+}
+
+fn is4(snb: &SnbGraph, message_id: i64) -> Option<Is4Row> {
+    let msg_vid = message_vid(snb, message_id)?;
+    let (_, creation_date, content) = message_summary(snb, msg_vid)?;
+    Some(Is4Row {
+        message_creation_date: creation_date,
+        message_content: content,
+    })
+}
+
+fn is5(snb: &SnbGraph, message_id: i64) -> Option<Is5Row> {
+    let msg_vid = message_vid(snb, message_id)?;
+    let creator_vid = message_creator_vid(snb, msg_vid)?;
+    let person = snb.person(creator_vid)?;
+    Some(Is5Row {
+        person_id: person.id,
+        first_name: person.first_name.clone(),
+        last_name: person.last_name.clone(),
+    })
+}
+
+fn is6(snb: &SnbGraph, message_id: i64) -> Option<Is6Row> {
+    let msg_vid = message_vid(snb, message_id)?;
+    let post_vid = root_post_vid(snb, msg_vid)?;
+    let forum_vid = snb
+        .in_neighbors_cached(post_vid, EdgeLabel::ContainerOf)
+        .first()
+        .copied()?;
+    let forum = snb.forum(forum_vid)?;
+    let moderator_vid = snb
+        .out_neighbors_cached(forum_vid, EdgeLabel::HasModerator)
+        .first()
+        .copied()?;
+    let moderator = snb.person(moderator_vid)?;
+    Some(Is6Row {
+        forum_id: forum.id,
+        forum_title: forum.title.clone(),
+        moderator_id: moderator.id,
+        moderator_first_name: moderator.first_name.clone(),
+        moderator_last_name: moderator.last_name.clone(),
+    })
+}
+
+fn is7(snb: &SnbGraph, message_id: i64) -> Vec<Is7Row> {
+    let Some(msg_vid) = message_vid(snb, message_id) else {
+        return Vec::new();
+    };
+    let Some(original_author) = message_creator_vid(snb, msg_vid) else {
+        return Vec::new();
+    };
+    let direct_friends: HashSet<_> = knows_neighbors(snb, original_author).into_iter().collect();
+    let mut replies = Vec::new();
+    for reply_vid in snb.in_neighbors_cached(msg_vid, EdgeLabel::ReplyOfPost) {
+        collect_is7_reply(snb, reply_vid, &direct_friends, &mut replies);
+    }
+    for reply_vid in snb.in_neighbors_cached(msg_vid, EdgeLabel::ReplyOfComment) {
+        collect_is7_reply(snb, reply_vid, &direct_friends, &mut replies);
+    }
+    replies.sort_by(|a, b| {
+        b.comment_creation_date
+            .cmp(&a.comment_creation_date)
+            .then_with(|| a.reply_author_id.cmp(&b.reply_author_id))
+    });
+    replies
+}
+
 fn req_i64(params: &Value, key: &str) -> i64 {
     params[key].as_i64().unwrap_or_default()
 }
 
+fn optional_positive_i64(params: &Value, key: &str) -> Option<i64> {
+    let value = req_i64(params, key);
+    (value >= 0).then_some(value)
+}
+
+fn req_i64_any(params: &Value, keys: &[&str]) -> i64 {
+    keys.iter()
+        .find_map(|key| params.get(*key).and_then(Value::as_i64))
+        .unwrap_or_default()
+}
+
 fn req_str<'a>(params: &'a Value, key: &str) -> &'a str {
     params[key].as_str().unwrap_or_default()
+}
+
+fn req_i64_array(params: &Value, key: &str) -> Vec<i64> {
+    params
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default()
+}
+
+fn req_object_array<'a>(params: &'a Value, key: &str) -> Vec<&'a Value> {
+    params
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().collect())
+        .unwrap_or_default()
+}
+
+fn insert_update_edge(
+    snb: &mut SnbGraph,
+    src: VertexId,
+    dst: VertexId,
+    edge_label: EdgeLabel,
+    prop: EdgeProp,
+    bidirectional_positive: bool,
+) {
+    snb.insert_edge_cached(src, dst, edge_label, prop, true);
+    if bidirectional_positive {
+        snb.insert_edge_cached(dst, src, edge_label, prop, false);
+    }
 }
 
 fn split_list(s: &str) -> Vec<String> {
@@ -1234,6 +2310,18 @@ fn message_creator_vid(snb: &SnbGraph, msg_vid: VertexId) -> Option<VertexId> {
         .copied()
 }
 
+fn message_vid(snb: &SnbGraph, message_id: i64) -> Option<VertexId> {
+    let post_vid = encode_vid(VertexLabel::Post, message_id);
+    if snb.post(post_vid).is_some() {
+        return Some(post_vid);
+    }
+    let comment_vid = encode_vid(VertexLabel::Comment, message_id);
+    if snb.comment(comment_vid).is_some() {
+        return Some(comment_vid);
+    }
+    None
+}
+
 fn message_summary(snb: &SnbGraph, msg_vid: VertexId) -> Option<(i64, i64, String)> {
     if let Some(comment) = snb.comment(msg_vid) {
         Some((comment.id, comment.creation_date, comment.content.clone()))
@@ -1245,6 +2333,54 @@ fn message_summary(snb: &SnbGraph, msg_vid: VertexId) -> Option<(i64, i64, Strin
             post.content_or_image().to_string(),
         ))
     }
+}
+
+fn root_post_vid(snb: &SnbGraph, msg_vid: VertexId) -> Option<VertexId> {
+    if snb.post(msg_vid).is_some() {
+        return Some(msg_vid);
+    }
+    let mut current = msg_vid;
+    let mut seen = HashSet::new();
+    while seen.insert(current) {
+        if let Some(post_vid) = snb
+            .out_neighbors_cached(current, EdgeLabel::ReplyOfPost)
+            .first()
+            .copied()
+        {
+            return Some(post_vid);
+        }
+        current = snb
+            .out_neighbors_cached(current, EdgeLabel::ReplyOfComment)
+            .first()
+            .copied()?;
+    }
+    None
+}
+
+fn collect_is7_reply(
+    snb: &SnbGraph,
+    reply_vid: VertexId,
+    original_author_friends: &HashSet<VertexId>,
+    out: &mut Vec<Is7Row>,
+) {
+    let Some(comment) = snb.comment(reply_vid) else {
+        return;
+    };
+    let Some(author_vid) = message_creator_vid(snb, reply_vid) else {
+        return;
+    };
+    let Some(author) = snb.person(author_vid) else {
+        return;
+    };
+    out.push(Is7Row {
+        comment_id: comment.id,
+        comment_content: comment.content.clone(),
+        comment_creation_date: comment.creation_date,
+        reply_author_id: author.id,
+        reply_author_first_name: author.first_name.clone(),
+        reply_author_last_name: author.last_name.clone(),
+        reply_author_knows_original_message_author: original_author_friends.contains(&author_vid),
+    });
 }
 
 fn message_content(snb: &SnbGraph, msg_vid: VertexId) -> String {

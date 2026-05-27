@@ -6,7 +6,10 @@ use clap::{Parser, Subcommand};
 use lsmgraph::config::{IoBackendKind, LsmGraphConfig};
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
-use lsmgraph::snb::{import_snb_full, validate_ic1_ic14, SnbGraph};
+use lsmgraph::snb::{
+    import_snb_full, import_snb_updates, rebuild_snb_edge_props, start_dgs_compatible_server,
+    validate_ic1_ic14, validate_ic_batch, validate_mixed_tugraph, SnbGraph,
+};
 
 const DEFAULT_DATA: &str = "/data/WorkSpace/dgs/data/social_network_tugraph";
 const DEFAULT_STORE: &str = "/data/WorkSpace/lsmgraph-rs/store/sf1";
@@ -71,7 +74,51 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         max_lines: usize,
     },
+    SnbValidateBatch {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+        #[arg(
+            long,
+            default_value = "/data/WorkSpace/lsmgraph-rs/deps/ldbc_snb_interactive_impls/dgs/validation_splits"
+        )]
+        validation_dir: PathBuf,
+        #[arg(long, default_value = "ic")]
+        queries: String,
+        #[arg(long, default_value_t = 100)]
+        max_lines_per_query: usize,
+    },
+    SnbValidateMixed {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+        #[arg(
+            long,
+            default_value = "/data/WorkSpace/lsmgraph-rs/deps/ldbc_snb_interactive_impls/dgs/validation_params_tugraph.csv"
+        )]
+        validation_params: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        max_lines: usize,
+    },
+    SnbServer {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 9090)]
+        port: u16,
+    },
     SnbCache {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+    },
+    SnbProps {
+        #[arg(long, default_value = DEFAULT_DATA)]
+        input: PathBuf,
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+    },
+    SnbUpdates {
+        #[arg(long, default_value = DEFAULT_DATA)]
+        input: PathBuf,
         #[arg(long, default_value = DEFAULT_STORE)]
         data_dir: PathBuf,
     },
@@ -176,6 +223,46 @@ async fn main() -> Result<()> {
                 validate_ic1_ic14(engine, &data_dir, &validation_params, max_lines).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::SnbValidateBatch {
+            data_dir,
+            validation_dir,
+            queries,
+            max_lines_per_query,
+        } => {
+            let engine =
+                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let query_list = parse_query_list(&queries);
+            let report = validate_ic_batch(
+                engine,
+                &data_dir,
+                &validation_dir,
+                &query_list,
+                max_lines_per_query,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::SnbValidateMixed {
+            data_dir,
+            validation_params,
+            max_lines,
+        } => {
+            let engine =
+                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let report =
+                validate_mixed_tugraph(engine, &data_dir, &validation_params, max_lines).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::SnbServer {
+            data_dir,
+            host,
+            port,
+        } => {
+            let engine =
+                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let snb = SnbGraph::open(engine, &data_dir).await?;
+            start_dgs_compatible_server(snb, &format!("{host}:{port}")).await?;
+        }
         Command::SnbCache { data_dir } => {
             let engine =
                 Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
@@ -186,6 +273,43 @@ async fn main() -> Result<()> {
                 groups
             );
         }
+        Command::SnbProps { input, data_dir } => {
+            let rows = rebuild_snb_edge_props(&input, &data_dir)?;
+            println!(
+                "{{\"data_dir\":\"{}\",\"input_rows\":{},\"edge_props\":\"{}\"}}",
+                data_dir.display(),
+                rows,
+                data_dir.join("snb_edge_props.jsonl").display()
+            );
+        }
+        Command::SnbUpdates { input, data_dir } => {
+            let engine =
+                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let stats = import_snb_updates(engine.clone(), &input, &data_dir).await?;
+            println!(
+                "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{}}}",
+                stats.input_rows,
+                stats.directed_edges,
+                engine.current_snapshot()
+            );
+        }
     }
     Ok(())
+}
+
+fn parse_query_list(raw: &str) -> Vec<String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ic" | "all-ic" | "ic1-ic14" => (1..=14).map(|i| format!("ic{i}")).collect(),
+        "is" | "all-is" | "is1-is7" => (1..=7).map(|i| format!("is{i}")).collect(),
+        "read" | "reads" | "all-read" | "all-reads" => (1..=14)
+            .map(|i| format!("ic{i}"))
+            .chain((1..=7).map(|i| format!("is{i}")))
+            .collect(),
+        other => other
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .collect(),
+    }
 }
