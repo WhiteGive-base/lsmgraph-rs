@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -411,10 +412,29 @@ impl SnbGraph {
     }
 
     pub async fn build_adjacency_cache(engine: Arc<Engine>, store_dir: &Path) -> Result<usize> {
+        let started = Instant::now();
         let snapshot = engine.current_snapshot();
-        let adjacency = build_adjacency_from_edges(engine.scan_edges(snapshot).await?);
+        eprintln!("[snb-cache] scanning edges snapshot={snapshot}");
+        let edges = engine.scan_edges(snapshot).await?;
+        eprintln!(
+            "[snb-cache] scanned edges={} elapsed_s={:.1}",
+            edges.len(),
+            started.elapsed().as_secs_f64()
+        );
+        let adjacency = build_adjacency_from_edges(edges);
         let count = adjacency.len();
+        let write_started = Instant::now();
+        eprintln!(
+            "[snb-cache] writing adjacency cache groups={} path={}",
+            count,
+            store_dir.join("snb_adjacency.bin").display()
+        );
         write_adjacency_cache_atomic(&store_dir.join("snb_adjacency.bin"), &adjacency)?;
+        eprintln!(
+            "[snb-cache] write complete elapsed_s={:.1} total_elapsed_s={:.1}",
+            write_started.elapsed().as_secs_f64(),
+            started.elapsed().as_secs_f64()
+        );
         Ok(count)
     }
 }

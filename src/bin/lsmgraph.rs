@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -258,9 +259,30 @@ async fn main() -> Result<()> {
             host,
             port,
         } => {
+            let total_started = Instant::now();
+            eprintln!(
+                "[snb-server] opening engine data_dir={}",
+                data_dir.display()
+            );
+            let engine_started = Instant::now();
             let engine =
                 Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            eprintln!(
+                "[snb-server] engine open complete elapsed_s={:.1}",
+                engine_started.elapsed().as_secs_f64()
+            );
+            let snb_started = Instant::now();
+            eprintln!("[snb-server] loading SNB vertices/properties/adjacency cache");
             let snb = SnbGraph::open(engine, &data_dir).await?;
+            eprintln!(
+                "[snb-server] SNB load complete elapsed_s={:.1} total_elapsed_s={:.1}",
+                snb_started.elapsed().as_secs_f64(),
+                total_started.elapsed().as_secs_f64()
+            );
+            eprintln!(
+                "[snb-server] binding http adapter addr={host}:{port} total_elapsed_s={:.1}",
+                total_started.elapsed().as_secs_f64()
+            );
             start_dgs_compatible_server(snb, &format!("{host}:{port}")).await?;
         }
         Command::SnbCache { data_dir } => {

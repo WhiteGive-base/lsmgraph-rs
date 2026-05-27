@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use csv::StringRecord;
 
@@ -14,11 +15,14 @@ use crate::snb::props::{
 };
 use crate::types::{EdgeLabel, VertexLabel};
 
+const IMPORT_PROGRESS_ROWS: u64 = 1_000_000;
+
 pub async fn import_snb_full(
     engine: Arc<Engine>,
     csv_root: &Path,
     store_dir: &Path,
 ) -> Result<ImportStats> {
+    let import_started = Instant::now();
     fs::create_dir_all(store_dir)?;
     let vertex_path = store_dir.join("snb_vertices.jsonl");
     let edge_prop_path = store_dir.join("snb_edge_props.jsonl");
@@ -29,8 +33,14 @@ pub async fn import_snb_full(
         directed_edges: 0,
     };
 
+    eprintln!("[snb-full] importing vertices from {}", csv_root.display());
     import_vertices(csv_root, &mut vertices)?;
     vertices.flush()?;
+    eprintln!(
+        "[snb-full] vertices written to {} elapsed_s={:.1}",
+        vertex_path.display(),
+        import_started.elapsed().as_secs_f64()
+    );
 
     let dynamic = csv_root.join("dynamic");
     let static_dir = csv_root.join("static");
@@ -285,8 +295,23 @@ pub async fn import_snb_full(
     }
 
     edge_props.flush()?;
+    eprintln!("[snb-full] edge import complete input_rows={} directed_edges={} edge_props={} elapsed_s={:.1}", stats.input_rows, stats.directed_edges, edge_prop_path.display(), import_started.elapsed().as_secs_f64());
+    let flush_started = Instant::now();
+    eprintln!("[snb-full] flushing active MemGraph to CSR");
     engine.flush_active().await?;
-    SnbGraph::build_adjacency_cache(engine, store_dir).await?;
+    eprintln!(
+        "[snb-full] flush complete elapsed_s={:.1}",
+        flush_started.elapsed().as_secs_f64()
+    );
+    let cache_started = Instant::now();
+    eprintln!("[snb-full] building adjacency cache");
+    let groups = SnbGraph::build_adjacency_cache(engine, store_dir).await?;
+    eprintln!(
+        "[snb-full] adjacency cache complete groups={} elapsed_s={:.1} total_elapsed_s={:.1}",
+        groups,
+        cache_started.elapsed().as_secs_f64(),
+        import_started.elapsed().as_secs_f64()
+    );
     Ok(stats)
 }
 
@@ -548,18 +573,40 @@ fn import_vertex_file<F>(
 where
     F: FnMut(&StringRecord, &StringRecord) -> Result<VertexData>,
 {
+    let started = Instant::now();
+    eprintln!(
+        "[snb-full][vertex] start file={} label={:?}",
+        path.display(),
+        label
+    );
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(b'|')
         .has_headers(true)
         .from_path(path)?;
     let headers = rdr.headers()?.clone();
+    let mut rows = 0u64;
     for rec in rdr.records() {
         let rec = rec?;
+        rows += 1;
         let data = build(&headers, &rec)?;
         let vid = encode_vid(label, data.external_id());
         serde_json::to_writer(out.by_ref(), &VertexRow { vid, data })?;
         out.write_all(b"\n")?;
+        if rows % IMPORT_PROGRESS_ROWS == 0 {
+            eprintln!(
+                "[snb-full][vertex] progress file={} rows={} elapsed_s={:.1}",
+                path.display(),
+                rows,
+                started.elapsed().as_secs_f64()
+            );
+        }
     }
+    eprintln!(
+        "[snb-full][vertex] done file={} rows={} elapsed_s={:.1}",
+        path.display(),
+        rows,
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -570,8 +617,11 @@ async fn import_update_stream_file(
     path: &Path,
     stats: &mut ImportStats,
 ) -> Result<()> {
+    let started = Instant::now();
+    eprintln!("[snb-full][update] start file={}", path.display());
     let file = File::open(path)?;
     let reader = BufReader::new(file);
+    let mut file_rows = 0u64;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -582,6 +632,10 @@ async fn import_update_stream_file(
             continue;
         }
         stats.input_rows += 1;
+        file_rows += 1;
+        if file_rows % IMPORT_PROGRESS_ROWS == 0 {
+            eprintln!("[snb-full][update] progress file={} rows={} total_rows={} directed_edges={} elapsed_s={:.1}", path.display(), file_rows, stats.input_rows, stats.directed_edges, started.elapsed().as_secs_f64());
+        }
         match parts[2] {
             "1" => apply_add_person(engine.clone(), vertices, edge_props, &parts, stats).await?,
             "2" => {
@@ -642,6 +696,14 @@ async fn import_update_stream_file(
             _ => {}
         }
     }
+    eprintln!(
+        "[snb-full][update] done file={} rows={} total_rows={} directed_edges={} elapsed_s={:.1}",
+        path.display(),
+        file_rows,
+        stats.input_rows,
+        stats.directed_edges,
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -657,6 +719,14 @@ async fn import_edge_file(
     dst_col: ColRef,
     prop: PropSpec,
 ) -> Result<ImportStats> {
+    let started = Instant::now();
+    eprintln!(
+        "[snb-full][edge] start file={} edge={:?} src={:?} dst={:?}",
+        path.display(),
+        edge_label,
+        src_label,
+        dst_label
+    );
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(b'|')
         .has_headers(true)
@@ -700,7 +770,23 @@ async fn import_edge_file(
             .await?;
             directed_edges += 1;
         }
+        if input_rows % IMPORT_PROGRESS_ROWS == 0 {
+            eprintln!(
+                "[snb-full][edge] progress file={} rows={} directed_edges={} elapsed_s={:.1}",
+                path.display(),
+                input_rows,
+                directed_edges,
+                started.elapsed().as_secs_f64()
+            );
+        }
     }
+    eprintln!(
+        "[snb-full][edge] done file={} rows={} directed_edges={} elapsed_s={:.1}",
+        path.display(),
+        input_rows,
+        directed_edges,
+        started.elapsed().as_secs_f64()
+    );
     Ok(ImportStats {
         input_rows,
         directed_edges,
