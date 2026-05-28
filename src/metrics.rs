@@ -7,6 +7,8 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::types::{EdgeType, VertexId};
+
 const LATENCY_BUCKET_US: [u64; 16] = [
     100,
     250,
@@ -95,6 +97,14 @@ pub struct Metrics {
     pub csr_header_bytes: AtomicU64,
     pub csr_offset_bytes: AtomicU64,
     pub csr_body_bytes: AtomicU64,
+    pub candidate_l0_segments: AtomicU64,
+    pub range_filtered_segments: AtomicU64,
+    pub bloom_filtered_segments: AtomicU64,
+    pub filter_passed_segments: AtomicU64,
+    pub matched_l0_segments: AtomicU64,
+    pub csr_offset_cache_hits: AtomicU64,
+    pub csr_offset_cache_misses: AtomicU64,
+    pub l0_bloom_false_positive_probes: AtomicU64,
 
     pub io_semaphore_wait_latency: LatencyMetric,
     pub io_read_blocking_latency: LatencyMetric,
@@ -104,6 +114,7 @@ pub struct Metrics {
     pub io_remove_blocking_latency: LatencyMetric,
 
     endpoint_metrics: Mutex<HashMap<String, Arc<EndpointMetric>>>,
+    l0_partition_metrics: Mutex<HashMap<L0PartitionKey, L0PartitionMetric>>,
 }
 
 impl Default for Metrics {
@@ -170,6 +181,14 @@ impl Default for Metrics {
             csr_header_bytes: AtomicU64::new(0),
             csr_offset_bytes: AtomicU64::new(0),
             csr_body_bytes: AtomicU64::new(0),
+            candidate_l0_segments: AtomicU64::new(0),
+            range_filtered_segments: AtomicU64::new(0),
+            bloom_filtered_segments: AtomicU64::new(0),
+            filter_passed_segments: AtomicU64::new(0),
+            matched_l0_segments: AtomicU64::new(0),
+            csr_offset_cache_hits: AtomicU64::new(0),
+            csr_offset_cache_misses: AtomicU64::new(0),
+            l0_bloom_false_positive_probes: AtomicU64::new(0),
             io_semaphore_wait_latency: LatencyMetric::default(),
             io_read_blocking_latency: LatencyMetric::default(),
             io_write_blocking_latency: LatencyMetric::default(),
@@ -177,6 +196,7 @@ impl Default for Metrics {
             io_sync_blocking_latency: LatencyMetric::default(),
             io_remove_blocking_latency: LatencyMetric::default(),
             endpoint_metrics: Mutex::new(HashMap::new()),
+            l0_partition_metrics: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -213,12 +233,49 @@ impl Metrics {
         metric.record(elapsed, ok);
     }
 
+    pub fn record_l0_partition_query(&self, key: L0PartitionKey) {
+        let mut partitions = self.l0_partition_metrics.lock();
+        partitions.entry(key).or_default().query_count += 1;
+    }
+
+    pub fn record_l0_partition_probe(&self, key: L0PartitionKey, probe: L0PartitionProbe) {
+        let mut partitions = self.l0_partition_metrics.lock();
+        let metric = partitions.entry(key).or_default();
+        metric.candidate_segments += probe.candidate_segments;
+        metric.range_filtered_segments += probe.range_filtered_segments;
+        metric.bloom_filtered_segments += probe.bloom_filtered_segments;
+        metric.filter_passed_segments += probe.filter_passed_segments;
+        metric.matched_segments += probe.matched_segments;
+        metric.offset_cache_hits += probe.offset_cache_hits;
+        metric.offset_cache_misses += probe.offset_cache_misses;
+        metric.body_reads += probe.body_reads;
+        metric.bloom_false_positive_probes += probe.bloom_false_positive_probes;
+    }
+
+    pub fn l0_partition_snapshots(&self) -> Vec<L0PartitionSnapshot> {
+        let mut snapshots: Vec<_> = self
+            .l0_partition_metrics
+            .lock()
+            .iter()
+            .map(|(key, metric)| metric.snapshot(*key))
+            .collect();
+        snapshots.sort_by_key(|snapshot| {
+            (
+                snapshot.key.src_label,
+                snapshot.key.edge_type,
+                snapshot.key.range_start,
+            )
+        });
+        snapshots
+    }
+
     pub fn reset(&self) {
         self.reset_counters();
         self.reset_latencies();
         for metric in self.endpoint_metrics.lock().values() {
             metric.reset();
         }
+        self.l0_partition_metrics.lock().clear();
     }
 
     pub fn snapshot_json(&self) -> Value {
@@ -270,6 +327,15 @@ impl Metrics {
                 "header_bytes": self.load(&self.csr_header_bytes),
                 "offset_bytes": self.load(&self.csr_offset_bytes),
                 "body_bytes": self.load(&self.csr_body_bytes),
+                "candidate_l0_segments": self.load(&self.candidate_l0_segments),
+                "range_filtered_segments": self.load(&self.range_filtered_segments),
+                "bloom_filtered_segments": self.load(&self.bloom_filtered_segments),
+                "filter_passed_segments": self.load(&self.filter_passed_segments),
+                "matched_l0_segments": self.load(&self.matched_l0_segments),
+                "offset_cache_hits": self.load(&self.csr_offset_cache_hits),
+                "offset_cache_misses": self.load(&self.csr_offset_cache_misses),
+                "bloom_false_positive_probes": self.load(&self.l0_bloom_false_positive_probes),
+                "l0_partitions": self.l0_partition_snapshots(),
             },
             "http": {
                 "requests": self.load(&self.http_requests),
@@ -372,6 +438,14 @@ impl Metrics {
             &self.csr_header_bytes,
             &self.csr_offset_bytes,
             &self.csr_body_bytes,
+            &self.candidate_l0_segments,
+            &self.range_filtered_segments,
+            &self.bloom_filtered_segments,
+            &self.filter_passed_segments,
+            &self.matched_l0_segments,
+            &self.csr_offset_cache_hits,
+            &self.csr_offset_cache_misses,
+            &self.l0_bloom_false_positive_probes,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -412,6 +486,87 @@ impl Metrics {
             &self.io_remove_blocking_latency,
         ] {
             latency.reset();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct L0PartitionKey {
+    pub src_label: i32,
+    pub edge_type: EdgeType,
+    pub range_start: VertexId,
+    pub range_end: VertexId,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct L0PartitionProbe {
+    pub candidate_segments: u64,
+    pub range_filtered_segments: u64,
+    pub bloom_filtered_segments: u64,
+    pub filter_passed_segments: u64,
+    pub matched_segments: u64,
+    pub offset_cache_hits: u64,
+    pub offset_cache_misses: u64,
+    pub body_reads: u64,
+    pub bloom_false_positive_probes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct L0PartitionSnapshot {
+    pub key: L0PartitionKey,
+    pub query_count: u64,
+    pub candidate_segments: u64,
+    pub range_filtered_segments: u64,
+    pub bloom_filtered_segments: u64,
+    pub filter_passed_segments: u64,
+    pub matched_segments: u64,
+    pub offset_cache_hits: u64,
+    pub offset_cache_misses: u64,
+    pub body_reads: u64,
+    pub bloom_false_positive_probes: u64,
+    pub avg_candidate_segments: f64,
+    pub offset_cache_miss_rate: f64,
+}
+
+#[derive(Debug, Default)]
+struct L0PartitionMetric {
+    query_count: u64,
+    candidate_segments: u64,
+    range_filtered_segments: u64,
+    bloom_filtered_segments: u64,
+    filter_passed_segments: u64,
+    matched_segments: u64,
+    offset_cache_hits: u64,
+    offset_cache_misses: u64,
+    body_reads: u64,
+    bloom_false_positive_probes: u64,
+}
+
+impl L0PartitionMetric {
+    fn snapshot(&self, key: L0PartitionKey) -> L0PartitionSnapshot {
+        let cache_probes = self.offset_cache_hits + self.offset_cache_misses;
+        L0PartitionSnapshot {
+            key,
+            query_count: self.query_count,
+            candidate_segments: self.candidate_segments,
+            range_filtered_segments: self.range_filtered_segments,
+            bloom_filtered_segments: self.bloom_filtered_segments,
+            filter_passed_segments: self.filter_passed_segments,
+            matched_segments: self.matched_segments,
+            offset_cache_hits: self.offset_cache_hits,
+            offset_cache_misses: self.offset_cache_misses,
+            body_reads: self.body_reads,
+            bloom_false_positive_probes: self.bloom_false_positive_probes,
+            avg_candidate_segments: if self.query_count == 0 {
+                0.0
+            } else {
+                self.candidate_segments as f64 / self.query_count as f64
+            },
+            offset_cache_miss_rate: if cache_probes == 0 {
+                0.0
+            } else {
+                self.offset_cache_misses as f64 / cache_probes as f64
+            },
         }
     }
 }

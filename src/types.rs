@@ -7,6 +7,18 @@ pub type FileId = u64;
 pub type LevelId = u8;
 pub type EdgeType = i32;
 
+pub const VERTEX_LABEL_SHIFT: u64 = 56;
+pub const UNKNOWN_SOURCE_LABEL: i32 = 0;
+pub const MIXED_EDGE_TYPE: EdgeType = 0;
+
+pub fn source_label_from_vertex_id(src: VertexId) -> i32 {
+    let label = (src >> VERTEX_LABEL_SHIFT) as i32;
+    match label {
+        1..=8 => label,
+        _ => UNKNOWN_SOURCE_LABEL,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum EdgeMarker {

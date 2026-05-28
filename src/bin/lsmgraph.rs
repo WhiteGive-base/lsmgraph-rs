@@ -11,6 +11,7 @@ use lsmgraph::snb::{
     import_snb_full, import_snb_updates, rebuild_snb_edge_props, start_dgs_compatible_server,
     validate_ic1_ic14, validate_ic_batch, validate_mixed_tugraph, SnbGraph,
 };
+use lsmgraph::types::UNKNOWN_SOURCE_LABEL;
 use serde_json::json;
 
 const DEFAULT_DATA: &str = "/data/WorkSpace/dgs/data/social_network_tugraph";
@@ -38,12 +39,18 @@ enum Command {
         memgraph_bytes: usize,
         #[arg(long, default_value_t = false)]
         compact: bool,
+        #[arg(long, default_value_t = false)]
+        auto_compact: bool,
+        #[arg(long, default_value_t = false)]
+        graph_aware_l0: bool,
     },
     Neighbors {
         #[arg(long, default_value = DEFAULT_STORE)]
         data_dir: PathBuf,
         #[arg(long)]
         src: u64,
+        #[arg(long)]
+        edge_type: Option<i32>,
     },
     Scan {
         #[arg(long, default_value = DEFAULT_STORE)]
@@ -56,6 +63,16 @@ enum Command {
     Compact {
         #[arg(long, default_value = DEFAULT_STORE)]
         data_dir: PathBuf,
+        #[arg(long, default_value_t = false)]
+        auto_pick: bool,
+        #[arg(long)]
+        src_label: Option<i32>,
+        #[arg(long)]
+        edge_type: Option<i32>,
+        #[arg(long)]
+        min_src: Option<u64>,
+        #[arg(long)]
+        max_src: Option<u64>,
     },
     ValidateKnows {
         #[arg(long, default_value = DEFAULT_DATA)]
@@ -131,6 +148,14 @@ enum Command {
         samples: usize,
         #[arg(long, default_value_t = true)]
         scan: bool,
+        #[arg(long, default_value_t = false)]
+        auto_compact: bool,
+        #[arg(long, default_value_t = 10)]
+        ra_min_queries: u64,
+        #[arg(long, default_value_t = 10.0)]
+        ra_min_score: f64,
+        #[arg(long, default_value_t = 2)]
+        ra_min_l0_segments: usize,
     },
 }
 
@@ -145,10 +170,14 @@ async fn main() -> Result<()> {
             relation,
             memgraph_bytes,
             compact,
+            auto_compact,
+            graph_aware_l0,
         } => {
             let config = LsmGraphConfig::new(&data_dir)
                 .with_memgraph_capacity(memgraph_bytes)
-                .with_io_backend(io_backend);
+                .with_io_backend(io_backend)
+                .with_auto_compaction(auto_compact)
+                .with_graph_aware_l0(graph_aware_l0);
             let engine = Engine::create(config).await?;
             let stats = match relation.as_str() {
                 "person_knows" => import_person_knows(engine.clone(), &input).await?,
@@ -170,11 +199,19 @@ async fn main() -> Result<()> {
                 engine.current_snapshot()
             );
         }
-        Command::Neighbors { data_dir, src } => {
+        Command::Neighbors {
+            data_dir,
+            src,
+            edge_type,
+        } => {
             let engine =
                 Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
             let snapshot = engine.current_snapshot();
-            let neighbors = engine.get_neighbors(src, snapshot).await?;
+            let neighbors = if let Some(edge_type) = edge_type {
+                engine.get_neighbors_typed(src, edge_type, snapshot).await?
+            } else {
+                engine.get_neighbors(src, snapshot).await?
+            };
             println!("{}", serde_json::to_string_pretty(&neighbors)?);
         }
         Command::Scan { data_dir } => {
@@ -202,11 +239,49 @@ async fn main() -> Result<()> {
                 }))?
             );
         }
-        Command::Compact { data_dir } => {
+        Command::Compact {
+            data_dir,
+            auto_pick,
+            src_label,
+            edge_type,
+            min_src,
+            max_src,
+        } => {
             let engine =
                 Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
-            let meta = engine.compact_l0_to_l1().await?;
-            println!("{}", serde_json::to_string_pretty(&meta)?);
+            if auto_pick {
+                let decision = engine.compact_best_l0_partition_by_score().await?;
+                println!("{}", serde_json::to_string_pretty(&decision)?);
+            } else if src_label.is_some()
+                || edge_type.is_some()
+                || min_src.is_some()
+                || max_src.is_some()
+            {
+                let src_label = src_label.unwrap_or(UNKNOWN_SOURCE_LABEL);
+                let outputs = match (min_src, max_src) {
+                    (Some(min_src), Some(max_src)) => {
+                        engine
+                            .compact_l0_range_to_l1(src_label, edge_type, min_src, max_src)
+                            .await?
+                    }
+                    (None, None) => {
+                        engine
+                            .compact_l0_partition_to_l1(src_label, edge_type)
+                            .await?
+                    }
+                    _ => anyhow::bail!("--min-src and --max-src must be supplied together"),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "output_count": outputs.len(),
+                        "outputs": outputs,
+                    }))?
+                );
+            } else {
+                let meta = engine.compact_l0_to_l1().await?;
+                println!("{}", serde_json::to_string_pretty(&meta)?);
+            }
         }
         Command::ValidateKnows {
             input,
@@ -331,9 +406,16 @@ async fn main() -> Result<()> {
             data_dir,
             samples,
             scan,
+            auto_compact,
+            ra_min_queries,
+            ra_min_score,
+            ra_min_l0_segments,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let mut config = LsmGraphConfig::new(&data_dir).with_io_backend(io_backend);
+            config.l0_ra_min_queries = ra_min_queries;
+            config.l0_ra_min_score = ra_min_score;
+            config.l0_ra_min_l0_segments = ra_min_l0_segments;
+            let engine = Engine::open(config).await?;
             let snapshot = engine.current_snapshot();
             let started = Instant::now();
             let edges = engine.scan_edges(snapshot).await?;
@@ -355,6 +437,11 @@ async fn main() -> Result<()> {
                 neighbor_edges += engine.get_neighbors(*src, snapshot).await?.len();
             }
             let get_neighbors_elapsed_ms = neighbor_started.elapsed().as_millis();
+            let auto_compaction = if auto_compact {
+                engine.compact_best_l0_partition_by_score().await?
+            } else {
+                None
+            };
             let metrics = engine.metrics();
             println!(
                 "{}",
@@ -367,6 +454,7 @@ async fn main() -> Result<()> {
                     "sampled_vertices": srcs.len(),
                     "neighbor_edges": neighbor_edges,
                     "get_neighbors_elapsed_ms": get_neighbors_elapsed_ms,
+                    "auto_compaction": auto_compaction,
                     "levels": engine.live_file_count_by_level(),
                     "metrics": metrics.snapshot_json(),
                 }))?

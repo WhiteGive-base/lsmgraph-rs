@@ -9,7 +9,10 @@ use crate::csr::format::{
 };
 use crate::error::Result;
 use crate::io::IoBackend;
-use crate::types::{EdgeRecord, FileId, LevelId};
+use crate::types::{
+    source_label_from_vertex_id, EdgeRecord, EdgeType, FileId, LevelId, MIXED_EDGE_TYPE,
+    UNKNOWN_SOURCE_LABEL,
+};
 
 pub struct CsrWriter<B: IoBackend> {
     backend: Arc<B>,
@@ -31,9 +34,13 @@ impl<B: IoBackend> CsrWriter<B> {
         mut edges: Vec<EdgeRecord>,
     ) -> Result<CsrSegmentMeta> {
         edges.sort_by_key(|e| (e.src, e.edge_type, e.dst, e.ts));
+        let min_ts = edges.iter().map(|e| e.ts).min().unwrap_or(0);
         let max_ts = edges.iter().map(|e| e.ts).max().unwrap_or(0);
         let min_src = edges.first().map(|e| e.src).unwrap_or(0);
         let max_src = edges.last().map(|e| e.src).unwrap_or(0);
+        let unique_src_count = count_unique_sources(&edges);
+        let src_label = segment_src_label(&edges);
+        let edge_type_partition = segment_edge_type(&edges);
 
         let mut offsets = Vec::new();
         let mut bodies = Vec::with_capacity(edges.len() * DISK_EDGE_BODY_LEN);
@@ -65,7 +72,10 @@ impl<B: IoBackend> CsrWriter<B> {
             flags: 0,
             file_id,
             create_ts: max_ts,
+            min_ts,
             max_ts,
+            src_label,
+            edge_type_partition,
             min_src,
             max_src,
             edge_offset_count: (offsets.len() / crate::csr::format::EDGE_OFFSET_LEN) as u64,
@@ -83,6 +93,7 @@ impl<B: IoBackend> CsrWriter<B> {
         bytes.extend_from_slice(&header.encode());
         bytes.extend_from_slice(&offsets);
         bytes.extend_from_slice(&bodies);
+        let segment_bytes = bytes.len() as u64;
 
         self.backend.create(&tmp_path).await?;
         self.backend
@@ -94,9 +105,14 @@ impl<B: IoBackend> CsrWriter<B> {
         Ok(CsrSegmentMeta {
             file_id,
             level,
+            src_label,
+            edge_type_partition,
             min_src,
             max_src,
+            min_ts,
             edge_count: edges.len() as u64,
+            unique_src_count,
+            segment_bytes,
             max_ts,
         })
     }
@@ -107,6 +123,43 @@ impl<B: IoBackend> CsrWriter<B> {
             .join(format!("L{}", level))
             .join(format!("{:012}.edge", file_id))
     }
+}
+
+fn count_unique_sources(edges: &[EdgeRecord]) -> u64 {
+    let mut count = 0u64;
+    let mut last = None;
+    for edge in edges {
+        if last != Some(edge.src) {
+            count += 1;
+            last = Some(edge.src);
+        }
+    }
+    count
+}
+
+fn segment_src_label(edges: &[EdgeRecord]) -> i32 {
+    let mut label = None;
+    for edge in edges {
+        let current = source_label_from_vertex_id(edge.src);
+        match label {
+            None => label = Some(current),
+            Some(existing) if existing == current => {}
+            Some(_) => return UNKNOWN_SOURCE_LABEL,
+        }
+    }
+    label.unwrap_or(UNKNOWN_SOURCE_LABEL)
+}
+
+fn segment_edge_type(edges: &[EdgeRecord]) -> EdgeType {
+    let mut edge_type = None;
+    for edge in edges {
+        match edge_type {
+            None => edge_type = Some(edge.edge_type),
+            Some(existing) if existing == edge.edge_type => {}
+            Some(_) => return MIXED_EDGE_TYPE,
+        }
+    }
+    edge_type.unwrap_or(MIXED_EDGE_TYPE)
 }
 
 async fn rename_blocking(from: &Path, to: &Path) -> Result<()> {

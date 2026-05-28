@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{EdgeMarker, EdgeRecord, EdgeType, FileId, LevelId, Timestamp, VertexId};
+use crate::types::{
+    source_label_from_vertex_id, EdgeMarker, EdgeRecord, EdgeType, FileId, LevelId, Timestamp,
+    VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL,
+};
 
 pub const CSR_MAGIC: u32 = 0x4753_4d4c;
 pub const CSR_VERSION: u16 = 1;
@@ -19,7 +22,10 @@ pub struct CsrHeader {
     pub flags: u8,
     pub file_id: FileId,
     pub create_ts: Timestamp,
+    pub min_ts: Timestamp,
     pub max_ts: Timestamp,
+    pub src_label: i32,
+    pub edge_type_partition: EdgeType,
     pub min_src: VertexId,
     pub max_src: VertexId,
     pub edge_offset_count: u64,
@@ -42,6 +48,9 @@ impl CsrHeader {
         put_u64(&mut out, 16, self.file_id);
         put_u64(&mut out, 24, self.create_ts);
         put_u64(&mut out, 32, self.max_ts);
+        put_u64(&mut out, 112, self.min_ts);
+        out[120..124].copy_from_slice(&self.src_label.to_le_bytes());
+        out[124..128].copy_from_slice(&self.edge_type_partition.to_le_bytes());
         put_u64(&mut out, 40, self.min_src);
         put_u64(&mut out, 48, self.max_src);
         put_u64(&mut out, 56, self.edge_offset_count);
@@ -66,7 +75,10 @@ impl CsrHeader {
             flags: buf[9],
             file_id: get_u64(buf, 16),
             create_ts: get_u64(buf, 24),
+            min_ts: get_u64(buf, 112),
             max_ts: get_u64(buf, 32),
+            src_label: i32::from_le_bytes(buf[120..124].try_into().unwrap()),
+            edge_type_partition: i32::from_le_bytes(buf[124..128].try_into().unwrap()),
             min_src: get_u64(buf, 40),
             max_src: get_u64(buf, 48),
             edge_offset_count: get_u64(buf, 56),
@@ -91,9 +103,19 @@ impl CsrHeader {
 pub struct CsrSegmentMeta {
     pub file_id: FileId,
     pub level: LevelId,
+    #[serde(default = "default_unknown_source_label")]
+    pub src_label: i32,
+    #[serde(default = "default_mixed_edge_type")]
+    pub edge_type_partition: EdgeType,
     pub min_src: VertexId,
     pub max_src: VertexId,
+    #[serde(default)]
+    pub min_ts: Timestamp,
     pub edge_count: u64,
+    #[serde(default)]
+    pub unique_src_count: u64,
+    #[serde(default)]
+    pub segment_bytes: u64,
     pub max_ts: Timestamp,
 }
 
@@ -103,6 +125,28 @@ impl CsrSegmentMeta {
             .join(format!("L{}", self.level))
             .join(format!("{:012}.edge", self.file_id))
     }
+
+    pub fn may_contain_partition(&self, src: VertexId, edge_type: Option<EdgeType>) -> bool {
+        let src_label = source_label_from_vertex_id(src);
+        let label_matches = self.src_label == UNKNOWN_SOURCE_LABEL
+            || src_label == UNKNOWN_SOURCE_LABEL
+            || self.src_label == src_label;
+        let edge_matches = match edge_type {
+            Some(edge_type) => {
+                self.edge_type_partition == MIXED_EDGE_TYPE || self.edge_type_partition == edge_type
+            }
+            None => true,
+        };
+        label_matches && edge_matches
+    }
+}
+
+fn default_unknown_source_label() -> i32 {
+    UNKNOWN_SOURCE_LABEL
+}
+
+fn default_mixed_edge_type() -> EdgeType {
+    MIXED_EDGE_TYPE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -32,9 +32,17 @@ pub struct LsmGraphConfig {
     pub max_levels: usize,
     pub l0_file_threshold: usize,
     pub segment_target_bytes: usize,
+    pub min_l0_partition_bytes: usize,
+    pub max_l0_segments_per_flush: usize,
     pub max_background_flushes: usize,
     pub max_outstanding_io: usize,
     pub io_backend: IoBackendKind,
+    pub auto_compaction: bool,
+    pub graph_aware_l0: bool,
+    pub l0_ra_range_bucket_size: u64,
+    pub l0_ra_min_queries: u64,
+    pub l0_ra_min_l0_segments: usize,
+    pub l0_ra_min_score: f64,
 }
 
 impl LsmGraphConfig {
@@ -47,9 +55,17 @@ impl LsmGraphConfig {
             max_levels: 5,
             l0_file_threshold: 4,
             segment_target_bytes: 64 * 1024 * 1024,
+            min_l0_partition_bytes: 4 * 1024 * 1024,
+            max_l0_segments_per_flush: 128,
             max_background_flushes: 2,
             max_outstanding_io: 128,
             io_backend: IoBackendKind::Blocking,
+            auto_compaction: false,
+            graph_aware_l0: false,
+            l0_ra_range_bucket_size: 1 << 20,
+            l0_ra_min_queries: 10,
+            l0_ra_min_l0_segments: 2,
+            l0_ra_min_score: 10.0,
         }
     }
 
@@ -60,6 +76,16 @@ impl LsmGraphConfig {
 
     pub fn with_io_backend(mut self, backend: IoBackendKind) -> Self {
         self.io_backend = backend;
+        self
+    }
+
+    pub fn with_auto_compaction(mut self, enabled: bool) -> Self {
+        self.auto_compaction = enabled;
+        self
+    }
+
+    pub fn with_graph_aware_l0(mut self, enabled: bool) -> Self {
+        self.graph_aware_l0 = enabled;
         self
     }
 }
