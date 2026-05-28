@@ -282,3 +282,10 @@ Observed I/O backend smoke results:
 - mmap the SNB adjacency cache to reduce validator startup memory copy cost.
 - Replace the functional `uring` backend with persistent ring workers and
   batched submissions.
+
+
+FORCE=1 INPUT=/data/WorkSpace/dgs/data/social_network_tugraph DATA_DIR=/data/WorkSpace/lsmgraph-rs/store/sf1-bench bash /data/WorkSpace/lsmgraph-rs/deps/ldbc_snb_interactive_impls/lsmgraph/prepare_validation_store.sh > /data/WorkSpace/lsmgraph-rs/logs/prepare-sf1-bench.log 2>&1 &
+
+FORCE=1 INPUT=/data/WorkSpace/ldbc-sf10/social_network DATA_DIR=/data/WorkSpace/lsmgraph-rs/store/sf10-bench bash /data/WorkSpace/lsmgraph-rs/deps/ldbc_snb_interactive_impls/lsmgraph/prepare_validation_store.sh > /data/WorkSpace/lsmgraph-rs/logs/prepare-sf10-bench.log 2>&1 &
+
+FORCE=1 INPUT=/data/WorkSpace/ldbc-sf30/social_network DATA_DIR=/data/WorkSpace/lsmgraph-rs/store/sf30-bench bash /data/WorkSpace/lsmgraph-rs/deps/ldbc_snb_interactive_impls/lsmgraph/prepare_validation_store.sh > /data/WorkSpace/lsmgraph-rs/logs/prepare-sf30-bench.log 2>&1 &

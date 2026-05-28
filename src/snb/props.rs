@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::graph::Engine;
+use crate::metrics::Metrics;
 use crate::types::{EdgeLabel, EdgeRecord, EdgeType, Timestamp, VertexId, VertexLabel};
 
 const LABEL_SHIFT: u64 = 56;
@@ -204,15 +206,51 @@ pub struct SnbGraph {
 
 impl SnbGraph {
     pub async fn open(engine: Arc<Engine>, store_dir: &Path) -> Result<Self> {
+        let metrics = engine.metrics();
+        let started = Instant::now();
         let vertices = load_vertices(&store_dir.join("snb_vertices.jsonl"))?;
+        metrics.snb_vertices_load_latency.record_since(started);
+        metrics
+            .snb_vertices_count
+            .store(vertices.len() as u64, Ordering::Relaxed);
+
+        let started = Instant::now();
         let edge_props = load_edge_props(&store_dir.join("snb_edge_props.jsonl"))?;
+        metrics.snb_edge_props_load_latency.record_since(started);
+        metrics
+            .snb_edge_props_count
+            .store(edge_props.len() as u64, Ordering::Relaxed);
+
         let snapshot = engine.current_snapshot();
         let cache_path = store_dir.join("snb_adjacency.bin");
         let adjacency = if cache_path.exists() {
-            load_adjacency_cache(&cache_path)?
+            metrics
+                .snb_adjacency_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
+            let adjacency = load_adjacency_cache(&cache_path)?;
+            metrics.snb_adjacency_load_latency.record_since(started);
+            let bytes = cache_path.metadata().map(|m| m.len()).unwrap_or(0);
+            record_adjacency_cache_stats(&metrics, &adjacency, bytes);
+            adjacency
         } else {
-            let adjacency = build_adjacency_from_edges(engine.scan_edges(snapshot).await?);
-            write_adjacency_cache_atomic(&cache_path, &adjacency)?;
+            metrics
+                .snb_adjacency_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
+            let edges = engine.scan_edges(snapshot).await?;
+            metrics.snb_adjacency_scan_latency.record_since(started);
+
+            let started = Instant::now();
+            let adjacency = build_adjacency_from_edges(edges);
+            metrics.snb_adjacency_group_latency.record_since(started);
+
+            let started = Instant::now();
+            let stats = write_adjacency_cache_atomic(&cache_path, &adjacency)?;
+            metrics.snb_adjacency_write_latency.record_since(started);
+            record_adjacency_write_stats(&metrics, stats);
+            let bytes = cache_path.metadata().map(|m| m.len()).unwrap_or(0);
+            record_adjacency_cache_stats(&metrics, &adjacency, bytes);
             adjacency
         };
         Ok(Self {
@@ -229,6 +267,10 @@ impl SnbGraph {
     }
 
     pub fn vertex(&self, vid: VertexId) -> Option<&VertexData> {
+        self.engine
+            .metrics()
+            .vertex_lookups
+            .fetch_add(1, Ordering::Relaxed);
         self.vertices.get(&vid)
     }
 
@@ -343,17 +385,31 @@ impl SnbGraph {
     }
 
     pub fn out_neighbors_cached(&self, vid: VertexId, edge_label: EdgeLabel) -> Vec<VertexId> {
-        self.adjacency
+        let metrics = self.engine.metrics();
+        metrics.adjacency_lookups.fetch_add(1, Ordering::Relaxed);
+        let neighbors = self
+            .adjacency
             .get(&(vid, edge_label.as_i32()))
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        metrics
+            .neighbor_clone_items
+            .fetch_add(neighbors.len() as u64, Ordering::Relaxed);
+        neighbors
     }
 
     pub fn in_neighbors_cached(&self, vid: VertexId, edge_label: EdgeLabel) -> Vec<VertexId> {
-        self.adjacency
+        let metrics = self.engine.metrics();
+        metrics.adjacency_lookups.fetch_add(1, Ordering::Relaxed);
+        let neighbors = self
+            .adjacency
             .get(&(vid, -edge_label.as_i32()))
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        metrics
+            .neighbor_clone_items
+            .fetch_add(neighbors.len() as u64, Ordering::Relaxed);
+        neighbors
     }
 
     pub async fn out_neighbors(
@@ -381,6 +437,10 @@ impl SnbGraph {
     }
 
     pub fn edge_prop_by_type(&self, src: VertexId, edge_type: EdgeType, dst: VertexId) -> EdgeProp {
+        self.engine
+            .metrics()
+            .edge_prop_lookups
+            .fetch_add(1, Ordering::Relaxed);
         self.edge_props
             .get(&(src, edge_type, dst))
             .copied()
@@ -412,31 +472,83 @@ impl SnbGraph {
     }
 
     pub async fn build_adjacency_cache(engine: Arc<Engine>, store_dir: &Path) -> Result<usize> {
+        let metrics = engine.metrics();
         let started = Instant::now();
         let snapshot = engine.current_snapshot();
         eprintln!("[snb-cache] scanning edges snapshot={snapshot}");
+        let scan_started = Instant::now();
         let edges = engine.scan_edges(snapshot).await?;
+        metrics
+            .snb_adjacency_scan_latency
+            .record_since(scan_started);
         eprintln!(
             "[snb-cache] scanned edges={} elapsed_s={:.1}",
             edges.len(),
             started.elapsed().as_secs_f64()
         );
+        let group_started = Instant::now();
         let adjacency = build_adjacency_from_edges(edges);
+        metrics
+            .snb_adjacency_group_latency
+            .record_since(group_started);
         let count = adjacency.len();
-        let write_started = Instant::now();
         eprintln!(
             "[snb-cache] writing adjacency cache groups={} path={}",
             count,
             store_dir.join("snb_adjacency.bin").display()
         );
-        write_adjacency_cache_atomic(&store_dir.join("snb_adjacency.bin"), &adjacency)?;
+        let write_started = Instant::now();
+        let write_stats =
+            write_adjacency_cache_atomic(&store_dir.join("snb_adjacency.bin"), &adjacency)?;
+        metrics
+            .snb_adjacency_write_latency
+            .record_since(write_started);
+        record_adjacency_write_stats(&metrics, write_stats);
+        let bytes = store_dir
+            .join("snb_adjacency.bin")
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        record_adjacency_cache_stats(&metrics, &adjacency, bytes);
         eprintln!(
-            "[snb-cache] write complete elapsed_s={:.1} total_elapsed_s={:.1}",
-            write_started.elapsed().as_secs_f64(),
+            "[snb-cache] write complete groups={} edges={} group_bytes={} dst_bytes={} write_elapsed_s={:.1} sync_elapsed_s={:.1} total_elapsed_s={:.1}",
+            write_stats.group_count,
+            write_stats.edge_count,
+            write_stats.encoded_group_bytes,
+            write_stats.encoded_dst_bytes,
+            write_stats.write_elapsed_s,
+            write_stats.sync_elapsed_s,
             started.elapsed().as_secs_f64()
         );
         Ok(count)
     }
+}
+
+fn record_adjacency_cache_stats(
+    metrics: &Metrics,
+    adjacency: &HashMap<(VertexId, EdgeType), Vec<VertexId>>,
+    bytes: u64,
+) {
+    let edge_count: usize = adjacency.values().map(Vec::len).sum();
+    metrics
+        .snb_adjacency_groups
+        .store(adjacency.len() as u64, Ordering::Relaxed);
+    metrics
+        .snb_adjacency_edges
+        .store(edge_count as u64, Ordering::Relaxed);
+    metrics.snb_adjacency_bytes.store(bytes, Ordering::Relaxed);
+}
+
+fn record_adjacency_write_stats(metrics: &Metrics, stats: AdjacencyCacheWriteStats) {
+    let dst_chunks = stats.edge_count.div_ceil(ADJ_DST_CHUNK);
+    let logical_write_calls = 1 + stats.group_count + dst_chunks;
+    metrics
+        .snb_adjacency_cache_write_syscalls
+        .fetch_add(logical_write_calls as u64, Ordering::Relaxed);
+    metrics.snb_adjacency_cache_write_bytes.fetch_add(
+        stats.encoded_group_bytes + stats.encoded_dst_bytes + ADJ_HEADER_LEN as u64,
+        Ordering::Relaxed,
+    );
 }
 
 fn load_vertices(path: &Path) -> Result<HashMap<VertexId, VertexData>> {
@@ -475,72 +587,179 @@ fn load_edge_props(path: &Path) -> Result<HashMap<(VertexId, EdgeType, VertexId)
 const ADJ_MAGIC: &[u8; 8] = b"LSMADJ01";
 const ADJ_HEADER_LEN: usize = 32;
 const ADJ_GROUP_LEN: usize = 32;
+const ADJ_WRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+const ADJ_DST_CHUNK: usize = 1_000_000;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdjacencyBuildStats {
+    pub groups: usize,
+    pub directed_edges: usize,
+    pub visible_edges: usize,
+    pub duplicate_edges_removed: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AdjacencyCacheWriteStats {
+    pub group_count: usize,
+    pub edge_count: usize,
+    pub encoded_group_bytes: u64,
+    pub encoded_dst_bytes: u64,
+    pub write_elapsed_s: f64,
+    pub sync_elapsed_s: f64,
+}
+
+#[derive(Debug, Default)]
+pub struct AdjacencyBuilder {
+    grouped: HashMap<(VertexId, EdgeType), Vec<(VertexId, Timestamp)>>,
+    directed_edges: usize,
+}
+
+impl AdjacencyBuilder {
+    pub fn from_adjacency(
+        adjacency: HashMap<(VertexId, EdgeType), Vec<VertexId>>,
+        max_existing_ts: Timestamp,
+    ) -> Self {
+        let mut builder = Self::default();
+        for ((src, edge_type), dsts) in adjacency {
+            for (idx, dst) in dsts.into_iter().enumerate() {
+                let ts = max_existing_ts.saturating_sub(idx as u64);
+                builder.record_edge(src, edge_type, dst, ts);
+            }
+        }
+        builder
+    }
+
+    pub fn record_edge(
+        &mut self,
+        src: VertexId,
+        edge_type: EdgeType,
+        dst: VertexId,
+        ts: Timestamp,
+    ) {
+        self.grouped
+            .entry((src, edge_type))
+            .or_default()
+            .push((dst, ts));
+        self.directed_edges += 1;
+    }
+
+    pub fn directed_edges(&self) -> usize {
+        self.directed_edges
+    }
+
+    pub fn build(
+        self,
+    ) -> (
+        HashMap<(VertexId, EdgeType), Vec<VertexId>>,
+        AdjacencyBuildStats,
+    ) {
+        let mut adjacency = HashMap::with_capacity(self.grouped.len());
+        let mut visible_edges = 0usize;
+        let mut duplicate_edges_removed = 0usize;
+
+        for (key, mut dsts) in self.grouped {
+            let original_len = dsts.len();
+            dsts.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+            dsts.dedup_by_key(|(dst, _)| *dst);
+            dsts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            visible_edges += dsts.len();
+            duplicate_edges_removed += original_len - dsts.len();
+            adjacency.insert(key, dsts.into_iter().map(|(dst, _)| dst).collect());
+        }
+
+        let stats = AdjacencyBuildStats {
+            groups: adjacency.len(),
+            directed_edges: self.directed_edges,
+            visible_edges,
+            duplicate_edges_removed,
+        };
+        (adjacency, stats)
+    }
+}
 
 fn build_adjacency_from_edges(
     edges: Vec<EdgeRecord>,
 ) -> HashMap<(VertexId, EdgeType), Vec<VertexId>> {
-    let mut grouped: HashMap<(VertexId, EdgeType), Vec<(VertexId, Timestamp)>> = HashMap::new();
+    let mut builder = AdjacencyBuilder::default();
     for edge in edges {
-        grouped
-            .entry((edge.src, edge.edge_type))
-            .or_default()
-            .push((edge.dst, edge.ts));
+        builder.record_edge(edge.src, edge.edge_type, edge.dst, edge.ts);
     }
-    let mut adjacency = HashMap::with_capacity(grouped.len());
-    for (key, mut dsts) in grouped {
-        dsts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        dsts.dedup_by_key(|(dst, _)| *dst);
-        adjacency.insert(key, dsts.into_iter().map(|(dst, _)| dst).collect());
-    }
+    let (adjacency, _) = builder.build();
     adjacency
 }
 
-fn write_adjacency_cache_atomic(
+pub fn write_adjacency_cache_atomic(
     path: &Path,
     adjacency: &HashMap<(VertexId, EdgeType), Vec<VertexId>>,
-) -> Result<()> {
+) -> Result<AdjacencyCacheWriteStats> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp_path = path.with_extension("bin.tmp");
-    write_adjacency_cache(&tmp_path, adjacency)?;
+    let stats = write_adjacency_cache(&tmp_path, adjacency)?;
     fs::rename(tmp_path, path)?;
-    Ok(())
+    Ok(stats)
 }
 
 fn write_adjacency_cache(
     path: &Path,
     adjacency: &HashMap<(VertexId, EdgeType), Vec<VertexId>>,
-) -> Result<()> {
+) -> Result<AdjacencyCacheWriteStats> {
+    let started = Instant::now();
     let mut groups: Vec<_> = adjacency.iter().collect();
     groups.sort_by_key(|((src, edge_type), _)| (*src, *edge_type));
     let total_edges: usize = groups.iter().map(|(_, dsts)| dsts.len()).sum();
-    let mut file = File::create(path)?;
-    file.write_all(ADJ_MAGIC)?;
-    file.write_all(&(1u32).to_le_bytes())?;
-    file.write_all(&(ADJ_HEADER_LEN as u32).to_le_bytes())?;
-    file.write_all(&(groups.len() as u64).to_le_bytes())?;
-    file.write_all(&(total_edges as u64).to_le_bytes())?;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::with_capacity(ADJ_WRITE_BUFFER_BYTES, file);
+
+    let mut header = [0u8; ADJ_HEADER_LEN];
+    header[0..8].copy_from_slice(ADJ_MAGIC);
+    header[8..12].copy_from_slice(&1u32.to_le_bytes());
+    header[12..16].copy_from_slice(&(ADJ_HEADER_LEN as u32).to_le_bytes());
+    header[16..24].copy_from_slice(&(groups.len() as u64).to_le_bytes());
+    header[24..32].copy_from_slice(&(total_edges as u64).to_le_bytes());
+    writer.write_all(&header)?;
 
     let mut first_idx = 0u64;
     for ((src, edge_type), dsts) in &groups {
-        file.write_all(&src.to_le_bytes())?;
-        file.write_all(&edge_type.to_le_bytes())?;
-        file.write_all(&0u32.to_le_bytes())?;
-        file.write_all(&first_idx.to_le_bytes())?;
-        file.write_all(&(dsts.len() as u64).to_le_bytes())?;
+        let mut group = [0u8; ADJ_GROUP_LEN];
+        group[0..8].copy_from_slice(&src.to_le_bytes());
+        group[8..12].copy_from_slice(&edge_type.to_le_bytes());
+        group[12..16].copy_from_slice(&0u32.to_le_bytes());
+        group[16..24].copy_from_slice(&first_idx.to_le_bytes());
+        group[24..32].copy_from_slice(&(dsts.len() as u64).to_le_bytes());
+        writer.write_all(&group)?;
         first_idx += dsts.len() as u64;
     }
+
+    let mut dst_buf = Vec::with_capacity(ADJ_DST_CHUNK * std::mem::size_of::<VertexId>());
     for (_, dsts) in groups {
-        for dst in dsts {
-            file.write_all(&dst.to_le_bytes())?;
+        for chunk in dsts.chunks(ADJ_DST_CHUNK) {
+            dst_buf.clear();
+            for dst in chunk {
+                dst_buf.extend_from_slice(&dst.to_le_bytes());
+            }
+            writer.write_all(&dst_buf)?;
         }
     }
-    file.sync_all()?;
-    Ok(())
+
+    writer.flush()?;
+    let write_elapsed_s = started.elapsed().as_secs_f64();
+    let sync_started = Instant::now();
+    writer.get_ref().sync_all()?;
+    let sync_elapsed_s = sync_started.elapsed().as_secs_f64();
+
+    Ok(AdjacencyCacheWriteStats {
+        group_count: adjacency.len(),
+        edge_count: total_edges,
+        encoded_group_bytes: (adjacency.len() * ADJ_GROUP_LEN) as u64,
+        encoded_dst_bytes: (total_edges * std::mem::size_of::<VertexId>()) as u64,
+        write_elapsed_s,
+        sync_elapsed_s,
+    })
 }
 
-fn load_adjacency_cache(path: &Path) -> Result<HashMap<(VertexId, EdgeType), Vec<VertexId>>> {
+pub fn load_adjacency_cache(path: &Path) -> Result<HashMap<(VertexId, EdgeType), Vec<VertexId>>> {
     let mut file = File::open(path)?;
     let mut header = [0u8; ADJ_HEADER_LEN];
     file.read_exact(&mut header)?;
@@ -574,4 +793,59 @@ fn load_adjacency_cache(path: &Path) -> Result<HashMap<(VertexId, EdgeType), Vec
         out.insert((src, edge_type), list);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adjacency_cache_round_trips_current_format() {
+        let tmp_root = Path::new("target/test-tmp");
+        fs::create_dir_all(tmp_root).unwrap();
+        let dir = tempfile::tempdir_in(tmp_root).unwrap();
+        let path = dir.path().join("snb_adjacency.bin");
+        let mut adjacency = HashMap::new();
+        adjacency.insert((10, 1), vec![20, 21, 22]);
+        adjacency.insert((10, -1), vec![30]);
+        adjacency.insert((11, 2), vec![40, 41]);
+
+        let stats = write_adjacency_cache_atomic(&path, &adjacency).unwrap();
+        assert_eq!(stats.group_count, 3);
+        assert_eq!(stats.edge_count, 6);
+        assert_eq!(stats.encoded_group_bytes, 3 * ADJ_GROUP_LEN as u64);
+        assert_eq!(
+            stats.encoded_dst_bytes,
+            6 * std::mem::size_of::<VertexId>() as u64
+        );
+
+        let loaded = load_adjacency_cache(&path).unwrap();
+        assert_eq!(loaded, adjacency);
+    }
+
+    #[test]
+    fn adjacency_builder_matches_scan_edge_builder() {
+        let edges = vec![
+            EdgeRecord::insert(1, 10, 7, 1),
+            EdgeRecord::insert(1, 11, 7, 2),
+            EdgeRecord::insert(1, 10, 7, 3),
+            EdgeRecord::insert(1, 12, -7, 4),
+            EdgeRecord::insert(2, 20, 7, 5),
+        ];
+        let expected = build_adjacency_from_edges(edges.clone());
+
+        let mut builder = AdjacencyBuilder::default();
+        for edge in edges {
+            builder.record_edge(edge.src, edge.edge_type, edge.dst, edge.ts);
+        }
+        let (actual, stats) = builder.build();
+
+        assert_eq!(actual, expected);
+        assert_eq!(stats.groups, 3);
+        assert_eq!(stats.directed_edges, 5);
+        assert_eq!(stats.visible_edges, 4);
+        assert_eq!(stats.duplicate_edges_removed, 1);
+        assert_eq!(actual.get(&(1, 7)).unwrap(), &vec![10, 11]);
+        assert_eq!(actual.get(&(1, -7)).unwrap(), &vec![12]);
+    }
 }

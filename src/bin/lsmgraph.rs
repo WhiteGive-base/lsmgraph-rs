@@ -1,5 +1,5 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -11,6 +11,7 @@ use lsmgraph::snb::{
     import_snb_full, import_snb_updates, rebuild_snb_edge_props, start_dgs_compatible_server,
     validate_ic1_ic14, validate_ic_batch, validate_mixed_tugraph, SnbGraph,
 };
+use serde_json::json;
 
 const DEFAULT_DATA: &str = "/data/WorkSpace/dgs/data/social_network_tugraph";
 const DEFAULT_STORE: &str = "/data/WorkSpace/lsmgraph-rs/store/sf1";
@@ -123,6 +124,14 @@ enum Command {
         #[arg(long, default_value = DEFAULT_STORE)]
         data_dir: PathBuf,
     },
+    StorageBench {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        samples: usize,
+        #[arg(long, default_value_t = true)]
+        scan: bool,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -185,13 +194,12 @@ async fn main() -> Result<()> {
             let levels = engine.live_file_count_by_level();
             let metrics = engine.metrics();
             println!(
-                "{{\"snapshot\":{},\"levels\":{:?},\"read_bytes\":{},\"write_bytes\":{},\"flush_count\":{},\"compaction_count\":{}}}",
-                engine.current_snapshot(),
-                levels,
-                metrics.read_bytes.load(Ordering::Relaxed),
-                metrics.write_bytes.load(Ordering::Relaxed),
-                metrics.flush_count.load(Ordering::Relaxed),
-                metrics.compaction_count.load(Ordering::Relaxed)
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "snapshot": engine.current_snapshot(),
+                    "levels": levels,
+                    "metrics": metrics.snapshot_json(),
+                }))?
             );
         }
         Command::Compact { data_dir } => {
@@ -288,11 +296,15 @@ async fn main() -> Result<()> {
         Command::SnbCache { data_dir } => {
             let engine =
                 Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
-            let groups = SnbGraph::build_adjacency_cache(engine, &data_dir).await?;
+            let groups = SnbGraph::build_adjacency_cache(engine.clone(), &data_dir).await?;
+            let metrics = engine.metrics();
             println!(
-                "{{\"data_dir\":\"{}\",\"adjacency_groups\":{}}}",
-                data_dir.display(),
-                groups
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "data_dir": data_dir,
+                    "adjacency_groups": groups,
+                    "metrics": metrics.snapshot_json(),
+                }))?
             );
         }
         Command::SnbProps { input, data_dir } => {
@@ -313,6 +325,51 @@ async fn main() -> Result<()> {
                 stats.input_rows,
                 stats.directed_edges,
                 engine.current_snapshot()
+            );
+        }
+        Command::StorageBench {
+            data_dir,
+            samples,
+            scan,
+        } => {
+            let engine =
+                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let snapshot = engine.current_snapshot();
+            let started = Instant::now();
+            let edges = engine.scan_edges(snapshot).await?;
+            let scan_elapsed_ms = started.elapsed().as_millis();
+            let mut srcs = Vec::new();
+            let mut seen = HashSet::new();
+            let stride = (edges.len() / samples.max(1)).max(1);
+            for edge in edges.iter().step_by(stride) {
+                if seen.insert(edge.src) {
+                    srcs.push(edge.src);
+                    if srcs.len() >= samples {
+                        break;
+                    }
+                }
+            }
+            let mut neighbor_edges = 0usize;
+            let neighbor_started = Instant::now();
+            for src in &srcs {
+                neighbor_edges += engine.get_neighbors(*src, snapshot).await?.len();
+            }
+            let get_neighbors_elapsed_ms = neighbor_started.elapsed().as_millis();
+            let metrics = engine.metrics();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "data_dir": data_dir,
+                    "snapshot": snapshot,
+                    "scan_requested": scan,
+                    "scan_edges": edges.len(),
+                    "scan_elapsed_ms": scan_elapsed_ms,
+                    "sampled_vertices": srcs.len(),
+                    "neighbor_edges": neighbor_edges,
+                    "get_neighbors_elapsed_ms": get_neighbors_elapsed_ms,
+                    "levels": engine.live_file_count_by_level(),
+                    "metrics": metrics.snapshot_json(),
+                }))?
             );
         }
     }

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
@@ -108,10 +109,14 @@ impl Engine {
         dst: VertexId,
         edge_type: EdgeType,
     ) -> Result<SnapshotId> {
+        let started = Instant::now();
         let ts = self.timestamp.fetch_add(1, Ordering::SeqCst) + 1;
         self.metrics.insert_ops.fetch_add(1, Ordering::Relaxed);
-        self.write_edge(EdgeRecord::insert(src, dst, edge_type, ts))
-            .await?;
+        let result = self
+            .write_edge(EdgeRecord::insert(src, dst, edge_type, ts))
+            .await;
+        self.metrics.storage_insert_latency.record_since(started);
+        result?;
         Ok(ts)
     }
 
@@ -121,10 +126,14 @@ impl Engine {
         dst: VertexId,
         edge_type: EdgeType,
     ) -> Result<SnapshotId> {
+        let started = Instant::now();
         let ts = self.timestamp.fetch_add(1, Ordering::SeqCst) + 1;
         self.metrics.delete_ops.fetch_add(1, Ordering::Relaxed);
-        self.write_edge(EdgeRecord::delete(src, dst, edge_type, ts))
-            .await?;
+        let result = self
+            .write_edge(EdgeRecord::delete(src, dst, edge_type, ts))
+            .await;
+        self.metrics.storage_delete_latency.record_since(started);
+        result?;
         Ok(ts)
     }
 
@@ -209,8 +218,10 @@ impl Engine {
     }
 
     async fn flush_memgraph(self: Arc<Self>, memgraph: Arc<MemGraph>) -> Result<()> {
+        let started = Instant::now();
         let edges = memgraph.all_edges_sorted();
         if edges.is_empty() {
+            self.metrics.storage_flush_latency.record_since(started);
             return Ok(());
         }
         let file_id = self.alloc_file_id();
@@ -237,6 +248,7 @@ impl Engine {
             levels,
         });
         self.rebuild_index().await?;
+        self.metrics.storage_flush_latency.record_since(started);
         Ok(())
     }
 
@@ -252,6 +264,7 @@ impl Engine {
         src: VertexId,
         snapshot: SnapshotId,
     ) -> Result<Vec<EdgeRecord>> {
+        let started = Instant::now();
         self.metrics
             .get_neighbors_ops
             .fetch_add(1, Ordering::Relaxed);
@@ -262,7 +275,11 @@ impl Engine {
             updates.extend(memgraph.get_edges_for_src(src));
         }
 
-        let reader = CsrReader::new(self.backend.clone(), self.config.store_dir.clone());
+        let reader = CsrReader::with_metrics(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.metrics.clone(),
+        );
         if let Some(l0) = guard.version().levels.get(L0 as usize) {
             for meta in l0 {
                 updates.extend(reader.get_neighbors(meta, src).await?);
@@ -272,26 +289,40 @@ impl Engine {
             updates.extend(reader.get_neighbors(&meta, src).await?);
         }
 
-        Ok(merge_visible(updates, snapshot))
+        let out = merge_visible(updates, snapshot);
+        self.metrics
+            .storage_get_neighbors_latency
+            .record_since(started);
+        Ok(out)
     }
 
     pub async fn scan_edges(&self, snapshot: SnapshotId) -> Result<Vec<EdgeRecord>> {
+        let started = Instant::now();
         self.metrics.scan_ops.fetch_add(1, Ordering::Relaxed);
         let guard = self.version_manager.pin_current();
         let mut updates = Vec::new();
         for memgraph in &guard.version().memgraphs {
             updates.extend(memgraph.all_edges_sorted());
         }
-        let reader = CsrReader::new(self.backend.clone(), self.config.store_dir.clone());
+        let reader = CsrReader::with_metrics(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.metrics.clone(),
+        );
         for level in &guard.version().levels {
             for meta in level {
                 updates.extend(reader.read_all_edges(meta).await?);
             }
         }
-        Ok(merge_visible(updates, snapshot))
+        let out = merge_visible(updates, snapshot);
+        self.metrics
+            .storage_scan_edges_latency
+            .record_since(started);
+        Ok(out)
     }
 
     pub async fn compact_l0_to_l1(&self) -> Result<Option<CsrSegmentMeta>> {
+        let started = Instant::now();
         self.wait_for_flushes().await?;
         let guard = self.version_manager.pin_current();
         let l0_files = guard
@@ -301,6 +332,9 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         if l0_files.is_empty() {
+            self.metrics
+                .storage_compaction_latency
+                .record_since(started);
             return Ok(None);
         }
         let l1_files = guard
@@ -310,7 +344,11 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
 
-        let reader = CsrReader::new(self.backend.clone(), self.config.store_dir.clone());
+        let reader = CsrReader::with_metrics(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.metrics.clone(),
+        );
         let mut updates = Vec::new();
         let mut input_bytes = 0u64;
         for meta in l0_files.iter().chain(l1_files.iter()) {
@@ -352,12 +390,20 @@ impl Engine {
             Ordering::Relaxed,
         );
         self.rebuild_index().await?;
+        self.metrics
+            .storage_compaction_latency
+            .record_since(started);
         Ok(Some(output))
     }
 
     async fn rebuild_index(&self) -> Result<()> {
+        let started = Instant::now();
         let guard = self.version_manager.pin_current();
-        let reader = CsrReader::new(self.backend.clone(), self.config.store_dir.clone());
+        let reader = CsrReader::with_metrics(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.metrics.clone(),
+        );
         let mut entries: HashMap<VertexId, Vec<CsrSegmentMeta>> = HashMap::new();
         for (level_id, level) in guard.version().levels.iter().enumerate() {
             if level_id == L0 as usize {
@@ -370,6 +416,9 @@ impl Engine {
             }
         }
         self.index.rebuild(entries);
+        self.metrics
+            .storage_rebuild_index_latency
+            .record_since(started);
         Ok(())
     }
 

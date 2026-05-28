@@ -1,15 +1,22 @@
+use std::env;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 
 use crate::error::Result;
+use crate::metrics::Metrics;
 use crate::snb::props::SnbGraph;
 use crate::snb::queries::{run_dgs_http_query, run_dgs_http_update};
 
 pub async fn start_dgs_compatible_server(snb: SnbGraph, bind: &str) -> Result<()> {
+    let metrics = snb.engine.metrics();
+    start_periodic_metrics_logger(metrics);
+
     let snb = Arc::new(RwLock::new(snb));
     let listener = TcpListener::bind(bind).await?;
     println!("{{\"server\":\"lsmgraph-snb\",\"bind\":\"{bind}\"}}");
@@ -25,52 +32,122 @@ pub async fn start_dgs_compatible_server(snb: SnbGraph, bind: &str) -> Result<()
 }
 
 async fn handle_connection(mut stream: TcpStream, snb: Arc<RwLock<SnbGraph>>) -> Result<()> {
+    let read_started = Instant::now();
     let request = read_http_request(&mut stream).await?;
+    let metrics = metrics_for(&snb).await;
+    metrics.http_request_read_latency.record_since(read_started);
+
+    let mut record_response_metrics = true;
     let response = match request {
         HttpRequest::Get { path } if path == "/" => {
             http_response(200, "application/json", br#"{"status":"ok"}"#.to_vec())
         }
+        HttpRequest::Get { path } if path.starts_with("/metrics") => {
+            let snapshot = metrics.snapshot_json();
+            json_response(&metrics, 200, &snapshot)
+        }
+        HttpRequest::Post { path, body: _ } if path == "/metrics/reset" => {
+            record_response_metrics = false;
+            let response =
+                http_response(200, "application/json", br#"{"status":"reset"}"#.to_vec());
+            metrics.reset();
+            response
+        }
         HttpRequest::Post { path, body } => {
+            let parse_started = Instant::now();
             let params: Value = serde_json::from_slice(&body)?;
+            metrics.http_json_parse_latency.record_since(parse_started);
+
+            let handler_started = Instant::now();
             let result = if path.starts_with("/query/interactive_update_") {
+                let lock_wait_started = Instant::now();
                 let mut guard = snb.write().await;
-                run_dgs_http_update(&mut guard, &path, &params)
+                metrics
+                    .snb_write_lock_wait_latency
+                    .record_since(lock_wait_started);
+                let lock_hold_started = Instant::now();
+                let result = run_dgs_http_update(&mut guard, &path, &params);
+                metrics
+                    .snb_write_lock_hold_latency
+                    .record_since(lock_hold_started);
+                result
             } else {
+                let lock_wait_started = Instant::now();
                 let guard = snb.read().await;
-                run_dgs_http_query(&guard, &path, &params)
+                metrics
+                    .snb_read_lock_wait_latency
+                    .record_since(lock_wait_started);
+                let lock_hold_started = Instant::now();
+                let result = run_dgs_http_query(&guard, &path, &params);
+                metrics
+                    .snb_read_lock_hold_latency
+                    .record_since(lock_hold_started);
+                result
             };
+            metrics.http_handler_latency.record_since(handler_started);
+            metrics.record_endpoint(&path, handler_started.elapsed(), result.is_ok());
+
             match result {
-                Ok(value) => http_response(
-                    200,
-                    "application/json",
-                    serde_json::to_vec(&value).expect("serialize query response"),
-                ),
-                Err(err) => http_response(
+                Ok(value) => json_response(&metrics, 200, &value),
+                Err(err) => json_response(
+                    &metrics,
                     500,
-                    "application/json",
-                    serde_json::to_vec(&json!({
+                    &json!({
                         "error": err.to_string(),
                         "path": path,
-                    }))
-                    .expect("serialize error response"),
+                    }),
                 ),
             }
         }
-        HttpRequest::Get { path } => http_response(
-            404,
-            "application/json",
-            serde_json::to_vec(&json!({"error": "not found", "path": path}))
-                .expect("serialize not found response"),
-        ),
+        HttpRequest::Get { path } => {
+            json_response(&metrics, 404, &json!({"error": "not found", "path": path}))
+        }
     };
-    stream.write_all(&response).await?;
+
+    if record_response_metrics {
+        metrics.record_http_status(response.status);
+    }
+    let write_started = Instant::now();
+    stream.write_all(&response.bytes).await?;
     stream.shutdown().await?;
+    if record_response_metrics {
+        metrics
+            .http_response_write_latency
+            .record_since(write_started);
+    }
     Ok(())
+}
+
+async fn metrics_for(snb: &Arc<RwLock<SnbGraph>>) -> Arc<Metrics> {
+    let guard = snb.read().await;
+    guard.engine.metrics()
+}
+
+fn start_periodic_metrics_logger(metrics: Arc<Metrics>) {
+    let interval_secs = env::var("LSMGRAPH_METRICS_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if interval_secs == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(interval_secs);
+        loop {
+            sleep(interval).await;
+            eprintln!("[metrics] {}", metrics.summary_json());
+        }
+    });
 }
 
 enum HttpRequest {
     Get { path: String },
     Post { path: String, body: Vec<u8> },
+}
+
+struct HttpResponse {
+    status: u16,
+    bytes: Vec<u8>,
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
@@ -134,18 +211,25 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn http_response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
+fn json_response(metrics: &Metrics, status: u16, value: &Value) -> HttpResponse {
+    let started = Instant::now();
+    let body = serde_json::to_vec(value).expect("serialize json response");
+    metrics.http_serialize_latency.record_since(started);
+    http_response(status, "application/json", body)
+}
+
+fn http_response(status: u16, content_type: &str, body: Vec<u8>) -> HttpResponse {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "OK",
     };
-    let mut response = format!(
+    let mut bytes = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
-    response.extend_from_slice(&body);
-    response
+    bytes.extend_from_slice(&body);
+    HttpResponse { status, bytes }
 }

@@ -10,8 +10,9 @@ use crate::error::Result;
 use crate::graph::Engine;
 use crate::loader::ImportStats;
 use crate::snb::props::{
-    encode_vid, CommentProps, EdgeProp, EdgePropRow, ForumProps, OrgProps, PersonProps, PlaceProps,
-    PostProps, SnbGraph, TagClassProps, TagProps, VertexData, VertexRow,
+    encode_vid, load_adjacency_cache, write_adjacency_cache_atomic, AdjacencyBuilder, CommentProps,
+    EdgeProp, EdgePropRow, ForumProps, OrgProps, PersonProps, PlaceProps, PostProps, TagClassProps,
+    TagProps, VertexData, VertexRow,
 };
 use crate::types::{EdgeLabel, VertexLabel};
 
@@ -32,6 +33,7 @@ pub async fn import_snb_full(
         input_rows: 0,
         directed_edges: 0,
     };
+    let mut adjacency = AdjacencyBuilder::default();
 
     eprintln!("[snb-full] importing vertices from {}", csv_root.display());
     import_vertices(csv_root, &mut vertices)?;
@@ -57,6 +59,7 @@ pub async fn import_snb_full(
             ColRef::Index(0),
             ColRef::Index(1),
             PropSpec::I64Col(2),
+            &mut adjacency,
         )
         .await?,
     );
@@ -72,6 +75,7 @@ pub async fn import_snb_full(
             ColRef::Index(0),
             ColRef::Index(1),
             PropSpec::I64Col(2),
+            &mut adjacency,
         )
         .await?,
     );
@@ -87,6 +91,7 @@ pub async fn import_snb_full(
             ColRef::Index(0),
             ColRef::Index(1),
             PropSpec::I64Col(2),
+            &mut adjacency,
         )
         .await?,
     );
@@ -102,6 +107,7 @@ pub async fn import_snb_full(
             ColRef::Index(0),
             ColRef::Index(1),
             PropSpec::None,
+            &mut adjacency,
         )
         .await?,
     );
@@ -117,6 +123,7 @@ pub async fn import_snb_full(
             ColRef::Index(0),
             ColRef::Index(1),
             PropSpec::I32Col(2),
+            &mut adjacency,
         )
         .await?,
     );
@@ -132,6 +139,7 @@ pub async fn import_snb_full(
             ColRef::Index(0),
             ColRef::Index(1),
             PropSpec::I32Col(2),
+            &mut adjacency,
         )
         .await?,
     );
@@ -147,6 +155,7 @@ pub async fn import_snb_full(
             ColRef::Index(0),
             ColRef::Index(1),
             PropSpec::I64Col(2),
+            &mut adjacency,
         )
         .await?,
     );
@@ -180,6 +189,7 @@ pub async fn import_snb_full(
                 ColRef::Index(0),
                 ColRef::Index(1),
                 PropSpec::None,
+                &mut adjacency,
             )
             .await?,
         );
@@ -291,11 +301,17 @@ pub async fn import_snb_full(
             "isSubclassOf",
         ),
     ] {
-        stats.add(import_named_edge(engine.clone(), &mut edge_props, spec).await?);
+        stats.add(import_named_edge(engine.clone(), &mut edge_props, spec, &mut adjacency).await?);
     }
 
     edge_props.flush()?;
-    eprintln!("[snb-full] edge import complete input_rows={} directed_edges={} edge_props={} elapsed_s={:.1}", stats.input_rows, stats.directed_edges, edge_prop_path.display(), import_started.elapsed().as_secs_f64());
+    eprintln!(
+        "[snb-full] edge import complete input_rows={} directed_edges={} edge_props={} elapsed_s={:.1}",
+        stats.input_rows,
+        stats.directed_edges,
+        edge_prop_path.display(),
+        import_started.elapsed().as_secs_f64()
+    );
     let flush_started = Instant::now();
     eprintln!("[snb-full] flushing active MemGraph to CSR");
     engine.flush_active().await?;
@@ -304,11 +320,30 @@ pub async fn import_snb_full(
         flush_started.elapsed().as_secs_f64()
     );
     let cache_started = Instant::now();
-    eprintln!("[snb-full] building adjacency cache");
-    let groups = SnbGraph::build_adjacency_cache(engine, store_dir).await?;
     eprintln!(
-        "[snb-full] adjacency cache complete groups={} elapsed_s={:.1} total_elapsed_s={:.1}",
-        groups,
+        "[snb-full] building adjacency cache from import stream directed_edges={}",
+        adjacency.directed_edges()
+    );
+    let build_started = Instant::now();
+    let (adjacency, build_stats) = adjacency.build();
+    eprintln!(
+        "[snb-full] adjacency build complete groups={} directed_edges={} visible_edges={} duplicate_edges_removed={} build_elapsed_s={:.1}",
+        build_stats.groups,
+        build_stats.directed_edges,
+        build_stats.visible_edges,
+        build_stats.duplicate_edges_removed,
+        build_started.elapsed().as_secs_f64()
+    );
+    let write_stats =
+        write_adjacency_cache_atomic(&store_dir.join("snb_adjacency.bin"), &adjacency)?;
+    eprintln!(
+        "[snb-full] adjacency cache complete groups={} edges={} group_bytes={} dst_bytes={} write_elapsed_s={:.1} sync_elapsed_s={:.1} elapsed_s={:.1} total_elapsed_s={:.1}",
+        write_stats.group_count,
+        write_stats.edge_count,
+        write_stats.encoded_group_bytes,
+        write_stats.encoded_dst_bytes,
+        write_stats.write_elapsed_s,
+        write_stats.sync_elapsed_s,
         cache_started.elapsed().as_secs_f64(),
         import_started.elapsed().as_secs_f64()
     );
@@ -400,6 +435,7 @@ pub async fn import_snb_updates(
     csv_root: &Path,
     store_dir: &Path,
 ) -> Result<ImportStats> {
+    let import_started = Instant::now();
     fs::create_dir_all(store_dir)?;
     let mut vertices = BufWriter::new(
         OpenOptions::new()
@@ -417,6 +453,19 @@ pub async fn import_snb_updates(
         input_rows: 0,
         directed_edges: 0,
     };
+    let cache_path = store_dir.join("snb_adjacency.bin");
+    let mut adjacency = if cache_path.exists() {
+        eprintln!(
+            "[snb-updates] loading existing adjacency cache path={}",
+            cache_path.display()
+        );
+        AdjacencyBuilder::from_adjacency(
+            load_adjacency_cache(&cache_path)?,
+            engine.current_snapshot(),
+        )
+    } else {
+        AdjacencyBuilder::default()
+    };
     let mut files = update_stream_files(csv_root)?;
     files.sort();
     for path in files {
@@ -426,13 +475,52 @@ pub async fn import_snb_updates(
             &mut edge_props,
             &path,
             &mut stats,
+            &mut adjacency,
         )
         .await?;
     }
     vertices.flush()?;
     edge_props.flush()?;
+    eprintln!(
+        "[snb-updates] update import complete input_rows={} directed_edges={} elapsed_s={:.1}",
+        stats.input_rows,
+        stats.directed_edges,
+        import_started.elapsed().as_secs_f64()
+    );
+    let flush_started = Instant::now();
+    eprintln!("[snb-updates] flushing active MemGraph to CSR");
     engine.flush_active().await?;
-    SnbGraph::build_adjacency_cache(engine, store_dir).await?;
+    eprintln!(
+        "[snb-updates] flush complete elapsed_s={:.1}",
+        flush_started.elapsed().as_secs_f64()
+    );
+    let cache_started = Instant::now();
+    eprintln!(
+        "[snb-updates] rebuilding adjacency cache from update stream directed_edges={}",
+        adjacency.directed_edges()
+    );
+    let build_started = Instant::now();
+    let (adjacency, build_stats) = adjacency.build();
+    eprintln!(
+        "[snb-updates] adjacency build complete groups={} directed_edges={} visible_edges={} duplicate_edges_removed={} build_elapsed_s={:.1}",
+        build_stats.groups,
+        build_stats.directed_edges,
+        build_stats.visible_edges,
+        build_stats.duplicate_edges_removed,
+        build_started.elapsed().as_secs_f64()
+    );
+    let write_stats = write_adjacency_cache_atomic(&cache_path, &adjacency)?;
+    eprintln!(
+        "[snb-updates] adjacency cache complete groups={} edges={} group_bytes={} dst_bytes={} write_elapsed_s={:.1} sync_elapsed_s={:.1} elapsed_s={:.1} total_elapsed_s={:.1}",
+        write_stats.group_count,
+        write_stats.edge_count,
+        write_stats.encoded_group_bytes,
+        write_stats.encoded_dst_bytes,
+        write_stats.write_elapsed_s,
+        write_stats.sync_elapsed_s,
+        cache_started.elapsed().as_secs_f64(),
+        import_started.elapsed().as_secs_f64()
+    );
     Ok(stats)
 }
 
@@ -616,6 +704,7 @@ async fn import_update_stream_file(
     edge_props: &mut BufWriter<File>,
     path: &Path,
     stats: &mut ImportStats,
+    adjacency: &mut AdjacencyBuilder,
 ) -> Result<()> {
     let started = Instant::now();
     eprintln!("[snb-full][update] start file={}", path.display());
@@ -634,10 +723,27 @@ async fn import_update_stream_file(
         stats.input_rows += 1;
         file_rows += 1;
         if file_rows % IMPORT_PROGRESS_ROWS == 0 {
-            eprintln!("[snb-full][update] progress file={} rows={} total_rows={} directed_edges={} elapsed_s={:.1}", path.display(), file_rows, stats.input_rows, stats.directed_edges, started.elapsed().as_secs_f64());
+            eprintln!(
+                "[snb-full][update] progress file={} rows={} total_rows={} directed_edges={} elapsed_s={:.1}",
+                path.display(),
+                file_rows,
+                stats.input_rows,
+                stats.directed_edges,
+                started.elapsed().as_secs_f64()
+            );
         }
         match parts[2] {
-            "1" => apply_add_person(engine.clone(), vertices, edge_props, &parts, stats).await?,
+            "1" => {
+                apply_add_person(
+                    engine.clone(),
+                    vertices,
+                    edge_props,
+                    &parts,
+                    stats,
+                    adjacency,
+                )
+                .await?
+            }
             "2" => {
                 apply_binary_update_edge(
                     engine.clone(),
@@ -647,6 +753,7 @@ async fn import_update_stream_file(
                     VertexLabel::Post,
                     EdgeLabel::LikesPost,
                     false,
+                    adjacency,
                 )
                 .await?;
                 stats.directed_edges += 2;
@@ -660,11 +767,22 @@ async fn import_update_stream_file(
                     VertexLabel::Comment,
                     EdgeLabel::LikesComment,
                     false,
+                    adjacency,
                 )
                 .await?;
                 stats.directed_edges += 2;
             }
-            "4" => apply_add_forum(engine.clone(), vertices, edge_props, &parts, stats).await?,
+            "4" => {
+                apply_add_forum(
+                    engine.clone(),
+                    vertices,
+                    edge_props,
+                    &parts,
+                    stats,
+                    adjacency,
+                )
+                .await?
+            }
             "5" => {
                 apply_binary_update_edge(
                     engine.clone(),
@@ -674,12 +792,33 @@ async fn import_update_stream_file(
                     VertexLabel::Person,
                     EdgeLabel::HasMember,
                     false,
+                    adjacency,
                 )
                 .await?;
                 stats.directed_edges += 2;
             }
-            "6" => apply_add_post(engine.clone(), vertices, edge_props, &parts, stats).await?,
-            "7" => apply_add_comment(engine.clone(), vertices, edge_props, &parts, stats).await?,
+            "6" => {
+                apply_add_post(
+                    engine.clone(),
+                    vertices,
+                    edge_props,
+                    &parts,
+                    stats,
+                    adjacency,
+                )
+                .await?
+            }
+            "7" => {
+                apply_add_comment(
+                    engine.clone(),
+                    vertices,
+                    edge_props,
+                    &parts,
+                    stats,
+                    adjacency,
+                )
+                .await?
+            }
             "8" => {
                 apply_binary_update_edge(
                     engine.clone(),
@@ -689,6 +828,7 @@ async fn import_update_stream_file(
                     VertexLabel::Person,
                     EdgeLabel::Knows,
                     true,
+                    adjacency,
                 )
                 .await?;
                 stats.directed_edges += 3;
@@ -718,6 +858,7 @@ async fn import_edge_file(
     src_col: ColRef,
     dst_col: ColRef,
     prop: PropSpec,
+    adjacency: &mut AdjacencyBuilder,
 ) -> Result<ImportStats> {
     let started = Instant::now();
     eprintln!(
@@ -754,6 +895,7 @@ async fn import_edge_file(
             edge_label,
             prop_value,
             true,
+            adjacency,
         )
         .await?;
         directed_edges += 2;
@@ -766,6 +908,7 @@ async fn import_edge_file(
                 edge_label,
                 prop_value,
                 false,
+                adjacency,
             )
             .await?;
             directed_edges += 1;
@@ -797,6 +940,7 @@ async fn import_named_edge(
     engine: Arc<Engine>,
     edge_props: &mut BufWriter<File>,
     spec: NamedEdgeSpec,
+    adjacency: &mut AdjacencyBuilder,
 ) -> Result<ImportStats> {
     import_edge_file(
         engine,
@@ -809,6 +953,7 @@ async fn import_named_edge(
         ColRef::Name(spec.src_col),
         ColRef::Name(spec.dst_col),
         PropSpec::None,
+        adjacency,
     )
     .await
 }
@@ -858,6 +1003,7 @@ async fn apply_add_person(
     edge_props: &mut BufWriter<File>,
     p: &[&str],
     stats: &mut ImportStats,
+    adjacency: &mut AdjacencyBuilder,
 ) -> Result<()> {
     let id = parse_field_i64(p, 3)?;
     let vid = encode_vid(VertexLabel::Person, id);
@@ -886,6 +1032,7 @@ async fn apply_add_person(
         EdgeLabel::IsLocatedIn,
         EdgeProp::Empty,
         true,
+        adjacency,
     )
     .await?;
     stats.directed_edges += 2;
@@ -898,6 +1045,7 @@ async fn apply_add_person(
             EdgeLabel::HasInterest,
             EdgeProp::Empty,
             true,
+            adjacency,
         )
         .await?;
         stats.directed_edges += 2;
@@ -911,6 +1059,7 @@ async fn apply_add_person(
             EdgeLabel::StudyAt,
             EdgeProp::I32(year),
             true,
+            adjacency,
         )
         .await?;
         stats.directed_edges += 2;
@@ -924,6 +1073,7 @@ async fn apply_add_person(
             EdgeLabel::WorkAt,
             EdgeProp::I32(year),
             true,
+            adjacency,
         )
         .await?;
         stats.directed_edges += 2;
@@ -937,6 +1087,7 @@ async fn apply_add_forum(
     edge_props: &mut BufWriter<File>,
     p: &[&str],
     stats: &mut ImportStats,
+    adjacency: &mut AdjacencyBuilder,
 ) -> Result<()> {
     let id = parse_field_i64(p, 3)?;
     let vid = encode_vid(VertexLabel::Forum, id);
@@ -958,6 +1109,7 @@ async fn apply_add_forum(
         EdgeLabel::HasModerator,
         EdgeProp::Empty,
         true,
+        adjacency,
     )
     .await?;
     stats.directed_edges += 2;
@@ -970,6 +1122,7 @@ async fn apply_add_forum(
             EdgeLabel::HasTag,
             EdgeProp::Empty,
             true,
+            adjacency,
         )
         .await?;
         stats.directed_edges += 2;
@@ -983,6 +1136,7 @@ async fn apply_add_post(
     edge_props: &mut BufWriter<File>,
     p: &[&str],
     stats: &mut ImportStats,
+    adjacency: &mut AdjacencyBuilder,
 ) -> Result<()> {
     let id = parse_field_i64(p, 3)?;
     let vid = encode_vid(VertexLabel::Post, id);
@@ -1011,6 +1165,7 @@ async fn apply_add_post(
         EdgeLabel::HasCreator,
         EdgeProp::Empty,
         true,
+        adjacency,
     )
     .await?;
     stats.directed_edges += 2;
@@ -1022,6 +1177,7 @@ async fn apply_add_post(
         EdgeLabel::ContainerOf,
         EdgeProp::Empty,
         true,
+        adjacency,
     )
     .await?;
     stats.directed_edges += 2;
@@ -1033,6 +1189,7 @@ async fn apply_add_post(
         EdgeLabel::IsLocatedIn,
         EdgeProp::Empty,
         true,
+        adjacency,
     )
     .await?;
     stats.directed_edges += 2;
@@ -1045,6 +1202,7 @@ async fn apply_add_post(
             EdgeLabel::HasTag,
             EdgeProp::Empty,
             true,
+            adjacency,
         )
         .await?;
         stats.directed_edges += 2;
@@ -1058,6 +1216,7 @@ async fn apply_add_comment(
     edge_props: &mut BufWriter<File>,
     p: &[&str],
     stats: &mut ImportStats,
+    adjacency: &mut AdjacencyBuilder,
 ) -> Result<()> {
     let id = parse_field_i64(p, 3)?;
     let vid = encode_vid(VertexLabel::Comment, id);
@@ -1087,6 +1246,7 @@ async fn apply_add_comment(
         EdgeLabel::HasCreator,
         EdgeProp::Empty,
         true,
+        adjacency,
     )
     .await?;
     stats.directed_edges += 2;
@@ -1098,6 +1258,7 @@ async fn apply_add_comment(
         EdgeLabel::IsLocatedIn,
         EdgeProp::Empty,
         true,
+        adjacency,
     )
     .await?;
     stats.directed_edges += 2;
@@ -1110,6 +1271,7 @@ async fn apply_add_comment(
             EdgeLabel::ReplyOfPost,
             EdgeProp::Empty,
             true,
+            adjacency,
         )
         .await?;
         stats.directed_edges += 2;
@@ -1123,6 +1285,7 @@ async fn apply_add_comment(
             EdgeLabel::ReplyOfComment,
             EdgeProp::Empty,
             true,
+            adjacency,
         )
         .await?;
         stats.directed_edges += 2;
@@ -1136,6 +1299,7 @@ async fn apply_add_comment(
             EdgeLabel::HasTag,
             EdgeProp::Empty,
             true,
+            adjacency,
         )
         .await?;
         stats.directed_edges += 2;
@@ -1151,13 +1315,27 @@ async fn apply_binary_update_edge(
     dst_label: VertexLabel,
     edge_label: EdgeLabel,
     bidirectional_positive: bool,
+    adjacency: &mut AdjacencyBuilder,
 ) -> Result<()> {
     let src = encode_vid(src_label, parse_field_i64(p, 3)?);
     let dst = encode_vid(dst_label, parse_field_i64(p, 4)?);
     let prop = EdgeProp::I64(parse_field_i64(p, 5)?);
-    insert_forward_reverse(engine.clone(), edge_props, src, dst, edge_label, prop, true).await?;
+    insert_forward_reverse(
+        engine.clone(),
+        edge_props,
+        src,
+        dst,
+        edge_label,
+        prop,
+        true,
+        adjacency,
+    )
+    .await?;
     if bidirectional_positive {
-        insert_forward_reverse(engine, edge_props, dst, src, edge_label, prop, false).await?;
+        insert_forward_reverse(
+            engine, edge_props, dst, src, edge_label, prop, false, adjacency,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1170,12 +1348,15 @@ async fn insert_forward_reverse(
     edge_label: EdgeLabel,
     prop: EdgeProp,
     include_reverse: bool,
+    adjacency: &mut AdjacencyBuilder,
 ) -> Result<()> {
     let label = edge_label.as_i32();
-    engine.insert_edge(src, dst, label).await?;
+    let ts = engine.insert_edge(src, dst, label).await?;
+    adjacency.record_edge(src, label, dst, ts);
     write_edge_prop(edge_props, src, dst, label, prop)?;
     if include_reverse {
-        engine.insert_edge(dst, src, -label).await?;
+        let ts = engine.insert_edge(dst, src, -label).await?;
+        adjacency.record_edge(dst, -label, src, ts);
         write_edge_prop(edge_props, dst, src, -label, prop)?;
     }
     Ok(())
