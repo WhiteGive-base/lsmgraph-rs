@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use lsmgraph::base_graph::{build_from_snb, BuildConfig, IoConfig};
 use lsmgraph::config::{IoBackendKind, LsmGraphConfig};
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
@@ -12,6 +13,7 @@ use lsmgraph::snb::{
     validate_ic1_ic14, validate_ic_batch, validate_mixed_tugraph, SnbGraph,
 };
 use lsmgraph::types::UNKNOWN_SOURCE_LABEL;
+use lsmgraph::DynamicGraphView;
 use serde_json::json;
 
 const DEFAULT_DATA: &str = "/data/WorkSpace/dgs/data/social_network_tugraph";
@@ -43,6 +45,16 @@ enum Command {
         auto_compact: bool,
         #[arg(long, default_value_t = false)]
         graph_aware_l0: bool,
+    },
+    BaseBuild {
+        #[arg(long, default_value = DEFAULT_DATA)]
+        input: PathBuf,
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+    },
+    DynamicStats {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
     },
     Neighbors {
         #[arg(long, default_value = DEFAULT_STORE)]
@@ -146,6 +158,8 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long, default_value_t = 100)]
         samples: usize,
+        #[arg(long)]
+        edge_type: Option<i32>,
         #[arg(long, default_value_t = true)]
         scan: bool,
         #[arg(long, default_value_t = false)]
@@ -173,6 +187,13 @@ async fn main() -> Result<()> {
             auto_compact,
             graph_aware_l0,
         } => {
+            if matches!(relation.as_str(), "snb-base" | "base" | "base-graph") {
+                let output_dir = data_dir.join("base_graph");
+                let config = BuildConfig::for_output(&output_dir);
+                let stats = build_from_snb(&input, &output_dir, &config)?;
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+                return Ok(());
+            }
             let config = LsmGraphConfig::new(&data_dir)
                 .with_memgraph_capacity(memgraph_bytes)
                 .with_io_backend(io_backend)
@@ -197,6 +218,32 @@ async fn main() -> Result<()> {
                 stats.input_rows,
                 stats.directed_edges,
                 engine.current_snapshot()
+            );
+        }
+        Command::BaseBuild { input, data_dir } => {
+            let output_dir = data_dir.join("base_graph");
+            let config = BuildConfig::for_output(&output_dir);
+            let stats = build_from_snb(&input, &output_dir, &config)?;
+            println!("{}", serde_json::to_string_pretty(&stats)?);
+        }
+        Command::DynamicStats { data_dir } => {
+            let view = DynamicGraphView::open(&data_dir, IoConfig::default(), io_backend).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "data_dir": data_dir,
+                    "base_graph": view.base().map(|base| json!({
+                        "base_dir": base.base_dir(),
+                        "vertex_labels": base.catalog().vertex_labels,
+                        "csr_count": base.catalog().csr_adjacencies.len(),
+                        "single_column_count": base.catalog().single_columns.len(),
+                        "derived_column_count": base.catalog().derived_columns.len(),
+                    })),
+                    "delta": view.delta().map(|delta| json!({
+                        "dir": delta.dir(),
+                        "snapshot": delta.current_snapshot(),
+                    })),
+                }))?
             );
         }
         Command::Neighbors {
@@ -405,6 +452,7 @@ async fn main() -> Result<()> {
         Command::StorageBench {
             data_dir,
             samples,
+            edge_type,
             scan,
             auto_compact,
             ra_min_queries,
@@ -420,21 +468,60 @@ async fn main() -> Result<()> {
             let started = Instant::now();
             let edges = engine.scan_edges(snapshot).await?;
             let scan_elapsed_ms = started.elapsed().as_millis();
+            let candidate_edges = edges
+                .iter()
+                .filter(|edge| {
+                    edge_type
+                        .map(|wanted| edge.edge_type == wanted)
+                        .unwrap_or(true)
+                })
+                .count();
             let mut srcs = Vec::new();
             let mut seen = HashSet::new();
-            let stride = (edges.len() / samples.max(1)).max(1);
-            for edge in edges.iter().step_by(stride) {
-                if seen.insert(edge.src) {
+            let stride = (candidate_edges / samples.max(1)).max(1);
+            let mut matched = 0usize;
+            for edge in &edges {
+                if !edge_type
+                    .map(|wanted| edge.edge_type == wanted)
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                if matched % stride == 0 && seen.insert(edge.src) {
                     srcs.push(edge.src);
                     if srcs.len() >= samples {
                         break;
+                    }
+                }
+                matched += 1;
+            }
+            if srcs.len() < samples {
+                for edge in &edges {
+                    if !edge_type
+                        .map(|wanted| edge.edge_type == wanted)
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    if seen.insert(edge.src) {
+                        srcs.push(edge.src);
+                        if srcs.len() >= samples {
+                            break;
+                        }
                     }
                 }
             }
             let mut neighbor_edges = 0usize;
             let neighbor_started = Instant::now();
             for src in &srcs {
-                neighbor_edges += engine.get_neighbors(*src, snapshot).await?.len();
+                let neighbors = if let Some(edge_type) = edge_type {
+                    engine
+                        .get_neighbors_typed(*src, edge_type, snapshot)
+                        .await?
+                } else {
+                    engine.get_neighbors(*src, snapshot).await?
+                };
+                neighbor_edges += neighbors.len();
             }
             let get_neighbors_elapsed_ms = neighbor_started.elapsed().as_millis();
             let auto_compaction = if auto_compact {
@@ -448,8 +535,10 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&json!({
                     "data_dir": data_dir,
                     "snapshot": snapshot,
+                    "edge_type": edge_type,
                     "scan_requested": scan,
                     "scan_edges": edges.len(),
+                    "candidate_edges_for_sampling": candidate_edges,
                     "scan_elapsed_ms": scan_elapsed_ms,
                     "sampled_vertices": srcs.len(),
                     "neighbor_edges": neighbor_edges,

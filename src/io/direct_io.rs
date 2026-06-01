@@ -3,7 +3,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::sync::Semaphore;
@@ -35,15 +34,9 @@ impl IoBackend for DirectIoBackend {
         let sem = self.semaphore.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
-            let wait_started = Instant::now();
             let _permit = sem.acquire_owned().await?;
-            metrics.io_semaphore_wait_latency.record_since(wait_started);
-            let blocking_started = Instant::now();
             let bytes =
                 tokio::task::spawn_blocking(move || direct_read_at(&path, offset, len)).await??;
-            metrics
-                .io_read_blocking_latency
-                .record_since(blocking_started);
             metrics.add_read(bytes.len() as u64);
             Ok(bytes)
         })
@@ -55,14 +48,8 @@ impl IoBackend for DirectIoBackend {
         let metrics = self.metrics.clone();
         Box::pin(async move {
             let len = buf.len();
-            let wait_started = Instant::now();
             let _permit = sem.acquire_owned().await?;
-            metrics.io_semaphore_wait_latency.record_since(wait_started);
-            let blocking_started = Instant::now();
             tokio::task::spawn_blocking(move || direct_write_at(&path, offset, &buf)).await??;
-            metrics
-                .io_write_blocking_latency
-                .record_since(blocking_started);
             metrics.add_write(len as u64);
             Ok(len)
         })
@@ -70,9 +57,7 @@ impl IoBackend for DirectIoBackend {
 
     fn create<'a>(&'a self, path: &'a Path) -> BoxIoFuture<'a, PathBuf> {
         let path = path.to_path_buf();
-        let metrics = self.metrics.clone();
         Box::pin(async move {
-            let blocking_started = Instant::now();
             tokio::task::spawn_blocking({
                 let path = path.clone();
                 move || -> Result<()> {
@@ -89,36 +74,26 @@ impl IoBackend for DirectIoBackend {
                 }
             })
             .await??;
-            metrics
-                .io_create_blocking_latency
-                .record_since(blocking_started);
             Ok(path)
         })
     }
 
     fn sync<'a>(&'a self, path: &'a Path) -> BoxIoFuture<'a, ()> {
         let path = path.to_path_buf();
-        let metrics = self.metrics.clone();
         Box::pin(async move {
-            let blocking_started = Instant::now();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let file = OpenOptions::new().read(true).write(true).open(&path)?;
                 file.sync_all()?;
                 Ok(())
             })
             .await??;
-            metrics
-                .io_sync_blocking_latency
-                .record_since(blocking_started);
             Ok(())
         })
     }
 
     fn remove<'a>(&'a self, path: &'a Path) -> BoxIoFuture<'a, ()> {
         let path = path.to_path_buf();
-        let metrics = self.metrics.clone();
         Box::pin(async move {
-            let blocking_started = Instant::now();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 match fs::remove_file(&path) {
                     Ok(()) => Ok(()),
@@ -127,9 +102,6 @@ impl IoBackend for DirectIoBackend {
                 }
             })
             .await??;
-            metrics
-                .io_remove_blocking_latency
-                .record_since(blocking_started);
             Ok(())
         })
     }

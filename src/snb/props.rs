@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,7 +9,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::graph::Engine;
-use crate::metrics::Metrics;
 use crate::types::{EdgeLabel, EdgeRecord, EdgeType, Timestamp, VertexId, VertexLabel};
 
 const LABEL_SHIFT: u64 = 56;
@@ -206,51 +204,15 @@ pub struct SnbGraph {
 
 impl SnbGraph {
     pub async fn open(engine: Arc<Engine>, store_dir: &Path) -> Result<Self> {
-        let metrics = engine.metrics();
-        let started = Instant::now();
         let vertices = load_vertices(&store_dir.join("snb_vertices.jsonl"))?;
-        metrics.snb_vertices_load_latency.record_since(started);
-        metrics
-            .snb_vertices_count
-            .store(vertices.len() as u64, Ordering::Relaxed);
-
-        let started = Instant::now();
         let edge_props = load_edge_props(&store_dir.join("snb_edge_props.jsonl"))?;
-        metrics.snb_edge_props_load_latency.record_since(started);
-        metrics
-            .snb_edge_props_count
-            .store(edge_props.len() as u64, Ordering::Relaxed);
-
         let snapshot = engine.current_snapshot();
         let cache_path = store_dir.join("snb_adjacency.bin");
         let adjacency = if cache_path.exists() {
-            metrics
-                .snb_adjacency_cache_hits
-                .fetch_add(1, Ordering::Relaxed);
-            let started = Instant::now();
-            let adjacency = load_adjacency_cache(&cache_path)?;
-            metrics.snb_adjacency_load_latency.record_since(started);
-            let bytes = cache_path.metadata().map(|m| m.len()).unwrap_or(0);
-            record_adjacency_cache_stats(&metrics, &adjacency, bytes);
-            adjacency
+            load_adjacency_cache(&cache_path)?
         } else {
-            metrics
-                .snb_adjacency_cache_misses
-                .fetch_add(1, Ordering::Relaxed);
-            let started = Instant::now();
-            let edges = engine.scan_edges(snapshot).await?;
-            metrics.snb_adjacency_scan_latency.record_since(started);
-
-            let started = Instant::now();
-            let adjacency = build_adjacency_from_edges(edges);
-            metrics.snb_adjacency_group_latency.record_since(started);
-
-            let started = Instant::now();
-            let stats = write_adjacency_cache_atomic(&cache_path, &adjacency)?;
-            metrics.snb_adjacency_write_latency.record_since(started);
-            record_adjacency_write_stats(&metrics, stats);
-            let bytes = cache_path.metadata().map(|m| m.len()).unwrap_or(0);
-            record_adjacency_cache_stats(&metrics, &adjacency, bytes);
+            let adjacency = build_adjacency_from_edges(engine.scan_edges(snapshot).await?);
+            write_adjacency_cache_atomic(&cache_path, &adjacency)?;
             adjacency
         };
         Ok(Self {
@@ -267,10 +229,6 @@ impl SnbGraph {
     }
 
     pub fn vertex(&self, vid: VertexId) -> Option<&VertexData> {
-        self.engine
-            .metrics()
-            .vertex_lookups
-            .fetch_add(1, Ordering::Relaxed);
         self.vertices.get(&vid)
     }
 
@@ -385,31 +343,17 @@ impl SnbGraph {
     }
 
     pub fn out_neighbors_cached(&self, vid: VertexId, edge_label: EdgeLabel) -> Vec<VertexId> {
-        let metrics = self.engine.metrics();
-        metrics.adjacency_lookups.fetch_add(1, Ordering::Relaxed);
-        let neighbors = self
-            .adjacency
+        self.adjacency
             .get(&(vid, edge_label.as_i32()))
             .cloned()
-            .unwrap_or_default();
-        metrics
-            .neighbor_clone_items
-            .fetch_add(neighbors.len() as u64, Ordering::Relaxed);
-        neighbors
+            .unwrap_or_default()
     }
 
     pub fn in_neighbors_cached(&self, vid: VertexId, edge_label: EdgeLabel) -> Vec<VertexId> {
-        let metrics = self.engine.metrics();
-        metrics.adjacency_lookups.fetch_add(1, Ordering::Relaxed);
-        let neighbors = self
-            .adjacency
+        self.adjacency
             .get(&(vid, -edge_label.as_i32()))
             .cloned()
-            .unwrap_or_default();
-        metrics
-            .neighbor_clone_items
-            .fetch_add(neighbors.len() as u64, Ordering::Relaxed);
-        neighbors
+            .unwrap_or_default()
     }
 
     pub async fn out_neighbors(
@@ -437,10 +381,6 @@ impl SnbGraph {
     }
 
     pub fn edge_prop_by_type(&self, src: VertexId, edge_type: EdgeType, dst: VertexId) -> EdgeProp {
-        self.engine
-            .metrics()
-            .edge_prop_lookups
-            .fetch_add(1, Ordering::Relaxed);
         self.edge_props
             .get(&(src, edge_type, dst))
             .copied()
@@ -472,44 +412,24 @@ impl SnbGraph {
     }
 
     pub async fn build_adjacency_cache(engine: Arc<Engine>, store_dir: &Path) -> Result<usize> {
-        let metrics = engine.metrics();
         let started = Instant::now();
         let snapshot = engine.current_snapshot();
         eprintln!("[snb-cache] scanning edges snapshot={snapshot}");
-        let scan_started = Instant::now();
         let edges = engine.scan_edges(snapshot).await?;
-        metrics
-            .snb_adjacency_scan_latency
-            .record_since(scan_started);
         eprintln!(
             "[snb-cache] scanned edges={} elapsed_s={:.1}",
             edges.len(),
             started.elapsed().as_secs_f64()
         );
-        let group_started = Instant::now();
         let adjacency = build_adjacency_from_edges(edges);
-        metrics
-            .snb_adjacency_group_latency
-            .record_since(group_started);
         let count = adjacency.len();
         eprintln!(
             "[snb-cache] writing adjacency cache groups={} path={}",
             count,
             store_dir.join("snb_adjacency.bin").display()
         );
-        let write_started = Instant::now();
         let write_stats =
             write_adjacency_cache_atomic(&store_dir.join("snb_adjacency.bin"), &adjacency)?;
-        metrics
-            .snb_adjacency_write_latency
-            .record_since(write_started);
-        record_adjacency_write_stats(&metrics, write_stats);
-        let bytes = store_dir
-            .join("snb_adjacency.bin")
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
-        record_adjacency_cache_stats(&metrics, &adjacency, bytes);
         eprintln!(
             "[snb-cache] write complete groups={} edges={} group_bytes={} dst_bytes={} write_elapsed_s={:.1} sync_elapsed_s={:.1} total_elapsed_s={:.1}",
             write_stats.group_count,
@@ -522,33 +442,6 @@ impl SnbGraph {
         );
         Ok(count)
     }
-}
-
-fn record_adjacency_cache_stats(
-    metrics: &Metrics,
-    adjacency: &HashMap<(VertexId, EdgeType), Vec<VertexId>>,
-    bytes: u64,
-) {
-    let edge_count: usize = adjacency.values().map(Vec::len).sum();
-    metrics
-        .snb_adjacency_groups
-        .store(adjacency.len() as u64, Ordering::Relaxed);
-    metrics
-        .snb_adjacency_edges
-        .store(edge_count as u64, Ordering::Relaxed);
-    metrics.snb_adjacency_bytes.store(bytes, Ordering::Relaxed);
-}
-
-fn record_adjacency_write_stats(metrics: &Metrics, stats: AdjacencyCacheWriteStats) {
-    let dst_chunks = stats.edge_count.div_ceil(ADJ_DST_CHUNK);
-    let logical_write_calls = 1 + stats.group_count + dst_chunks;
-    metrics
-        .snb_adjacency_cache_write_syscalls
-        .fetch_add(logical_write_calls as u64, Ordering::Relaxed);
-    metrics.snb_adjacency_cache_write_bytes.fetch_add(
-        stats.encoded_group_bytes + stats.encoded_dst_bytes + ADJ_HEADER_LEN as u64,
-        Ordering::Relaxed,
-    );
 }
 
 fn load_vertices(path: &Path) -> Result<HashMap<VertexId, VertexData>> {
@@ -799,11 +692,20 @@ pub fn load_adjacency_cache(path: &Path) -> Result<HashMap<(VertexId, EdgeType),
 mod tests {
     use super::*;
 
+    fn target_tempdir(name: &str) -> tempfile::TempDir {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix(name)
+            .tempdir_in(root)
+            .unwrap()
+    }
+
     #[test]
     fn adjacency_cache_round_trips_current_format() {
-        let tmp_root = Path::new("target/test-tmp");
-        fs::create_dir_all(tmp_root).unwrap();
-        let dir = tempfile::tempdir_in(tmp_root).unwrap();
+        let dir = target_tempdir("adjacency-cache-round-trip-");
         let path = dir.path().join("snb_adjacency.bin");
         let mut adjacency = HashMap::new();
         adjacency.insert((10, 1), vec![20, 21, 22]);

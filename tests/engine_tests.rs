@@ -2,15 +2,17 @@ use lsmgraph::config::LsmGraphConfig;
 use lsmgraph::graph::Engine;
 use lsmgraph::types::EdgeLabel;
 
-fn temp_store() -> anyhow::Result<tempfile::TempDir> {
-    let root = std::path::Path::new("target/test-tmp");
-    std::fs::create_dir_all(root)?;
-    Ok(tempfile::tempdir_in(root)?)
+fn target_tempdir(name: &str) -> anyhow::Result<tempfile::TempDir> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp");
+    std::fs::create_dir_all(&root)?;
+    Ok(tempfile::Builder::new().prefix(name).tempdir_in(root)?)
 }
 
 #[tokio::test]
 async fn insert_flush_reopen_and_scan() -> anyhow::Result<()> {
-    let tmp = temp_store()?;
+    let tmp = target_tempdir("insert-flush-reopen-and-scan-")?;
     let config = LsmGraphConfig::new(tmp.path()).with_memgraph_capacity(256);
     let engine = Engine::create(config.clone()).await?;
     engine.insert_edge(1, 2, EdgeLabel::Knows.as_i32()).await?;
@@ -29,7 +31,7 @@ async fn insert_flush_reopen_and_scan() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn delete_tombstone_hides_latest_edge() -> anyhow::Result<()> {
-    let tmp = temp_store()?;
+    let tmp = target_tempdir("delete-tombstone-hides-latest-edge-")?;
     let engine =
         Engine::create(LsmGraphConfig::new(tmp.path()).with_memgraph_capacity(256)).await?;
     engine.insert_edge(1, 2, EdgeLabel::Knows.as_i32()).await?;
@@ -42,7 +44,7 @@ async fn delete_tombstone_hides_latest_edge() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn compact_l0_to_l1_preserves_visible_edges() -> anyhow::Result<()> {
-    let tmp = temp_store()?;
+    let tmp = target_tempdir("compact-l0-to-l1-preserves-visible-edges-")?;
     let config = LsmGraphConfig::new(tmp.path()).with_memgraph_capacity(128);
     let engine = Engine::create(config).await?;
     for i in 0..20u64 {

@@ -1,7 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::sync::Semaphore;
@@ -31,10 +30,7 @@ impl IoBackend for BlockingPreadBackend {
         let sem = self.semaphore.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
-            let wait_started = Instant::now();
             let _permit = sem.acquire_owned().await?;
-            metrics.io_semaphore_wait_latency.record_since(wait_started);
-            let blocking_started = Instant::now();
             let bytes = tokio::task::spawn_blocking(move || -> Result<Bytes> {
                 let file = OpenOptions::new().read(true).open(&path)?;
                 let mut buf = vec![0u8; len];
@@ -43,9 +39,6 @@ impl IoBackend for BlockingPreadBackend {
                 Ok(Bytes::from(buf))
             })
             .await??;
-            metrics
-                .io_read_blocking_latency
-                .record_since(blocking_started);
             metrics.add_read(bytes.len() as u64);
             Ok(bytes)
         })
@@ -57,10 +50,7 @@ impl IoBackend for BlockingPreadBackend {
         let metrics = self.metrics.clone();
         Box::pin(async move {
             let len = buf.len();
-            let wait_started = Instant::now();
             let _permit = sem.acquire_owned().await?;
-            metrics.io_semaphore_wait_latency.record_since(wait_started);
-            let blocking_started = Instant::now();
             let written = tokio::task::spawn_blocking(move || -> Result<usize> {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
@@ -74,9 +64,6 @@ impl IoBackend for BlockingPreadBackend {
                 Ok(len)
             })
             .await??;
-            metrics
-                .io_write_blocking_latency
-                .record_since(blocking_started);
             metrics.add_write(written as u64);
             Ok(written)
         })
@@ -84,9 +71,7 @@ impl IoBackend for BlockingPreadBackend {
 
     fn create<'a>(&'a self, path: &'a Path) -> BoxIoFuture<'a, PathBuf> {
         let path = path.to_path_buf();
-        let metrics = self.metrics.clone();
         Box::pin(async move {
-            let blocking_started = Instant::now();
             tokio::task::spawn_blocking({
                 let path = path.clone();
                 move || -> Result<()> {
@@ -103,36 +88,26 @@ impl IoBackend for BlockingPreadBackend {
                 }
             })
             .await??;
-            metrics
-                .io_create_blocking_latency
-                .record_since(blocking_started);
             Ok(path)
         })
     }
 
     fn sync<'a>(&'a self, path: &'a Path) -> BoxIoFuture<'a, ()> {
         let path = path.to_path_buf();
-        let metrics = self.metrics.clone();
         Box::pin(async move {
-            let blocking_started = Instant::now();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let file = OpenOptions::new().read(true).write(true).open(&path)?;
                 file.sync_all()?;
                 Ok(())
             })
             .await??;
-            metrics
-                .io_sync_blocking_latency
-                .record_since(blocking_started);
             Ok(())
         })
     }
 
     fn remove<'a>(&'a self, path: &'a Path) -> BoxIoFuture<'a, ()> {
         let path = path.to_path_buf();
-        let metrics = self.metrics.clone();
         Box::pin(async move {
-            let blocking_started = Instant::now();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 match fs::remove_file(&path) {
                     Ok(()) => Ok(()),
@@ -141,9 +116,6 @@ impl IoBackend for BlockingPreadBackend {
                 }
             })
             .await??;
-            metrics
-                .io_remove_blocking_latency
-                .record_since(blocking_started);
             Ok(())
         })
     }
