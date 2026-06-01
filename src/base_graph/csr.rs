@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -126,6 +127,7 @@ pub struct CsrAdjacency {
     pub id: String,
     pub offsets: Vec<u64>,
     pub neighbors_path: PathBuf,
+    pub prop_paths: BTreeMap<String, (PathBuf, String)>,
     pub sort_order: SortOrder,
 }
 
@@ -137,6 +139,16 @@ impl CsrAdjacency {
             id: entry.name.clone(),
             offsets,
             neighbors_path: path.join("neighbors.bin"),
+            prop_paths: entry
+                .props
+                .iter()
+                .map(|prop| {
+                    (
+                        prop.name.clone(),
+                        (path.join(&prop.file), prop.value_type.clone()),
+                    )
+                })
+                .collect(),
             sort_order: match entry.sort_order.as_str() {
                 "creation_date_desc" => SortOrder::CreationDateDesc,
                 "join_date_desc" => SortOrder::JoinDateDesc,
@@ -194,6 +206,80 @@ impl CsrAdjacency {
         })?;
         Ok(out)
     }
+
+    pub fn neighbors_with_i64_prop_vec(
+        &self,
+        src: u32,
+        prop_name: &str,
+        _ctx: &mut ReadContext,
+    ) -> Result<Option<Vec<(u32, i64)>>> {
+        let Some((prop_path, value_type)) = self.prop_paths.get(prop_name) else {
+            return Ok(None);
+        };
+        if value_type != "i64" {
+            return Ok(None);
+        }
+        let Some((start, end)) = self.range(src) else {
+            return Ok(Some(Vec::new()));
+        };
+        let len = (end - start) as usize;
+        let mut neighbors = vec![0u8; len * 4];
+        let mut props = vec![0u8; len * 8];
+        let mut neighbor_file = File::open(&self.neighbors_path)?;
+        neighbor_file.seek(SeekFrom::Start(start * 4))?;
+        neighbor_file.read_exact(&mut neighbors)?;
+        let mut prop_file = File::open(prop_path)?;
+        prop_file.seek(SeekFrom::Start(start * 8))?;
+        prop_file.read_exact(&mut props)?;
+        let out = neighbors
+            .chunks_exact(4)
+            .zip(props.chunks_exact(8))
+            .map(|(neighbor, prop)| {
+                (
+                    u32::from_le_bytes(neighbor.try_into().unwrap()),
+                    i64::from_le_bytes(prop.try_into().unwrap()),
+                )
+            })
+            .collect();
+        Ok(Some(out))
+    }
+
+    pub fn neighbors_with_i32_prop_vec(
+        &self,
+        src: u32,
+        prop_name: &str,
+        _ctx: &mut ReadContext,
+    ) -> Result<Option<Vec<(u32, i32)>>> {
+        let Some((prop_path, value_type)) = self.prop_paths.get(prop_name) else {
+            return Ok(None);
+        };
+        if value_type != "i32" {
+            return Ok(None);
+        }
+        let Some((start, end)) = self.range(src) else {
+            return Ok(Some(Vec::new()));
+        };
+        let len = (end - start) as usize;
+        let mut neighbors = vec![0u8; len * 4];
+        let mut props = vec![0u8; len * 4];
+        let mut neighbor_file = File::open(&self.neighbors_path)?;
+        neighbor_file.seek(SeekFrom::Start(start * 4))?;
+        neighbor_file.read_exact(&mut neighbors)?;
+        let mut prop_file = File::open(prop_path)?;
+        prop_file.seek(SeekFrom::Start(start * 4))?;
+        prop_file.read_exact(&mut props)?;
+        let out = neighbors
+            .chunks_exact(4)
+            .zip(props.chunks_exact(4))
+            .map(|(neighbor, prop)| {
+                (
+                    u32::from_le_bytes(neighbor.try_into().unwrap()),
+                    i32::from_le_bytes(prop.try_into().unwrap()),
+                )
+            })
+            .collect();
+        Ok(Some(out))
+    }
 }
 
 pub fn write_csr(
@@ -228,6 +314,86 @@ pub fn write_csr(
     Ok(neighbors.len() as u64)
 }
 
+pub fn write_csr_i64_prop(
+    dir: &Path,
+    num_src_vertices: usize,
+    mut edges: Vec<(u32, u32, i64)>,
+    sort_order: SortOrder,
+    prop_file: &str,
+) -> Result<u64> {
+    std::fs::create_dir_all(dir)?;
+    edges.sort_unstable_by_key(|(src, dst, _)| (*src, *dst));
+    let mut offsets = vec![0u64; num_src_vertices + 1];
+    for (src, _, _) in &edges {
+        let idx = *src as usize;
+        if idx < num_src_vertices {
+            offsets[idx + 1] += 1;
+        }
+    }
+    for idx in 1..offsets.len() {
+        offsets[idx] += offsets[idx - 1];
+    }
+    write_u64s(&dir.join("offsets.bin"), &offsets)?;
+    let mut neighbors = Vec::with_capacity(edges.len());
+    let mut props = Vec::with_capacity(edges.len());
+    for (_, dst, prop) in edges {
+        neighbors.push(dst);
+        props.push(prop);
+    }
+    write_u32s(&dir.join("neighbors.bin"), &neighbors)?;
+    write_i64s(&dir.join(prop_file), &props)?;
+    let meta = serde_json::json!({
+        "num_src_vertices": num_src_vertices,
+        "num_edges": neighbors.len(),
+        "sort_order": sort_order.as_str(),
+        "props": [{"file": prop_file, "type": "i64"}],
+    });
+    let mut writer = BufWriter::new(File::create(dir.join("meta.json"))?);
+    serde_json::to_writer_pretty(&mut writer, &meta)?;
+    writer.flush()?;
+    Ok(neighbors.len() as u64)
+}
+
+pub fn write_csr_i32_prop(
+    dir: &Path,
+    num_src_vertices: usize,
+    mut edges: Vec<(u32, u32, i32)>,
+    sort_order: SortOrder,
+    prop_file: &str,
+) -> Result<u64> {
+    std::fs::create_dir_all(dir)?;
+    edges.sort_unstable_by_key(|(src, dst, _)| (*src, *dst));
+    let mut offsets = vec![0u64; num_src_vertices + 1];
+    for (src, _, _) in &edges {
+        let idx = *src as usize;
+        if idx < num_src_vertices {
+            offsets[idx + 1] += 1;
+        }
+    }
+    for idx in 1..offsets.len() {
+        offsets[idx] += offsets[idx - 1];
+    }
+    write_u64s(&dir.join("offsets.bin"), &offsets)?;
+    let mut neighbors = Vec::with_capacity(edges.len());
+    let mut props = Vec::with_capacity(edges.len());
+    for (_, dst, prop) in edges {
+        neighbors.push(dst);
+        props.push(prop);
+    }
+    write_u32s(&dir.join("neighbors.bin"), &neighbors)?;
+    write_i32s(&dir.join(prop_file), &props)?;
+    let meta = serde_json::json!({
+        "num_src_vertices": num_src_vertices,
+        "num_edges": neighbors.len(),
+        "sort_order": sort_order.as_str(),
+        "props": [{"file": prop_file, "type": "i32"}],
+    });
+    let mut writer = BufWriter::new(File::create(dir.join("meta.json"))?);
+    serde_json::to_writer_pretty(&mut writer, &meta)?;
+    writer.flush()?;
+    Ok(neighbors.len() as u64)
+}
+
 fn write_u64s(path: &Path, values: &[u64]) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     for value in values {
@@ -238,6 +404,24 @@ fn write_u64s(path: &Path, values: &[u64]) -> Result<()> {
 }
 
 fn write_u32s(path: &Path, values: &[u32]) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    for value in values {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_i32s(path: &Path, values: &[i32]) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    for value in values {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_i64s(path: &Path, values: &[i64]) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     for value in values {
         writer.write_all(&value.to_le_bytes())?;

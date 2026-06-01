@@ -9,6 +9,7 @@ pub mod io;
 pub use builder::{build_from_snb, BaseGraphBuildStats, BuildConfig};
 pub use catalog::{
     BaseGraphCatalog, CsrCatalogEntry, DerivedColumnEntry, SingleColumnEntry, VertexCatalogEntry,
+    VertexPropertyEntry,
 };
 pub use csr::{CachePolicy, CsrAdjacency, CsrId, ReadContext, SortOrder};
 pub use graph::BaseGraph;

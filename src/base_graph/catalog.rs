@@ -13,6 +13,8 @@ pub struct BaseGraphCatalog {
     pub version: u32,
     pub source: String,
     pub vertex_labels: BTreeMap<String, VertexCatalogEntry>,
+    #[serde(default)]
+    pub vertex_properties: BTreeMap<String, VertexPropertyEntry>,
     pub single_columns: BTreeMap<String, SingleColumnEntry>,
     pub csr_adjacencies: BTreeMap<String, CsrCatalogEntry>,
     pub derived_columns: BTreeMap<String, DerivedColumnEntry>,
@@ -25,6 +27,7 @@ impl BaseGraphCatalog {
             version: 1,
             source: source.into(),
             vertex_labels: BTreeMap::new(),
+            vertex_properties: BTreeMap::new(),
             single_columns: BTreeMap::new(),
             csr_adjacencies: BTreeMap::new(),
             derived_columns: BTreeMap::new(),
@@ -51,6 +54,16 @@ pub struct VertexCatalogEntry {
     pub label: String,
     pub count: u64,
     pub ext_id_to_local: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VertexPropertyEntry {
+    pub label: String,
+    pub name: String,
+    pub file: String,
+    pub rows: u64,
+    pub value_type: String,
+    pub encoding: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

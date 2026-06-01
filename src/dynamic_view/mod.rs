@@ -39,6 +39,32 @@ impl DynamicGraphView {
         })
     }
 
+    pub async fn open_or_create_delta(
+        store_dir: impl AsRef<Path>,
+        base_io: IoConfig,
+        delta_backend: IoBackendKind,
+        memgraph_bytes: usize,
+    ) -> Result<Self> {
+        let store_dir = store_dir.as_ref().to_path_buf();
+        let base_dir = store_dir.join("base_graph");
+        let base = if base_dir.join("catalog.json").exists() {
+            Some(Arc::new(BaseGraph::open(&base_dir, base_io)?))
+        } else {
+            None
+        };
+        let delta_dir = store_dir.join("delta");
+        let delta = if delta_dir.exists() {
+            Some(DeltaGraph::open(&store_dir, delta_backend).await?)
+        } else {
+            Some(DeltaGraph::create(&store_dir, delta_backend, memgraph_bytes).await?)
+        };
+        Ok(Self {
+            store_dir,
+            base,
+            delta,
+        })
+    }
+
     pub fn store_dir(&self) -> &Path {
         &self.store_dir
     }

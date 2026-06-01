@@ -391,22 +391,14 @@ async fn main() -> Result<()> {
         } => {
             let total_started = Instant::now();
             eprintln!(
-                "[snb-server] opening engine data_dir={}",
+                "[snb-server] opening DynamicGraphView data_dir={}",
                 data_dir.display()
             );
-            let engine_started = Instant::now();
-            let engine =
-                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let view_started = Instant::now();
+            let snb = SnbGraph::open_dynamic(&data_dir, IoConfig::default(), io_backend).await?;
             eprintln!(
-                "[snb-server] engine open complete elapsed_s={:.1}",
-                engine_started.elapsed().as_secs_f64()
-            );
-            let snb_started = Instant::now();
-            eprintln!("[snb-server] loading SNB vertices/properties/adjacency cache");
-            let snb = SnbGraph::open(engine, &data_dir).await?;
-            eprintln!(
-                "[snb-server] SNB load complete elapsed_s={:.1} total_elapsed_s={:.1}",
-                snb_started.elapsed().as_secs_f64(),
+                "[snb-server] DynamicGraphView open complete elapsed_s={:.1} total_elapsed_s={:.1}",
+                view_started.elapsed().as_secs_f64(),
                 total_started.elapsed().as_secs_f64()
             );
             eprintln!(
