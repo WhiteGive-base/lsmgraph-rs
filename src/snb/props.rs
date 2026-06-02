@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use crate::base_graph::column::StringColumnReader;
 use crate::base_graph::ids::LabelId;
 use crate::base_graph::{BaseGraph, IoConfig};
 use crate::config::{IoBackendKind, LsmGraphConfig};
@@ -192,6 +193,20 @@ impl EdgeProp {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageRef {
+    pub vid: VertexId,
+    pub id: i64,
+    pub creation_date: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyRef {
+    pub reply_vid: VertexId,
+    pub comment_id: i64,
+    pub creation_date: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgePropRow {
     pub src: VertexId,
@@ -348,6 +363,20 @@ impl LegacySnbGraph {
         self.place(vid).map(|p| p.name.clone()).unwrap_or_default()
     }
 
+    pub fn post_content_or_image(&self, vid: VertexId) -> Option<String> {
+        self.post(vid)
+            .map(|post| post.content_or_image().to_string())
+    }
+
+    pub fn comment_content(&self, vid: VertexId) -> Option<String> {
+        self.comment(vid).map(|comment| comment.content.clone())
+    }
+
+    pub fn message_content(&self, vid: VertexId) -> Option<String> {
+        self.comment_content(vid)
+            .or_else(|| self.post_content_or_image(vid))
+    }
+
     pub fn out_neighbors_cached(&self, vid: VertexId, edge_label: EdgeLabel) -> Vec<VertexId> {
         self.adjacency
             .get(&(vid, edge_label.as_i32()))
@@ -453,8 +482,43 @@ impl LegacySnbGraph {
 pub struct DynamicSnbGraph {
     view: DynamicGraphView,
     fallback_engine: Option<Arc<Engine>>,
+    base_vertices: Option<BaseSnbProperties>,
     vertices: HashMap<VertexId, VertexData>,
     edge_props: HashMap<(VertexId, EdgeType, VertexId), EdgeProp>,
+    lookup_indexes: SnbLookupIndexes,
+    delta_messages_by_creator: HashMap<VertexId, Vec<MessageRef>>,
+    delta_replies_by_parent_creator: HashMap<VertexId, Vec<ReplyRef>>,
+}
+
+struct BaseSnbProperties {
+    persons: Vec<PersonProps>,
+    places: Vec<PlaceProps>,
+    organisations: Vec<OrgProps>,
+    posts: Vec<PostProps>,
+    comments: Vec<CommentProps>,
+    forums: Vec<ForumProps>,
+    tags: Vec<TagProps>,
+    tag_classes: Vec<TagClassProps>,
+    message_strings: BaseMessageStringColumns,
+    messages_by_creator: Vec<Vec<MessageRef>>,
+    replies_by_parent_creator: Vec<Vec<ReplyRef>>,
+    persons_by_place: Vec<Vec<VertexId>>,
+    posts_by_place: Vec<Vec<VertexId>>,
+    comments_by_place: Vec<Vec<VertexId>>,
+    organisations_by_place: Vec<Vec<VertexId>>,
+}
+
+struct BaseMessageStringColumns {
+    post_image_file: StringColumnReader,
+    post_content: StringColumnReader,
+    comment_content: StringColumnReader,
+}
+
+#[derive(Default)]
+struct SnbLookupIndexes {
+    country_by_name: HashMap<String, VertexId>,
+    tag_by_name: HashMap<String, VertexId>,
+    tag_class_by_name: HashMap<String, VertexId>,
 }
 
 impl DynamicSnbGraph {
@@ -492,25 +556,26 @@ impl DynamicSnbGraph {
             engine_started.elapsed().as_secs_f64()
         );
         let vertices_started = Instant::now();
-        let vertices = if let Some(base) = view.base().filter(|base| base.has_vertex_properties()) {
-            eprintln!("[dynamic-snb] loading vertex properties from BaseGraph columns");
-            let vertices = load_vertices_from_base_graph(base)?;
-            eprintln!(
-                "[dynamic-snb] BaseGraph vertex properties ready vertices={} elapsed_s={:.1}",
-                vertices.len(),
-                vertices_started.elapsed().as_secs_f64()
-            );
-            vertices
-        } else {
-            eprintln!("[dynamic-snb] loading vertex property sidecar");
-            let vertices = load_vertices(&store_dir.join("snb_vertices.jsonl"))?;
-            eprintln!(
-                "[dynamic-snb] vertex property sidecar ready vertices={} elapsed_s={:.1}",
-                vertices.len(),
-                vertices_started.elapsed().as_secs_f64()
-            );
-            vertices
-        };
+        let (base_vertices, vertices) =
+            if let Some(base) = view.base().filter(|base| base.has_vertex_properties()) {
+                eprintln!("[dynamic-snb] loading vertex properties from BaseGraph columns");
+                let base_vertices = load_vertices_from_base_graph(base)?;
+                eprintln!(
+                    "[dynamic-snb] BaseGraph vertex properties ready vertices={} elapsed_s={:.1}",
+                    base_vertices.len(),
+                    vertices_started.elapsed().as_secs_f64()
+                );
+                (Some(base_vertices), HashMap::new())
+            } else {
+                eprintln!("[dynamic-snb] loading vertex property sidecar");
+                let vertices = load_vertices(&store_dir.join("snb_vertices.jsonl"))?;
+                eprintln!(
+                    "[dynamic-snb] vertex property sidecar ready vertices={} elapsed_s={:.1}",
+                    vertices.len(),
+                    vertices_started.elapsed().as_secs_f64()
+                );
+                (None, vertices)
+            };
         let edge_props_started = Instant::now();
         let edge_props = if view
             .base()
@@ -532,8 +597,16 @@ impl DynamicSnbGraph {
         Ok(Self {
             view,
             fallback_engine,
+            base_vertices,
             vertices,
             edge_props,
+            lookup_indexes: SnbLookupIndexes::default(),
+            delta_messages_by_creator: HashMap::new(),
+            delta_replies_by_parent_creator: HashMap::new(),
+        })
+        .map(|mut graph| {
+            graph.rebuild_lookup_indexes();
+            graph
         })
     }
 
@@ -559,6 +632,8 @@ impl DynamicSnbGraph {
 
     pub fn insert_vertex(&mut self, data: VertexData) {
         let vid = encode_vid(data.label(), data.external_id());
+        self.index_vertex(vid, &data);
+        self.index_delta_message_vertex(vid, &data);
         self.vertices.insert(vid, data);
     }
 
@@ -598,75 +673,203 @@ impl DynamicSnbGraph {
     }
 
     pub fn person(&self, vid: VertexId) -> Option<&PersonProps> {
-        match self.vertices.get(&vid)? {
-            VertexData::Person(p) => Some(p),
-            _ => None,
+        if let Some(data) = self.vertices.get(&vid) {
+            return match data {
+                VertexData::Person(p) => Some(p),
+                _ => None,
+            };
         }
+        self.base_vertices
+            .as_ref()?
+            .person(self.base_local(LabelId::Person, vid)?)
     }
 
     pub fn place(&self, vid: VertexId) -> Option<&PlaceProps> {
-        match self.vertices.get(&vid)? {
-            VertexData::Place(p) => Some(p),
-            _ => None,
+        if let Some(data) = self.vertices.get(&vid) {
+            return match data {
+                VertexData::Place(p) => Some(p),
+                _ => None,
+            };
         }
+        self.base_vertices
+            .as_ref()?
+            .place(self.base_local(LabelId::Place, vid)?)
     }
 
     pub fn organisation(&self, vid: VertexId) -> Option<&OrgProps> {
-        match self.vertices.get(&vid)? {
-            VertexData::Organisation(p) => Some(p),
-            _ => None,
+        if let Some(data) = self.vertices.get(&vid) {
+            return match data {
+                VertexData::Organisation(p) => Some(p),
+                _ => None,
+            };
         }
+        self.base_vertices
+            .as_ref()?
+            .organisation(self.base_local(LabelId::Organisation, vid)?)
     }
 
     pub fn post(&self, vid: VertexId) -> Option<&PostProps> {
-        match self.vertices.get(&vid)? {
-            VertexData::Post(p) => Some(p),
-            _ => None,
+        if let Some(data) = self.vertices.get(&vid) {
+            return match data {
+                VertexData::Post(p) => Some(p),
+                _ => None,
+            };
         }
+        self.base_vertices
+            .as_ref()?
+            .post(self.base_local(LabelId::Post, vid)?)
     }
 
     pub fn comment(&self, vid: VertexId) -> Option<&CommentProps> {
-        match self.vertices.get(&vid)? {
-            VertexData::Comment(p) => Some(p),
-            _ => None,
+        if let Some(data) = self.vertices.get(&vid) {
+            return match data {
+                VertexData::Comment(p) => Some(p),
+                _ => None,
+            };
         }
+        self.base_vertices
+            .as_ref()?
+            .comment(self.base_local(LabelId::Comment, vid)?)
     }
 
     pub fn forum(&self, vid: VertexId) -> Option<&ForumProps> {
-        match self.vertices.get(&vid)? {
-            VertexData::Forum(p) => Some(p),
-            _ => None,
+        if let Some(data) = self.vertices.get(&vid) {
+            return match data {
+                VertexData::Forum(p) => Some(p),
+                _ => None,
+            };
         }
+        self.base_vertices
+            .as_ref()?
+            .forum(self.base_local(LabelId::Forum, vid)?)
     }
 
     pub fn tag(&self, vid: VertexId) -> Option<&TagProps> {
-        match self.vertices.get(&vid)? {
-            VertexData::Tag(p) => Some(p),
-            _ => None,
+        if let Some(data) = self.vertices.get(&vid) {
+            return match data {
+                VertexData::Tag(p) => Some(p),
+                _ => None,
+            };
         }
+        self.base_vertices
+            .as_ref()?
+            .tag(self.base_local(LabelId::Tag, vid)?)
     }
 
     pub fn tag_class(&self, vid: VertexId) -> Option<&TagClassProps> {
-        match self.vertices.get(&vid)? {
-            VertexData::TagClass(p) => Some(p),
-            _ => None,
+        if let Some(data) = self.vertices.get(&vid) {
+            return match data {
+                VertexData::TagClass(p) => Some(p),
+                _ => None,
+            };
         }
+        self.base_vertices
+            .as_ref()?
+            .tag_class(self.base_local(LabelId::TagClass, vid)?)
     }
 
     pub fn vertex_label(&self, vid: VertexId) -> Option<VertexLabel> {
-        self.vertex(vid).map(VertexData::label)
+        if let Some(data) = self.vertices.get(&vid) {
+            return Some(data.label());
+        }
+        let label = label_from_vid(vid)?;
+        let local = self.base_local(vertex_label_to_base(label), vid)?;
+        self.base_vertices
+            .as_ref()
+            .filter(|base| base.contains(vertex_label_to_base(label), local))
+            .map(|_| label)
     }
 
     pub fn vertices_by_label(&self, label: VertexLabel) -> Box<dyn Iterator<Item = VertexId> + '_> {
-        Box::new(
+        let mut out = self
+            .base_vertices
+            .as_ref()
+            .and_then(|base_props| self.base_vertices_by_label(base_props, label))
+            .unwrap_or_default();
+        out.extend(
             self.vertices
                 .iter()
                 .filter_map(move |(&vid, data)| (data.label() == label).then_some(vid)),
-        )
+        );
+        Box::new(out.into_iter())
     }
 
     pub fn place_name(&self, vid: VertexId) -> String {
         self.place(vid).map(|p| p.name.clone()).unwrap_or_default()
+    }
+
+    pub fn post_content_or_image(&self, vid: VertexId) -> Option<String> {
+        if let Some(VertexData::Post(post)) = self.vertices.get(&vid) {
+            return Some(post.content_or_image().to_string());
+        }
+        let local = self.base_local(LabelId::Post, vid)?;
+        self.base_vertices
+            .as_ref()?
+            .post_content_or_image(local)
+            .ok()
+    }
+
+    pub fn comment_content(&self, vid: VertexId) -> Option<String> {
+        if let Some(VertexData::Comment(comment)) = self.vertices.get(&vid) {
+            return Some(comment.content.clone());
+        }
+        let local = self.base_local(LabelId::Comment, vid)?;
+        self.base_vertices.as_ref()?.comment_content(local).ok()
+    }
+
+    pub fn message_content(&self, vid: VertexId) -> Option<String> {
+        self.comment_content(vid)
+            .or_else(|| self.post_content_or_image(vid))
+    }
+
+    pub fn message_refs_by_creator_date(&self, person_vid: VertexId) -> Option<Vec<MessageRef>> {
+        let mut out = self
+            .base_message_refs_by_creator_date(person_vid)
+            .unwrap_or_default();
+        if let Some(delta) = self.delta_messages_by_creator.get(&person_vid) {
+            out.extend_from_slice(delta);
+        }
+        if out.is_empty() {
+            return Some(out);
+        }
+        out.sort_by(|a, b| {
+            b.creation_date
+                .cmp(&a.creation_date)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out.dedup_by_key(|msg| msg.vid);
+        Some(out)
+    }
+
+    pub fn reply_refs_by_parent_creator_date(&self, person_vid: VertexId) -> Option<Vec<ReplyRef>> {
+        let mut out = self
+            .base_reply_refs_by_parent_creator_date(person_vid)
+            .unwrap_or_default();
+        if let Some(delta) = self.delta_replies_by_parent_creator.get(&person_vid) {
+            out.extend_from_slice(delta);
+        }
+        if out.is_empty() {
+            return Some(out);
+        }
+        out.sort_by(|a, b| {
+            b.creation_date
+                .cmp(&a.creation_date)
+                .then_with(|| a.comment_id.cmp(&b.comment_id))
+        });
+        out.dedup_by_key(|reply| reply.reply_vid);
+        Some(out)
+    }
+
+    pub fn country_by_name(&self, name: &str) -> Option<VertexId> {
+        self.lookup_indexes.country_by_name.get(name).copied()
+    }
+
+    pub fn tag_by_name(&self, name: &str) -> Option<VertexId> {
+        self.lookup_indexes.tag_by_name.get(name).copied()
+    }
+
+    pub fn tag_class_by_name(&self, name: &str) -> Option<VertexId> {
+        self.lookup_indexes.tag_class_by_name.get(name).copied()
     }
 
     pub fn out_neighbors_cached(&self, vid: VertexId, edge_label: EdgeLabel) -> Vec<VertexId> {
@@ -743,6 +946,205 @@ impl DynamicSnbGraph {
             .collect()
     }
 
+    fn base_local(&self, label: LabelId, vid: VertexId) -> Option<u32> {
+        let external = external_id(vid);
+        self.view.base()?.local_id(label, external)
+    }
+
+    fn base_vertices_by_label(
+        &self,
+        base_props: &BaseSnbProperties,
+        label: VertexLabel,
+    ) -> Option<Vec<VertexId>> {
+        let base = self.view.base()?;
+        let label_id = vertex_label_to_base(label);
+        let count = base_props.len_for_label(label_id);
+        let mut out = Vec::with_capacity(count);
+        for local in 0..count {
+            if let Some(external) = base.external_id(label_id, local as u32) {
+                out.push(encode_vid(label, external));
+            }
+        }
+        Some(out)
+    }
+
+    fn base_message_refs_by_creator_date(&self, person_vid: VertexId) -> Option<Vec<MessageRef>> {
+        let base = self.view.base()?;
+        let local = base.local_id(LabelId::Person, external_id(person_vid))? as usize;
+        Some(
+            self.base_vertices
+                .as_ref()?
+                .messages_by_creator
+                .get(local)?
+                .clone(),
+        )
+    }
+
+    fn base_reply_refs_by_parent_creator_date(
+        &self,
+        person_vid: VertexId,
+    ) -> Option<Vec<ReplyRef>> {
+        let base = self.view.base()?;
+        let local = base.local_id(LabelId::Person, external_id(person_vid))? as usize;
+        Some(
+            self.base_vertices
+                .as_ref()?
+                .replies_by_parent_creator
+                .get(local)?
+                .clone(),
+        )
+    }
+
+    fn base_reverse_located_in(&self, place_vid: VertexId) -> Option<Vec<VertexId>> {
+        let base = self.view.base()?;
+        let local = base.local_id(LabelId::Place, external_id(place_vid))? as usize;
+        let base_props = self.base_vertices.as_ref()?;
+        let mut out = Vec::new();
+        if let Some(values) = base_props.persons_by_place.get(local) {
+            out.extend_from_slice(values);
+        }
+        if let Some(values) = base_props.posts_by_place.get(local) {
+            out.extend_from_slice(values);
+        }
+        if let Some(values) = base_props.comments_by_place.get(local) {
+            out.extend_from_slice(values);
+        }
+        if let Some(values) = base_props.organisations_by_place.get(local) {
+            out.extend_from_slice(values);
+        }
+        Some(out)
+    }
+
+    fn rebuild_lookup_indexes(&mut self) {
+        self.lookup_indexes = SnbLookupIndexes::default();
+        if let Some(base_props) = &self.base_vertices {
+            if let Some(base) = self.view.base() {
+                let mut pending = Vec::new();
+                for (local, place) in base_props.places.iter().enumerate() {
+                    if place.place_type == "country" {
+                        if let Some(external) = base.external_id(LabelId::Place, local as u32) {
+                            pending.push((
+                                place.name.clone(),
+                                encode_vid(VertexLabel::Place, external),
+                            ));
+                        }
+                    }
+                }
+                for (name, vid) in pending {
+                    self.lookup_indexes.country_by_name.insert(name, vid);
+                }
+                let mut pending = Vec::new();
+                for (local, tag) in base_props.tags.iter().enumerate() {
+                    if let Some(external) = base.external_id(LabelId::Tag, local as u32) {
+                        pending.push((tag.name.clone(), encode_vid(VertexLabel::Tag, external)));
+                    }
+                }
+                for (name, vid) in pending {
+                    self.lookup_indexes.tag_by_name.insert(name, vid);
+                }
+                let mut pending = Vec::new();
+                for (local, tag_class) in base_props.tag_classes.iter().enumerate() {
+                    if let Some(external) = base.external_id(LabelId::TagClass, local as u32) {
+                        pending.push((
+                            tag_class.name.clone(),
+                            encode_vid(VertexLabel::TagClass, external),
+                        ));
+                    }
+                }
+                for (name, vid) in pending {
+                    self.lookup_indexes.tag_class_by_name.insert(name, vid);
+                }
+            }
+        }
+        let indexed: Vec<_> = self
+            .vertices
+            .iter()
+            .map(|(&vid, data)| (vid, data.clone()))
+            .collect();
+        for (vid, data) in indexed {
+            self.index_vertex(vid, &data);
+        }
+    }
+
+    fn index_vertex(&mut self, vid: VertexId, data: &VertexData) {
+        match data {
+            VertexData::Place(place) if place.place_type == "country" => {
+                self.lookup_indexes
+                    .country_by_name
+                    .insert(place.name.clone(), vid);
+            }
+            VertexData::Tag(tag) => {
+                self.lookup_indexes
+                    .tag_by_name
+                    .insert(tag.name.clone(), vid);
+            }
+            VertexData::TagClass(tag_class) => {
+                self.lookup_indexes
+                    .tag_class_by_name
+                    .insert(tag_class.name.clone(), vid);
+            }
+            _ => {}
+        }
+    }
+
+    fn index_delta_message_vertex(&mut self, vid: VertexId, data: &VertexData) {
+        match data {
+            VertexData::Post(post) => {
+                let creator = encode_vid(VertexLabel::Person, post.creator);
+                self.delta_messages_by_creator
+                    .entry(creator)
+                    .or_default()
+                    .push(MessageRef {
+                        vid,
+                        id: post.id,
+                        creation_date: post.creation_date,
+                    });
+                sort_message_refs(self.delta_messages_by_creator.get_mut(&creator).unwrap());
+            }
+            VertexData::Comment(comment) => {
+                let creator = encode_vid(VertexLabel::Person, comment.creator);
+                self.delta_messages_by_creator
+                    .entry(creator)
+                    .or_default()
+                    .push(MessageRef {
+                        vid,
+                        id: comment.id,
+                        creation_date: comment.creation_date,
+                    });
+                sort_message_refs(self.delta_messages_by_creator.get_mut(&creator).unwrap());
+
+                if let Some(parent_creator) = self.comment_parent_creator(comment) {
+                    self.delta_replies_by_parent_creator
+                        .entry(parent_creator)
+                        .or_default()
+                        .push(ReplyRef {
+                            reply_vid: vid,
+                            comment_id: comment.id,
+                            creation_date: comment.creation_date,
+                        });
+                    sort_reply_refs(
+                        self.delta_replies_by_parent_creator
+                            .get_mut(&parent_creator)
+                            .unwrap(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn comment_parent_creator(&self, comment: &CommentProps) -> Option<VertexId> {
+        if let Some(post_id) = comment.reply_of_post {
+            let post = self.post(encode_vid(VertexLabel::Post, post_id))?;
+            return Some(encode_vid(VertexLabel::Person, post.creator));
+        }
+        if let Some(comment_id) = comment.reply_of_comment {
+            let parent = self.comment(encode_vid(VertexLabel::Comment, comment_id))?;
+            return Some(encode_vid(VertexLabel::Person, parent.creator));
+        }
+        None
+    }
+
     fn neighbors_by_type(&self, src: VertexId, edge_type: EdgeType) -> Vec<VertexId> {
         let mut out = if let Some(base_neighbors) = self.base_neighbors_by_type(src, edge_type) {
             base_neighbors
@@ -758,15 +1160,10 @@ impl DynamicSnbGraph {
         let src_label = label_from_vid(src)?;
         let external = external_id(src);
         match (src_label, edge_type) {
-            (VertexLabel::Person, x) if x == EdgeLabel::Knows.as_i32() => self.scan_base_csr(
-                base,
-                "KNOWS/OUT",
-                LabelId::Person,
-                external,
-                LabelId::Person,
-            ),
-            (VertexLabel::Person, x) if x == -EdgeLabel::Knows.as_i32() => {
-                self.scan_base_csr(base, "KNOWS/IN", LabelId::Person, external, LabelId::Person)
+            (VertexLabel::Person, x)
+                if x == EdgeLabel::Knows.as_i32() || x == -EdgeLabel::Knows.as_i32() =>
+            {
+                Some(self.scan_base_undirected_knows(base, external))
             }
             (VertexLabel::Person, x) if x == EdgeLabel::LikesPost.as_i32() => self.scan_base_csr(
                 base,
@@ -885,7 +1282,7 @@ impl DynamicSnbGraph {
                     external,
                     LabelId::Comment,
                 ),
-            (VertexLabel::Post, x) if x == EdgeLabel::ContainerOf.as_i32() => self
+            (VertexLabel::Post, x) if x == -EdgeLabel::ContainerOf.as_i32() => self
                 .base_single_neighbor(
                     base,
                     LabelId::Post,
@@ -893,7 +1290,7 @@ impl DynamicSnbGraph {
                     LabelId::Forum,
                     |base, local| base.post_forum(local),
                 ),
-            (VertexLabel::Forum, x) if x == -EdgeLabel::ContainerOf.as_i32() => self.scan_base_csr(
+            (VertexLabel::Forum, x) if x == EdgeLabel::ContainerOf.as_i32() => self.scan_base_csr(
                 base,
                 "FORUM_CONTAINER_OF_POST",
                 LabelId::Forum,
@@ -932,6 +1329,9 @@ impl DynamicSnbGraph {
                     LabelId::Place,
                     |base, local| base.organisation_place(local),
                 ),
+            (VertexLabel::Place, x) if x == -EdgeLabel::IsLocatedIn.as_i32() => {
+                self.base_reverse_located_in(src)
+            }
             (VertexLabel::Forum, x) if x == EdgeLabel::HasModerator.as_i32() => self
                 .base_single_neighbor(
                     base,
@@ -1073,24 +1473,11 @@ impl DynamicSnbGraph {
         let src_label = label_from_vid(src)?;
         let external = external_id(src);
         match (src_label, edge_type) {
-            (VertexLabel::Person, x) if x == EdgeLabel::Knows.as_i32() => self
-                .scan_base_csr_i64_prop(
-                    base,
-                    "KNOWS/OUT",
-                    LabelId::Person,
-                    external,
-                    LabelId::Person,
-                    "creation_date",
-                ),
-            (VertexLabel::Person, x) if x == -EdgeLabel::Knows.as_i32() => self
-                .scan_base_csr_i64_prop(
-                    base,
-                    "KNOWS/IN",
-                    LabelId::Person,
-                    external,
-                    LabelId::Person,
-                    "creation_date",
-                ),
+            (VertexLabel::Person, x)
+                if x == EdgeLabel::Knows.as_i32() || x == -EdgeLabel::Knows.as_i32() =>
+            {
+                Some(self.scan_base_undirected_knows_with_prop(base, external))
+            }
             (VertexLabel::Person, x) if x == EdgeLabel::LikesPost.as_i32() => self
                 .scan_base_csr_i64_prop(
                     base,
@@ -1266,6 +1653,58 @@ impl DynamicSnbGraph {
             }
         }
         Some(out)
+    }
+
+    fn scan_base_undirected_knows(&self, base: &BaseGraph, person_external: i64) -> Vec<VertexId> {
+        let mut out = self
+            .scan_base_csr(
+                base,
+                "KNOWS/OUT",
+                LabelId::Person,
+                person_external,
+                LabelId::Person,
+            )
+            .unwrap_or_default();
+        out.extend(
+            self.scan_base_csr(
+                base,
+                "KNOWS/IN",
+                LabelId::Person,
+                person_external,
+                LabelId::Person,
+            )
+            .unwrap_or_default(),
+        );
+        dedup_vertices(out)
+    }
+
+    fn scan_base_undirected_knows_with_prop(
+        &self,
+        base: &BaseGraph,
+        person_external: i64,
+    ) -> Vec<(VertexId, EdgeProp)> {
+        let mut out = self
+            .scan_base_csr_i64_prop(
+                base,
+                "KNOWS/OUT",
+                LabelId::Person,
+                person_external,
+                LabelId::Person,
+                "creation_date",
+            )
+            .unwrap_or_default();
+        out.extend(
+            self.scan_base_csr_i64_prop(
+                base,
+                "KNOWS/IN",
+                LabelId::Person,
+                person_external,
+                LabelId::Person,
+                "creation_date",
+            )
+            .unwrap_or_default(),
+        );
+        dedup_edges_with_prop(out)
     }
 
     fn base_single_neighbor<F>(
@@ -1494,6 +1933,74 @@ impl SnbGraph {
         }
     }
 
+    pub fn post_content_or_image(&self, vid: VertexId) -> Option<String> {
+        match self {
+            Self::Legacy(graph) => graph.post_content_or_image(vid),
+            Self::Dynamic(graph) => graph.post_content_or_image(vid),
+        }
+    }
+
+    pub fn comment_content(&self, vid: VertexId) -> Option<String> {
+        match self {
+            Self::Legacy(graph) => graph.comment_content(vid),
+            Self::Dynamic(graph) => graph.comment_content(vid),
+        }
+    }
+
+    pub fn message_content(&self, vid: VertexId) -> Option<String> {
+        match self {
+            Self::Legacy(graph) => graph.message_content(vid),
+            Self::Dynamic(graph) => graph.message_content(vid),
+        }
+    }
+
+    pub fn message_refs_by_creator_date(&self, person_vid: VertexId) -> Option<Vec<MessageRef>> {
+        match self {
+            Self::Dynamic(graph) => graph.message_refs_by_creator_date(person_vid),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    pub fn reply_refs_by_parent_creator_date(&self, person_vid: VertexId) -> Option<Vec<ReplyRef>> {
+        match self {
+            Self::Dynamic(graph) => graph.reply_refs_by_parent_creator_date(person_vid),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    pub fn country_by_name(&self, name: &str) -> Option<VertexId> {
+        match self {
+            Self::Dynamic(graph) => graph.country_by_name(name),
+            Self::Legacy(graph) => graph.vertices_by_label(VertexLabel::Place).find(|&vid| {
+                graph
+                    .place(vid)
+                    .map(|place| place.name == name && place.place_type == "country")
+                    .unwrap_or(false)
+            }),
+        }
+    }
+
+    pub fn tag_by_name(&self, name: &str) -> Option<VertexId> {
+        match self {
+            Self::Dynamic(graph) => graph.tag_by_name(name),
+            Self::Legacy(graph) => graph
+                .vertices_by_label(VertexLabel::Tag)
+                .find(|&vid| graph.tag(vid).map(|tag| tag.name == name).unwrap_or(false)),
+        }
+    }
+
+    pub fn tag_class_by_name(&self, name: &str) -> Option<VertexId> {
+        match self {
+            Self::Dynamic(graph) => graph.tag_class_by_name(name),
+            Self::Legacy(graph) => graph.vertices_by_label(VertexLabel::TagClass).find(|&vid| {
+                graph
+                    .tag_class(vid)
+                    .map(|tag_class| tag_class.name == name)
+                    .unwrap_or(false)
+            }),
+        }
+    }
+
     pub fn out_neighbors_cached(&self, vid: VertexId, edge_label: EdgeLabel) -> Vec<VertexId> {
         match self {
             Self::Legacy(graph) => graph.out_neighbors_cached(vid, edge_label),
@@ -1629,9 +2136,96 @@ fn vertex_label_from_base(label: LabelId) -> VertexLabel {
     }
 }
 
-fn load_vertices_from_base_graph(base: &BaseGraph) -> Result<HashMap<VertexId, VertexData>> {
-    let mut out = HashMap::new();
+fn vertex_label_to_base(label: VertexLabel) -> LabelId {
+    match label {
+        VertexLabel::Person => LabelId::Person,
+        VertexLabel::Comment => LabelId::Comment,
+        VertexLabel::Post => LabelId::Post,
+        VertexLabel::Forum => LabelId::Forum,
+        VertexLabel::Organisation => LabelId::Organisation,
+        VertexLabel::Place => LabelId::Place,
+        VertexLabel::Tag => LabelId::Tag,
+        VertexLabel::TagClass => LabelId::TagClass,
+    }
+}
 
+impl BaseSnbProperties {
+    fn len(&self) -> usize {
+        self.persons.len()
+            + self.places.len()
+            + self.organisations.len()
+            + self.posts.len()
+            + self.comments.len()
+            + self.forums.len()
+            + self.tags.len()
+            + self.tag_classes.len()
+    }
+
+    fn len_for_label(&self, label: LabelId) -> usize {
+        match label {
+            LabelId::Person => self.persons.len(),
+            LabelId::Comment => self.comments.len(),
+            LabelId::Post => self.posts.len(),
+            LabelId::Forum => self.forums.len(),
+            LabelId::Organisation => self.organisations.len(),
+            LabelId::Place => self.places.len(),
+            LabelId::Tag => self.tags.len(),
+            LabelId::TagClass => self.tag_classes.len(),
+        }
+    }
+
+    fn contains(&self, label: LabelId, local: u32) -> bool {
+        (local as usize) < self.len_for_label(label)
+    }
+
+    fn person(&self, local: u32) -> Option<&PersonProps> {
+        self.persons.get(local as usize)
+    }
+
+    fn place(&self, local: u32) -> Option<&PlaceProps> {
+        self.places.get(local as usize)
+    }
+
+    fn organisation(&self, local: u32) -> Option<&OrgProps> {
+        self.organisations.get(local as usize)
+    }
+
+    fn post(&self, local: u32) -> Option<&PostProps> {
+        self.posts.get(local as usize)
+    }
+
+    fn comment(&self, local: u32) -> Option<&CommentProps> {
+        self.comments.get(local as usize)
+    }
+
+    fn forum(&self, local: u32) -> Option<&ForumProps> {
+        self.forums.get(local as usize)
+    }
+
+    fn tag(&self, local: u32) -> Option<&TagProps> {
+        self.tags.get(local as usize)
+    }
+
+    fn tag_class(&self, local: u32) -> Option<&TagClassProps> {
+        self.tag_classes.get(local as usize)
+    }
+
+    fn post_content_or_image(&self, local: u32) -> Result<String> {
+        let idx = local as usize;
+        let content = self.message_strings.post_content.get(idx)?;
+        if content.is_empty() {
+            self.message_strings.post_image_file.get(idx)
+        } else {
+            Ok(content)
+        }
+    }
+
+    fn comment_content(&self, local: u32) -> Result<String> {
+        self.message_strings.comment_content.get(local as usize)
+    }
+}
+
+fn load_vertices_from_base_graph(base: &BaseGraph) -> Result<BaseSnbProperties> {
     let person_first_name = base.read_string_property("Person", "first_name")?;
     let person_last_name = base.read_string_property("Person", "last_name")?;
     let person_gender = base.read_string_property("Person", "gender")?;
@@ -1642,177 +2236,318 @@ fn load_vertices_from_base_graph(base: &BaseGraph) -> Result<HashMap<VertexId, V
     let person_place = base.read_i64_property("Person", "place")?;
     let person_language = base.read_string_property("Person", "language")?;
     let person_email = base.read_string_property("Person", "email")?;
+    let mut persons = Vec::with_capacity(person_first_name.len());
     for local in 0..person_first_name.len() {
-        let Some(id) = base.external_id(LabelId::Person, local as u32) else {
-            continue;
-        };
-        out.insert(
-            encode_vid(VertexLabel::Person, id),
-            VertexData::Person(PersonProps {
-                id,
-                first_name: person_first_name[local].clone(),
-                last_name: person_last_name[local].clone(),
-                gender: person_gender[local].clone(),
-                birthday: person_birthday[local],
-                creation_date: person_creation_date[local],
-                location_ip: person_location_ip[local].clone(),
-                browser_used: person_browser_used[local].clone(),
-                place: person_place[local],
-                language: person_language[local].clone(),
-                email: person_email[local].clone(),
-            }),
-        );
+        let id = required_external_id(base, LabelId::Person, local)?;
+        persons.push(PersonProps {
+            id,
+            first_name: person_first_name[local].clone(),
+            last_name: person_last_name[local].clone(),
+            gender: person_gender[local].clone(),
+            birthday: person_birthday[local],
+            creation_date: person_creation_date[local],
+            location_ip: person_location_ip[local].clone(),
+            browser_used: person_browser_used[local].clone(),
+            place: person_place[local],
+            language: person_language[local].clone(),
+            email: person_email[local].clone(),
+        });
     }
 
     let forum_title = base.read_string_property("Forum", "title")?;
     let forum_creation_date = base.read_i64_property("Forum", "creation_date")?;
     let forum_moderator = base.read_i64_property("Forum", "moderator")?;
+    let mut forums = Vec::with_capacity(forum_title.len());
     for local in 0..forum_title.len() {
-        let Some(id) = base.external_id(LabelId::Forum, local as u32) else {
-            continue;
-        };
-        out.insert(
-            encode_vid(VertexLabel::Forum, id),
-            VertexData::Forum(ForumProps {
-                id,
-                title: forum_title[local].clone(),
-                creation_date: forum_creation_date[local],
-                moderator: forum_moderator[local],
-            }),
-        );
+        let id = required_external_id(base, LabelId::Forum, local)?;
+        forums.push(ForumProps {
+            id,
+            title: forum_title[local].clone(),
+            creation_date: forum_creation_date[local],
+            moderator: forum_moderator[local],
+        });
     }
 
-    let post_image_file = base.read_string_property("Post", "image_file")?;
+    let message_strings = BaseMessageStringColumns {
+        post_image_file: base.open_string_property("Post", "image_file")?,
+        post_content: base.open_string_property("Post", "content")?,
+        comment_content: base.open_string_property("Comment", "content")?,
+    };
+
     let post_creation_date = base.read_i64_property("Post", "creation_date")?;
-    let post_location_ip = base.read_string_property("Post", "location_ip")?;
-    let post_browser_used = base.read_string_property("Post", "browser_used")?;
-    let post_language = base.read_string_property("Post", "language")?;
-    let post_content = base.read_string_property("Post", "content")?;
     let post_length = base.read_i64_property("Post", "length")?;
     let post_creator = base.read_i64_property("Post", "creator")?;
     let post_forum = base.read_i64_property("Post", "forum_id")?;
     let post_place = base.read_i64_property("Post", "place")?;
-    for local in 0..post_creation_date.len() {
-        let Some(id) = base.external_id(LabelId::Post, local as u32) else {
-            continue;
-        };
-        out.insert(
-            encode_vid(VertexLabel::Post, id),
-            VertexData::Post(PostProps {
-                id,
-                image_file: post_image_file[local].clone(),
-                creation_date: post_creation_date[local],
-                location_ip: post_location_ip[local].clone(),
-                browser_used: post_browser_used[local].clone(),
-                language: post_language[local].clone(),
-                content: post_content[local].clone(),
-                length: post_length[local],
-                creator: post_creator[local],
-                forum_id: post_forum[local],
-                place: post_place[local],
-            }),
+    if message_strings.post_content.len() != post_creation_date.len()
+        || message_strings.post_image_file.len() != post_creation_date.len()
+    {
+        anyhow::bail!(
+            "Post lazy string column length mismatch content={} image={} rows={}",
+            message_strings.post_content.len(),
+            message_strings.post_image_file.len(),
+            post_creation_date.len()
         );
+    }
+    let mut posts = Vec::with_capacity(post_creation_date.len());
+    for local in 0..post_creation_date.len() {
+        let id = required_external_id(base, LabelId::Post, local)?;
+        posts.push(PostProps {
+            id,
+            image_file: String::new(),
+            creation_date: post_creation_date[local],
+            location_ip: String::new(),
+            browser_used: String::new(),
+            language: String::new(),
+            content: String::new(),
+            length: post_length[local],
+            creator: post_creator[local],
+            forum_id: post_forum[local],
+            place: post_place[local],
+        });
     }
 
     let comment_creation_date = base.read_i64_property("Comment", "creation_date")?;
-    let comment_location_ip = base.read_string_property("Comment", "location_ip")?;
-    let comment_browser_used = base.read_string_property("Comment", "browser_used")?;
-    let comment_content = base.read_string_property("Comment", "content")?;
     let comment_length = base.read_i64_property("Comment", "length")?;
     let comment_creator = base.read_i64_property("Comment", "creator")?;
     let comment_place = base.read_i64_property("Comment", "place")?;
     let comment_reply_post = base.read_i64_property("Comment", "reply_of_post")?;
     let comment_reply_comment = base.read_i64_property("Comment", "reply_of_comment")?;
-    for local in 0..comment_creation_date.len() {
-        let Some(id) = base.external_id(LabelId::Comment, local as u32) else {
-            continue;
-        };
-        out.insert(
-            encode_vid(VertexLabel::Comment, id),
-            VertexData::Comment(CommentProps {
-                id,
-                creation_date: comment_creation_date[local],
-                location_ip: comment_location_ip[local].clone(),
-                browser_used: comment_browser_used[local].clone(),
-                content: comment_content[local].clone(),
-                length: comment_length[local],
-                creator: comment_creator[local],
-                place: comment_place[local],
-                reply_of_post: optional_i64(comment_reply_post[local]),
-                reply_of_comment: optional_i64(comment_reply_comment[local]),
-            }),
+    if message_strings.comment_content.len() != comment_creation_date.len() {
+        anyhow::bail!(
+            "Comment lazy string column length mismatch content={} rows={}",
+            message_strings.comment_content.len(),
+            comment_creation_date.len()
         );
     }
+    let mut comments = Vec::with_capacity(comment_creation_date.len());
+    for local in 0..comment_creation_date.len() {
+        let id = required_external_id(base, LabelId::Comment, local)?;
+        comments.push(CommentProps {
+            id,
+            creation_date: comment_creation_date[local],
+            location_ip: String::new(),
+            browser_used: String::new(),
+            content: String::new(),
+            length: comment_length[local],
+            creator: comment_creator[local],
+            place: comment_place[local],
+            reply_of_post: optional_i64(comment_reply_post[local]),
+            reply_of_comment: optional_i64(comment_reply_comment[local]),
+        });
+    }
+    let (messages_by_creator, replies_by_parent_creator) =
+        build_base_message_indexes(base, persons.len(), &posts, &comments)?;
 
     let place_name = base.read_string_property("Place", "name")?;
     let place_type = base.read_string_property("Place", "place_type")?;
     let place_parent = base.read_i64_property("Place", "is_part_of")?;
+    let mut places = Vec::with_capacity(place_name.len());
     for local in 0..place_name.len() {
-        let Some(id) = base.external_id(LabelId::Place, local as u32) else {
-            continue;
-        };
-        out.insert(
-            encode_vid(VertexLabel::Place, id),
-            VertexData::Place(PlaceProps {
-                id,
-                name: place_name[local].clone(),
-                place_type: place_type[local].clone(),
-                is_part_of: optional_i64(place_parent[local]),
-            }),
-        );
+        let id = required_external_id(base, LabelId::Place, local)?;
+        places.push(PlaceProps {
+            id,
+            name: place_name[local].clone(),
+            place_type: place_type[local].clone(),
+            is_part_of: optional_i64(place_parent[local]),
+        });
     }
 
     let org_type = base.read_string_property("Organisation", "org_type")?;
     let org_name = base.read_string_property("Organisation", "name")?;
     let org_place = base.read_i64_property("Organisation", "place")?;
+    let mut organisations = Vec::with_capacity(org_name.len());
     for local in 0..org_name.len() {
-        let Some(id) = base.external_id(LabelId::Organisation, local as u32) else {
-            continue;
-        };
-        out.insert(
-            encode_vid(VertexLabel::Organisation, id),
-            VertexData::Organisation(OrgProps {
-                id,
-                org_type: org_type[local].clone(),
-                name: org_name[local].clone(),
-                place: org_place[local],
-            }),
-        );
+        let id = required_external_id(base, LabelId::Organisation, local)?;
+        organisations.push(OrgProps {
+            id,
+            org_type: org_type[local].clone(),
+            name: org_name[local].clone(),
+            place: org_place[local],
+        });
     }
 
     let tag_name = base.read_string_property("Tag", "name")?;
     let tag_has_type = base.read_i64_property("Tag", "has_type")?;
+    let mut tags = Vec::with_capacity(tag_name.len());
     for local in 0..tag_name.len() {
-        let Some(id) = base.external_id(LabelId::Tag, local as u32) else {
-            continue;
-        };
-        out.insert(
-            encode_vid(VertexLabel::Tag, id),
-            VertexData::Tag(TagProps {
-                id,
-                name: tag_name[local].clone(),
-                has_type: tag_has_type[local],
-            }),
-        );
+        let id = required_external_id(base, LabelId::Tag, local)?;
+        tags.push(TagProps {
+            id,
+            name: tag_name[local].clone(),
+            has_type: tag_has_type[local],
+        });
     }
 
     let tagclass_name = base.read_string_property("TagClass", "name")?;
     let tagclass_parent = base.read_i64_property("TagClass", "is_subclass_of")?;
+    let mut tag_classes = Vec::with_capacity(tagclass_name.len());
     for local in 0..tagclass_name.len() {
-        let Some(id) = base.external_id(LabelId::TagClass, local as u32) else {
-            continue;
-        };
-        out.insert(
-            encode_vid(VertexLabel::TagClass, id),
-            VertexData::TagClass(TagClassProps {
-                id,
-                name: tagclass_name[local].clone(),
-                is_subclass_of: optional_i64(tagclass_parent[local]),
-            }),
-        );
+        let id = required_external_id(base, LabelId::TagClass, local)?;
+        tag_classes.push(TagClassProps {
+            id,
+            name: tagclass_name[local].clone(),
+            is_subclass_of: optional_i64(tagclass_parent[local]),
+        });
     }
 
-    Ok(out)
+    let (persons_by_place, posts_by_place, comments_by_place, organisations_by_place) =
+        build_base_place_indexes(
+            base,
+            places.len(),
+            &persons,
+            &posts,
+            &comments,
+            &organisations,
+        );
+
+    Ok(BaseSnbProperties {
+        persons,
+        places,
+        organisations,
+        posts,
+        comments,
+        forums,
+        tags,
+        tag_classes,
+        message_strings,
+        messages_by_creator,
+        replies_by_parent_creator,
+        persons_by_place,
+        posts_by_place,
+        comments_by_place,
+        organisations_by_place,
+    })
+}
+
+type BasePlaceIndexes = (
+    Vec<Vec<VertexId>>,
+    Vec<Vec<VertexId>>,
+    Vec<Vec<VertexId>>,
+    Vec<Vec<VertexId>>,
+);
+
+fn build_base_place_indexes(
+    base: &BaseGraph,
+    place_count: usize,
+    persons: &[PersonProps],
+    posts: &[PostProps],
+    comments: &[CommentProps],
+    organisations: &[OrgProps],
+) -> BasePlaceIndexes {
+    let mut persons_by_place = vec![Vec::new(); place_count];
+    let mut posts_by_place = vec![Vec::new(); place_count];
+    let mut comments_by_place = vec![Vec::new(); place_count];
+    let mut organisations_by_place = vec![Vec::new(); place_count];
+
+    for person in persons {
+        if let Some(place_local) = base.local_id(LabelId::Place, person.place) {
+            persons_by_place[place_local as usize].push(encode_vid(VertexLabel::Person, person.id));
+        }
+    }
+    for post in posts {
+        if let Some(place_local) = base.local_id(LabelId::Place, post.place) {
+            posts_by_place[place_local as usize].push(encode_vid(VertexLabel::Post, post.id));
+        }
+    }
+    for comment in comments {
+        if let Some(place_local) = base.local_id(LabelId::Place, comment.place) {
+            comments_by_place[place_local as usize]
+                .push(encode_vid(VertexLabel::Comment, comment.id));
+        }
+    }
+    for organisation in organisations {
+        if let Some(place_local) = base.local_id(LabelId::Place, organisation.place) {
+            organisations_by_place[place_local as usize]
+                .push(encode_vid(VertexLabel::Organisation, organisation.id));
+        }
+    }
+
+    (
+        persons_by_place,
+        posts_by_place,
+        comments_by_place,
+        organisations_by_place,
+    )
+}
+
+fn build_base_message_indexes(
+    base: &BaseGraph,
+    person_count: usize,
+    posts: &[PostProps],
+    comments: &[CommentProps],
+) -> Result<(Vec<Vec<MessageRef>>, Vec<Vec<ReplyRef>>)> {
+    let mut messages_by_creator = vec![Vec::new(); person_count];
+    let mut replies_by_parent_creator = vec![Vec::new(); person_count];
+
+    for post in posts {
+        if let Some(person_local) = base.local_id(LabelId::Person, post.creator) {
+            messages_by_creator[person_local as usize].push(MessageRef {
+                vid: encode_vid(VertexLabel::Post, post.id),
+                id: post.id,
+                creation_date: post.creation_date,
+            });
+        }
+    }
+
+    for comment in comments {
+        if let Some(person_local) = base.local_id(LabelId::Person, comment.creator) {
+            messages_by_creator[person_local as usize].push(MessageRef {
+                vid: encode_vid(VertexLabel::Comment, comment.id),
+                id: comment.id,
+                creation_date: comment.creation_date,
+            });
+        }
+        let parent_creator = if let Some(post_id) = comment.reply_of_post {
+            base.local_id(LabelId::Post, post_id)
+                .and_then(|post_local| posts.get(post_local as usize))
+                .and_then(|post| base.local_id(LabelId::Person, post.creator))
+        } else if let Some(comment_id) = comment.reply_of_comment {
+            base.local_id(LabelId::Comment, comment_id)
+                .and_then(|comment_local| comments.get(comment_local as usize))
+                .and_then(|parent| base.local_id(LabelId::Person, parent.creator))
+        } else {
+            None
+        };
+        if let Some(person_local) = parent_creator {
+            replies_by_parent_creator[person_local as usize].push(ReplyRef {
+                reply_vid: encode_vid(VertexLabel::Comment, comment.id),
+                comment_id: comment.id,
+                creation_date: comment.creation_date,
+            });
+        }
+    }
+
+    for messages in &mut messages_by_creator {
+        sort_message_refs(messages);
+    }
+    for replies in &mut replies_by_parent_creator {
+        sort_reply_refs(replies);
+    }
+    Ok((messages_by_creator, replies_by_parent_creator))
+}
+
+fn sort_message_refs(messages: &mut Vec<MessageRef>) {
+    messages.sort_by(|a, b| {
+        b.creation_date
+            .cmp(&a.creation_date)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    messages.dedup_by_key(|msg| msg.vid);
+}
+
+fn sort_reply_refs(replies: &mut Vec<ReplyRef>) {
+    replies.sort_by(|a, b| {
+        b.creation_date
+            .cmp(&a.creation_date)
+            .then_with(|| a.comment_id.cmp(&b.comment_id))
+    });
+    replies.dedup_by_key(|reply| reply.reply_vid);
+}
+
+fn required_external_id(base: &BaseGraph, label: LabelId, local: usize) -> Result<i64> {
+    base.external_id(label, local as u32)
+        .ok_or_else(|| anyhow::anyhow!("missing external id for {:?} local {}", label, local))
 }
 
 fn optional_i64(value: i64) -> Option<i64> {

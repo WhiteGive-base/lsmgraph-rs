@@ -10,7 +10,7 @@ use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
 use lsmgraph::snb::{
     import_snb_full, import_snb_updates, rebuild_snb_edge_props, start_dgs_compatible_server,
-    validate_ic1_ic14, validate_ic_batch, validate_mixed_tugraph, SnbGraph,
+    validate_ic1_ic14_dynamic, validate_ic_batch_dynamic, validate_mixed_tugraph_dynamic, SnbGraph,
 };
 use lsmgraph::types::UNKNOWN_SOURCE_LABEL;
 use lsmgraph::DynamicGraphView;
@@ -348,10 +348,14 @@ async fn main() -> Result<()> {
             validation_params,
             max_lines,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
-            let report =
-                validate_ic1_ic14(engine, &data_dir, &validation_params, max_lines).await?;
+            let report = validate_ic1_ic14_dynamic(
+                &data_dir,
+                IoConfig::default(),
+                io_backend,
+                &validation_params,
+                max_lines,
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::SnbValidateBatch {
@@ -360,12 +364,11 @@ async fn main() -> Result<()> {
             queries,
             max_lines_per_query,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
             let query_list = parse_query_list(&queries);
-            let report = validate_ic_batch(
-                engine,
+            let report = validate_ic_batch_dynamic(
                 &data_dir,
+                IoConfig::default(),
+                io_backend,
                 &validation_dir,
                 &query_list,
                 max_lines_per_query,
@@ -378,10 +381,14 @@ async fn main() -> Result<()> {
             validation_params,
             max_lines,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
-            let report =
-                validate_mixed_tugraph(engine, &data_dir, &validation_params, max_lines).await?;
+            let report = validate_mixed_tugraph_dynamic(
+                &data_dir,
+                IoConfig::default(),
+                io_backend,
+                &validation_params,
+                max_lines,
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::SnbServer {

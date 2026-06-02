@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::base_graph::catalog::{BaseGraphCatalog, SingleColumnEntry};
 use crate::base_graph::column::{
-    read_ext_id_map, read_i64_column, read_string_column, read_u32_column,
+    read_ext_id_map, read_i64_column, read_string_column, read_u32_column, StringColumnReader,
 };
 use crate::base_graph::csr::{CsrAdjacency, ReadContext};
 use crate::base_graph::ids::{LabelId, MessageId};
@@ -266,6 +266,21 @@ impl BaseGraph {
             );
         }
         read_string_column(&self.base_dir.join(&entry.file))
+    }
+
+    pub fn open_string_property(&self, label: &str, name: &str) -> Result<StringColumnReader> {
+        let entry = self
+            .catalog
+            .vertex_properties
+            .get(&format!("{label}.{name}"))
+            .ok_or_else(|| anyhow::anyhow!("missing vertex property {label}.{name}"))?;
+        if entry.value_type != "string" {
+            anyhow::bail!(
+                "vertex property {label}.{name} is {}, expected string",
+                entry.value_type
+            );
+        }
+        StringColumnReader::open(&self.base_dir.join(&entry.file))
     }
 
     fn single_value(&self, name: &str, idx: u32) -> Option<u32> {

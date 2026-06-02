@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,33 +13,161 @@ use crate::snb::queries::{run_dgs_http_query, run_dgs_http_update};
 
 pub async fn start_dgs_compatible_server(snb: SnbGraph, bind: &str) -> Result<()> {
     let snb = Arc::new(RwLock::new(snb));
+    let metrics = Arc::new(ServerMetrics::default());
     let listener = TcpListener::bind(bind).await?;
     println!("{{\"server\":\"lsmgraph-snb\",\"bind\":\"{bind}\"}}");
     loop {
         let (stream, _) = listener.accept().await?;
         let snb = snb.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, snb).await {
+            if let Err(err) = handle_connection(stream, snb, metrics).await {
                 eprintln!("snb-server connection error: {err:#}");
             }
         });
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, snb: Arc<RwLock<SnbGraph>>) -> Result<()> {
+#[derive(Default)]
+struct ServerMetrics {
+    requests: AtomicU64,
+    queries: AtomicU64,
+    updates: AtomicU64,
+    errors: AtomicU64,
+    read_lock_wait_us: AtomicU64,
+    write_lock_wait_us: AtomicU64,
+    max_read_lock_wait_us: AtomicU64,
+    max_write_lock_wait_us: AtomicU64,
+    query_exec_us: AtomicU64,
+    update_exec_us: AtomicU64,
+    max_query_exec_us: AtomicU64,
+    max_update_exec_us: AtomicU64,
+}
+
+impl ServerMetrics {
+    fn reset(&self) {
+        for counter in [
+            &self.requests,
+            &self.queries,
+            &self.updates,
+            &self.errors,
+            &self.read_lock_wait_us,
+            &self.write_lock_wait_us,
+            &self.max_read_lock_wait_us,
+            &self.max_write_lock_wait_us,
+            &self.query_exec_us,
+            &self.update_exec_us,
+            &self.max_query_exec_us,
+            &self.max_update_exec_us,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        let queries = self.queries.load(Ordering::Relaxed);
+        let updates = self.updates.load(Ordering::Relaxed);
+        json!({
+            "requests": self.requests.load(Ordering::Relaxed),
+            "queries": queries,
+            "updates": updates,
+            "errors": self.errors.load(Ordering::Relaxed),
+            "read_lock_wait_us_total": self.read_lock_wait_us.load(Ordering::Relaxed),
+            "write_lock_wait_us_total": self.write_lock_wait_us.load(Ordering::Relaxed),
+            "read_lock_wait_us_avg": avg(self.read_lock_wait_us.load(Ordering::Relaxed), queries),
+            "write_lock_wait_us_avg": avg(self.write_lock_wait_us.load(Ordering::Relaxed), updates),
+            "read_lock_wait_us_max": self.max_read_lock_wait_us.load(Ordering::Relaxed),
+            "write_lock_wait_us_max": self.max_write_lock_wait_us.load(Ordering::Relaxed),
+            "query_exec_us_avg": avg(self.query_exec_us.load(Ordering::Relaxed), queries),
+            "update_exec_us_avg": avg(self.update_exec_us.load(Ordering::Relaxed), updates),
+            "query_exec_us_max": self.max_query_exec_us.load(Ordering::Relaxed),
+            "update_exec_us_max": self.max_update_exec_us.load(Ordering::Relaxed),
+        })
+    }
+
+    fn record_query(&self, lock_wait_us: u64, exec_us: u64, is_update: bool, ok: bool) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        if !ok {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if is_update {
+            self.updates.fetch_add(1, Ordering::Relaxed);
+            self.write_lock_wait_us
+                .fetch_add(lock_wait_us, Ordering::Relaxed);
+            self.update_exec_us.fetch_add(exec_us, Ordering::Relaxed);
+            update_max(&self.max_write_lock_wait_us, lock_wait_us);
+            update_max(&self.max_update_exec_us, exec_us);
+        } else {
+            self.queries.fetch_add(1, Ordering::Relaxed);
+            self.read_lock_wait_us
+                .fetch_add(lock_wait_us, Ordering::Relaxed);
+            self.query_exec_us.fetch_add(exec_us, Ordering::Relaxed);
+            update_max(&self.max_read_lock_wait_us, lock_wait_us);
+            update_max(&self.max_query_exec_us, exec_us);
+        }
+    }
+}
+
+fn avg(total: u64, count: u64) -> u64 {
+    if count == 0 {
+        0
+    } else {
+        total / count
+    }
+}
+
+fn update_max(max: &AtomicU64, value: u64) {
+    let mut current = max.load(Ordering::Relaxed);
+    while value > current {
+        match max.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+async fn handle_connection(
+    mut stream: TcpStream,
+    snb: Arc<RwLock<SnbGraph>>,
+    metrics: Arc<ServerMetrics>,
+) -> Result<()> {
     let request = read_http_request(&mut stream).await?;
     let response = match request {
         HttpRequest::Get { path } if path == "/" => {
             http_response(200, "application/json", br#"{"status":"ok"}"#.to_vec())
         }
+        HttpRequest::Get { path } if path == "/metrics" => http_response(
+            200,
+            "application/json",
+            serde_json::to_vec(&metrics.snapshot()).expect("serialize metrics"),
+        ),
+        HttpRequest::Post { path, .. } if path == "/metrics/reset" => {
+            metrics.reset();
+            http_response(200, "application/json", br#"{"status":"ok"}"#.to_vec())
+        }
         HttpRequest::Post { path, body } => {
             let params: Value = serde_json::from_slice(&body)?;
-            let result = if path.starts_with("/query/interactive_update_") {
+            let is_update = path.starts_with("/query/interactive_update_");
+            let lock_started = Instant::now();
+            let exec_started;
+            let result = if is_update {
                 let mut guard = snb.write().await;
-                run_dgs_http_update(&mut guard, &path, &params)
+                let lock_wait_us = lock_started.elapsed().as_micros() as u64;
+                exec_started = Instant::now();
+                let result = run_dgs_http_update(&mut guard, &path, &params);
+                let exec_us = exec_started.elapsed().as_micros() as u64;
+                metrics.record_query(lock_wait_us, exec_us, true, result.is_ok());
+                log_slow_request(&path, true, lock_wait_us, exec_us);
+                result
             } else {
                 let guard = snb.read().await;
-                run_dgs_http_query(&guard, &path, &params)
+                let lock_wait_us = lock_started.elapsed().as_micros() as u64;
+                exec_started = Instant::now();
+                let result = run_dgs_http_query(&guard, &path, &params);
+                let exec_us = exec_started.elapsed().as_micros() as u64;
+                metrics.record_query(lock_wait_us, exec_us, false, result.is_ok());
+                log_slow_request(&path, false, lock_wait_us, exec_us);
+                result
             };
             match result {
                 Ok(value) => http_response(
@@ -45,15 +175,26 @@ async fn handle_connection(mut stream: TcpStream, snb: Arc<RwLock<SnbGraph>>) ->
                     "application/json",
                     serde_json::to_vec(&value).expect("serialize query response"),
                 ),
-                Err(err) => http_response(
-                    500,
-                    "application/json",
-                    serde_json::to_vec(&json!({
-                        "error": err.to_string(),
-                        "path": path,
-                    }))
-                    .expect("serialize error response"),
-                ),
+                Err(err) => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "snb_request_error",
+                            "path": path,
+                            "kind": if is_update { "update" } else { "query" },
+                            "error": err.to_string(),
+                        })
+                    );
+                    http_response(
+                        500,
+                        "application/json",
+                        serde_json::to_vec(&json!({
+                            "error": err.to_string(),
+                            "path": path,
+                        }))
+                        .expect("serialize error response"),
+                    )
+                }
             }
         }
         HttpRequest::Get { path } => http_response(
@@ -66,6 +207,21 @@ async fn handle_connection(mut stream: TcpStream, snb: Arc<RwLock<SnbGraph>>) ->
     stream.write_all(&response).await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+fn log_slow_request(path: &str, is_update: bool, lock_wait_us: u64, exec_us: u64) {
+    if lock_wait_us >= 5_000 || exec_us >= 50_000 {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "snb_request_slow",
+                "path": path,
+                "kind": if is_update { "update" } else { "query" },
+                "lock_wait_us": lock_wait_us,
+                "exec_us": exec_us,
+            })
+        );
+    }
 }
 
 enum HttpRequest {

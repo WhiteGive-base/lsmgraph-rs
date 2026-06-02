@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
@@ -6,10 +8,13 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::base_graph::IoConfig;
+use crate::config::IoBackendKind;
 use crate::error::Result;
 use crate::graph::Engine;
 use crate::snb::props::{
-    encode_vid, CommentProps, EdgeProp, ForumProps, PersonProps, PostProps, SnbGraph, VertexData,
+    encode_vid, CommentProps, EdgeProp, ForumProps, MessageRef, PersonProps, PostProps, ReplyRef,
+    SnbGraph, VertexData,
 };
 use crate::types::{EdgeLabel, VertexId, VertexLabel};
 
@@ -296,6 +301,17 @@ pub async fn validate_ic1_ic14(
     validate_file_with_snb(&snb, validation_params, max_lines, None)
 }
 
+pub async fn validate_ic1_ic14_dynamic(
+    store_dir: &Path,
+    base_io: IoConfig,
+    io_backend: IoBackendKind,
+    validation_params: &Path,
+    max_lines: usize,
+) -> Result<ValidationReport> {
+    let snb = SnbGraph::open_dynamic(store_dir, base_io, io_backend).await?;
+    validate_file_with_snb(&snb, validation_params, max_lines, None)
+}
+
 pub async fn validate_ic_batch(
     engine: Arc<Engine>,
     store_dir: &Path,
@@ -351,6 +367,62 @@ pub async fn validate_ic_batch(
     })
 }
 
+pub async fn validate_ic_batch_dynamic(
+    store_dir: &Path,
+    base_io: IoConfig,
+    io_backend: IoBackendKind,
+    validation_dir: &Path,
+    queries: &[String],
+    max_lines_per_query: usize,
+) -> Result<BatchValidationReport> {
+    let snb = SnbGraph::open_dynamic(store_dir, base_io, io_backend).await?;
+    let mut reports = Vec::new();
+    for query in queries {
+        let query = query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            continue;
+        }
+        let path = validation_dir.join(format!("validation_params_{query}.csv"));
+        if !path.exists() {
+            reports.push(ValidationReport {
+                validation_params: path.display().to_string(),
+                max_lines: max_lines_per_query,
+                checked: 0,
+                passed: 0,
+                skipped: 0,
+                failed: 1,
+                supported_queries: supported_query_names(),
+                first_failure: Some(json!({
+                    "error": "validation split file not found",
+                    "query": query,
+                    "path": path,
+                })),
+            });
+            continue;
+        }
+        reports.push(validate_file_with_snb(
+            &snb,
+            &path,
+            max_lines_per_query,
+            Some(&query),
+        )?);
+    }
+
+    let checked = reports.iter().map(|r| r.checked).sum();
+    let passed = reports.iter().map(|r| r.passed).sum();
+    let skipped = reports.iter().map(|r| r.skipped).sum();
+    let failed = reports.iter().map(|r| r.failed).sum();
+    Ok(BatchValidationReport {
+        validation_dir: validation_dir.display().to_string(),
+        max_lines_per_query,
+        reports,
+        checked,
+        passed,
+        skipped,
+        failed,
+    })
+}
+
 pub async fn validate_mixed_tugraph(
     engine: Arc<Engine>,
     store_dir: &Path,
@@ -358,6 +430,17 @@ pub async fn validate_mixed_tugraph(
     max_lines: usize,
 ) -> Result<MixedValidationReport> {
     let mut snb = SnbGraph::open(engine, store_dir).await?;
+    validate_mixed_file_with_snb(&mut snb, validation_params, max_lines)
+}
+
+pub async fn validate_mixed_tugraph_dynamic(
+    store_dir: &Path,
+    base_io: IoConfig,
+    io_backend: IoBackendKind,
+    validation_params: &Path,
+    max_lines: usize,
+) -> Result<MixedValidationReport> {
+    let mut snb = SnbGraph::open_dynamic(store_dir, base_io, io_backend).await?;
     validate_mixed_file_with_snb(&mut snb, validation_params, max_lines)
 }
 
@@ -421,6 +504,12 @@ fn validate_mixed_file_with_snb(
                     "actual": actual,
                 }));
             }
+        }
+
+        if processed % 1000 == 0 {
+            eprintln!(
+                "[snb-validate-mixed] processed={processed} reads_checked={reads_checked} reads_passed={reads_passed} updates_applied={updates_applied} skipped={skipped} failed={failed}"
+            );
         }
     }
 
@@ -507,8 +596,8 @@ pub fn supported_query_names() -> Vec<&'static str> {
 }
 
 fn update_endpoint_for_params(params: &Value) -> Option<&'static str> {
-    if params.get("firstName").is_some()
-        && params.get("lastName").is_some()
+    if (params.get("firstName").is_some() || params.get("personFirstName").is_some())
+        && (params.get("lastName").is_some() || params.get("personLastName").is_some())
         && params.get("birthday").is_some()
     {
         Some("/query/interactive_update_1")
@@ -1056,16 +1145,16 @@ pub fn run_dgs_http_update(snb: &mut SnbGraph, endpoint: &str, params: &Value) -
             let person_vid = encode_vid(VertexLabel::Person, person_id);
             snb.insert_vertex(VertexData::Person(PersonProps {
                 id: person_id,
-                first_name: req_str(params, "firstName").to_string(),
-                last_name: req_str(params, "lastName").to_string(),
+                first_name: req_str_any(params, &["firstName", "personFirstName"]).to_string(),
+                last_name: req_str_any(params, &["lastName", "personLastName"]).to_string(),
                 gender: req_str(params, "gender").to_string(),
                 birthday: req_i64(params, "birthday"),
                 creation_date: req_i64(params, "creationDate"),
                 location_ip: req_str(params, "locationIp").to_string(),
                 browser_used: req_str(params, "browserUsed").to_string(),
                 place: req_i64(params, "cityId"),
-                language: req_str(params, "language").to_string(),
-                email: req_str(params, "email").to_string(),
+                language: req_string_or_array_join(params, "language", "languages"),
+                email: req_string_or_array_join(params, "email", "emails"),
             }));
             snb.insert_edge_cached(
                 person_vid,
@@ -1088,7 +1177,7 @@ pub fn run_dgs_http_update(snb: &mut SnbGraph, endpoint: &str, params: &Value) -
                     person_vid,
                     encode_vid(VertexLabel::Organisation, req_i64(org, "organizationId")),
                     EdgeLabel::StudyAt,
-                    EdgeProp::I32(req_i64(org, "classYear") as i32),
+                    EdgeProp::I32(req_i64_any(org, &["classYear", "year"]) as i32),
                     true,
                 );
             }
@@ -1097,7 +1186,7 @@ pub fn run_dgs_http_update(snb: &mut SnbGraph, endpoint: &str, params: &Value) -
                     person_vid,
                     encode_vid(VertexLabel::Organisation, req_i64(org, "organizationId")),
                     EdgeLabel::WorkAt,
-                    EdgeProp::I32(req_i64(org, "workFromYear") as i32),
+                    EdgeProp::I32(req_i64_any(org, &["workFromYear", "year"]) as i32),
                     true,
                 );
             }
@@ -1384,12 +1473,9 @@ fn ic2(snb: &SnbGraph, person_id: i64, max_date: i64, limit: usize) -> Vec<Ic2Ro
     let friends: HashSet<VertexId> = knows_neighbors(snb, start).into_iter().collect();
     let mut rows: Vec<(i64, i64, VertexId, VertexId)> = Vec::new();
     for friend in friends {
-        for msg in in_messages_creators(snb, friend) {
-            let Some((msg_id, creation_date, _content)) = message_summary(snb, msg) else {
-                continue;
-            };
-            if creation_date <= max_date {
-                rows.push((creation_date, msg_id, msg, friend));
+        for msg in message_refs_by_creator(snb, friend) {
+            if msg.creation_date <= max_date {
+                rows.push((msg.creation_date, msg.id, msg.vid, friend));
             }
         }
     }
@@ -1559,9 +1645,16 @@ fn ic5(snb: &SnbGraph, person_id: i64, min_date: i64, limit: usize) -> Vec<Ic5Ro
             continue;
         }
         for post_vid in in_posts_creators(snb, friend) {
-            for forum_vid in snb.in_neighbors_cached(post_vid, EdgeLabel::ContainerOf) {
+            if let Some(post) = snb.post(post_vid) {
+                let forum_vid = encode_vid(VertexLabel::Forum, post.forum_id);
                 if qual_forums.contains(&forum_vid) {
                     *forum_posts.get_mut(&forum_vid).unwrap() += 1;
+                }
+            } else {
+                for forum_vid in snb.in_neighbors_cached(post_vid, EdgeLabel::ContainerOf) {
+                    if qual_forums.contains(&forum_vid) {
+                        *forum_posts.get_mut(&forum_vid).unwrap() += 1;
+                    }
                 }
             }
         }
@@ -1640,28 +1733,25 @@ fn ic7(snb: &SnbGraph, person_id: i64, limit: usize) -> Vec<Ic7Row> {
     let knows_set: HashSet<VertexId> = knows_neighbors(snb, person_vid).into_iter().collect();
     let mut liker_best: HashMap<VertexId, (i64, i64, i64, VertexId)> = HashMap::new();
 
-    for msg_vid in in_messages_creators(snb, person_vid) {
-        let Some((msg_id, msg_creation_date, _content)) = message_summary(snb, msg_vid) else {
-            continue;
-        };
-        for (liker, prop) in snb.in_edges_with_prop(msg_vid, EdgeLabel::LikesPost) {
+    for msg in message_refs_by_creator(snb, person_vid) {
+        for (liker, prop) in snb.in_edges_with_prop(msg.vid, EdgeLabel::LikesPost) {
             keep_best_like(
                 &mut liker_best,
                 liker,
                 prop.as_i64(),
-                msg_id,
-                msg_creation_date,
-                msg_vid,
+                msg.id,
+                msg.creation_date,
+                msg.vid,
             );
         }
-        for (liker, prop) in snb.in_edges_with_prop(msg_vid, EdgeLabel::LikesComment) {
+        for (liker, prop) in snb.in_edges_with_prop(msg.vid, EdgeLabel::LikesComment) {
             keep_best_like(
                 &mut liker_best,
                 liker,
                 prop.as_i64(),
-                msg_id,
-                msg_creation_date,
-                msg_vid,
+                msg.id,
+                msg.creation_date,
+                msg.vid,
             );
         }
     }
@@ -1695,27 +1785,34 @@ fn ic7(snb: &SnbGraph, person_id: i64, limit: usize) -> Vec<Ic7Row> {
 
 fn ic8(snb: &SnbGraph, person_id: i64, limit: usize) -> Vec<Ic8Row> {
     let person_vid = encode_vid(VertexLabel::Person, person_id);
-    if snb.person(person_vid).is_none() {
+    if limit == 0 || snb.person(person_vid).is_none() {
         return Vec::new();
     }
-    let mut rows = Vec::new();
-    for msg_vid in snb.in_neighbors_cached(person_vid, EdgeLabel::HasCreator) {
-        for reply_vid in snb
-            .in_neighbors_cached(msg_vid, EdgeLabel::ReplyOfPost)
-            .into_iter()
-            .chain(snb.in_neighbors_cached(msg_vid, EdgeLabel::ReplyOfComment))
-        {
-            let Some(comment) = snb.comment(reply_vid) else {
-                continue;
-            };
-            rows.push((comment.creation_date, comment.id, reply_vid));
+    let mut top: BinaryHeap<Reverse<(i64, Reverse<i64>, VertexId)>> = BinaryHeap::new();
+    for reply in reply_refs_by_parent_creator(snb, person_vid) {
+        let key = (
+            reply.creation_date,
+            Reverse(reply.comment_id),
+            reply.reply_vid,
+        );
+        if top.len() < limit {
+            top.push(Reverse(key));
+        } else if let Some(worst) = top.peek() {
+            if key > worst.0 {
+                top.pop();
+                top.push(Reverse(key));
+            }
         }
     }
+    let mut rows: Vec<_> = top
+        .into_iter()
+        .map(|Reverse((creation_date, Reverse(comment_id), reply_vid))| {
+            (creation_date, comment_id, reply_vid)
+        })
+        .collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    rows.truncate(limit);
     rows.into_iter()
         .filter_map(|(creation_date, comment_id, reply_vid)| {
-            let comment = snb.comment(reply_vid)?;
             let creator = message_creator_vid(snb, reply_vid)?;
             let person = snb.person(creator)?;
             Some(Ic8Row {
@@ -1724,7 +1821,7 @@ fn ic8(snb: &SnbGraph, person_id: i64, limit: usize) -> Vec<Ic8Row> {
                 person_last_name: person.last_name.clone(),
                 comment_creation_date: creation_date,
                 comment_id,
-                comment_content: comment.content.clone(),
+                comment_content: snb.comment_content(reply_vid).unwrap_or_default(),
             })
         })
         .collect()
@@ -1739,13 +1836,10 @@ fn ic9(snb: &SnbGraph, person_id: i64, max_date: i64, limit: usize) -> Vec<Ic9Ro
     let mut friend_of_msg: HashMap<VertexId, VertexId> = HashMap::new();
     let mut rows = Vec::new();
     for friend in friends {
-        for msg in in_messages_creators(snb, friend) {
-            let Some((msg_id, creation_date, _content)) = message_summary(snb, msg) else {
-                continue;
-            };
-            if creation_date < max_date {
-                rows.push((creation_date, msg_id, msg));
-                friend_of_msg.insert(msg, friend);
+        for msg in message_refs_by_creator(snb, friend) {
+            if msg.creation_date < max_date {
+                rows.push((msg.creation_date, msg.id, msg.vid));
+                friend_of_msg.insert(msg.vid, friend);
             }
         }
     }
@@ -2059,43 +2153,45 @@ fn is1(snb: &SnbGraph, person_id: i64) -> Option<Is1Row> {
 
 fn is2(snb: &SnbGraph, person_id: i64, limit: usize) -> Vec<Is2Row> {
     let person_vid = encode_vid(VertexLabel::Person, person_id);
-    if snb.person(person_vid).is_none() {
+    if limit == 0 || snb.person(person_vid).is_none() {
         return Vec::new();
     }
-    let mut rows = Vec::new();
-    for msg_vid in in_messages_creators(snb, person_vid) {
-        let Some((message_id, creation_date, content)) = message_summary(snb, msg_vid) else {
-            continue;
-        };
-        let Some(post_vid) = root_post_vid(snb, msg_vid) else {
-            continue;
-        };
-        let Some(post) = snb.post(post_vid) else {
-            continue;
-        };
-        let Some(author_vid) = message_creator_vid(snb, post_vid) else {
-            continue;
-        };
-        let Some(author) = snb.person(author_vid) else {
-            continue;
-        };
-        rows.push(Is2Row {
-            message_id,
-            message_content: content,
-            message_creation_date: creation_date,
-            original_post_id: post.id,
-            original_post_author_id: author.id,
-            original_post_author_first_name: author.first_name.clone(),
-            original_post_author_last_name: author.last_name.clone(),
-        });
+    let mut top: BinaryHeap<Reverse<(i64, Reverse<i64>, VertexId)>> = BinaryHeap::new();
+    for msg in message_refs_by_creator(snb, person_vid) {
+        let key = (msg.creation_date, Reverse(msg.id), msg.vid);
+        if top.len() < limit {
+            top.push(Reverse(key));
+        } else if let Some(worst) = top.peek() {
+            if key > worst.0 {
+                top.pop();
+                top.push(Reverse(key));
+            }
+        }
     }
-    rows.sort_by(|a, b| {
-        b.message_creation_date
-            .cmp(&a.message_creation_date)
-            .then_with(|| a.message_id.cmp(&b.message_id))
-    });
-    rows.truncate(limit);
-    rows
+    let mut rows: Vec<_> = top
+        .into_iter()
+        .map(|Reverse((creation_date, Reverse(message_id), msg_vid))| {
+            (creation_date, message_id, msg_vid)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    rows.into_iter()
+        .filter_map(|(creation_date, message_id, msg_vid)| {
+            let post_vid = root_post_vid(snb, msg_vid)?;
+            let post = snb.post(post_vid)?;
+            let author_vid = message_creator_vid(snb, post_vid)?;
+            let author = snb.person(author_vid)?;
+            Some(Is2Row {
+                message_id,
+                message_content: message_content(snb, msg_vid),
+                message_creation_date: creation_date,
+                original_post_id: post.id,
+                original_post_author_id: author.id,
+                original_post_author_first_name: author.first_name.clone(),
+                original_post_author_last_name: author.last_name.clone(),
+            })
+        })
+        .collect()
 }
 
 fn is3(snb: &SnbGraph, person_id: i64) -> Vec<Is3Row> {
@@ -2147,14 +2243,19 @@ fn is6(snb: &SnbGraph, message_id: i64) -> Option<Is6Row> {
     let msg_vid = message_vid(snb, message_id)?;
     let post_vid = root_post_vid(snb, msg_vid)?;
     let forum_vid = snb
-        .in_neighbors_cached(post_vid, EdgeLabel::ContainerOf)
-        .first()
-        .copied()?;
+        .post(post_vid)
+        .map(|post| encode_vid(VertexLabel::Forum, post.forum_id))
+        .or_else(|| {
+            snb.in_neighbors_cached(post_vid, EdgeLabel::ContainerOf)
+                .first()
+                .copied()
+        })?;
     let forum = snb.forum(forum_vid)?;
-    let moderator_vid = snb
-        .out_neighbors_cached(forum_vid, EdgeLabel::HasModerator)
-        .first()
-        .copied()?;
+    let moderator_vid = Some(encode_vid(VertexLabel::Person, forum.moderator)).or_else(|| {
+        snb.out_neighbors_cached(forum_vid, EdgeLabel::HasModerator)
+            .first()
+            .copied()
+    })?;
     let moderator = snb.person(moderator_vid)?;
     Some(Is6Row {
         forum_id: forum.id,
@@ -2205,6 +2306,29 @@ fn req_i64_any(params: &Value, keys: &[&str]) -> i64 {
 
 fn req_str<'a>(params: &'a Value, key: &str) -> &'a str {
     params[key].as_str().unwrap_or_default()
+}
+
+fn req_str_any<'a>(params: &'a Value, keys: &[&str]) -> &'a str {
+    keys.iter()
+        .find_map(|key| params.get(*key).and_then(Value::as_str))
+        .unwrap_or_default()
+}
+
+fn req_string_or_array_join(params: &Value, string_key: &str, array_key: &str) -> String {
+    if let Some(value) = params.get(string_key).and_then(Value::as_str) {
+        return value.to_string();
+    }
+    params
+        .get(array_key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(";")
+        })
+        .unwrap_or_default()
 }
 
 fn req_i64_array(params: &Value, key: &str) -> Vec<i64> {
@@ -2293,6 +2417,9 @@ fn in_posts_creators(snb: &SnbGraph, person_vid: VertexId) -> Vec<VertexId> {
 }
 
 fn in_messages_creators(snb: &SnbGraph, person_vid: VertexId) -> Vec<VertexId> {
+    if let Some(messages) = snb.message_refs_by_creator_date(person_vid) {
+        return messages.into_iter().map(|msg| msg.vid).collect();
+    }
     snb.in_neighbors_cached(person_vid, EdgeLabel::HasCreator)
         .into_iter()
         .filter(|&vid| {
@@ -2304,7 +2431,59 @@ fn in_messages_creators(snb: &SnbGraph, person_vid: VertexId) -> Vec<VertexId> {
         .collect()
 }
 
+fn message_refs_by_creator(snb: &SnbGraph, person_vid: VertexId) -> Vec<MessageRef> {
+    if let Some(messages) = snb.message_refs_by_creator_date(person_vid) {
+        return messages;
+    }
+    in_messages_creators(snb, person_vid)
+        .into_iter()
+        .filter_map(|vid| {
+            let (id, creation_date) = message_identity(snb, vid)?;
+            Some(MessageRef {
+                vid,
+                id,
+                creation_date,
+            })
+        })
+        .collect()
+}
+
+fn reply_refs_by_parent_creator(snb: &SnbGraph, person_vid: VertexId) -> Vec<ReplyRef> {
+    if let Some(replies) = snb.reply_refs_by_parent_creator_date(person_vid) {
+        return replies;
+    }
+    let mut out = Vec::new();
+    for msg_vid in in_messages_creators(snb, person_vid) {
+        for reply_vid in snb
+            .in_neighbors_cached(msg_vid, EdgeLabel::ReplyOfPost)
+            .into_iter()
+            .chain(snb.in_neighbors_cached(msg_vid, EdgeLabel::ReplyOfComment))
+        {
+            let Some(comment) = snb.comment(reply_vid) else {
+                continue;
+            };
+            out.push(ReplyRef {
+                reply_vid,
+                comment_id: comment.id,
+                creation_date: comment.creation_date,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.creation_date
+            .cmp(&a.creation_date)
+            .then_with(|| a.comment_id.cmp(&b.comment_id))
+    });
+    out
+}
+
 fn message_creator_vid(snb: &SnbGraph, msg_vid: VertexId) -> Option<VertexId> {
+    if let Some(post) = snb.post(msg_vid) {
+        return Some(encode_vid(VertexLabel::Person, post.creator));
+    }
+    if let Some(comment) = snb.comment(msg_vid) {
+        return Some(encode_vid(VertexLabel::Person, comment.creator));
+    }
     snb.out_neighbors_cached(msg_vid, EdgeLabel::HasCreator)
         .first()
         .copied()
@@ -2323,15 +2502,16 @@ fn message_vid(snb: &SnbGraph, message_id: i64) -> Option<VertexId> {
 }
 
 fn message_summary(snb: &SnbGraph, msg_vid: VertexId) -> Option<(i64, i64, String)> {
+    let (id, creation_date) = message_identity(snb, msg_vid)?;
+    Some((id, creation_date, message_content(snb, msg_vid)))
+}
+
+fn message_identity(snb: &SnbGraph, msg_vid: VertexId) -> Option<(i64, i64)> {
     if let Some(comment) = snb.comment(msg_vid) {
-        Some((comment.id, comment.creation_date, comment.content.clone()))
+        Some((comment.id, comment.creation_date))
     } else {
         let post = snb.post(msg_vid)?;
-        Some((
-            post.id,
-            post.creation_date,
-            post.content_or_image().to_string(),
-        ))
+        Some((post.id, post.creation_date))
     }
 }
 
@@ -2342,6 +2522,15 @@ fn root_post_vid(snb: &SnbGraph, msg_vid: VertexId) -> Option<VertexId> {
     let mut current = msg_vid;
     let mut seen = HashSet::new();
     while seen.insert(current) {
+        if let Some(comment) = snb.comment(current) {
+            if let Some(post_id) = comment.reply_of_post {
+                return Some(encode_vid(VertexLabel::Post, post_id));
+            }
+            if let Some(comment_id) = comment.reply_of_comment {
+                current = encode_vid(VertexLabel::Comment, comment_id);
+                continue;
+            }
+        }
         if let Some(post_vid) = snb
             .out_neighbors_cached(current, EdgeLabel::ReplyOfPost)
             .first()
@@ -2374,7 +2563,7 @@ fn collect_is7_reply(
     };
     out.push(Is7Row {
         comment_id: comment.id,
-        comment_content: comment.content.clone(),
+        comment_content: snb.comment_content(reply_vid).unwrap_or_default(),
         comment_creation_date: comment.creation_date,
         reply_author_id: author.id,
         reply_author_first_name: author.first_name.clone(),
@@ -2384,12 +2573,13 @@ fn collect_is7_reply(
 }
 
 fn message_content(snb: &SnbGraph, msg_vid: VertexId) -> String {
-    message_summary(snb, msg_vid)
-        .map(|(_, _, content)| content)
-        .unwrap_or_default()
+    snb.message_content(msg_vid).unwrap_or_default()
 }
 
 fn person_city_name(snb: &SnbGraph, person_vid: VertexId) -> String {
+    if let Some(person) = snb.person(person_vid) {
+        return snb.place_name(encode_vid(VertexLabel::Place, person.place));
+    }
     snb.out_neighbors_cached(person_vid, EdgeLabel::IsLocatedIn)
         .first()
         .map(|&place| snb.place_name(place))
@@ -2402,15 +2592,19 @@ fn org_entries(snb: &SnbGraph, person_vid: VertexId, edge_label: EdgeLabel) -> V
         let year = snb
             .edge_prop_by_type(person_vid, edge_label.as_i32(), org_vid)
             .as_i32();
-        let org_name = snb
-            .organisation(org_vid)
-            .map(|o| o.name.clone())
-            .unwrap_or_default();
-        let place_name = snb
-            .out_neighbors_cached(org_vid, EdgeLabel::IsLocatedIn)
-            .first()
-            .map(|&place| snb.place_name(place))
-            .unwrap_or_default();
+        let (org_name, place_name) = if let Some(org) = snb.organisation(org_vid) {
+            (
+                org.name.clone(),
+                snb.place_name(encode_vid(VertexLabel::Place, org.place)),
+            )
+        } else {
+            let place_name = snb
+                .out_neighbors_cached(org_vid, EdgeLabel::IsLocatedIn)
+                .first()
+                .map(|&place| snb.place_name(place))
+                .unwrap_or_default();
+            (String::new(), place_name)
+        };
         rows.push(OrgJson {
             organization_name: org_name,
             year,
@@ -2428,24 +2622,15 @@ fn org_entries(snb: &SnbGraph, person_vid: VertexId, edge_label: EdgeLabel) -> V
 }
 
 fn find_country_vid(snb: &SnbGraph, country_name: &str) -> Option<VertexId> {
-    snb.vertices_by_label(VertexLabel::Place).find(|&vid| {
-        snb.place(vid)
-            .map(|p| p.name == country_name && p.place_type == "country")
-            .unwrap_or(false)
-    })
+    snb.country_by_name(country_name)
 }
 
 fn find_tag_vid(snb: &SnbGraph, tag_name: &str) -> Option<VertexId> {
-    snb.vertices_by_label(VertexLabel::Tag)
-        .find(|&vid| snb.tag(vid).map(|t| t.name == tag_name).unwrap_or(false))
+    snb.tag_by_name(tag_name)
 }
 
 fn find_tag_class_vid(snb: &SnbGraph, tag_class_name: &str) -> Option<VertexId> {
-    snb.vertices_by_label(VertexLabel::TagClass).find(|&vid| {
-        snb.tag_class(vid)
-            .map(|t| t.name == tag_class_name)
-            .unwrap_or(false)
-    })
+    snb.tag_class_by_name(tag_class_name)
 }
 
 fn collect_xy_persons(
@@ -2455,8 +2640,8 @@ fn collect_xy_persons(
 ) -> HashSet<VertexId> {
     let mut out = HashSet::new();
     for country in country_x.into_iter().chain(country_y) {
-        for city in snb.in_neighbors_cached(country, EdgeLabel::IsPartOf) {
-            for person in snb.in_neighbors_cached(city, EdgeLabel::IsLocatedIn) {
+        for place in place_descendants_inclusive(snb, country) {
+            for person in snb.in_neighbors_cached(place, EdgeLabel::IsLocatedIn) {
                 if snb.vertex_label(person) == Some(VertexLabel::Person) {
                     out.insert(person);
                 }
@@ -2502,27 +2687,47 @@ fn place_incoming_messages(
     end_date: i64,
 ) -> Vec<(VertexId, u8, i64, VertexId)> {
     let mut out = Vec::new();
-    for msg_vid in snb.in_neighbors_cached(place_vid, EdgeLabel::IsLocatedIn) {
-        match snb.vertex_label(msg_vid) {
-            Some(VertexLabel::Post) => {
-                if let Some(post) = snb.post(msg_vid) {
-                    if post.creation_date >= start_date && post.creation_date < end_date {
-                        if let Some(creator) = message_creator_vid(snb, msg_vid) {
-                            out.push((msg_vid, 1, post.creation_date, creator));
+    for place in place_descendants_inclusive(snb, place_vid) {
+        for msg_vid in snb.in_neighbors_cached(place, EdgeLabel::IsLocatedIn) {
+            match snb.vertex_label(msg_vid) {
+                Some(VertexLabel::Post) => {
+                    if let Some(post) = snb.post(msg_vid) {
+                        if post.creation_date >= start_date && post.creation_date < end_date {
+                            if let Some(creator) = message_creator_vid(snb, msg_vid) {
+                                out.push((msg_vid, 1, post.creation_date, creator));
+                            }
                         }
                     }
                 }
-            }
-            Some(VertexLabel::Comment) => {
-                if let Some(comment) = snb.comment(msg_vid) {
-                    if comment.creation_date >= start_date && comment.creation_date < end_date {
-                        if let Some(creator) = message_creator_vid(snb, msg_vid) {
-                            out.push((msg_vid, 2, comment.creation_date, creator));
+                Some(VertexLabel::Comment) => {
+                    if let Some(comment) = snb.comment(msg_vid) {
+                        if comment.creation_date >= start_date && comment.creation_date < end_date {
+                            if let Some(creator) = message_creator_vid(snb, msg_vid) {
+                                out.push((msg_vid, 2, comment.creation_date, creator));
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
+        }
+    }
+    out
+}
+
+fn place_descendants_inclusive(snb: &SnbGraph, root: VertexId) -> Vec<VertexId> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([root]);
+    while let Some(place) = queue.pop_front() {
+        if !seen.insert(place) {
+            continue;
+        }
+        out.push(place);
+        for child in snb.in_neighbors_cached(place, EdgeLabel::IsPartOf) {
+            if snb.vertex_label(child) == Some(VertexLabel::Place) {
+                queue.push_back(child);
+            }
         }
     }
     out

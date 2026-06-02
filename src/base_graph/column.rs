@@ -1,6 +1,10 @@
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::error::Result;
 
@@ -173,6 +177,99 @@ pub fn read_string_column(path_prefix: &Path) -> Result<Vec<String>> {
         out.push(String::from_utf8(blob[start..end].to_vec())?);
     }
     Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub struct StringColumnReader {
+    offsets: Vec<u64>,
+    blob_path: PathBuf,
+    file: Arc<Mutex<File>>,
+    cache: Arc<Mutex<StringColumnCache>>,
+}
+
+#[derive(Debug)]
+struct StringColumnCache {
+    max_items: usize,
+    values: HashMap<usize, String>,
+    order: VecDeque<usize>,
+}
+
+impl StringColumnCache {
+    fn new(max_items: usize) -> Self {
+        Self {
+            max_items,
+            values: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, idx: usize) -> Option<String> {
+        self.values.get(&idx).cloned()
+    }
+
+    fn insert(&mut self, idx: usize, value: String) {
+        if self.values.contains_key(&idx) {
+            self.values.insert(idx, value);
+            return;
+        }
+        self.values.insert(idx, value);
+        self.order.push_back(idx);
+        while self.values.len() > self.max_items {
+            if let Some(evict) = self.order.pop_front() {
+                self.values.remove(&evict);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+impl StringColumnReader {
+    pub fn open(path_prefix: &Path) -> Result<Self> {
+        let blob_path = path_prefix.with_extension("blob");
+        Ok(Self {
+            offsets: read_u64_column(&path_prefix.with_extension("offsets"))?,
+            file: Arc::new(Mutex::new(File::open(&blob_path)?)),
+            blob_path,
+            cache: Arc::new(Mutex::new(StringColumnCache::new(8192))),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn get(&self, idx: usize) -> Result<String> {
+        if let Some(value) = self.cache.lock().get(idx) {
+            return Ok(value);
+        }
+        if idx + 1 >= self.offsets.len() {
+            anyhow::bail!(
+                "string column {} index {} out of bounds len {}",
+                self.blob_path.display(),
+                idx,
+                self.len()
+            );
+        }
+        let start = self.offsets[idx];
+        let end = self.offsets[idx + 1];
+        if end < start {
+            anyhow::bail!(
+                "string column {} has invalid offset range {}..{}",
+                self.blob_path.display(),
+                start,
+                end
+            );
+        }
+        let len = (end - start) as usize;
+        let mut file = self.file.lock();
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0u8; len];
+        file.read_exact(&mut bytes)?;
+        let value = String::from_utf8(bytes)?;
+        self.cache.lock().insert(idx, value.clone());
+        Ok(value)
+    }
 }
 
 pub fn read_ext_id_map(path: &Path) -> Result<Vec<(i64, u32)>> {

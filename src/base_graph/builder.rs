@@ -1220,8 +1220,9 @@ fn build_bidirectional_csr(
     let mut out_edges = Vec::new();
     let mut in_edges = Vec::new();
     scan_csv(csv_path, |header, record| {
-        let src = src_map.get(parse_i64(record, idx(header, src_col)?)?)?;
-        let dst = dst_map.get(parse_i64(record, idx(header, dst_col)?)?)?;
+        let (src_idx, dst_idx) = idx_pair(header, src_col, dst_col)?;
+        let src = src_map.get(parse_i64(record, src_idx)?)?;
+        let dst = dst_map.get(parse_i64(record, dst_idx)?)?;
         out_edges.push((src, dst));
         in_edges.push((dst, src));
         Ok(())
@@ -1272,8 +1273,9 @@ fn build_bidirectional_csr_i64_prop(
     let mut out_edges = Vec::new();
     let mut in_edges = Vec::new();
     scan_csv(csv_path, |header, record| {
-        let src = src_map.get(parse_i64(record, idx(header, src_col)?)?)?;
-        let dst = dst_map.get(parse_i64(record, idx(header, dst_col)?)?)?;
+        let (src_idx, dst_idx) = idx_pair(header, src_col, dst_col)?;
+        let src = src_map.get(parse_i64(record, src_idx)?)?;
+        let dst = dst_map.get(parse_i64(record, dst_idx)?)?;
         let prop = parse_i64(record, idx(header, prop_col)?)?;
         out_edges.push((src, dst, prop));
         in_edges.push((dst, src, prop));
@@ -1329,8 +1331,9 @@ fn build_bidirectional_csr_i32_prop(
     let mut out_edges = Vec::new();
     let mut in_edges = Vec::new();
     scan_csv(csv_path, |header, record| {
-        let src = src_map.get(parse_i64(record, idx(header, src_col)?)?)?;
-        let dst = dst_map.get(parse_i64(record, idx(header, dst_col)?)?)?;
+        let (src_idx, dst_idx) = idx_pair(header, src_col, dst_col)?;
+        let src = src_map.get(parse_i64(record, src_idx)?)?;
+        let dst = dst_map.get(parse_i64(record, dst_idx)?)?;
         let prop = parse_i64(record, idx(header, prop_col)?)? as i32;
         out_edges.push((src, dst, prop));
         in_edges.push((dst, src, prop));
@@ -1478,7 +1481,7 @@ fn write_csr_i32_prop_entry(
         &output_dir.join(rel),
         num_src,
         edges,
-        SortOrder::DstId,
+        SortOrder::Unsorted,
         prop_file,
     )?;
     catalog.csr_adjacencies.insert(
@@ -1492,7 +1495,7 @@ fn write_csr_i32_prop_entry(
             num_edges: edge_count,
             offset_type: "u64".to_string(),
             neighbor_type: "u32".to_string(),
-            sort_order: "dst_id".to_string(),
+            sort_order: SortOrder::Unsorted.as_str().to_string(),
             prop_access: "aligned".to_string(),
             props: vec![CsrPropEntry {
                 name: prop_name.to_string(),
@@ -1620,6 +1623,23 @@ fn idx(header: &StringRecord, name: &str) -> Result<usize> {
         .iter()
         .position(|candidate| candidate == name)
         .ok_or_else(|| anyhow::anyhow!("missing column {name} in {:?}", header))
+}
+
+fn idx_pair(header: &StringRecord, first: &str, second: &str) -> Result<(usize, usize)> {
+    if first != second {
+        return Ok((idx(header, first)?, idx(header, second)?));
+    }
+    let mut matches = header
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, candidate)| (candidate == first).then_some(idx));
+    let first_idx = matches
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing column {first} in {:?}", header))?;
+    let second_idx = matches
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing second column {second} in {:?}", header))?;
+    Ok((first_idx, second_idx))
 }
 
 fn parse_i64(record: &StringRecord, idx: usize) -> Result<i64> {
