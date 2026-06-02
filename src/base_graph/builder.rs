@@ -142,12 +142,25 @@ fn build_id_maps(
     ] {
         let rel = format!("vertices/{}/ext_id_to_local.idx", label.as_str());
         write_ext_id_map(&output_dir.join(&rel), &map.ordered_pairs)?;
+        let sorted_rel = format!("vertices/{}/ext_id_to_local.sorted.idx", label.as_str());
+        let mut sorted_pairs = map.ordered_pairs.clone();
+        sorted_pairs.sort_unstable_by_key(|(external, _)| *external);
+        write_ext_id_map(&output_dir.join(&sorted_rel), &sorted_pairs)?;
+        let local_rel = format!("vertices/{}/local_to_external.col", label.as_str());
+        let local_to_external: Vec<i64> = map
+            .ordered_pairs
+            .iter()
+            .map(|(external, _)| *external)
+            .collect();
+        write_i64_column(&output_dir.join(&local_rel), &local_to_external)?;
         catalog.vertex_labels.insert(
             label.as_str().to_string(),
             VertexCatalogEntry {
                 label: label.as_str().to_string(),
                 count: map.len() as u64,
                 ext_id_to_local: rel,
+                ext_id_to_local_sorted: Some(sorted_rel),
+                local_to_external: Some(local_rel),
             },
         );
         stats

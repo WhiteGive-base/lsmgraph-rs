@@ -13,8 +13,8 @@ use crate::config::IoBackendKind;
 use crate::error::Result;
 use crate::graph::Engine;
 use crate::snb::props::{
-    encode_vid, CommentProps, EdgeProp, ForumProps, MessageRef, PersonProps, PostProps, ReplyRef,
-    SnbGraph, VertexData,
+    encode_vid, CommentProps, EdgeProp, ForumProps, MessageRef, PersonProps, PostProps, SnbGraph,
+    VertexData,
 };
 use crate::types::{EdgeLabel, VertexId, VertexLabel};
 
@@ -1518,24 +1518,26 @@ fn ic3(
     if non_xy_persons.is_empty() {
         return Vec::new();
     }
+    let country_x_places = country_x
+        .map(|country| place_descendants_set(snb, country))
+        .unwrap_or_default();
+    let country_y_places = country_y
+        .map(|country| place_descendants_set(snb, country))
+        .unwrap_or_default();
 
-    if let Some(country) = country_x {
-        for (_msg, _kind, _date, creator) in
-            place_incoming_messages(snb, country, start_date, end_date)
-        {
-            if non_xy_persons.contains(&creator) {
-                counts.entry(creator).or_insert((0, 0)).0 += 1;
+    for &creator in &non_xy_persons {
+        snb.for_each_message_ref_by_creator_date_range(creator, start_date, end_date, |msg| {
+            let Some(place) = message_place_vid(snb, msg.vid) else {
+                return;
+            };
+            let entry = counts.entry(creator).or_insert((0, 0));
+            if country_x_places.contains(&place) {
+                entry.0 += 1;
             }
-        }
-    }
-    if let Some(country) = country_y {
-        for (_msg, _kind, _date, creator) in
-            place_incoming_messages(snb, country, start_date, end_date)
-        {
-            if non_xy_persons.contains(&creator) {
-                counts.entry(creator).or_insert((0, 0)).1 += 1;
+            if country_y_places.contains(&place) {
+                entry.1 += 1;
             }
-        }
+        });
     }
 
     let mut rows: Vec<(i64, i64, VertexId, i64, i64)> = counts
@@ -1788,28 +1790,10 @@ fn ic8(snb: &SnbGraph, person_id: i64, limit: usize) -> Vec<Ic8Row> {
     if limit == 0 || snb.person(person_vid).is_none() {
         return Vec::new();
     }
-    let mut top: BinaryHeap<Reverse<(i64, Reverse<i64>, VertexId)>> = BinaryHeap::new();
-    for reply in reply_refs_by_parent_creator(snb, person_vid) {
-        let key = (
-            reply.creation_date,
-            Reverse(reply.comment_id),
-            reply.reply_vid,
-        );
-        if top.len() < limit {
-            top.push(Reverse(key));
-        } else if let Some(worst) = top.peek() {
-            if key > worst.0 {
-                top.pop();
-                top.push(Reverse(key));
-            }
-        }
-    }
-    let mut rows: Vec<_> = top
-        .into_iter()
-        .map(|Reverse((creation_date, Reverse(comment_id), reply_vid))| {
-            (creation_date, comment_id, reply_vid)
-        })
-        .collect();
+    let mut rows = Vec::with_capacity(limit);
+    snb.for_each_top_reply_ref_by_parent_creator_date(person_vid, limit, |reply| {
+        rows.push((reply.creation_date, reply.comment_id, reply.reply_vid));
+    });
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     rows.into_iter()
         .filter_map(|(creation_date, comment_id, reply_vid)| {
@@ -1978,67 +1962,61 @@ fn ic12(snb: &SnbGraph, person_id: i64, tag_class_name: &str, limit: usize) -> V
     };
     let ancestors = tag_class_ancestors_like_dgs(snb, root_tc);
     let mut tag_set = HashSet::new();
-    for tag_vid in snb.vertices_by_label(VertexLabel::Tag) {
-        for tc_vid in snb.out_neighbors_cached(tag_vid, EdgeLabel::HasType) {
-            if ancestors.contains(&tc_vid) {
-                tag_set.insert(tag_vid);
-            }
-        }
+    for tc_vid in &ancestors {
+        snb.for_each_tag_with_type(*tc_vid, |tag_vid| {
+            tag_set.insert(tag_vid);
+        });
     }
     if tag_set.is_empty() {
         return Vec::new();
     }
 
     let mut rows = Vec::new();
-    for friend in knows_neighbors(snb, start) {
+    snb.for_each_out_neighbor(start, EdgeLabel::Knows, |friend| {
         let Some(person) = snb.person(friend) else {
-            continue;
+            return;
         };
         let mut count = 0i32;
-        let mut names = BTreeSet::new();
-        for msg in in_messages_creators(snb, friend) {
-            if snb.comment(msg).is_none() {
-                continue;
-            }
-            let Some(post_vid) = snb
-                .out_neighbors_cached(msg, EdgeLabel::ReplyOfPost)
-                .first()
-                .copied()
-            else {
-                continue;
+        let mut matched_tags = BTreeSet::new();
+        snb.for_each_message_ref_by_creator_date(friend, |message| {
+            let Some(comment) = snb.comment(message.vid) else {
+                return;
+            };
+            let post_vid = match comment.reply_of_post {
+                Some(post_id) => encode_vid(VertexLabel::Post, post_id),
+                None => return,
             };
             let mut matched = false;
-            for tag_vid in has_tag_neighbors(snb, post_vid) {
+            snb.for_each_out_neighbor(post_vid, EdgeLabel::HasTag, |tag_vid| {
                 if tag_set.contains(&tag_vid) {
                     matched = true;
-                    if let Some(tag) = snb.tag(tag_vid) {
-                        names.insert(tag.name.clone());
-                    }
+                    matched_tags.insert(tag_vid);
                 }
-            }
+            });
             if matched {
                 count += 1;
             }
-        }
+        });
         if count > 0 {
-            rows.push((
-                count,
-                person.id,
-                friend,
-                names.into_iter().rev().collect::<Vec<_>>(),
-            ));
+            rows.push((count, person.id, friend, matched_tags));
         }
-    }
+    });
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     rows.truncate(limit);
     rows.into_iter()
-        .map(|(count, _pid, friend, tag_names)| {
+        .map(|(count, _pid, friend, tag_vids)| {
             let person = snb.person(friend).unwrap();
+            let mut tag_names = BTreeSet::new();
+            for tag_vid in tag_vids {
+                if let Some(tag) = snb.tag(tag_vid) {
+                    tag_names.insert(tag.name.clone());
+                }
+            }
             Ic12Row {
                 person_id: person.id,
                 person_first_name: person.first_name.clone(),
                 person_last_name: person.last_name.clone(),
-                tag_names,
+                tag_names: tag_names.into_iter().rev().collect(),
                 reply_count: count,
             }
         })
@@ -2448,35 +2426,6 @@ fn message_refs_by_creator(snb: &SnbGraph, person_vid: VertexId) -> Vec<MessageR
         .collect()
 }
 
-fn reply_refs_by_parent_creator(snb: &SnbGraph, person_vid: VertexId) -> Vec<ReplyRef> {
-    if let Some(replies) = snb.reply_refs_by_parent_creator_date(person_vid) {
-        return replies;
-    }
-    let mut out = Vec::new();
-    for msg_vid in in_messages_creators(snb, person_vid) {
-        for reply_vid in snb
-            .in_neighbors_cached(msg_vid, EdgeLabel::ReplyOfPost)
-            .into_iter()
-            .chain(snb.in_neighbors_cached(msg_vid, EdgeLabel::ReplyOfComment))
-        {
-            let Some(comment) = snb.comment(reply_vid) else {
-                continue;
-            };
-            out.push(ReplyRef {
-                reply_vid,
-                comment_id: comment.id,
-                creation_date: comment.creation_date,
-            });
-        }
-    }
-    out.sort_by(|a, b| {
-        b.creation_date
-            .cmp(&a.creation_date)
-            .then_with(|| a.comment_id.cmp(&b.comment_id))
-    });
-    out
-}
-
 fn message_creator_vid(snb: &SnbGraph, msg_vid: VertexId) -> Option<VertexId> {
     if let Some(post) = snb.post(msg_vid) {
         return Some(encode_vid(VertexLabel::Person, post.creator));
@@ -2485,6 +2434,18 @@ fn message_creator_vid(snb: &SnbGraph, msg_vid: VertexId) -> Option<VertexId> {
         return Some(encode_vid(VertexLabel::Person, comment.creator));
     }
     snb.out_neighbors_cached(msg_vid, EdgeLabel::HasCreator)
+        .first()
+        .copied()
+}
+
+fn message_place_vid(snb: &SnbGraph, msg_vid: VertexId) -> Option<VertexId> {
+    if let Some(post) = snb.post(msg_vid) {
+        return Some(encode_vid(VertexLabel::Place, post.place));
+    }
+    if let Some(comment) = snb.comment(msg_vid) {
+        return Some(encode_vid(VertexLabel::Place, comment.place));
+    }
+    snb.out_neighbors_cached(msg_vid, EdgeLabel::IsLocatedIn)
         .first()
         .copied()
 }
@@ -2680,41 +2641,6 @@ fn bfs_non_xy_friends(
     (non_xy, counts)
 }
 
-fn place_incoming_messages(
-    snb: &SnbGraph,
-    place_vid: VertexId,
-    start_date: i64,
-    end_date: i64,
-) -> Vec<(VertexId, u8, i64, VertexId)> {
-    let mut out = Vec::new();
-    for place in place_descendants_inclusive(snb, place_vid) {
-        for msg_vid in snb.in_neighbors_cached(place, EdgeLabel::IsLocatedIn) {
-            match snb.vertex_label(msg_vid) {
-                Some(VertexLabel::Post) => {
-                    if let Some(post) = snb.post(msg_vid) {
-                        if post.creation_date >= start_date && post.creation_date < end_date {
-                            if let Some(creator) = message_creator_vid(snb, msg_vid) {
-                                out.push((msg_vid, 1, post.creation_date, creator));
-                            }
-                        }
-                    }
-                }
-                Some(VertexLabel::Comment) => {
-                    if let Some(comment) = snb.comment(msg_vid) {
-                        if comment.creation_date >= start_date && comment.creation_date < end_date {
-                            if let Some(creator) = message_creator_vid(snb, msg_vid) {
-                                out.push((msg_vid, 2, comment.creation_date, creator));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    out
-}
-
 fn place_descendants_inclusive(snb: &SnbGraph, root: VertexId) -> Vec<VertexId> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -2731,6 +2657,10 @@ fn place_descendants_inclusive(snb: &SnbGraph, root: VertexId) -> Vec<VertexId> 
         }
     }
     out
+}
+
+fn place_descendants_set(snb: &SnbGraph, root: VertexId) -> HashSet<VertexId> {
+    place_descendants_inclusive(snb, root).into_iter().collect()
 }
 
 fn keep_best_like(

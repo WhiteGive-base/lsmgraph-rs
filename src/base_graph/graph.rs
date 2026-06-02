@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use crate::base_graph::catalog::{BaseGraphCatalog, SingleColumnEntry};
 use crate::base_graph::column::{
-    read_ext_id_map, read_i64_column, read_string_column, read_u32_column, StringColumnReader,
+    read_ext_id_map, read_i64_column, read_string_column, read_u32_column, I64ColumnReader,
+    StringColumnReader,
 };
 use crate::base_graph::csr::{CsrAdjacency, ReadContext};
 use crate::base_graph::ids::{LabelId, MessageId};
@@ -22,9 +23,15 @@ pub struct BaseGraph {
 }
 
 #[derive(Debug)]
-struct RuntimeIdMap {
-    external_to_local: HashMap<i64, u32>,
-    local_to_external: Vec<i64>,
+enum RuntimeIdMap {
+    Eager {
+        external_to_local: HashMap<i64, u32>,
+        local_to_external: Vec<i64>,
+    },
+    Compact {
+        external_to_local_sorted: Vec<(i64, u32)>,
+        local_to_external: Vec<i64>,
+    },
 }
 
 impl BaseGraph {
@@ -34,7 +41,10 @@ impl BaseGraph {
         let catalog = BaseGraphCatalog::load(&base_dir.join("catalog.json"))?;
         let mut csr = BTreeMap::new();
         for (name, entry) in &catalog.csr_adjacencies {
-            csr.insert(name.clone(), CsrAdjacency::open(&base_dir, entry)?);
+            csr.insert(
+                name.clone(),
+                CsrAdjacency::open(&base_dir, entry, io_config.backend)?,
+            );
         }
         let mut single_u32 = BTreeMap::new();
         for (name, entry) in &catalog.single_columns {
@@ -44,22 +54,40 @@ impl BaseGraph {
         }
         let mut id_maps = BTreeMap::new();
         for (label, entry) in &catalog.vertex_labels {
-            let pairs = read_ext_id_map(&base_dir.join(&entry.ext_id_to_local))?;
-            let mut external_to_local = HashMap::with_capacity(pairs.len());
-            let mut local_to_external = vec![0i64; pairs.len()];
-            for (external, local) in pairs {
-                external_to_local.insert(external, local);
-                if let Some(slot) = local_to_external.get_mut(local as usize) {
-                    *slot = external;
+            let use_compact = entry.count >= 10_000_000
+                && entry.ext_id_to_local_sorted.is_some()
+                && entry.local_to_external.is_some();
+            if use_compact {
+                let sorted = read_ext_id_map(
+                    &base_dir.join(entry.ext_id_to_local_sorted.as_ref().unwrap()),
+                )?;
+                let local_to_external =
+                    read_i64_column(&base_dir.join(entry.local_to_external.as_ref().unwrap()))?;
+                id_maps.insert(
+                    label.clone(),
+                    RuntimeIdMap::Compact {
+                        external_to_local_sorted: sorted,
+                        local_to_external,
+                    },
+                );
+            } else {
+                let pairs = read_ext_id_map(&base_dir.join(&entry.ext_id_to_local))?;
+                let mut external_to_local = HashMap::with_capacity(pairs.len());
+                let mut local_to_external = vec![0i64; pairs.len()];
+                for (external, local) in pairs {
+                    external_to_local.insert(external, local);
+                    if let Some(slot) = local_to_external.get_mut(local as usize) {
+                        *slot = external;
+                    }
                 }
+                id_maps.insert(
+                    label.clone(),
+                    RuntimeIdMap::Eager {
+                        external_to_local,
+                        local_to_external,
+                    },
+                );
             }
-            id_maps.insert(
-                label.clone(),
-                RuntimeIdMap {
-                    external_to_local,
-                    local_to_external,
-                },
-            );
         }
         let comment_parent_kind = read_optional_u8_column(
             &base_dir.join("single_edges/REPLY_OF/comment_parent_kind.col"),
@@ -92,19 +120,11 @@ impl BaseGraph {
     }
 
     pub fn local_id(&self, label: LabelId, external_id: i64) -> Option<u32> {
-        self.id_maps
-            .get(label.as_str())?
-            .external_to_local
-            .get(&external_id)
-            .copied()
+        self.id_maps.get(label.as_str())?.local_id(external_id)
     }
 
     pub fn external_id(&self, label: LabelId, local_id: u32) -> Option<i64> {
-        self.id_maps
-            .get(label.as_str())?
-            .local_to_external
-            .get(local_id as usize)
-            .copied()
+        self.id_maps.get(label.as_str())?.external_id(local_id)
     }
 
     pub fn scan_csr<F>(&self, name: &str, src: u32, ctx: &mut ReadContext, f: F) -> Result<()>
@@ -283,6 +303,21 @@ impl BaseGraph {
         StringColumnReader::open(&self.base_dir.join(&entry.file))
     }
 
+    pub fn open_i64_property(&self, label: &str, name: &str) -> Result<I64ColumnReader> {
+        let entry = self
+            .catalog
+            .vertex_properties
+            .get(&format!("{label}.{name}"))
+            .ok_or_else(|| anyhow::anyhow!("missing vertex property {label}.{name}"))?;
+        if entry.value_type != "i64" {
+            anyhow::bail!(
+                "vertex property {label}.{name} is {}, expected i64",
+                entry.value_type
+            );
+        }
+        I64ColumnReader::open(&self.base_dir.join(&entry.file))
+    }
+
     fn single_value(&self, name: &str, idx: u32) -> Option<u32> {
         let value = *self.single_u32.get(name)?.get(idx as usize)?;
         (value != u32::MAX).then_some(value)
@@ -293,6 +328,35 @@ impl BaseGraph {
         let values = read_u32_column(&self.base_dir.join(&entry.file)).ok()?;
         let value = *values.get(idx as usize)?;
         (value != u32::MAX).then_some(value)
+    }
+}
+
+impl RuntimeIdMap {
+    fn local_id(&self, external_id: i64) -> Option<u32> {
+        match self {
+            Self::Eager {
+                external_to_local, ..
+            } => external_to_local.get(&external_id).copied(),
+            Self::Compact {
+                external_to_local_sorted,
+                ..
+            } => external_to_local_sorted
+                .binary_search_by_key(&external_id, |(external, _)| *external)
+                .ok()
+                .map(|idx| external_to_local_sorted[idx].1),
+        }
+    }
+
+    fn external_id(&self, local_id: u32) -> Option<i64> {
+        let local = local_id as usize;
+        match self {
+            Self::Eager {
+                local_to_external, ..
+            }
+            | Self::Compact {
+                local_to_external, ..
+            } => local_to_external.get(local).copied(),
+        }
     }
 }
 

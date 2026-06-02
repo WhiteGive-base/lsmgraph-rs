@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(all(feature = "direct-io", unix))]
+use std::os::fd::AsRawFd;
+#[cfg(all(feature = "direct-io", unix))]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::base_graph::catalog::CsrCatalogEntry;
 use crate::base_graph::column::read_u64_column;
-use crate::base_graph::io::IoConfig;
+use crate::base_graph::io::{IoConfig, ReaderBackendKind};
 use crate::error::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -108,10 +112,15 @@ pub struct ReadContext {
     pub worker_id: usize,
     pub scratch_u32: Vec<u32>,
     pub scratch_bytes: Vec<u8>,
+    direct_scratch: DirectReadBuffer,
     pub read_chunks: u64,
     pub read_items: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    pub direct_reads: u64,
+    pub direct_bytes: u64,
+    pub blocking_reads: u64,
+    pub blocking_bytes: u64,
     pub config: IoConfig,
 }
 
@@ -121,10 +130,20 @@ impl ReadContext {
             worker_id,
             scratch_u32: Vec::new(),
             scratch_bytes: Vec::new(),
+            direct_scratch: DirectReadBuffer::new(
+                config
+                    .neighbor_block_bytes
+                    .max(config.prop_block_bytes)
+                    .max(4096),
+            ),
             read_chunks: 0,
             read_items: 0,
             cache_hits: 0,
             cache_misses: 0,
+            direct_reads: 0,
+            direct_bytes: 0,
+            blocking_reads: 0,
+            blocking_bytes: 0,
             config,
         }
     }
@@ -134,12 +153,28 @@ impl ReadContext {
 pub struct CsrAdjacency {
     pub id: String,
     pub offsets: Vec<u64>,
-    pub neighbors_path: PathBuf,
-    pub prop_paths: BTreeMap<String, (PathBuf, String)>,
+    neighbors_file: CsrDataFile,
+    prop_files: BTreeMap<String, (CsrDataFile, String)>,
     pub sort_order: SortOrder,
     block_bytes: usize,
-    block_cache: Arc<Mutex<CsrBlockCache>>,
-    prop_block_caches: Arc<Mutex<HashMap<String, CsrBlockCache>>>,
+    block_caches: Arc<Mutex<HashMap<usize, CsrBlockCache>>>,
+    prop_block_caches: Arc<Mutex<HashMap<(usize, String), CsrBlockCache>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CsrDataFile {
+    file: Arc<Mutex<File>>,
+    len: u64,
+}
+
+impl CsrDataFile {
+    fn open(path: PathBuf, backend: ReaderBackendKind) -> Result<Self> {
+        let len = std::fs::metadata(&path)?.len();
+        Ok(Self {
+            file: Arc::new(Mutex::new(open_data_file(&path, backend)?)),
+            len,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -179,23 +214,31 @@ impl CsrBlockCache {
 }
 
 impl CsrAdjacency {
-    pub fn open(base_dir: &Path, entry: &CsrCatalogEntry) -> Result<Self> {
+    pub fn open(
+        base_dir: &Path,
+        entry: &CsrCatalogEntry,
+        backend: ReaderBackendKind,
+    ) -> Result<Self> {
         let path = base_dir.join(&entry.path);
         let offsets = read_u64_column(&path.join("offsets.bin"))?;
+        let neighbors_path = path.join("neighbors.bin");
         Ok(Self {
             id: entry.name.clone(),
             offsets,
-            neighbors_path: path.join("neighbors.bin"),
-            prop_paths: entry
+            neighbors_file: CsrDataFile::open(neighbors_path, backend)?,
+            prop_files: entry
                 .props
                 .iter()
                 .map(|prop| {
-                    (
+                    Ok((
                         prop.name.clone(),
-                        (path.join(&prop.file), prop.value_type.clone()),
-                    )
+                        (
+                            CsrDataFile::open(path.join(&prop.file), backend)?,
+                            prop.value_type.clone(),
+                        ),
+                    ))
                 })
-                .collect(),
+                .collect::<Result<BTreeMap<_, _>>>()?,
             sort_order: match entry.sort_order.as_str() {
                 "creation_date_desc" => SortOrder::CreationDateDesc,
                 "join_date_desc" => SortOrder::JoinDateDesc,
@@ -205,7 +248,7 @@ impl CsrAdjacency {
                 _ => SortOrder::DstId,
             },
             block_bytes: entry.neighbor_block_bytes.max(4096),
-            block_cache: Arc::new(Mutex::new(CsrBlockCache::new(64))),
+            block_caches: Arc::new(Mutex::new(HashMap::new())),
             prop_block_caches: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -263,23 +306,29 @@ impl CsrAdjacency {
     }
 
     fn read_neighbor_block(&self, block_idx: u64, ctx: &mut ReadContext) -> Result<Arc<Vec<u8>>> {
-        if let Some(block) = self.block_cache.lock().get(block_idx) {
-            ctx.cache_hits += 1;
-            return Ok(block);
+        {
+            let mut caches = self.block_caches.lock();
+            if let Some(block) = caches
+                .get_mut(&ctx.worker_id)
+                .and_then(|cache| cache.get(block_idx))
+            {
+                ctx.cache_hits += 1;
+                return Ok(block);
+            }
         }
         ctx.cache_misses += 1;
-        let mut file = File::open(&self.neighbors_path)?;
-        let file_len = file.metadata()?.len();
         let offset = block_idx * self.block_bytes as u64;
-        if offset >= file_len {
+        if offset >= self.neighbors_file.len {
             return Ok(Arc::new(Vec::new()));
         }
-        let len = ((file_len - offset) as usize).min(self.block_bytes);
-        let mut block = vec![0u8; len];
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut block)?;
+        let len = ((self.neighbors_file.len - offset) as usize).min(self.block_bytes);
+        let block = read_block_at(&self.neighbors_file, offset, len, ctx)?;
         let block = Arc::new(block);
-        self.block_cache.lock().insert(block_idx, block.clone());
+        self.block_caches
+            .lock()
+            .entry(ctx.worker_id)
+            .or_insert_with(|| CsrBlockCache::new(64))
+            .insert(block_idx, block.clone());
         Ok(block)
     }
 
@@ -297,7 +346,7 @@ impl CsrAdjacency {
     fn prop_range_bytes_cached(
         &self,
         prop_name: &str,
-        prop_path: &Path,
+        prop_file: &CsrDataFile,
         item_bytes: usize,
         start: u64,
         len: usize,
@@ -305,7 +354,7 @@ impl CsrAdjacency {
     ) -> Result<Vec<u8>> {
         let byte_start = start * item_bytes as u64;
         self.range_bytes_from_blocks(byte_start, len * item_bytes, ctx, |block_idx, ctx| {
-            self.read_prop_block(prop_name, prop_path, block_idx, ctx)
+            self.read_prop_block(prop_name, prop_file, block_idx, ctx)
         })
     }
 
@@ -339,34 +388,32 @@ impl CsrAdjacency {
     fn read_prop_block(
         &self,
         prop_name: &str,
-        prop_path: &Path,
+        prop_file: &CsrDataFile,
         block_idx: u64,
         ctx: &mut ReadContext,
     ) -> Result<Arc<Vec<u8>>> {
-        if let Some(block) = self
-            .prop_block_caches
-            .lock()
-            .get_mut(prop_name)
-            .and_then(|cache| cache.get(block_idx))
+        let cache_key = (ctx.worker_id, prop_name.to_string());
         {
-            ctx.cache_hits += 1;
-            return Ok(block);
+            let mut caches = self.prop_block_caches.lock();
+            if let Some(block) = caches
+                .get_mut(&cache_key)
+                .and_then(|cache| cache.get(block_idx))
+            {
+                ctx.cache_hits += 1;
+                return Ok(block);
+            }
         }
         ctx.cache_misses += 1;
-        let mut file = File::open(prop_path)?;
-        let file_len = file.metadata()?.len();
         let offset = block_idx * self.block_bytes as u64;
-        if offset >= file_len {
+        if offset >= prop_file.len {
             return Ok(Arc::new(Vec::new()));
         }
-        let len = ((file_len - offset) as usize).min(self.block_bytes);
-        let mut block = vec![0u8; len];
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut block)?;
+        let len = ((prop_file.len - offset) as usize).min(self.block_bytes);
+        let block = read_block_at(prop_file, offset, len, ctx)?;
         let block = Arc::new(block);
         self.prop_block_caches
             .lock()
-            .entry(prop_name.to_string())
+            .entry(cache_key)
             .or_insert_with(|| CsrBlockCache::new(64))
             .insert(block_idx, block.clone());
         Ok(block)
@@ -387,7 +434,7 @@ impl CsrAdjacency {
         prop_name: &str,
         _ctx: &mut ReadContext,
     ) -> Result<Option<Vec<(u32, i64)>>> {
-        let Some((prop_path, value_type)) = self.prop_paths.get(prop_name) else {
+        let Some((prop_file, value_type)) = self.prop_files.get(prop_name) else {
             return Ok(None);
         };
         if value_type != "i64" {
@@ -398,7 +445,7 @@ impl CsrAdjacency {
         };
         let len = (end - start) as usize;
         let neighbors = self.neighbor_range_bytes_cached(start, len, _ctx)?;
-        let props = self.prop_range_bytes_cached(prop_name, prop_path, 8, start, len, _ctx)?;
+        let props = self.prop_range_bytes_cached(prop_name, prop_file, 8, start, len, _ctx)?;
         let out = neighbors
             .chunks_exact(4)
             .zip(props.chunks_exact(8))
@@ -418,7 +465,7 @@ impl CsrAdjacency {
         prop_name: &str,
         _ctx: &mut ReadContext,
     ) -> Result<Option<Vec<(u32, i32)>>> {
-        let Some((prop_path, value_type)) = self.prop_paths.get(prop_name) else {
+        let Some((prop_file, value_type)) = self.prop_files.get(prop_name) else {
             return Ok(None);
         };
         if value_type != "i32" {
@@ -429,7 +476,7 @@ impl CsrAdjacency {
         };
         let len = (end - start) as usize;
         let neighbors = self.neighbor_range_bytes_cached(start, len, _ctx)?;
-        let props = self.prop_range_bytes_cached(prop_name, prop_path, 4, start, len, _ctx)?;
+        let props = self.prop_range_bytes_cached(prop_name, prop_file, 4, start, len, _ctx)?;
         let out = neighbors
             .chunks_exact(4)
             .zip(props.chunks_exact(4))
@@ -604,4 +651,197 @@ fn choose_chunk_items(degree: u64, config: &IoConfig) -> usize {
     } else {
         (config.neighbor_block_bytes / std::mem::size_of::<u32>()).max(1)
     }
+}
+
+fn read_block_at(
+    file: &CsrDataFile,
+    offset: u64,
+    len: usize,
+    ctx: &mut ReadContext,
+) -> Result<Vec<u8>> {
+    match ctx.config.backend {
+        ReaderBackendKind::Direct => {
+            let out = ctx.direct_scratch.read_direct_at(file, offset, len)?;
+            ctx.direct_reads += 1;
+            ctx.direct_bytes += out.len() as u64;
+            Ok(out)
+        }
+        ReaderBackendKind::BufferedPread | ReaderBackendKind::MmapDebug => {
+            let out = read_buffered_at(file, offset, len)?;
+            ctx.blocking_reads += 1;
+            ctx.blocking_bytes += out.len() as u64;
+            Ok(out)
+        }
+    }
+}
+
+fn read_buffered_at(data_file: &CsrDataFile, offset: u64, len: usize) -> Result<Vec<u8>> {
+    let mut file = data_file.file.lock();
+    let mut block = vec![0u8; len];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut block)?;
+    Ok(block)
+}
+
+fn open_data_file(path: &Path, backend: ReaderBackendKind) -> Result<File> {
+    match backend {
+        ReaderBackendKind::Direct => open_direct_file(path),
+        ReaderBackendKind::BufferedPread | ReaderBackendKind::MmapDebug => Ok(File::open(path)?),
+    }
+}
+
+#[cfg(all(feature = "direct-io", unix))]
+fn open_direct_file(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)?)
+}
+
+#[cfg(not(all(feature = "direct-io", unix)))]
+fn open_direct_file(path: &Path) -> Result<File> {
+    Ok(File::open(path)?)
+}
+
+#[derive(Debug)]
+struct DirectReadBuffer {
+    #[cfg(all(feature = "direct-io", unix))]
+    aligned: AlignedBuf,
+}
+
+impl DirectReadBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            #[cfg(all(feature = "direct-io", unix))]
+            aligned: AlignedBuf::new(capacity.max(4096), 4096)
+                .expect("aligned direct I/O buffer allocation failed"),
+        }
+    }
+
+    fn read_direct_at(&mut self, file: &CsrDataFile, offset: u64, len: usize) -> Result<Vec<u8>> {
+        #[cfg(all(feature = "direct-io", unix))]
+        {
+            return self.read_direct_at_impl(file, offset, len);
+        }
+        #[cfg(not(all(feature = "direct-io", unix)))]
+        {
+            read_buffered_at(file, offset, len)
+        }
+    }
+
+    #[cfg(all(feature = "direct-io", unix))]
+    fn read_direct_at_impl(
+        &mut self,
+        file: &CsrDataFile,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        const ALIGN: usize = 4096;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let aligned_offset = align_down(offset as usize, ALIGN) as u64;
+        let delta = (offset - aligned_offset) as usize;
+        let aligned_len = align_up(delta + len, ALIGN);
+        self.aligned.ensure_len(aligned_len, ALIGN)?;
+        let file = file.file.lock();
+        let n = unsafe {
+            libc::pread(
+                file.as_raw_fd(),
+                self.aligned.as_mut_ptr().cast(),
+                aligned_len,
+                aligned_offset as libc::off_t,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let n = n as usize;
+        if n <= delta {
+            return Ok(Vec::new());
+        }
+        let available = (n - delta).min(len);
+        Ok(self.aligned.as_slice()[delta..delta + available].to_vec())
+    }
+}
+
+#[cfg(all(feature = "direct-io", unix))]
+#[derive(Debug)]
+struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+    capacity: usize,
+}
+
+#[cfg(all(feature = "direct-io", unix))]
+impl AlignedBuf {
+    fn new(capacity: usize, align: usize) -> Result<Self> {
+        let mut ptr = std::ptr::null_mut();
+        let capacity = align_up(capacity, align);
+        let rc = unsafe { libc::posix_memalign(&mut ptr, align, capacity) };
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc).into());
+        }
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, capacity);
+        }
+        Ok(Self {
+            ptr: ptr.cast(),
+            len: capacity,
+            capacity,
+        })
+    }
+
+    fn ensure_len(&mut self, len: usize, align: usize) -> Result<()> {
+        if len <= self.capacity {
+            self.len = len;
+            return Ok(());
+        }
+        unsafe {
+            libc::free(self.ptr.cast());
+        }
+        let mut ptr = std::ptr::null_mut();
+        let capacity = align_up(len, align);
+        let rc = unsafe { libc::posix_memalign(&mut ptr, align, capacity) };
+        if rc != 0 {
+            self.ptr = std::ptr::null_mut();
+            self.capacity = 0;
+            self.len = 0;
+            return Err(std::io::Error::from_raw_os_error(rc).into());
+        }
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, capacity);
+        }
+        self.ptr = ptr.cast();
+        self.capacity = capacity;
+        self.len = len;
+        Ok(())
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[cfg(all(feature = "direct-io", unix))]
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe {
+            libc::free(self.ptr.cast());
+        }
+    }
+}
+
+#[cfg(all(feature = "direct-io", unix))]
+fn align_down(v: usize, align: usize) -> usize {
+    v & !(align - 1)
+}
+
+#[cfg(all(feature = "direct-io", unix))]
+fn align_up(v: usize, align: usize) -> usize {
+    (v + align - 1) & !(align - 1)
 }

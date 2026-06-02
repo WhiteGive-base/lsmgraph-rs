@@ -1,7 +1,9 @@
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -10,6 +12,9 @@ use tokio::sync::RwLock;
 use crate::error::Result;
 use crate::snb::props::SnbGraph;
 use crate::snb::queries::{run_dgs_http_query, run_dgs_http_update};
+
+const SLOW_LOCK_WAIT_US: u64 = 5_000;
+const SLOW_EXEC_US: u64 = 50_000;
 
 pub async fn start_dgs_compatible_server(snb: SnbGraph, bind: &str) -> Result<()> {
     let snb = Arc::new(RwLock::new(snb));
@@ -34,6 +39,7 @@ struct ServerMetrics {
     queries: AtomicU64,
     updates: AtomicU64,
     errors: AtomicU64,
+    slow_requests: AtomicU64,
     read_lock_wait_us: AtomicU64,
     write_lock_wait_us: AtomicU64,
     max_read_lock_wait_us: AtomicU64,
@@ -42,6 +48,20 @@ struct ServerMetrics {
     update_exec_us: AtomicU64,
     max_query_exec_us: AtomicU64,
     max_update_exec_us: AtomicU64,
+    endpoints: Mutex<HashMap<String, Arc<EndpointMetrics>>>,
+}
+
+#[derive(Default)]
+struct EndpointMetrics {
+    requests: AtomicU64,
+    queries: AtomicU64,
+    updates: AtomicU64,
+    errors: AtomicU64,
+    slow_requests: AtomicU64,
+    lock_wait_us: AtomicU64,
+    max_lock_wait_us: AtomicU64,
+    exec_us: AtomicU64,
+    max_exec_us: AtomicU64,
 }
 
 impl ServerMetrics {
@@ -51,6 +71,7 @@ impl ServerMetrics {
             &self.queries,
             &self.updates,
             &self.errors,
+            &self.slow_requests,
             &self.read_lock_wait_us,
             &self.write_lock_wait_us,
             &self.max_read_lock_wait_us,
@@ -62,16 +83,19 @@ impl ServerMetrics {
         ] {
             counter.store(0, Ordering::Relaxed);
         }
+        self.endpoints.lock().clear();
     }
 
     fn snapshot(&self) -> Value {
         let queries = self.queries.load(Ordering::Relaxed);
         let updates = self.updates.load(Ordering::Relaxed);
+        let endpoints = self.endpoint_snapshots();
         json!({
             "requests": self.requests.load(Ordering::Relaxed),
             "queries": queries,
             "updates": updates,
             "errors": self.errors.load(Ordering::Relaxed),
+            "slow_requests": self.slow_requests.load(Ordering::Relaxed),
             "read_lock_wait_us_total": self.read_lock_wait_us.load(Ordering::Relaxed),
             "write_lock_wait_us_total": self.write_lock_wait_us.load(Ordering::Relaxed),
             "read_lock_wait_us_avg": avg(self.read_lock_wait_us.load(Ordering::Relaxed), queries),
@@ -82,13 +106,18 @@ impl ServerMetrics {
             "update_exec_us_avg": avg(self.update_exec_us.load(Ordering::Relaxed), updates),
             "query_exec_us_max": self.max_query_exec_us.load(Ordering::Relaxed),
             "update_exec_us_max": self.max_update_exec_us.load(Ordering::Relaxed),
+            "endpoints": endpoints,
         })
     }
 
-    fn record_query(&self, lock_wait_us: u64, exec_us: u64, is_update: bool, ok: bool) {
+    fn record_query(&self, path: &str, lock_wait_us: u64, exec_us: u64, is_update: bool, ok: bool) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         if !ok {
             self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        let is_slow = is_slow_request(lock_wait_us, exec_us);
+        if is_slow {
+            self.slow_requests.fetch_add(1, Ordering::Relaxed);
         }
         if is_update {
             self.updates.fetch_add(1, Ordering::Relaxed);
@@ -105,6 +134,69 @@ impl ServerMetrics {
             update_max(&self.max_read_lock_wait_us, lock_wait_us);
             update_max(&self.max_query_exec_us, exec_us);
         }
+        let endpoint = {
+            let mut endpoints = self.endpoints.lock();
+            endpoints
+                .entry(path.to_string())
+                .or_insert_with(|| Arc::new(EndpointMetrics::default()))
+                .clone()
+        };
+        endpoint.record(lock_wait_us, exec_us, is_update, ok, is_slow);
+    }
+
+    fn endpoint_snapshots(&self) -> BTreeMap<String, Value> {
+        let endpoints = self.endpoints.lock();
+        endpoints
+            .iter()
+            .map(|(path, metric)| (path.clone(), metric.snapshot()))
+            .collect()
+    }
+}
+
+impl EndpointMetrics {
+    fn record(&self, lock_wait_us: u64, exec_us: u64, is_update: bool, ok: bool, is_slow: bool) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        if is_update {
+            self.updates.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.queries.fetch_add(1, Ordering::Relaxed);
+        }
+        if !ok {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if is_slow {
+            self.slow_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        self.lock_wait_us.fetch_add(lock_wait_us, Ordering::Relaxed);
+        self.exec_us.fetch_add(exec_us, Ordering::Relaxed);
+        update_max(&self.max_lock_wait_us, lock_wait_us);
+        update_max(&self.max_exec_us, exec_us);
+    }
+
+    fn snapshot(&self) -> Value {
+        let requests = self.requests.load(Ordering::Relaxed);
+        let queries = self.queries.load(Ordering::Relaxed);
+        let updates = self.updates.load(Ordering::Relaxed);
+        let kind = match (queries > 0, updates > 0) {
+            (true, false) => "query",
+            (false, true) => "update",
+            (true, true) => "mixed",
+            (false, false) => "unknown",
+        };
+        json!({
+            "kind": kind,
+            "count": requests,
+            "queries": queries,
+            "updates": updates,
+            "errors": self.errors.load(Ordering::Relaxed),
+            "slow_requests": self.slow_requests.load(Ordering::Relaxed),
+            "lock_wait_us_total": self.lock_wait_us.load(Ordering::Relaxed),
+            "lock_wait_us_avg": avg(self.lock_wait_us.load(Ordering::Relaxed), requests),
+            "lock_wait_us_max": self.max_lock_wait_us.load(Ordering::Relaxed),
+            "exec_us_total": self.exec_us.load(Ordering::Relaxed),
+            "exec_us_avg": avg(self.exec_us.load(Ordering::Relaxed), requests),
+            "exec_us_max": self.max_exec_us.load(Ordering::Relaxed),
+        })
     }
 }
 
@@ -124,6 +216,10 @@ fn update_max(max: &AtomicU64, value: u64) {
             Err(next) => current = next,
         }
     }
+}
+
+fn is_slow_request(lock_wait_us: u64, exec_us: u64) -> bool {
+    lock_wait_us >= SLOW_LOCK_WAIT_US || exec_us >= SLOW_EXEC_US
 }
 
 async fn handle_connection(
@@ -149,26 +245,23 @@ async fn handle_connection(
             let params: Value = serde_json::from_slice(&body)?;
             let is_update = path.starts_with("/query/interactive_update_");
             let lock_started = Instant::now();
-            let exec_started;
-            let result = if is_update {
+            let (result, lock_wait_us, exec_us) = if is_update {
                 let mut guard = snb.write().await;
                 let lock_wait_us = lock_started.elapsed().as_micros() as u64;
-                exec_started = Instant::now();
+                let exec_started = Instant::now();
                 let result = run_dgs_http_update(&mut guard, &path, &params);
                 let exec_us = exec_started.elapsed().as_micros() as u64;
-                metrics.record_query(lock_wait_us, exec_us, true, result.is_ok());
-                log_slow_request(&path, true, lock_wait_us, exec_us);
-                result
+                (result, lock_wait_us, exec_us)
             } else {
                 let guard = snb.read().await;
                 let lock_wait_us = lock_started.elapsed().as_micros() as u64;
-                exec_started = Instant::now();
+                let exec_started = Instant::now();
                 let result = run_dgs_http_query(&guard, &path, &params);
                 let exec_us = exec_started.elapsed().as_micros() as u64;
-                metrics.record_query(lock_wait_us, exec_us, false, result.is_ok());
-                log_slow_request(&path, false, lock_wait_us, exec_us);
-                result
+                (result, lock_wait_us, exec_us)
             };
+            metrics.record_query(&path, lock_wait_us, exec_us, is_update, result.is_ok());
+            log_slow_request(&path, is_update, lock_wait_us, exec_us);
             match result {
                 Ok(value) => http_response(
                     200,
@@ -210,7 +303,7 @@ async fn handle_connection(
 }
 
 fn log_slow_request(path: &str, is_update: bool, lock_wait_us: u64, exec_us: u64) {
-    if lock_wait_us >= 5_000 || exec_us >= 50_000 {
+    if is_slow_request(lock_wait_us, exec_us) {
         eprintln!(
             "{}",
             json!({
@@ -304,4 +397,57 @@ fn http_response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
     .into_bytes();
     response.extend_from_slice(&body);
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_metrics_snapshot_includes_endpoint_aggregates() {
+        let metrics = ServerMetrics::default();
+        metrics.record_query(
+            "/query/interactive_complex_read_3",
+            100,
+            SLOW_EXEC_US,
+            false,
+            true,
+        );
+        metrics.record_query(
+            "/query/interactive_update_5",
+            SLOW_LOCK_WAIT_US,
+            42,
+            true,
+            false,
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["requests"], 2);
+        assert_eq!(snapshot["slow_requests"], 2);
+        assert_eq!(
+            snapshot["endpoints"]["/query/interactive_complex_read_3"]["kind"],
+            "query"
+        );
+        assert_eq!(
+            snapshot["endpoints"]["/query/interactive_complex_read_3"]["exec_us_max"],
+            SLOW_EXEC_US
+        );
+        assert_eq!(
+            snapshot["endpoints"]["/query/interactive_update_5"]["kind"],
+            "update"
+        );
+        assert_eq!(
+            snapshot["endpoints"]["/query/interactive_update_5"]["errors"],
+            1
+        );
+        assert_eq!(
+            snapshot["endpoints"]["/query/interactive_update_5"]["lock_wait_us_max"],
+            SLOW_LOCK_WAIT_US
+        );
+
+        metrics.reset();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["requests"], 0);
+        assert_eq!(snapshot["endpoints"].as_object().unwrap().len(), 0);
+    }
 }

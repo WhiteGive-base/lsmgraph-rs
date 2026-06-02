@@ -272,6 +272,104 @@ impl StringColumnReader {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct I64ColumnReader {
+    path: PathBuf,
+    len: usize,
+    file: Arc<Mutex<File>>,
+    cache: Arc<Mutex<I64ColumnCache>>,
+}
+
+#[derive(Debug)]
+struct I64ColumnCache {
+    block_items: usize,
+    max_blocks: usize,
+    blocks: HashMap<usize, Arc<Vec<i64>>>,
+    order: VecDeque<usize>,
+}
+
+impl I64ColumnCache {
+    fn new(block_items: usize, max_blocks: usize) -> Self {
+        Self {
+            block_items,
+            max_blocks,
+            blocks: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, block_idx: usize) -> Option<Arc<Vec<i64>>> {
+        self.blocks.get(&block_idx).cloned()
+    }
+
+    fn insert(&mut self, block_idx: usize, block: Arc<Vec<i64>>) {
+        if self.blocks.contains_key(&block_idx) {
+            return;
+        }
+        self.blocks.insert(block_idx, block);
+        self.order.push_back(block_idx);
+        while self.blocks.len() > self.max_blocks {
+            if let Some(evict) = self.order.pop_front() {
+                self.blocks.remove(&evict);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+impl I64ColumnReader {
+    pub fn open(path: &Path) -> Result<Self> {
+        let bytes = std::fs::metadata(path)?.len();
+        if bytes % 8 != 0 {
+            anyhow::bail!("i64 column {} has non-i64 length {}", path.display(), bytes);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            len: (bytes / 8) as usize,
+            file: Arc::new(Mutex::new(File::open(path)?)),
+            cache: Arc::new(Mutex::new(I64ColumnCache::new(4096, 1024))),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn get(&self, idx: usize) -> Result<i64> {
+        if idx >= self.len {
+            anyhow::bail!(
+                "i64 column {} index {} out of bounds len {}",
+                self.path.display(),
+                idx,
+                self.len
+            );
+        }
+        let block_items = self.cache.lock().block_items;
+        let block_idx = idx / block_items;
+        let item_idx = idx % block_items;
+        if let Some(block) = self.cache.lock().get(block_idx) {
+            return Ok(block[item_idx]);
+        }
+        let block_start = block_idx * block_items;
+        let items = (self.len - block_start).min(block_items);
+        let mut bytes = vec![0u8; items * 8];
+        {
+            let mut file = self.file.lock();
+            file.seek(SeekFrom::Start((block_start * 8) as u64))?;
+            file.read_exact(&mut bytes)?;
+        }
+        let values: Vec<i64> = bytes
+            .chunks_exact(8)
+            .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        let values = Arc::new(values);
+        let value = values[item_idx];
+        self.cache.lock().insert(block_idx, values);
+        Ok(value)
+    }
+}
+
 pub fn read_ext_id_map(path: &Path) -> Result<Vec<(i64, u32)>> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut bytes = Vec::new();

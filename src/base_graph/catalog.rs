@@ -54,6 +54,10 @@ pub struct VertexCatalogEntry {
     pub label: String,
     pub count: u64,
     pub ext_id_to_local: String,
+    #[serde(default)]
+    pub ext_id_to_local_sorted: Option<String>,
+    #[serde(default)]
+    pub local_to_external: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

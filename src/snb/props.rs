@@ -391,6 +391,148 @@ impl LegacySnbGraph {
             .unwrap_or_default()
     }
 
+    pub fn for_each_out_neighbor<F>(&self, vid: VertexId, edge_label: EdgeLabel, mut f: F)
+    where
+        F: FnMut(VertexId),
+    {
+        if let Some(dsts) = self.adjacency.get(&(vid, edge_label.as_i32())) {
+            for &dst in dsts {
+                f(dst);
+            }
+        }
+    }
+
+    pub fn for_each_in_neighbor<F>(&self, vid: VertexId, edge_label: EdgeLabel, mut f: F)
+    where
+        F: FnMut(VertexId),
+    {
+        if let Some(srcs) = self.adjacency.get(&(vid, -edge_label.as_i32())) {
+            for &src in srcs {
+                f(src);
+            }
+        }
+    }
+
+    pub fn for_each_message_ref_by_creator_date<F>(&self, person_vid: VertexId, mut f: F)
+    where
+        F: FnMut(MessageRef),
+    {
+        let mut messages = Vec::new();
+        self.for_each_in_neighbor(person_vid, EdgeLabel::HasCreator, |vid| {
+            if matches!(
+                self.vertex_label(vid),
+                Some(VertexLabel::Post | VertexLabel::Comment)
+            ) {
+                let message = match self.vertex(vid) {
+                    Some(VertexData::Post(post)) => Some(MessageRef {
+                        vid,
+                        id: post.id,
+                        creation_date: post.creation_date,
+                    }),
+                    Some(VertexData::Comment(comment)) => Some(MessageRef {
+                        vid,
+                        id: comment.id,
+                        creation_date: comment.creation_date,
+                    }),
+                    _ => None,
+                };
+                if let Some(message) = message {
+                    messages.push(message);
+                }
+            }
+        });
+        sort_message_refs(&mut messages);
+        for message in messages {
+            f(message);
+        }
+    }
+
+    pub fn for_each_message_ref_by_creator_date_range<F>(
+        &self,
+        person_vid: VertexId,
+        start_date: i64,
+        end_date: i64,
+        mut f: F,
+    ) where
+        F: FnMut(MessageRef),
+    {
+        self.for_each_message_ref_by_creator_date(person_vid, |message| {
+            if message.creation_date >= start_date && message.creation_date < end_date {
+                f(message);
+            }
+        });
+    }
+
+    pub fn for_each_reply_ref_by_parent_creator_date<F>(&self, person_vid: VertexId, mut f: F)
+    where
+        F: FnMut(ReplyRef),
+    {
+        let mut replies = Vec::new();
+        self.for_each_message_ref_by_creator_date(person_vid, |message| {
+            self.for_each_in_neighbor(message.vid, EdgeLabel::ReplyOfPost, |reply_vid| {
+                if let Some(comment) = self.comment(reply_vid) {
+                    replies.push(ReplyRef {
+                        reply_vid,
+                        comment_id: comment.id,
+                        creation_date: comment.creation_date,
+                    });
+                }
+            });
+            self.for_each_in_neighbor(message.vid, EdgeLabel::ReplyOfComment, |reply_vid| {
+                if let Some(comment) = self.comment(reply_vid) {
+                    replies.push(ReplyRef {
+                        reply_vid,
+                        comment_id: comment.id,
+                        creation_date: comment.creation_date,
+                    });
+                }
+            });
+        });
+        sort_reply_refs(&mut replies);
+        for reply in replies {
+            f(reply);
+        }
+    }
+
+    pub fn for_each_top_reply_ref_by_parent_creator_date<F>(
+        &self,
+        person_vid: VertexId,
+        limit: usize,
+        mut f: F,
+    ) where
+        F: FnMut(ReplyRef),
+    {
+        let mut emitted = 0usize;
+        self.for_each_reply_ref_by_parent_creator_date(person_vid, |reply| {
+            if emitted < limit {
+                emitted += 1;
+                f(reply);
+            }
+        });
+    }
+
+    pub fn for_each_tag_with_type<F>(&self, tag_class_vid: VertexId, mut f: F)
+    where
+        F: FnMut(VertexId),
+    {
+        let mut emitted = false;
+        self.for_each_in_neighbor(tag_class_vid, EdgeLabel::HasType, |tag_vid| {
+            if self.vertex_label(tag_vid) == Some(VertexLabel::Tag) {
+                emitted = true;
+                f(tag_vid);
+            }
+        });
+        if emitted {
+            return;
+        }
+        let tag_class_id = external_id(tag_class_vid);
+        for vid in self.vertices_by_label(VertexLabel::Tag) {
+            if self.tag(vid).map(|tag| tag.has_type) == Some(tag_class_id) {
+                f(vid);
+            }
+        }
+    }
+
     pub async fn out_neighbors(
         &self,
         vid: VertexId,
@@ -506,6 +648,7 @@ struct BaseSnbProperties {
     posts_by_place: Vec<Vec<VertexId>>,
     comments_by_place: Vec<Vec<VertexId>>,
     organisations_by_place: Vec<Vec<VertexId>>,
+    tags_by_tag_class: Vec<Vec<VertexId>>,
 }
 
 struct BaseMessageStringColumns {
@@ -880,6 +1023,115 @@ impl DynamicSnbGraph {
         self.neighbors_by_type(vid, -edge_label.as_i32())
     }
 
+    pub fn for_each_out_neighbor<F>(&self, vid: VertexId, edge_label: EdgeLabel, mut f: F)
+    where
+        F: FnMut(VertexId),
+    {
+        self.for_each_neighbor_by_type(vid, edge_label.as_i32(), &mut f);
+    }
+
+    pub fn for_each_in_neighbor<F>(&self, vid: VertexId, edge_label: EdgeLabel, mut f: F)
+    where
+        F: FnMut(VertexId),
+    {
+        self.for_each_neighbor_by_type(vid, -edge_label.as_i32(), &mut f);
+    }
+
+    pub fn for_each_message_ref_by_creator_date<F>(&self, person_vid: VertexId, f: F)
+    where
+        F: FnMut(MessageRef),
+    {
+        let base = self
+            .base_message_refs_slice_by_creator_date(person_vid)
+            .unwrap_or(&[]);
+        let delta = self
+            .delta_messages_by_creator
+            .get(&person_vid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for_each_merged_message_ref(base, delta, f);
+    }
+
+    pub fn for_each_message_ref_by_creator_date_range<F>(
+        &self,
+        person_vid: VertexId,
+        start_date: i64,
+        end_date: i64,
+        f: F,
+    ) where
+        F: FnMut(MessageRef),
+    {
+        let base = self
+            .base_message_refs_slice_by_creator_date(person_vid)
+            .unwrap_or(&[]);
+        let delta = self
+            .delta_messages_by_creator
+            .get(&person_vid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for_each_merged_message_ref_range(base, delta, start_date, end_date, f);
+    }
+
+    pub fn for_each_reply_ref_by_parent_creator_date<F>(&self, person_vid: VertexId, f: F)
+    where
+        F: FnMut(ReplyRef),
+    {
+        let base = self
+            .base_reply_refs_slice_by_parent_creator_date(person_vid)
+            .unwrap_or(&[]);
+        let delta = self
+            .delta_replies_by_parent_creator
+            .get(&person_vid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for_each_merged_reply_ref(base, delta, f);
+    }
+
+    pub fn for_each_top_reply_ref_by_parent_creator_date<F>(
+        &self,
+        person_vid: VertexId,
+        limit: usize,
+        f: F,
+    ) where
+        F: FnMut(ReplyRef),
+    {
+        let base = self
+            .base_reply_refs_slice_by_parent_creator_date(person_vid)
+            .unwrap_or(&[]);
+        let delta = self
+            .delta_replies_by_parent_creator
+            .get(&person_vid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for_each_merged_reply_ref_limited(base, delta, limit, f);
+    }
+
+    pub fn for_each_tag_with_type<F>(&self, tag_class_vid: VertexId, mut f: F)
+    where
+        F: FnMut(VertexId),
+    {
+        let mut seen = BTreeSet::new();
+        if let (Some(base), Some(base_props)) = (self.view.base(), self.base_vertices.as_ref()) {
+            if let Some(local) = base.local_id(LabelId::TagClass, external_id(tag_class_vid)) {
+                if let Some(tags) = base_props.tags_by_tag_class.get(local as usize) {
+                    for &tag_vid in tags {
+                        if seen.insert(tag_vid) {
+                            f(tag_vid);
+                        }
+                    }
+                }
+            }
+        }
+        let tag_class_id = external_id(tag_class_vid);
+        for (&vid, data) in &self.vertices {
+            if let VertexData::Tag(tag) = data {
+                if tag.has_type == tag_class_id && seen.insert(vid) {
+                    f(vid);
+                }
+            }
+        }
+    }
+
     pub async fn out_neighbors(
         &self,
         vid: VertexId,
@@ -969,14 +1221,9 @@ impl DynamicSnbGraph {
     }
 
     fn base_message_refs_by_creator_date(&self, person_vid: VertexId) -> Option<Vec<MessageRef>> {
-        let base = self.view.base()?;
-        let local = base.local_id(LabelId::Person, external_id(person_vid))? as usize;
         Some(
-            self.base_vertices
-                .as_ref()?
-                .messages_by_creator
-                .get(local)?
-                .clone(),
+            self.base_message_refs_slice_by_creator_date(person_vid)?
+                .to_vec(),
         )
     }
 
@@ -984,6 +1231,31 @@ impl DynamicSnbGraph {
         &self,
         person_vid: VertexId,
     ) -> Option<Vec<ReplyRef>> {
+        Some(
+            self.base_reply_refs_slice_by_parent_creator_date(person_vid)?
+                .to_vec(),
+        )
+    }
+
+    fn base_message_refs_slice_by_creator_date(
+        &self,
+        person_vid: VertexId,
+    ) -> Option<&[MessageRef]> {
+        let base = self.view.base()?;
+        let local = base.local_id(LabelId::Person, external_id(person_vid))? as usize;
+        Some(
+            self.base_vertices
+                .as_ref()?
+                .messages_by_creator
+                .get(local)?
+                .as_slice(),
+        )
+    }
+
+    fn base_reply_refs_slice_by_parent_creator_date(
+        &self,
+        person_vid: VertexId,
+    ) -> Option<&[ReplyRef]> {
         let base = self.view.base()?;
         let local = base.local_id(LabelId::Person, external_id(person_vid))? as usize;
         Some(
@@ -991,7 +1263,7 @@ impl DynamicSnbGraph {
                 .as_ref()?
                 .replies_by_parent_creator
                 .get(local)?
-                .clone(),
+                .as_slice(),
         )
     }
 
@@ -1143,6 +1415,404 @@ impl DynamicSnbGraph {
             return Some(encode_vid(VertexLabel::Person, parent.creator));
         }
         None
+    }
+
+    fn for_each_neighbor_by_type<F>(&self, src: VertexId, edge_type: EdgeType, f: &mut F)
+    where
+        F: FnMut(VertexId),
+    {
+        let mut seen = BTreeSet::new();
+        let base_handled = self.for_each_base_neighbor_by_type(src, edge_type, &mut |dst| {
+            if seen.insert(dst) {
+                f(dst);
+            }
+        });
+        if base_handled.is_none() {
+            for dst in self.fallback_neighbors(src, edge_type) {
+                if seen.insert(dst) {
+                    f(dst);
+                }
+            }
+        }
+        for dst in self.delta_neighbors(src, edge_type) {
+            if seen.insert(dst) {
+                f(dst);
+            }
+        }
+    }
+
+    fn for_each_base_neighbor_by_type<F>(
+        &self,
+        src: VertexId,
+        edge_type: EdgeType,
+        f: &mut F,
+    ) -> Option<()>
+    where
+        F: FnMut(VertexId),
+    {
+        let base = self.view.base()?.as_ref();
+        let src_label = label_from_vid(src)?;
+        let external = external_id(src);
+        match (src_label, edge_type) {
+            (VertexLabel::Person, x)
+                if x == EdgeLabel::Knows.as_i32() || x == -EdgeLabel::Knows.as_i32() =>
+            {
+                self.for_each_base_csr(
+                    base,
+                    "KNOWS/OUT",
+                    LabelId::Person,
+                    external,
+                    LabelId::Person,
+                    f,
+                );
+                self.for_each_base_csr(
+                    base,
+                    "KNOWS/IN",
+                    LabelId::Person,
+                    external,
+                    LabelId::Person,
+                    f,
+                );
+                Some(())
+            }
+            (VertexLabel::Person, x) if x == EdgeLabel::LikesPost.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "PERSON_LIKES_POST/OUT",
+                    LabelId::Person,
+                    external,
+                    LabelId::Post,
+                    f,
+                ),
+            (VertexLabel::Post, x) if x == -EdgeLabel::LikesPost.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "PERSON_LIKES_POST/IN",
+                    LabelId::Post,
+                    external,
+                    LabelId::Person,
+                    f,
+                ),
+            (VertexLabel::Person, x) if x == EdgeLabel::LikesComment.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "PERSON_LIKES_COMMENT/OUT",
+                    LabelId::Person,
+                    external,
+                    LabelId::Comment,
+                    f,
+                ),
+            (VertexLabel::Comment, x) if x == -EdgeLabel::LikesComment.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "PERSON_LIKES_COMMENT/IN",
+                    LabelId::Comment,
+                    external,
+                    LabelId::Person,
+                    f,
+                ),
+            (VertexLabel::Forum, x) if x == EdgeLabel::HasMember.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "FORUM_HAS_MEMBER/OUT",
+                    LabelId::Forum,
+                    external,
+                    LabelId::Person,
+                    f,
+                ),
+            (VertexLabel::Person, x) if x == -EdgeLabel::HasMember.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "FORUM_HAS_MEMBER/IN",
+                    LabelId::Person,
+                    external,
+                    LabelId::Forum,
+                    f,
+                ),
+            (VertexLabel::Person, x) if x == EdgeLabel::HasCreator.as_i32() => Some(()),
+            (VertexLabel::Person, x) if x == -EdgeLabel::HasCreator.as_i32() => {
+                self.for_each_base_csr(
+                    base,
+                    "PERSON_CREATED_POST",
+                    LabelId::Person,
+                    external,
+                    LabelId::Post,
+                    f,
+                );
+                self.for_each_base_csr(
+                    base,
+                    "PERSON_CREATED_COMMENT",
+                    LabelId::Person,
+                    external,
+                    LabelId::Comment,
+                    f,
+                );
+                Some(())
+            }
+            (VertexLabel::Post, x) if x == EdgeLabel::HasCreator.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Post,
+                    external,
+                    LabelId::Person,
+                    |base, local| base.post_creator(local),
+                    f,
+                ),
+            (VertexLabel::Comment, x) if x == EdgeLabel::HasCreator.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Comment,
+                    external,
+                    LabelId::Person,
+                    |base, local| base.comment_creator(local),
+                    f,
+                ),
+            (VertexLabel::Comment, x)
+                if x == EdgeLabel::ReplyOfPost.as_i32()
+                    || x == EdgeLabel::ReplyOfComment.as_i32() =>
+            {
+                let local = base.local_id(LabelId::Comment, external)?;
+                match (edge_type, base.comment_reply_of(local)?) {
+                    (x, crate::base_graph::ids::MessageId::Post(post))
+                        if x == EdgeLabel::ReplyOfPost.as_i32() =>
+                    {
+                        f(self.base_vid(base, LabelId::Post, post)?);
+                    }
+                    (x, crate::base_graph::ids::MessageId::Comment(comment))
+                        if x == EdgeLabel::ReplyOfComment.as_i32() =>
+                    {
+                        f(self.base_vid(base, LabelId::Comment, comment)?);
+                    }
+                    _ => {}
+                }
+                Some(())
+            }
+            (VertexLabel::Post, x) if x == -EdgeLabel::ReplyOfPost.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "POST_CHILD_COMMENTS",
+                    LabelId::Post,
+                    external,
+                    LabelId::Comment,
+                    f,
+                ),
+            (VertexLabel::Comment, x) if x == -EdgeLabel::ReplyOfComment.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "COMMENT_CHILD_COMMENTS",
+                    LabelId::Comment,
+                    external,
+                    LabelId::Comment,
+                    f,
+                ),
+            (VertexLabel::Post, x) if x == -EdgeLabel::ContainerOf.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Post,
+                    external,
+                    LabelId::Forum,
+                    |base, local| base.post_forum(local),
+                    f,
+                ),
+            (VertexLabel::Forum, x) if x == EdgeLabel::ContainerOf.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "FORUM_CONTAINER_OF_POST",
+                    LabelId::Forum,
+                    external,
+                    LabelId::Post,
+                    f,
+                ),
+            (VertexLabel::Person, x) if x == EdgeLabel::IsLocatedIn.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Person,
+                    external,
+                    LabelId::Place,
+                    |base, local| base.person_place(local),
+                    f,
+                ),
+            (VertexLabel::Post, x) if x == EdgeLabel::IsLocatedIn.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Post,
+                    external,
+                    LabelId::Place,
+                    |base, local| base.post_place(local),
+                    f,
+                ),
+            (VertexLabel::Comment, x) if x == EdgeLabel::IsLocatedIn.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Comment,
+                    external,
+                    LabelId::Place,
+                    |base, local| base.comment_place(local),
+                    f,
+                ),
+            (VertexLabel::Organisation, x) if x == EdgeLabel::IsLocatedIn.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Organisation,
+                    external,
+                    LabelId::Place,
+                    |base, local| base.organisation_place(local),
+                    f,
+                ),
+            (VertexLabel::Place, x) if x == -EdgeLabel::IsLocatedIn.as_i32() => {
+                for dst in self.base_reverse_located_in(src)? {
+                    f(dst);
+                }
+                Some(())
+            }
+            (VertexLabel::Forum, x) if x == EdgeLabel::HasModerator.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Forum,
+                    external,
+                    LabelId::Person,
+                    |base, local| base.forum_moderator(local),
+                    f,
+                ),
+            (VertexLabel::Tag, x) if x == EdgeLabel::HasType.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Tag,
+                    external,
+                    LabelId::TagClass,
+                    |base, local| base.tag_tagclass(local),
+                    f,
+                ),
+            (VertexLabel::Place, x) if x == EdgeLabel::IsPartOf.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::Place,
+                    external,
+                    LabelId::Place,
+                    |base, local| base.place_parent(local),
+                    f,
+                ),
+            (VertexLabel::Place, x) if x == -EdgeLabel::IsPartOf.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "PLACE_CHILD_PLACES",
+                    LabelId::Place,
+                    external,
+                    LabelId::Place,
+                    f,
+                ),
+            (VertexLabel::TagClass, x) if x == EdgeLabel::IsSubclassOf.as_i32() => self
+                .for_each_base_single_neighbor(
+                    base,
+                    LabelId::TagClass,
+                    external,
+                    LabelId::TagClass,
+                    |base, local| base.tagclass_parent(local),
+                    f,
+                ),
+            (VertexLabel::TagClass, x) if x == -EdgeLabel::IsSubclassOf.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "TAGCLASS_CHILD_CLASSES",
+                    LabelId::TagClass,
+                    external,
+                    LabelId::TagClass,
+                    f,
+                ),
+            (VertexLabel::Person, x) if x == EdgeLabel::HasInterest.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "PERSON_HAS_INTEREST/OUT",
+                    LabelId::Person,
+                    external,
+                    LabelId::Tag,
+                    f,
+                ),
+            (VertexLabel::Tag, x) if x == -EdgeLabel::HasInterest.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "PERSON_HAS_INTEREST/IN",
+                    LabelId::Tag,
+                    external,
+                    LabelId::Person,
+                    f,
+                ),
+            (VertexLabel::Post, x) if x == EdgeLabel::HasTag.as_i32() => self.for_each_base_csr(
+                base,
+                "POST_HAS_TAG/OUT",
+                LabelId::Post,
+                external,
+                LabelId::Tag,
+                f,
+            ),
+            (VertexLabel::Comment, x) if x == EdgeLabel::HasTag.as_i32() => self.for_each_base_csr(
+                base,
+                "COMMENT_HAS_TAG/OUT",
+                LabelId::Comment,
+                external,
+                LabelId::Tag,
+                f,
+            ),
+            (VertexLabel::Forum, x) if x == EdgeLabel::HasTag.as_i32() => self.for_each_base_csr(
+                base,
+                "FORUM_HAS_TAG/OUT",
+                LabelId::Forum,
+                external,
+                LabelId::Tag,
+                f,
+            ),
+            (VertexLabel::Tag, x) if x == -EdgeLabel::HasTag.as_i32() => {
+                let mut handled = false;
+                for (csr, src_label) in [
+                    ("POST_HAS_TAG/IN", LabelId::Post),
+                    ("COMMENT_HAS_TAG/IN", LabelId::Comment),
+                    ("FORUM_HAS_TAG/IN", LabelId::Forum),
+                ] {
+                    if self
+                        .for_each_base_csr(base, csr, LabelId::Tag, external, src_label, f)
+                        .is_some()
+                    {
+                        handled = true;
+                    }
+                }
+                handled.then_some(())
+            }
+            (VertexLabel::Person, x) if x == EdgeLabel::WorkAt.as_i32() => self.for_each_base_csr(
+                base,
+                "WORK_AT/OUT",
+                LabelId::Person,
+                external,
+                LabelId::Organisation,
+                f,
+            ),
+            (VertexLabel::Organisation, x) if x == -EdgeLabel::WorkAt.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "WORK_AT/IN",
+                    LabelId::Organisation,
+                    external,
+                    LabelId::Person,
+                    f,
+                ),
+            (VertexLabel::Person, x) if x == EdgeLabel::StudyAt.as_i32() => self.for_each_base_csr(
+                base,
+                "STUDY_AT/OUT",
+                LabelId::Person,
+                external,
+                LabelId::Organisation,
+                f,
+            ),
+            (VertexLabel::Organisation, x) if x == -EdgeLabel::StudyAt.as_i32() => self
+                .for_each_base_csr(
+                    base,
+                    "STUDY_AT/IN",
+                    LabelId::Organisation,
+                    external,
+                    LabelId::Person,
+                    f,
+                ),
+            _ => None,
+        }
     }
 
     fn neighbors_by_type(&self, src: VertexId, edge_type: EdgeType) -> Vec<VertexId> {
@@ -1609,6 +2279,52 @@ impl DynamicSnbGraph {
         Some(out)
     }
 
+    fn for_each_base_csr<F>(
+        &self,
+        base: &BaseGraph,
+        csr: &str,
+        src_label: LabelId,
+        src_external: i64,
+        dst_label: LabelId,
+        f: &mut F,
+    ) -> Option<()>
+    where
+        F: FnMut(VertexId),
+    {
+        base.csr(csr)?;
+        let src_local = base.local_id(src_label, src_external)?;
+        let mut ctx = base.new_read_context(0);
+        base.scan_csr(csr, src_local, &mut ctx, |chunk| {
+            for dst_local in chunk {
+                if let Some(vid) = self.base_vid(base, dst_label, *dst_local) {
+                    f(vid);
+                }
+            }
+            Ok(())
+        })
+        .ok()?;
+        Some(())
+    }
+
+    fn for_each_base_single_neighbor<F, R>(
+        &self,
+        base: &BaseGraph,
+        src_label: LabelId,
+        src_external: i64,
+        dst_label: LabelId,
+        read: R,
+        f: &mut F,
+    ) -> Option<()>
+    where
+        F: FnMut(VertexId),
+        R: FnOnce(&BaseGraph, u32) -> Option<u32>,
+    {
+        let src_local = base.local_id(src_label, src_external)?;
+        let dst_local = read(base, src_local)?;
+        f(self.base_vid(base, dst_label, dst_local)?);
+        Some(())
+    }
+
     fn scan_base_csr_i64_prop(
         &self,
         base: &BaseGraph,
@@ -1733,6 +2449,9 @@ impl DynamicSnbGraph {
             return Vec::new();
         };
         let snapshot = delta.current_snapshot();
+        if snapshot == 0 {
+            return Vec::new();
+        }
         block_on_runtime(delta.get_neighbors(src, Some(edge_type), snapshot))
             .map(|edges| {
                 edges
@@ -2015,6 +2734,97 @@ impl SnbGraph {
         }
     }
 
+    pub fn for_each_out_neighbor<F>(&self, vid: VertexId, edge_label: EdgeLabel, mut f: F)
+    where
+        F: FnMut(VertexId),
+    {
+        match self {
+            Self::Legacy(graph) => graph.for_each_out_neighbor(vid, edge_label, &mut f),
+            Self::Dynamic(graph) => graph.for_each_out_neighbor(vid, edge_label, &mut f),
+        }
+    }
+
+    pub fn for_each_in_neighbor<F>(&self, vid: VertexId, edge_label: EdgeLabel, mut f: F)
+    where
+        F: FnMut(VertexId),
+    {
+        match self {
+            Self::Legacy(graph) => graph.for_each_in_neighbor(vid, edge_label, &mut f),
+            Self::Dynamic(graph) => graph.for_each_in_neighbor(vid, edge_label, &mut f),
+        }
+    }
+
+    pub fn for_each_message_ref_by_creator_date<F>(&self, person_vid: VertexId, mut f: F)
+    where
+        F: FnMut(MessageRef),
+    {
+        match self {
+            Self::Legacy(graph) => graph.for_each_message_ref_by_creator_date(person_vid, &mut f),
+            Self::Dynamic(graph) => graph.for_each_message_ref_by_creator_date(person_vid, &mut f),
+        }
+    }
+
+    pub fn for_each_message_ref_by_creator_date_range<F>(
+        &self,
+        person_vid: VertexId,
+        start_date: i64,
+        end_date: i64,
+        mut f: F,
+    ) where
+        F: FnMut(MessageRef),
+    {
+        match self {
+            Self::Legacy(graph) => graph.for_each_message_ref_by_creator_date_range(
+                person_vid, start_date, end_date, &mut f,
+            ),
+            Self::Dynamic(graph) => graph.for_each_message_ref_by_creator_date_range(
+                person_vid, start_date, end_date, &mut f,
+            ),
+        }
+    }
+
+    pub fn for_each_reply_ref_by_parent_creator_date<F>(&self, person_vid: VertexId, mut f: F)
+    where
+        F: FnMut(ReplyRef),
+    {
+        match self {
+            Self::Legacy(graph) => {
+                graph.for_each_reply_ref_by_parent_creator_date(person_vid, &mut f)
+            }
+            Self::Dynamic(graph) => {
+                graph.for_each_reply_ref_by_parent_creator_date(person_vid, &mut f)
+            }
+        }
+    }
+
+    pub fn for_each_top_reply_ref_by_parent_creator_date<F>(
+        &self,
+        person_vid: VertexId,
+        limit: usize,
+        mut f: F,
+    ) where
+        F: FnMut(ReplyRef),
+    {
+        match self {
+            Self::Legacy(graph) => {
+                graph.for_each_top_reply_ref_by_parent_creator_date(person_vid, limit, &mut f)
+            }
+            Self::Dynamic(graph) => {
+                graph.for_each_top_reply_ref_by_parent_creator_date(person_vid, limit, &mut f)
+            }
+        }
+    }
+
+    pub fn for_each_tag_with_type<F>(&self, tag_class_vid: VertexId, mut f: F)
+    where
+        F: FnMut(VertexId),
+    {
+        match self {
+            Self::Legacy(graph) => graph.for_each_tag_with_type(tag_class_vid, &mut f),
+            Self::Dynamic(graph) => graph.for_each_tag_with_type(tag_class_vid, &mut f),
+        }
+    }
+
     pub async fn out_neighbors(
         &self,
         vid: VertexId,
@@ -2107,6 +2917,234 @@ fn dedup_edges_with_prop(edges: Vec<(VertexId, EdgeProp)>) -> Vec<(VertexId, Edg
         .into_iter()
         .filter(|(vid, _)| seen.insert(*vid))
         .collect()
+}
+
+fn for_each_merged_message_ref<F>(base: &[MessageRef], delta: &[MessageRef], mut f: F)
+where
+    F: FnMut(MessageRef),
+{
+    if delta.is_empty() {
+        for &message in base {
+            f(message);
+        }
+        return;
+    }
+    if base.is_empty() {
+        for &message in delta {
+            f(message);
+        }
+        return;
+    }
+    let mut base_idx = 0usize;
+    let mut delta_idx = 0usize;
+    let mut seen = BTreeSet::new();
+    while base_idx < base.len() || delta_idx < delta.len() {
+        let next = match (base.get(base_idx), delta.get(delta_idx)) {
+            (Some(base_ref), Some(delta_ref)) => {
+                if message_ref_precedes_or_ties(*base_ref, *delta_ref) {
+                    base_idx += 1;
+                    *base_ref
+                } else {
+                    delta_idx += 1;
+                    *delta_ref
+                }
+            }
+            (Some(base_ref), None) => {
+                base_idx += 1;
+                *base_ref
+            }
+            (None, Some(delta_ref)) => {
+                delta_idx += 1;
+                *delta_ref
+            }
+            (None, None) => break,
+        };
+        if seen.insert(next.vid) {
+            f(next);
+        }
+    }
+}
+
+fn for_each_merged_message_ref_range<F>(
+    base: &[MessageRef],
+    delta: &[MessageRef],
+    start_date: i64,
+    end_date: i64,
+    mut f: F,
+) where
+    F: FnMut(MessageRef),
+{
+    if start_date >= end_date {
+        return;
+    }
+    if delta.is_empty() {
+        for &message in base {
+            if message.creation_date >= end_date {
+                continue;
+            }
+            if message.creation_date < start_date {
+                break;
+            }
+            f(message);
+        }
+        return;
+    }
+    if base.is_empty() {
+        for &message in delta {
+            if message.creation_date >= end_date {
+                continue;
+            }
+            if message.creation_date < start_date {
+                break;
+            }
+            f(message);
+        }
+        return;
+    }
+
+    let mut base_idx = 0usize;
+    let mut delta_idx = 0usize;
+    let mut seen = BTreeSet::new();
+    while base_idx < base.len() || delta_idx < delta.len() {
+        let next = match (base.get(base_idx), delta.get(delta_idx)) {
+            (Some(base_ref), Some(delta_ref)) => {
+                if message_ref_precedes_or_ties(*base_ref, *delta_ref) {
+                    base_idx += 1;
+                    *base_ref
+                } else {
+                    delta_idx += 1;
+                    *delta_ref
+                }
+            }
+            (Some(base_ref), None) => {
+                base_idx += 1;
+                *base_ref
+            }
+            (None, Some(delta_ref)) => {
+                delta_idx += 1;
+                *delta_ref
+            }
+            (None, None) => break,
+        };
+        if next.creation_date < start_date {
+            break;
+        }
+        if seen.insert(next.vid) && next.creation_date < end_date {
+            f(next);
+        }
+    }
+}
+
+fn for_each_merged_reply_ref<F>(base: &[ReplyRef], delta: &[ReplyRef], mut f: F)
+where
+    F: FnMut(ReplyRef),
+{
+    if delta.is_empty() {
+        for &reply in base {
+            f(reply);
+        }
+        return;
+    }
+    if base.is_empty() {
+        for &reply in delta {
+            f(reply);
+        }
+        return;
+    }
+    let mut base_idx = 0usize;
+    let mut delta_idx = 0usize;
+    let mut seen = BTreeSet::new();
+    while base_idx < base.len() || delta_idx < delta.len() {
+        let next = match (base.get(base_idx), delta.get(delta_idx)) {
+            (Some(base_ref), Some(delta_ref)) => {
+                if reply_ref_precedes_or_ties(*base_ref, *delta_ref) {
+                    base_idx += 1;
+                    *base_ref
+                } else {
+                    delta_idx += 1;
+                    *delta_ref
+                }
+            }
+            (Some(base_ref), None) => {
+                base_idx += 1;
+                *base_ref
+            }
+            (None, Some(delta_ref)) => {
+                delta_idx += 1;
+                *delta_ref
+            }
+            (None, None) => break,
+        };
+        if seen.insert(next.reply_vid) {
+            f(next);
+        }
+    }
+}
+
+fn for_each_merged_reply_ref_limited<F>(
+    base: &[ReplyRef],
+    delta: &[ReplyRef],
+    limit: usize,
+    mut f: F,
+) where
+    F: FnMut(ReplyRef),
+{
+    if limit == 0 {
+        return;
+    }
+    if delta.is_empty() {
+        for &reply in base.iter().take(limit) {
+            f(reply);
+        }
+        return;
+    }
+    if base.is_empty() {
+        for &reply in delta.iter().take(limit) {
+            f(reply);
+        }
+        return;
+    }
+
+    let mut base_idx = 0usize;
+    let mut delta_idx = 0usize;
+    let mut emitted = 0usize;
+    let mut seen = BTreeSet::new();
+    while emitted < limit && (base_idx < base.len() || delta_idx < delta.len()) {
+        let next = match (base.get(base_idx), delta.get(delta_idx)) {
+            (Some(base_ref), Some(delta_ref)) => {
+                if reply_ref_precedes_or_ties(*base_ref, *delta_ref) {
+                    base_idx += 1;
+                    *base_ref
+                } else {
+                    delta_idx += 1;
+                    *delta_ref
+                }
+            }
+            (Some(base_ref), None) => {
+                base_idx += 1;
+                *base_ref
+            }
+            (None, Some(delta_ref)) => {
+                delta_idx += 1;
+                *delta_ref
+            }
+            (None, None) => break,
+        };
+        if seen.insert(next.reply_vid) {
+            emitted += 1;
+            f(next);
+        }
+    }
+}
+
+fn message_ref_precedes_or_ties(left: MessageRef, right: MessageRef) -> bool {
+    left.creation_date > right.creation_date
+        || (left.creation_date == right.creation_date && left.id <= right.id)
+}
+
+fn reply_ref_precedes_or_ties(left: ReplyRef, right: ReplyRef) -> bool {
+    left.creation_date > right.creation_date
+        || (left.creation_date == right.creation_date && left.comment_id <= right.comment_id)
 }
 
 fn label_from_vid(vid: VertexId) -> Option<VertexLabel> {
@@ -2400,6 +3438,7 @@ fn load_vertices_from_base_graph(base: &BaseGraph) -> Result<BaseSnbProperties> 
             &comments,
             &organisations,
         );
+    let tags_by_tag_class = build_base_tag_class_index(base, tag_classes.len(), &tags);
 
     Ok(BaseSnbProperties {
         persons,
@@ -2417,6 +3456,7 @@ fn load_vertices_from_base_graph(base: &BaseGraph) -> Result<BaseSnbProperties> 
         posts_by_place,
         comments_by_place,
         organisations_by_place,
+        tags_by_tag_class,
     })
 }
 
@@ -2469,6 +3509,20 @@ fn build_base_place_indexes(
         comments_by_place,
         organisations_by_place,
     )
+}
+
+fn build_base_tag_class_index(
+    base: &BaseGraph,
+    tag_class_count: usize,
+    tags: &[TagProps],
+) -> Vec<Vec<VertexId>> {
+    let mut tags_by_tag_class = vec![Vec::new(); tag_class_count];
+    for tag in tags {
+        if let Some(tag_class_local) = base.local_id(LabelId::TagClass, tag.has_type) {
+            tags_by_tag_class[tag_class_local as usize].push(encode_vid(VertexLabel::Tag, tag.id));
+        }
+    }
+    tags_by_tag_class
 }
 
 fn build_base_message_indexes(

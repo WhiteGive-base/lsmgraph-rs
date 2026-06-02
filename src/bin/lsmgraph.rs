@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use lsmgraph::base_graph::{build_from_snb, BuildConfig, IoConfig};
+use lsmgraph::base_graph::{
+    build_from_snb, BaseGraph, BuildConfig, CsrAdjacency, IoConfig, ReaderBackendKind,
+};
 use lsmgraph::config::{IoBackendKind, LsmGraphConfig};
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
@@ -171,6 +173,16 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         ra_min_l0_segments: usize,
     },
+    BaseStorageBench {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        samples: usize,
+        #[arg(long)]
+        csr: Option<String>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        prop_reads: bool,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -227,7 +239,8 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&stats)?);
         }
         Command::DynamicStats { data_dir } => {
-            let view = DynamicGraphView::open(&data_dir, IoConfig::default(), io_backend).await?;
+            let view =
+                DynamicGraphView::open(&data_dir, base_io_config(io_backend), io_backend).await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -350,7 +363,7 @@ async fn main() -> Result<()> {
         } => {
             let report = validate_ic1_ic14_dynamic(
                 &data_dir,
-                IoConfig::default(),
+                base_io_config(io_backend),
                 io_backend,
                 &validation_params,
                 max_lines,
@@ -367,7 +380,7 @@ async fn main() -> Result<()> {
             let query_list = parse_query_list(&queries);
             let report = validate_ic_batch_dynamic(
                 &data_dir,
-                IoConfig::default(),
+                base_io_config(io_backend),
                 io_backend,
                 &validation_dir,
                 &query_list,
@@ -383,7 +396,7 @@ async fn main() -> Result<()> {
         } => {
             let report = validate_mixed_tugraph_dynamic(
                 &data_dir,
-                IoConfig::default(),
+                base_io_config(io_backend),
                 io_backend,
                 &validation_params,
                 max_lines,
@@ -402,7 +415,8 @@ async fn main() -> Result<()> {
                 data_dir.display()
             );
             let view_started = Instant::now();
-            let snb = SnbGraph::open_dynamic(&data_dir, IoConfig::default(), io_backend).await?;
+            let snb =
+                SnbGraph::open_dynamic(&data_dir, base_io_config(io_backend), io_backend).await?;
             eprintln!(
                 "[snb-server] DynamicGraphView open complete elapsed_s={:.1} total_elapsed_s={:.1}",
                 view_started.elapsed().as_secs_f64(),
@@ -548,8 +562,141 @@ async fn main() -> Result<()> {
                 }))?
             );
         }
+        Command::BaseStorageBench {
+            data_dir,
+            samples,
+            csr,
+            prop_reads,
+        } => {
+            let base = BaseGraph::open(data_dir.join("base_graph"), base_io_config(io_backend))?;
+            let started = Instant::now();
+            let mut total_sampled_sources = 0usize;
+            let mut total_neighbor_edges = 0u64;
+            let mut total_prop_edges = 0u64;
+            let mut per_csr = Vec::new();
+
+            for (name, entry) in &base.catalog().csr_adjacencies {
+                if let Some(filter) = csr.as_deref() {
+                    if filter != name {
+                        continue;
+                    }
+                }
+                let Some(adjacency) = base.csr(name) else {
+                    continue;
+                };
+                let mut ctx = base.new_read_context(0);
+                let csr_started = Instant::now();
+                let (non_empty_sources, sampled) = sample_non_empty_sources(adjacency, samples);
+                let mut neighbor_edges = 0u64;
+                let mut prop_edges = 0u64;
+                for (local_src, start, end) in &sampled {
+                    neighbor_edges += end - start;
+                    adjacency.scan_chunks(*local_src, &mut ctx, |_| Ok(()))?;
+                    if prop_reads {
+                        for prop in &entry.props {
+                            match prop.value_type.as_str() {
+                                "i64" => {
+                                    if let Some(values) = base
+                                        .csr_i64_prop_vec(name, *local_src, &prop.name, &mut ctx)?
+                                    {
+                                        prop_edges += values.len() as u64;
+                                    }
+                                }
+                                "i32" => {
+                                    if let Some(values) = base
+                                        .csr_i32_prop_vec(name, *local_src, &prop.name, &mut ctx)?
+                                    {
+                                        prop_edges += values.len() as u64;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                total_sampled_sources += sampled.len();
+                total_neighbor_edges += neighbor_edges;
+                total_prop_edges += prop_edges;
+                per_csr.push(json!({
+                    "name": name,
+                    "src_label": entry.src_label,
+                    "dst_label": entry.dst_label,
+                    "num_src_vertices": entry.num_src_vertices,
+                    "num_edges": entry.num_edges,
+                    "non_empty_sources": non_empty_sources,
+                    "sampled_sources": sampled.len(),
+                    "neighbor_edges": neighbor_edges,
+                    "prop_edges": prop_edges,
+                    "elapsed_ms": csr_started.elapsed().as_millis(),
+                    "read_chunks": ctx.read_chunks,
+                    "read_items": ctx.read_items,
+                    "cache_hits": ctx.cache_hits,
+                    "cache_misses": ctx.cache_misses,
+                    "direct_reads": ctx.direct_reads,
+                    "direct_bytes": ctx.direct_bytes,
+                    "blocking_reads": ctx.blocking_reads,
+                    "blocking_bytes": ctx.blocking_bytes,
+                }));
+            }
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "data_dir": data_dir,
+                    "io_backend": format!("{:?}", io_backend),
+                    "requested_csr": csr,
+                    "samples_per_csr": samples,
+                    "prop_reads": prop_reads,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "total_sampled_sources": total_sampled_sources,
+                    "total_neighbor_edges": total_neighbor_edges,
+                    "total_prop_edges": total_prop_edges,
+                    "csr": per_csr,
+                }))?
+            );
+        }
     }
     Ok(())
+}
+
+fn sample_non_empty_sources(
+    adjacency: &CsrAdjacency,
+    samples: usize,
+) -> (usize, Vec<(u32, u64, u64)>) {
+    let target = samples.max(1);
+    let non_empty_sources = adjacency
+        .offsets
+        .windows(2)
+        .filter(|range| range[0] != range[1])
+        .count();
+    if non_empty_sources == 0 {
+        return (0, Vec::new());
+    }
+    let stride = (non_empty_sources / target).max(1);
+    let mut seen = 0usize;
+    let mut out = Vec::with_capacity(target.min(non_empty_sources));
+    for (src, range) in adjacency.offsets.windows(2).enumerate() {
+        if range[0] == range[1] {
+            continue;
+        }
+        if seen % stride == 0 {
+            out.push((src as u32, range[0], range[1]));
+            if out.len() >= target {
+                break;
+            }
+        }
+        seen += 1;
+    }
+    (non_empty_sources, out)
+}
+
+fn base_io_config(backend: IoBackendKind) -> IoConfig {
+    let mut config = IoConfig::default();
+    config.backend = match backend {
+        IoBackendKind::Direct => ReaderBackendKind::Direct,
+        IoBackendKind::Blocking | IoBackendKind::Uring => ReaderBackendKind::BufferedPread,
+    };
+    config
 }
 
 fn parse_query_list(raw: &str) -> Vec<String> {
