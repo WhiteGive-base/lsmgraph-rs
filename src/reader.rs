@@ -84,13 +84,6 @@ impl CsrEdgeRecordWithDecodedProperties {
 pub struct CsrPropertyValuePredicate {
     pub property_id: PropertyId,
     pub expected: PropertyValue,
-    pub absent_policy: AbsentPropertyPolicy,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum AbsentPropertyPolicy {
-    NeverMatches,
-    MatchesSchemaDefault { default_value: PropertyValue },
 }
 
 impl CsrPropertyValuePredicate {
@@ -98,47 +91,11 @@ impl CsrPropertyValuePredicate {
         Self {
             property_id,
             expected,
-            absent_policy: AbsentPropertyPolicy::NeverMatches,
-        }
-    }
-
-    pub fn equals_with_schema_default(
-        property_id: PropertyId,
-        expected: PropertyValue,
-        default_value: PropertyValue,
-    ) -> Self {
-        Self {
-            property_id,
-            expected,
-            absent_policy: AbsentPropertyPolicy::MatchesSchemaDefault { default_value },
         }
     }
 
     pub fn matches(&self, property: &CsrDecodedPropertyValue) -> bool {
         property.property_id == self.property_id && property.value == self.expected
-    }
-
-    pub fn absent_property_matches(&self) -> bool {
-        match &self.absent_policy {
-            AbsentPropertyPolicy::NeverMatches => false,
-            AbsentPropertyPolicy::MatchesSchemaDefault { default_value } => {
-                default_value == &self.expected
-            }
-        }
-    }
-
-    pub fn matches_decoded_properties(&self, properties: &[CsrDecodedPropertyValue]) -> bool {
-        let mut saw_property = false;
-        for property in properties {
-            if property.property_id != self.property_id {
-                continue;
-            }
-            saw_property = true;
-            if self.matches(property) {
-                return true;
-            }
-        }
-        !saw_property && self.absent_property_matches()
     }
 }
 
@@ -332,7 +289,11 @@ impl<B: IoBackend> CsrReader<B> {
             .await?;
         Ok(rows
             .into_iter()
-            .filter(|row| predicate.matches_decoded_properties(&row.properties))
+            .filter(|row| {
+                row.properties
+                    .iter()
+                    .any(|property| predicate.matches(property))
+            })
             .collect())
     }
 
@@ -914,71 +875,6 @@ mod tests {
             )
             .await?;
         assert!(absent.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn get_neighbors_matching_property_value_can_match_absent_default_rows() -> Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let backend = backend();
-        let writer = CsrWriter::new(backend.clone(), tmp.path(), 89);
-        let src = person_vid(11);
-        let absent_dst = person_vid(12);
-        let explicit_dst = person_vid(13);
-        let mut registry = PropertyEncodingRegistry::new();
-        registry.register(PropertyEncodingSpec {
-            property_id: 5,
-            encoding_epoch: 1,
-            physical_encoding: PropertyPhysicalEncoding::PlainI64,
-            encoding_version: 1,
-        });
-
-        let meta = writer
-            .write_segment_with_properties(
-                0,
-                25,
-                vec![
-                    WriterEdgeRecordWithProperties {
-                        edge: EdgeRecord::insert(src, absent_dst, 2, 10),
-                        properties: Vec::new(),
-                    },
-                    WriterEdgeRecordWithProperties {
-                        edge: EdgeRecord::insert(src, explicit_dst, 2, 20),
-                        properties: vec![EdgePropertyValue::encoded(5, 1, 7_i64.to_le_bytes())],
-                    },
-                ],
-            )
-            .await?;
-
-        let reader = CsrReader::new(backend, tmp.path());
-        let default_match = reader
-            .get_neighbors_matching_property_value(
-                &meta,
-                src,
-                &registry,
-                &CsrPropertyValuePredicate::equals_with_schema_default(
-                    5,
-                    PropertyValue::I64(42),
-                    PropertyValue::I64(42),
-                ),
-            )
-            .await?;
-        assert_eq!(default_match.len(), 1);
-        assert_eq!(default_match[0].edge.dst, absent_dst);
-
-        let default_does_not_match_explicit_value = reader
-            .get_neighbors_matching_property_value(
-                &meta,
-                src,
-                &registry,
-                &CsrPropertyValuePredicate::equals_with_schema_default(
-                    5,
-                    PropertyValue::I64(100),
-                    PropertyValue::I64(42),
-                ),
-            )
-            .await?;
-        assert!(default_does_not_match_explicit_value.is_empty());
         Ok(())
     }
 }

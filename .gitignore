@@ -1,3 +1,7 @@
 /target/
 /store/
 /deps/
+/remote-logs/
+/logs/
+/docs/
+/paper/ 

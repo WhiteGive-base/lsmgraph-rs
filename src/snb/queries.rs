@@ -4,6 +4,7 @@ use std::collections::BinaryHeap;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -28,8 +29,46 @@ pub struct ValidationReport {
     pub passed: usize,
     pub skipped: usize,
     pub failed: usize,
+    pub elapsed_ms: u64,
+    pub query_latency_us: QueryLatencyReport,
+    pub storage_metrics: Value,
     pub supported_queries: Vec<&'static str>,
     pub first_failure: Option<Value>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct QueryLatencyReport {
+    pub count: usize,
+    pub sum_us: u64,
+    pub avg_us: u64,
+    pub min_us: u64,
+    pub p50_us: u64,
+    pub p90_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+}
+
+fn summarize_query_latencies(mut values: Vec<u64>) -> QueryLatencyReport {
+    if values.is_empty() {
+        return QueryLatencyReport::default();
+    }
+    values.sort_unstable();
+    let count = values.len();
+    let sum_us = values.iter().sum();
+    let percentile = |pct: usize| -> u64 {
+        let idx = ((count * pct).div_ceil(100)).saturating_sub(1);
+        values[idx.min(count - 1)]
+    };
+    QueryLatencyReport {
+        count,
+        sum_us,
+        avg_us: sum_us / count as u64,
+        min_us: values[0],
+        p50_us: percentile(50),
+        p90_us: percentile(90),
+        p99_us: percentile(99),
+        max_us: values[count - 1],
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -335,6 +374,9 @@ pub async fn validate_ic_batch(
                 passed: 0,
                 skipped: 0,
                 failed: 1,
+                elapsed_ms: 0,
+                query_latency_us: QueryLatencyReport::default(),
+                storage_metrics: Value::Null,
                 supported_queries: supported_query_names(),
                 first_failure: Some(json!({
                     "error": "validation split file not found",
@@ -391,6 +433,9 @@ pub async fn validate_ic_batch_dynamic(
                 passed: 0,
                 skipped: 0,
                 failed: 1,
+                elapsed_ms: 0,
+                query_latency_us: QueryLatencyReport::default(),
+                storage_metrics: Value::Null,
                 supported_queries: supported_query_names(),
                 first_failure: Some(json!({
                     "error": "validation split file not found",
@@ -534,6 +579,9 @@ fn validate_file_with_snb(
     query_hint: Option<&str>,
 ) -> Result<ValidationReport> {
     let text = std::fs::read_to_string(validation_params)?;
+    snb.reset_storage_metrics();
+    let validation_started = Instant::now();
+    let mut query_latencies = Vec::new();
     let mut checked = 0usize;
     let mut passed = 0usize;
     let mut skipped = 0usize;
@@ -549,8 +597,10 @@ fn validate_file_with_snb(
         };
         let params: Value = serde_json::from_str(params_raw)?;
         let expected: Value = serde_json::from_str(expected_raw)?;
+        let query_started = Instant::now();
         let (query_name, actual) = match dispatch_query(&snb, &params, query_hint)? {
             Some((query_name, value)) => {
+                query_latencies.push(query_started.elapsed().as_micros() as u64);
                 checked += 1;
                 (query_name, value)
             }
@@ -574,6 +624,8 @@ fn validate_file_with_snb(
             }
         }
     }
+    let elapsed_ms = validation_started.elapsed().as_millis() as u64;
+    let storage_metrics = snb.storage_metrics_snapshot_json();
 
     Ok(ValidationReport {
         validation_params: validation_params.display().to_string(),
@@ -582,6 +634,9 @@ fn validate_file_with_snb(
         passed,
         skipped,
         failed,
+        elapsed_ms,
+        query_latency_us: summarize_query_latencies(query_latencies),
+        storage_metrics,
         supported_queries: supported_query_names(),
         first_failure,
     })

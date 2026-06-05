@@ -2,9 +2,13 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::schema::{PropertyId, SchemaEpoch, SemanticSummaryCompleteness};
+use crate::semantic::{
+    DegreeClass, EdgeDirection, GraphAccessSignature, PropertyPredicate, SegmentSortKey,
+};
 use crate::types::{
-    source_label_from_vertex_id, EdgeMarker, EdgeRecord, EdgeType, FileId, LevelId, Timestamp,
-    VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL,
+    EdgeMarker, EdgeRecord, EdgeType, FileId, LevelId, Timestamp, VertexId, MIXED_EDGE_TYPE,
+    UNKNOWN_SOURCE_LABEL,
 };
 
 pub const CSR_MAGIC: u32 = 0x4753_4d4c;
@@ -12,6 +16,8 @@ pub const CSR_VERSION: u16 = 1;
 pub const CSR_HEADER_LEN: usize = 128;
 pub const EDGE_OFFSET_LEN: usize = 24;
 pub const DISK_EDGE_BODY_LEN: usize = 32;
+pub const DISK_PROPERTY_LIST_HEADER_LEN: usize = 4;
+pub const DISK_PROPERTY_VALUE_INDEX_ENTRY_LEN: usize = 28;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CsrHeader {
@@ -105,8 +111,38 @@ pub struct CsrSegmentMeta {
     pub level: LevelId,
     #[serde(default = "default_unknown_source_label")]
     pub src_label: i32,
+    #[serde(default = "default_unknown_source_label")]
+    pub dst_label: i32,
+    #[serde(default)]
+    pub schema_epoch: SchemaEpoch,
+    #[serde(default)]
+    pub summary_completeness: SemanticSummaryCompleteness,
+    #[serde(default)]
+    pub property_summary_completeness: SemanticSummaryCompleteness,
+    #[serde(default)]
+    pub property_presence_bitmap: u64,
+    #[serde(default)]
+    pub property_encoding_epoch: SchemaEpoch,
+    #[serde(default)]
+    pub property_index_offset: u64,
+    #[serde(default)]
+    pub property_index_len: u64,
+    #[serde(default)]
+    pub property_values_offset: u64,
+    #[serde(default)]
+    pub property_values_len: u64,
+    #[serde(default = "default_may_contain_tombstones")]
+    pub may_contain_tombstones: bool,
     #[serde(default = "default_mixed_edge_type")]
     pub edge_type_partition: EdgeType,
+    #[serde(default)]
+    pub direction: EdgeDirection,
+    #[serde(default)]
+    pub degree_class: DegreeClass,
+    #[serde(default)]
+    pub degree_class_exact: bool,
+    #[serde(default)]
+    pub sort_key: SegmentSortKey,
     pub min_src: VertexId,
     pub max_src: VertexId,
     #[serde(default)]
@@ -114,6 +150,10 @@ pub struct CsrSegmentMeta {
     pub edge_count: u64,
     #[serde(default)]
     pub unique_src_count: u64,
+    #[serde(default)]
+    pub avg_degree_x100: u64,
+    #[serde(default)]
+    pub max_degree: u64,
     #[serde(default)]
     pub segment_bytes: u64,
     pub max_ts: Timestamp,
@@ -127,17 +167,80 @@ impl CsrSegmentMeta {
     }
 
     pub fn may_contain_partition(&self, src: VertexId, edge_type: Option<EdgeType>) -> bool {
-        let src_label = source_label_from_vertex_id(src);
-        let label_matches = self.src_label == UNKNOWN_SOURCE_LABEL
-            || src_label == UNKNOWN_SOURCE_LABEL
-            || self.src_label == src_label;
-        let edge_matches = match edge_type {
+        self.may_contain_signature(&GraphAccessSignature::neighbor_scan(src, edge_type))
+    }
+
+    pub fn has_property_value_section(&self) -> bool {
+        self.property_index_len > 0
+    }
+
+    pub fn may_contain_signature(&self, signature: &GraphAccessSignature) -> bool {
+        let time_matches = !signature
+            .min_ts
+            .map(|min_ts| self.max_ts < min_ts)
+            .unwrap_or(false)
+            && !signature
+                .max_ts
+                .map(|max_ts| self.min_ts > max_ts)
+                .unwrap_or(false);
+        if !time_matches {
+            return false;
+        }
+        if !self.summary_completeness.allows_semantic_pruning() {
+            return true;
+        }
+
+        let label_matches = signature.label_matches(self.src_label);
+        let edge_matches = match signature.edge_type {
             Some(edge_type) => {
                 self.edge_type_partition == MIXED_EDGE_TYPE || self.edge_type_partition == edge_type
             }
             None => true,
         };
-        label_matches && edge_matches
+        let direction_matches = signature.direction_matches(self.direction);
+        let degree_matches = match signature.degree_class {
+            Some(degree_class) if self.degree_class_exact => {
+                self.degree_class.may_contain_global_query(degree_class)
+            }
+            _ => true,
+        };
+        let dst_matches = match signature.dst_label {
+            Some(dst_label) => {
+                self.dst_label == UNKNOWN_SOURCE_LABEL || self.dst_label == dst_label
+            }
+            None => true,
+        };
+        let property_matches = match signature.property_predicate {
+            Some(predicate) => self.may_satisfy_property_predicate(predicate),
+            None => true,
+        };
+        label_matches
+            && edge_matches
+            && direction_matches
+            && degree_matches
+            && dst_matches
+            && property_matches
+    }
+
+    pub fn may_contain_property(&self, property_id: PropertyId) -> bool {
+        !self.definitely_lacks_property(property_id)
+    }
+
+    pub fn definitely_lacks_property(&self, property_id: PropertyId) -> bool {
+        let Some(bit) = property_presence_bit(property_id) else {
+            return false;
+        };
+        self.property_summary_completeness.allows_semantic_pruning()
+            && self.property_presence_bitmap & bit == 0
+    }
+
+    pub fn may_satisfy_property_predicate(&self, predicate: PropertyPredicate) -> bool {
+        match predicate {
+            PropertyPredicate::RequiredPresent { property_id } => {
+                self.may_contain_tombstones || self.may_contain_property(property_id)
+            }
+            PropertyPredicate::AbsentOrDefault { property_id: _ } => true,
+        }
     }
 }
 
@@ -147,6 +250,18 @@ fn default_unknown_source_label() -> i32 {
 
 fn default_mixed_edge_type() -> EdgeType {
     MIXED_EDGE_TYPE
+}
+
+fn default_may_contain_tombstones() -> bool {
+    true
+}
+
+pub fn property_presence_bit(property_id: PropertyId) -> Option<u64> {
+    if property_id < 64 {
+        Some(1u64 << property_id)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +339,55 @@ impl DiskEdgeBody {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskPropertyListHeader {
+    pub count: u16,
+    pub reserved: u16,
+}
+
+impl DiskPropertyListHeader {
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.count.to_le_bytes());
+        out.extend_from_slice(&self.reserved.to_le_bytes());
+    }
+
+    pub fn decode(buf: &[u8]) -> Self {
+        Self {
+            count: get_u16(buf, 0),
+            reserved: get_u16(buf, 2),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskPropertyValueIndexEntry {
+    pub property_id: PropertyId,
+    pub encoding_epoch: SchemaEpoch,
+    pub value_offset: u64,
+    pub value_len: u32,
+    pub flags: u32,
+}
+
+impl DiskPropertyValueIndexEntry {
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.property_id.to_le_bytes());
+        out.extend_from_slice(&self.encoding_epoch.to_le_bytes());
+        out.extend_from_slice(&self.value_offset.to_le_bytes());
+        out.extend_from_slice(&self.value_len.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+    }
+
+    pub fn decode(buf: &[u8]) -> Self {
+        Self {
+            property_id: get_u32(buf, 0),
+            encoding_epoch: get_u64(buf, 4),
+            value_offset: get_u64(buf, 12),
+            value_len: get_u32(buf, 20),
+            flags: get_u32(buf, 24),
+        }
+    }
+}
+
 fn put_u16(out: &mut [u8], off: usize, v: u16) {
     out[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
@@ -246,4 +410,224 @@ fn get_u32(buf: &[u8], off: usize) -> u32 {
 
 fn get_u64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn person_vid(local: u64) -> VertexId {
+        (1u64 << 56) | local
+    }
+
+    fn semantic_meta(edge_type: EdgeType) -> CsrSegmentMeta {
+        CsrSegmentMeta {
+            file_id: 1,
+            level: 0,
+            src_label: 1,
+            dst_label: 1,
+            schema_epoch: 0,
+            summary_completeness: SemanticSummaryCompleteness::Exact,
+            property_summary_completeness: SemanticSummaryCompleteness::Exact,
+            property_presence_bitmap: 0,
+            property_encoding_epoch: 0,
+            property_index_offset: 0,
+            property_index_len: 0,
+            property_values_offset: 0,
+            property_values_len: 0,
+            may_contain_tombstones: false,
+            edge_type_partition: edge_type,
+            direction: EdgeDirection::Out,
+            degree_class: DegreeClass::Low,
+            degree_class_exact: true,
+            sort_key: SegmentSortKey::SrcEdgeDstTs,
+            min_src: person_vid(1),
+            max_src: person_vid(100),
+            min_ts: 10,
+            edge_count: 10,
+            unique_src_count: 2,
+            avg_degree_x100: 500,
+            max_degree: 8,
+            segment_bytes: 1024,
+            max_ts: 20,
+        }
+    }
+
+    #[test]
+    fn semantic_signature_prunes_edge_type_but_keeps_legacy_unknowns() {
+        let meta = semantic_meta(1);
+        assert!(meta
+            .may_contain_signature(&GraphAccessSignature::neighbor_scan(person_vid(7), Some(1))));
+        assert!(!meta
+            .may_contain_signature(&GraphAccessSignature::neighbor_scan(person_vid(7), Some(2))));
+
+        let mut legacy_meta = meta;
+        legacy_meta.direction = EdgeDirection::Unknown;
+        legacy_meta.src_label = UNKNOWN_SOURCE_LABEL;
+        assert!(legacy_meta
+            .may_contain_signature(&GraphAccessSignature::neighbor_scan(person_vid(7), Some(1))));
+    }
+
+    #[test]
+    fn semantic_degree_signature_treats_segment_degree_as_local_bound() {
+        let low_meta = semantic_meta(1);
+        assert!(low_meta.may_contain_signature(
+            &GraphAccessSignature::neighbor_scan(person_vid(7), Some(1))
+                .with_degree_class(DegreeClass::High)
+        ));
+
+        let mut high_meta = low_meta;
+        high_meta.degree_class = DegreeClass::High;
+        assert!(!high_meta.may_contain_signature(
+            &GraphAccessSignature::neighbor_scan(person_vid(7), Some(1))
+                .with_degree_class(DegreeClass::Low)
+        ));
+    }
+
+    #[test]
+    fn legacy_manifest_meta_defaults_to_conservative_schema_summary() {
+        let json = r#"{
+            "file_id":1,
+            "level":0,
+            "src_label":1,
+            "dst_label":1,
+            "edge_type_partition":1,
+            "direction":"out",
+            "degree_class":"low",
+            "degree_class_exact":true,
+            "sort_key":"src_edge_dst_ts",
+            "min_src":72057594037927937,
+            "max_src":72057594037928036,
+            "min_ts":10,
+            "edge_count":10,
+            "unique_src_count":2,
+            "avg_degree_x100":500,
+            "max_degree":8,
+            "segment_bytes":1024,
+            "max_ts":20
+        }"#;
+        let meta: CsrSegmentMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.schema_epoch, 0);
+        assert_eq!(
+            meta.summary_completeness,
+            SemanticSummaryCompleteness::Unknown
+        );
+        assert_eq!(
+            meta.property_summary_completeness,
+            SemanticSummaryCompleteness::Unknown
+        );
+        assert_eq!(meta.property_presence_bitmap, 0);
+        assert_eq!(meta.property_encoding_epoch, 0);
+        assert_eq!(meta.property_index_offset, 0);
+        assert_eq!(meta.property_index_len, 0);
+        assert_eq!(meta.property_values_offset, 0);
+        assert_eq!(meta.property_values_len, 0);
+        assert!(!meta.has_property_value_section());
+        assert!(meta.may_contain_tombstones);
+        assert!(meta
+            .may_contain_signature(&GraphAccessSignature::neighbor_scan(person_vid(7), Some(2))));
+        assert!(meta.may_contain_property(1));
+        assert!(!meta.definitely_lacks_property(1));
+    }
+
+    #[test]
+    fn exact_property_presence_allows_safe_absence_reasoning() {
+        let mut meta = semantic_meta(1);
+        meta.property_presence_bitmap =
+            property_presence_bit(1).unwrap() | property_presence_bit(3).unwrap();
+
+        assert!(meta.may_contain_property(1));
+        assert!(!meta.definitely_lacks_property(1));
+        assert!(!meta.may_contain_property(2));
+        assert!(meta.definitely_lacks_property(2));
+
+        meta.property_summary_completeness = SemanticSummaryCompleteness::Unknown;
+        assert!(meta.may_contain_property(2));
+        assert!(!meta.definitely_lacks_property(2));
+        assert!(meta.may_contain_property(65));
+        assert!(!meta.definitely_lacks_property(65));
+    }
+
+    #[test]
+    fn property_predicate_pruning_respects_default_and_unknown_summaries() {
+        let mut meta = semantic_meta(1);
+        let src = person_vid(7);
+
+        assert!(!meta.may_contain_signature(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2)
+        ));
+        assert!(meta.may_contain_signature(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_absent_or_default_property(2)
+        ));
+
+        meta.property_presence_bitmap = property_presence_bit(2).unwrap();
+        assert!(meta.may_contain_signature(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2)
+        ));
+
+        meta.property_summary_completeness = SemanticSummaryCompleteness::Unknown;
+        meta.property_presence_bitmap = 0;
+        assert!(meta.may_contain_signature(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2)
+        ));
+        assert!(meta.may_contain_signature(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(65)
+        ));
+    }
+
+    #[test]
+    fn required_property_keeps_exact_absent_tombstone_segments() {
+        let mut meta = semantic_meta(1);
+        let src = person_vid(7);
+
+        assert!(!meta.may_contain_signature(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2)
+        ));
+
+        meta.may_contain_tombstones = true;
+        assert!(meta.may_contain_signature(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2)
+        ));
+    }
+
+    #[test]
+    fn property_section_metadata_tracks_presence_without_breaking_defaults() {
+        let mut meta = semantic_meta(1);
+        assert!(!meta.has_property_value_section());
+
+        meta.property_index_offset = 512;
+        meta.property_index_len = 64;
+        meta.property_values_offset = 576;
+        meta.property_values_len = 128;
+        assert!(meta.has_property_value_section());
+    }
+
+    #[test]
+    fn disk_property_list_header_round_trips() {
+        let header = DiskPropertyListHeader {
+            count: 3,
+            reserved: 0,
+        };
+        let mut bytes = Vec::new();
+        header.encode(&mut bytes);
+
+        assert_eq!(bytes.len(), DISK_PROPERTY_LIST_HEADER_LEN);
+        assert_eq!(DiskPropertyListHeader::decode(&bytes), header);
+    }
+
+    #[test]
+    fn disk_property_value_index_entry_round_trips() {
+        let entry = DiskPropertyValueIndexEntry {
+            property_id: 7,
+            encoding_epoch: 42,
+            value_offset: 4096,
+            value_len: 16,
+            flags: 1,
+        };
+        let mut bytes = Vec::new();
+        entry.encode(&mut bytes);
+
+        assert_eq!(bytes.len(), DISK_PROPERTY_VALUE_INDEX_ENTRY_LEN);
+        assert_eq!(DiskPropertyValueIndexEntry::decode(&bytes), entry);
+    }
 }
