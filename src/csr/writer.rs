@@ -55,6 +55,15 @@ impl EdgeRecordWithProperties {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CsrSegmentSemanticOverrides {
+    pub src_label: Option<i32>,
+    pub dst_label: Option<i32>,
+    pub edge_type_partition: Option<EdgeType>,
+    pub degree_class: Option<DegreeClass>,
+    pub degree_class_exact: Option<bool>,
+}
+
 pub struct CsrWriter<B: IoBackend> {
     backend: Arc<B>,
     store_dir: PathBuf,
@@ -80,8 +89,13 @@ impl<B: IoBackend> CsrWriter<B> {
             .into_iter()
             .map(EdgeRecordWithProperties::topology_only)
             .collect();
-        self.write_property_records_with_edge_type_partition(level, file_id, records, None)
-            .await
+        self.write_property_records_with_semantic_overrides(
+            level,
+            file_id,
+            records,
+            CsrSegmentSemanticOverrides::default(),
+        )
+        .await
     }
 
     pub async fn write_segment_with_edge_type_partition(
@@ -95,11 +109,14 @@ impl<B: IoBackend> CsrWriter<B> {
             .into_iter()
             .map(EdgeRecordWithProperties::topology_only)
             .collect();
-        self.write_property_records_with_edge_type_partition(
+        self.write_property_records_with_semantic_overrides(
             level,
             file_id,
             records,
-            edge_type_partition_override,
+            CsrSegmentSemanticOverrides {
+                edge_type_partition: edge_type_partition_override,
+                ..CsrSegmentSemanticOverrides::default()
+            },
         )
         .await
     }
@@ -110,8 +127,13 @@ impl<B: IoBackend> CsrWriter<B> {
         file_id: FileId,
         records: Vec<EdgeRecordWithProperties>,
     ) -> Result<CsrSegmentMeta> {
-        self.write_property_records_with_edge_type_partition(level, file_id, records, None)
-            .await
+        self.write_property_records_with_semantic_overrides(
+            level,
+            file_id,
+            records,
+            CsrSegmentSemanticOverrides::default(),
+        )
+        .await
     }
 
     pub async fn write_segment_with_properties_and_edge_type_partition(
@@ -121,21 +143,40 @@ impl<B: IoBackend> CsrWriter<B> {
         records: Vec<EdgeRecordWithProperties>,
         edge_type_partition_override: Option<EdgeType>,
     ) -> Result<CsrSegmentMeta> {
-        self.write_property_records_with_edge_type_partition(
+        self.write_property_records_with_semantic_overrides(
             level,
             file_id,
             records,
-            edge_type_partition_override,
+            CsrSegmentSemanticOverrides {
+                edge_type_partition: edge_type_partition_override,
+                ..CsrSegmentSemanticOverrides::default()
+            },
         )
         .await
     }
 
-    async fn write_property_records_with_edge_type_partition(
+    pub async fn write_segment_with_properties_and_semantic_overrides(
+        &self,
+        level: LevelId,
+        file_id: FileId,
+        records: Vec<EdgeRecordWithProperties>,
+        semantic_overrides: CsrSegmentSemanticOverrides,
+    ) -> Result<CsrSegmentMeta> {
+        self.write_property_records_with_semantic_overrides(
+            level,
+            file_id,
+            records,
+            semantic_overrides,
+        )
+        .await
+    }
+
+    async fn write_property_records_with_semantic_overrides(
         &self,
         level: LevelId,
         file_id: FileId,
         mut records: Vec<EdgeRecordWithProperties>,
-        edge_type_partition_override: Option<EdgeType>,
+        semantic_overrides: CsrSegmentSemanticOverrides,
     ) -> Result<CsrSegmentMeta> {
         records.sort_by_key(|record| {
             (
@@ -152,10 +193,15 @@ impl<B: IoBackend> CsrWriter<B> {
         let max_src = edges.last().map(|e| e.src).unwrap_or(0);
         let degree_stats = source_degree_stats(&edges);
         let unique_src_count = degree_stats.unique_src_count;
-        let src_label = segment_src_label(&edges);
-        let dst_label = segment_dst_label(&edges);
-        let edge_type_partition =
-            edge_type_partition_override.unwrap_or_else(|| segment_edge_type(&edges));
+        let src_label = semantic_overrides
+            .src_label
+            .unwrap_or_else(|| segment_src_label(&edges));
+        let dst_label = semantic_overrides
+            .dst_label
+            .unwrap_or_else(|| segment_dst_label(&edges));
+        let edge_type_partition = semantic_overrides
+            .edge_type_partition
+            .unwrap_or_else(|| segment_edge_type(&edges));
 
         let mut offsets = Vec::new();
         let mut bodies = Vec::with_capacity(edges.len() * DISK_EDGE_BODY_LEN);
@@ -275,8 +321,12 @@ impl<B: IoBackend> CsrWriter<B> {
             may_contain_tombstones: edges.iter().any(|edge| edge.marker == EdgeMarker::Delete),
             edge_type_partition,
             direction: EdgeDirection::Out,
-            degree_class: degree_stats.degree_class,
-            degree_class_exact: degree_stats.degree_class_exact,
+            degree_class: semantic_overrides
+                .degree_class
+                .unwrap_or(degree_stats.degree_class),
+            degree_class_exact: semantic_overrides
+                .degree_class_exact
+                .unwrap_or(degree_stats.degree_class_exact),
             sort_key: SegmentSortKey::SrcEdgeDstTs,
             min_src,
             max_src,

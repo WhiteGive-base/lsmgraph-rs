@@ -13,8 +13,8 @@ use crate::config::{L0LayoutPolicy, LsmGraphConfig};
 use crate::csr::format::property_presence_bit;
 use crate::csr::{
     CsrEdgeRecordWithProperties, CsrMetadataCache, CsrPropertyValuePredicate, CsrReader,
-    CsrSegmentMeta, CsrWriter, EdgePropertyValue, EdgeRecordWithProperties, Manifest,
-    ManifestRecord,
+    CsrSegmentMeta, CsrSegmentSemanticOverrides, CsrWriter, EdgePropertyValue,
+    EdgeRecordWithProperties, Manifest, ManifestRecord,
 };
 use crate::error::Result;
 use crate::index::{MultiLevelIndex, VertexLockTable};
@@ -157,6 +157,101 @@ impl SemanticL0Index {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct OracleL0Index {
+    index: HashMap<(VertexId, Option<EdgeType>), Vec<FileId>>,
+}
+
+impl OracleL0Index {
+    pub fn build_from_edges(
+        edges: &[EdgeRecord],
+        l0_files: &[CsrSegmentMeta],
+    ) -> Self {
+        let mut index: HashMap<(VertexId, Option<EdgeType>), HashSet<FileId>> =
+            HashMap::new();
+
+        let mut file_edges: HashMap<FileId, Vec<EdgeRecord>> = HashMap::new();
+        for edge in edges {
+            for meta in l0_files {
+                if meta.file_id == 0 {
+                    continue;
+                }
+                if edge.src >= meta.min_src
+                    && edge.src <= meta.max_src
+                    && (meta.edge_type_partition == MIXED_EDGE_TYPE
+                        || meta.edge_type_partition == edge.edge_type)
+                    && meta.src_label == UNKNOWN_SOURCE_LABEL
+                        || source_label_from_vertex_id(edge.src) == meta.src_label
+                {
+                    file_edges.entry(meta.file_id).or_default().push(*edge);
+                }
+            }
+        }
+
+        for edge in edges {
+            for (file_id, file_edge_list) in &file_edges {
+                if file_edge_list.contains(edge) {
+                    let key = (edge.src, Some(edge.edge_type));
+                    index.entry(key).or_default().insert(*file_id);
+                }
+            }
+        }
+
+        let index: HashMap<_, Vec<_>> = index
+            .into_iter()
+            .map(|(k, v)| {
+                let mut ids: Vec<_> = v.into_iter().collect();
+                ids.sort_unstable();
+                (k, ids)
+            })
+            .collect();
+
+        Self { index }
+    }
+
+    pub async fn build_from_reader(
+        l0_files: &[CsrSegmentMeta],
+        reader: &CsrReader<AnyIoBackend>,
+    ) -> Result<Self> {
+        let mut index: HashMap<(VertexId, Option<EdgeType>), HashSet<FileId>> =
+            HashMap::new();
+
+        for meta in l0_files {
+            let edges = reader.read_all_edges(meta).await?;
+            for edge in &edges {
+                let key = (edge.src, Some(edge.edge_type));
+                index.entry(key).or_default().insert(meta.file_id);
+            }
+        }
+
+        let index: HashMap<_, Vec<_>> = index
+            .into_iter()
+            .map(|(k, v)| {
+                let mut ids: Vec<_> = v.into_iter().collect();
+                ids.sort_unstable();
+                (k, ids)
+            })
+            .collect();
+
+        Ok(Self { index })
+    }
+
+    pub fn get(&self, src: VertexId, edge_type: Option<EdgeType>) -> Vec<FileId> {
+        self.index
+            .get(&(src, edge_type))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+}
+
 fn degree_classes_that_may_contain_queries(query_classes: &[DegreeClass]) -> Vec<DegreeClass> {
     let mut out = Vec::new();
     for query_class in query_classes {
@@ -199,6 +294,7 @@ pub struct Engine {
     metadata_cache: Arc<CsrMetadataCache>,
     degree_directory: RwLock<HashMap<(VertexId, EdgeType), Vec<DegreeClass>>>,
     semantic_l0_index: RwLock<SemanticL0Index>,
+    oracle_l0_index: RwLock<OracleL0Index>,
     schema_catalog: RwLock<SchemaCatalog>,
 }
 
@@ -292,6 +388,23 @@ pub struct PropertyEncodingMigrationCandidateReport {
     pub blocked_by_snapshot_gc: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OracleIndexStats {
+    pub entry_count: usize,
+    pub l0_segment_count: usize,
+    pub elapsed_ms: u64,
+}
+
+impl OracleIndexStats {
+    fn empty() -> Self {
+        Self {
+            entry_count: 0,
+            l0_segment_count: 0,
+            elapsed_ms: 0,
+        }
+    }
+}
+
 fn summary_completeness_key(value: crate::schema::SemanticSummaryCompleteness) -> String {
     format!("{value:?}")
 }
@@ -355,22 +468,48 @@ struct BudgetedEdgeTypeDecision {
 #[derive(Debug)]
 struct L0FlushSegment {
     edges: Vec<EdgeRecord>,
-    edge_type_partition_override: Option<EdgeType>,
+    semantic_overrides: CsrSegmentSemanticOverrides,
 }
 
 impl L0FlushSegment {
     fn new(edges: Vec<EdgeRecord>, edge_type_partition_override: Option<EdgeType>) -> Self {
         Self {
             edges,
-            edge_type_partition_override,
+            semantic_overrides: CsrSegmentSemanticOverrides {
+                edge_type_partition: edge_type_partition_override,
+                ..CsrSegmentSemanticOverrides::default()
+            },
         }
+    }
+
+    fn with_semantic_overrides(
+        edges: Vec<EdgeRecord>,
+        semantic_overrides: CsrSegmentSemanticOverrides,
+    ) -> Self {
+        Self {
+            edges,
+            semantic_overrides,
+        }
+    }
+
+    fn fully_mixed(edges: Vec<EdgeRecord>) -> Self {
+        Self::with_semantic_overrides(
+            edges,
+            CsrSegmentSemanticOverrides {
+                src_label: Some(UNKNOWN_SOURCE_LABEL),
+                dst_label: Some(UNKNOWN_SOURCE_LABEL),
+                edge_type_partition: Some(MIXED_EDGE_TYPE),
+                degree_class: Some(DegreeClass::Mixed),
+                degree_class_exact: Some(false),
+            },
+        )
     }
 }
 
 #[derive(Debug)]
 struct L0PropertyFlushSegment {
     records: Vec<EdgeRecordWithProperties>,
-    edge_type_partition_override: Option<EdgeType>,
+    semantic_overrides: CsrSegmentSemanticOverrides,
 }
 
 impl Engine {
@@ -438,6 +577,7 @@ impl Engine {
             metadata_cache: Arc::new(CsrMetadataCache::new(4096)),
             degree_directory: RwLock::new(HashMap::new()),
             semantic_l0_index: RwLock::new(SemanticL0Index::default()),
+            oracle_l0_index: RwLock::new(OracleL0Index::default()),
             schema_catalog: RwLock::new(schema_catalog),
         });
         engine.rebuild_index().await?;
@@ -1015,11 +1155,11 @@ impl Engine {
         for segment in self.build_l0_property_flush_segments(records)? {
             let file_id = self.alloc_file_id();
             let meta = writer
-                .write_segment_with_properties_and_edge_type_partition(
+                .write_segment_with_properties_and_semantic_overrides(
                     L0,
                     file_id,
                     segment.records,
-                    segment.edge_type_partition_override,
+                    segment.semantic_overrides,
                 )
                 .await?;
             self.append_manifest(&ManifestRecord::CreateFile { meta })?;
@@ -1062,10 +1202,18 @@ impl Engine {
         let segments = match self.config.l0_layout {
             L0LayoutPolicy::Naive => vec![L0FlushSegment::new(edges, None)],
             L0LayoutPolicy::Schema => self.build_schema_l0_flush_segments(edges),
+            L0LayoutPolicy::LabelOnly => self.build_label_only_l0_flush_segments(edges),
+            L0LayoutPolicy::EdgeTypeOnly => self.build_edge_type_only_l0_flush_segments(edges),
+            L0LayoutPolicy::DegreeOnly => self.build_degree_only_l0_flush_segments(edges),
             L0LayoutPolicy::Semantic => self.build_semantic_l0_flush_segments(edges),
             L0LayoutPolicy::SemanticBudgeted => {
                 self.build_budgeted_semantic_l0_flush_segments(edges)?
             }
+            L0LayoutPolicy::LsmGraphStyle => vec![L0FlushSegment::new(edges, None)],
+            L0LayoutPolicy::FullCompact | L0LayoutPolicy::OracleSemantic => {
+                vec![L0FlushSegment::new(edges, None)]
+            }
+            L0LayoutPolicy::RocksDbStyle => self.build_rocksdb_style_l0_flush_segments(edges),
         };
 
         let segments = if segments.is_empty() {
@@ -1102,7 +1250,7 @@ impl Engine {
                     .collect();
                 L0PropertyFlushSegment {
                     records,
-                    edge_type_partition_override: segment.edge_type_partition_override,
+                    semantic_overrides: segment.semantic_overrides,
                 }
             })
             .collect())
@@ -1202,6 +1350,85 @@ impl Engine {
         segments
     }
 
+    fn build_label_only_l0_flush_segments(&self, edges: Vec<EdgeRecord>) -> Vec<L0FlushSegment> {
+        let mut partitions: BTreeMap<i32, Vec<EdgeRecord>> = BTreeMap::new();
+        for edge in edges {
+            partitions
+                .entry(source_label_from_vertex_id(edge.src))
+                .or_default()
+                .push(edge);
+        }
+
+        let overrides = CsrSegmentSemanticOverrides {
+            dst_label: Some(UNKNOWN_SOURCE_LABEL),
+            edge_type_partition: Some(MIXED_EDGE_TYPE),
+            degree_class: Some(DegreeClass::Mixed),
+            degree_class_exact: Some(false),
+            ..CsrSegmentSemanticOverrides::default()
+        };
+        let mut segments = Vec::new();
+        for (_, mut group) in partitions {
+            group.sort_by_key(|e| (e.src, e.edge_type, e.dst, e.ts));
+            segments.extend(
+                split_range_bounded_segments(group, self.config.segment_target_bytes)
+                    .into_iter()
+                    .map(|segment| L0FlushSegment::with_semantic_overrides(segment, overrides)),
+            );
+        }
+        segments
+    }
+
+    fn build_edge_type_only_l0_flush_segments(
+        &self,
+        edges: Vec<EdgeRecord>,
+    ) -> Vec<L0FlushSegment> {
+        let mut partitions: BTreeMap<EdgeType, Vec<EdgeRecord>> = BTreeMap::new();
+        for edge in edges {
+            partitions.entry(edge.edge_type).or_default().push(edge);
+        }
+
+        let overrides = CsrSegmentSemanticOverrides {
+            src_label: Some(UNKNOWN_SOURCE_LABEL),
+            dst_label: Some(UNKNOWN_SOURCE_LABEL),
+            degree_class: Some(DegreeClass::Mixed),
+            degree_class_exact: Some(false),
+            ..CsrSegmentSemanticOverrides::default()
+        };
+        let mut segments = Vec::new();
+        for (_, mut group) in partitions {
+            group.sort_by_key(|e| (e.src, e.edge_type, e.dst, e.ts));
+            segments.extend(
+                split_range_bounded_segments(group, self.config.segment_target_bytes)
+                    .into_iter()
+                    .map(|segment| L0FlushSegment::with_semantic_overrides(segment, overrides)),
+            );
+        }
+        segments
+    }
+
+    fn build_degree_only_l0_flush_segments(
+        &self,
+        mut edges: Vec<EdgeRecord>,
+    ) -> Vec<L0FlushSegment> {
+        edges.sort_by_key(|e| (e.src, e.edge_type, e.dst, e.ts));
+        let overrides = CsrSegmentSemanticOverrides {
+            src_label: Some(UNKNOWN_SOURCE_LABEL),
+            dst_label: Some(UNKNOWN_SOURCE_LABEL),
+            edge_type_partition: Some(MIXED_EDGE_TYPE),
+            ..CsrSegmentSemanticOverrides::default()
+        };
+        let mut segments = Vec::new();
+        for (_, mut group) in split_by_source_degree_class(edges) {
+            group.sort_by_key(|e| (e.src, e.edge_type, e.dst, e.ts));
+            segments.extend(
+                split_range_bounded_segments(group, self.config.segment_target_bytes)
+                    .into_iter()
+                    .map(|segment| L0FlushSegment::with_semantic_overrides(segment, overrides)),
+            );
+        }
+        segments
+    }
+
     fn build_semantic_l0_flush_segments(&self, edges: Vec<EdgeRecord>) -> Vec<L0FlushSegment> {
         let mut exact: BTreeMap<(i32, EdgeType), Vec<EdgeRecord>> = BTreeMap::new();
         for edge in edges {
@@ -1232,6 +1459,48 @@ impl Engine {
             );
         }
 
+        segments
+    }
+
+    /// Builds L0 flush segments for RocksDB-style KV-LSM baseline.
+    ///
+    /// This policy is designed to simulate a RocksDB-style key-value LSM store where
+    /// edges are encoded as KV pairs. The key insight is:
+    ///
+    /// 1. **Write path**: Edges are written to CSR segments in a completely unsemantic way.
+    ///    All edges go into a single mixed segment with conservative/Unknown metadata.
+    ///
+    /// 2. **Semantic metadata is conservative**: All semantic fields are set to Unknown/Mixed:
+    ///    - `src_label = UNKNOWN_SOURCE_LABEL` (don't know source vertex label)
+    ///    - `edge_type_partition = MIXED_EDGE_TYPE` (don't know edge type)
+    ///    - `degree_class = DegreeClass::Mixed` (don't know degree class)
+    ///    - `direction = EdgeDirection::Unknown` (don't know direction)
+    ///
+    /// 3. **No semantic pruning benefit**: Since `summary_completeness = Unknown`, the
+    ///    `may_contain_signature()` check in `CsrSegmentMeta` always returns `true`
+    ///    (conservative). This means every segment is considered a candidate for every query.
+    ///
+    /// 4. **This proves the point**: SemL0's contribution is making the semantic metadata
+    ///    **useful** at query time. Without semantic pruning logic (i.e., in RocksDB-style),
+    ///    the metadata is worthless and causes high read amplification.
+    ///
+    /// Note: We still partition by key range to keep file sizes reasonable, but all partitions
+    /// share the same conservative semantic metadata.
+    fn build_rocksdb_style_l0_flush_segments(
+        &self,
+        edges: Vec<EdgeRecord>,
+    ) -> Vec<L0FlushSegment> {
+        // RocksDB-style: sort by (src, edge_type, dst, ts) to enable range scans
+        let mut sorted = edges;
+        sorted.sort_by_key(|e| (e.src, e.edge_type, e.dst, e.ts));
+
+        // Split into range-bounded segments (same as Naive, but with conservative metadata)
+        let mut segments = Vec::new();
+        for group in
+            split_range_bounded_segments(sorted, self.config.segment_target_bytes)
+        {
+            segments.push(L0FlushSegment::fully_mixed(group));
+        }
         segments
     }
 
@@ -1756,7 +2025,21 @@ impl Engine {
             self.metrics.clone(),
             self.metadata_cache.clone(),
         );
-        if let Some(l0) = guard.version().levels.get(L0 as usize) {
+        if matches!(self.config.l0_layout, L0LayoutPolicy::LsmGraphStyle) {
+            if let Some(l0) = guard.version().levels.get(L0 as usize) {
+                updates.extend(
+                    self.get_neighbors_lsmgraph_style(l0, src)
+                        .await?,
+                );
+            }
+        } else if matches!(self.config.l0_layout, L0LayoutPolicy::OracleSemantic) {
+            if let Some(l0) = guard.version().levels.get(L0 as usize) {
+                updates.extend(
+                    self.get_neighbors_oracle_semantic(l0, &reader, &signature, src)
+                        .await?,
+                );
+            }
+        } else if let Some(l0) = guard.version().levels.get(L0 as usize) {
             let use_semantic_l0_index =
                 signature.edge_type.is_some() && signature.src_label != UNKNOWN_SOURCE_LABEL;
             let indexed_l0 = if use_semantic_l0_index {
@@ -1861,6 +2144,71 @@ impl Engine {
         Ok(out)
     }
 
+    async fn get_neighbors_lsmgraph_style(
+        &self,
+        l0: &[CsrSegmentMeta],
+        src: VertexId,
+    ) -> Result<Vec<EdgeRecord>> {
+        let reader = CsrReader::with_metrics_and_cache(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.metrics.clone(),
+            self.metadata_cache.clone(),
+        );
+        let mut results = Vec::new();
+        for meta in l0 {
+            if src < meta.min_src || src > meta.max_src {
+                continue;
+            }
+            let cached = reader.cached_may_contain_src(meta, src);
+            if matches!(cached, Some(false)) {
+                continue;
+            }
+            let edges: Vec<EdgeRecord> = reader.get_neighbors(meta, src).await?;
+            if !edges.is_empty() {
+                results.extend(edges);
+            }
+        }
+        Ok(results)
+    }
+
+    async fn get_neighbors_oracle_semantic(
+        &self,
+        l0: &[CsrSegmentMeta],
+        reader: &CsrReader<AnyIoBackend>,
+        signature: &GraphAccessSignature,
+        src: VertexId,
+    ) -> Result<Vec<EdgeRecord>> {
+        let edge_type = signature.edge_type;
+        let oracle_file_ids = self.oracle_l0_index.read().get(src, edge_type);
+        if oracle_file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let oracle_meta_set: HashSet<FileId> =
+            oracle_file_ids.iter().copied().collect();
+        let mut results = Vec::new();
+        for meta in l0 {
+            if !oracle_meta_set.contains(&meta.file_id) {
+                continue;
+            }
+            if src < meta.min_src || src > meta.max_src {
+                continue;
+            }
+            if !meta.may_contain_signature(signature) {
+                continue;
+            }
+            self.metrics
+                .candidate_l0_segments
+                .fetch_add(1, Ordering::Relaxed);
+            let edges: Vec<EdgeRecord> = reader.get_neighbors(meta, src).await?;
+            if !edges.is_empty() {
+                self.metrics.matched_l0_segments.fetch_add(1, Ordering::Relaxed);
+                results.extend(edges);
+            }
+        }
+        Ok(results)
+    }
+
     pub async fn scan_edges(&self, snapshot: SnapshotId) -> Result<Vec<EdgeRecord>> {
         let started = Instant::now();
         self.metrics.scan_ops.fetch_add(1, Ordering::Relaxed);
@@ -1889,6 +2237,39 @@ impl Engine {
 
     pub async fn compact_l0_to_l1(&self) -> Result<Option<CsrSegmentMeta>> {
         self.compact_l0_to_l1_inner(true).await
+    }
+
+    pub async fn build_oracle_index(&self) -> Result<OracleIndexStats> {
+        let started = Instant::now();
+        let guard = self.version_manager.pin_current();
+        let l0_files: Vec<_> = guard
+            .version()
+            .levels
+            .get(L0 as usize)
+            .cloned()
+            .unwrap_or_default();
+
+        if l0_files.is_empty() {
+            return Ok(OracleIndexStats::empty());
+        }
+
+        let reader = CsrReader::with_metrics_and_cache(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.metrics.clone(),
+            self.metadata_cache.clone(),
+        );
+
+        let oracle_index = OracleL0Index::build_from_reader(&l0_files, &reader).await?;
+        let entry_count = oracle_index.len();
+
+        *self.oracle_l0_index.write() = oracle_index;
+
+        Ok(OracleIndexStats {
+            entry_count,
+            l0_segment_count: l0_files.len(),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
     }
 
     pub async fn compact_l0_partition_to_l1(
@@ -1922,6 +2303,9 @@ impl Engine {
     }
 
     pub async fn compact_best_l0_partition_by_score(&self) -> Result<Option<L0CompactionDecision>> {
+        if !self.config.supports_feedback_compaction() {
+            return Ok(None);
+        }
         let Some(pick) = self.pick_l0_partition_by_score() else {
             return Ok(None);
         };
@@ -2684,14 +3068,11 @@ fn merge_l0_flush_segments_to_cap(
     for (idx, segment) in segments.into_iter().enumerate() {
         current.extend(segment.edges);
         if (idx + 1) % chunk_size == 0 {
-            merged.push(L0FlushSegment::new(
-                std::mem::take(&mut current),
-                Some(MIXED_EDGE_TYPE),
-            ));
+            merged.push(L0FlushSegment::fully_mixed(std::mem::take(&mut current)));
         }
     }
     if !current.is_empty() {
-        merged.push(L0FlushSegment::new(current, Some(MIXED_EDGE_TYPE)));
+        merged.push(L0FlushSegment::fully_mixed(current));
     }
     merged
 }

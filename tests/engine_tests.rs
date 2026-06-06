@@ -9,7 +9,7 @@ use lsmgraph::graph::Engine;
 use lsmgraph::io::BlockingPreadBackend;
 use lsmgraph::metrics::Metrics;
 use lsmgraph::property_encoding::PropertyValue;
-use lsmgraph::types::{EdgeLabel, EdgeRecord, VertexId, MIXED_EDGE_TYPE};
+use lsmgraph::types::{EdgeLabel, EdgeRecord, VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
     DegreeClass, GraphAccessSignature, NewPropertyEntry, PropertyOwner, SchemaCatalog,
     SemanticSummaryCompleteness, VertexLabel,
@@ -893,6 +893,207 @@ async fn semantic_l0_degree_pruning_keeps_edges_across_flushes() -> anyhow::Resu
     assert_eq!(
         candidates, 20,
         "medium global degree should include all low-degree local L0 fragments"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn label_only_l0_exposes_only_source_label_baseline() -> anyhow::Result<()> {
+    let tmp = target_tempdir("label-only-l0-baseline-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::LabelOnly);
+    let engine = Engine::create(config).await?;
+    let person_knows = encoded(VertexLabel::Person, 10);
+    let person_interest = encoded(VertexLabel::Person, 20);
+    let comment_knows = encoded(VertexLabel::Comment, 30);
+
+    engine
+        .insert_edge(
+            person_knows,
+            encoded(VertexLabel::Person, 11),
+            EdgeLabel::Knows.as_i32(),
+        )
+        .await?;
+    engine
+        .insert_edge(
+            person_interest,
+            encoded(VertexLabel::Tag, 21),
+            EdgeLabel::HasInterest.as_i32(),
+        )
+        .await?;
+    engine
+        .insert_edge(
+            comment_knows,
+            encoded(VertexLabel::Person, 31),
+            EdgeLabel::Knows.as_i32(),
+        )
+        .await?;
+    engine.flush_active().await?;
+
+    let guard = engine.version_guard();
+    let l0 = &guard.version().levels[0];
+    let person_meta = l0
+        .iter()
+        .find(|meta| meta.src_label == VertexLabel::Person as i32)
+        .expect("label-only layout should keep a Person-label segment");
+    assert_eq!(person_meta.edge_type_partition, MIXED_EDGE_TYPE);
+    assert_eq!(person_meta.dst_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(person_meta.degree_class, DegreeClass::Mixed);
+    assert!(!person_meta.degree_class_exact);
+
+    engine.metrics().reset();
+    let knows = engine
+        .get_neighbors_typed(
+            person_knows,
+            EdgeLabel::Knows.as_i32(),
+            engine.current_snapshot(),
+        )
+        .await?;
+    assert_eq!(knows.len(), 1);
+    let knows_candidates = engine.metrics().snapshot_json()["csr"]["candidate_l0_segments"]
+        .as_u64()
+        .unwrap_or_default();
+
+    engine.metrics().reset();
+    let interests = engine
+        .get_neighbors_typed(
+            person_knows,
+            EdgeLabel::HasInterest.as_i32(),
+            engine.current_snapshot(),
+        )
+        .await?;
+    assert!(interests.is_empty());
+    let interest_candidates = engine.metrics().snapshot_json()["csr"]["candidate_l0_segments"]
+        .as_u64()
+        .unwrap_or_default();
+    assert_eq!(knows_candidates, 1);
+    assert_eq!(
+        interest_candidates, 1,
+        "label-only baseline should not prune by edge type inside a matching label segment"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn edge_type_only_l0_exposes_only_edge_type_baseline() -> anyhow::Result<()> {
+    let tmp = target_tempdir("edge-type-only-l0-baseline-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::EdgeTypeOnly);
+    let engine = Engine::create(config).await?;
+    let person_knows = encoded(VertexLabel::Person, 10);
+    let person_without_knows = encoded(VertexLabel::Person, 20);
+    let comment_knows = encoded(VertexLabel::Comment, 30);
+
+    engine
+        .insert_edge(
+            person_knows,
+            encoded(VertexLabel::Person, 11),
+            EdgeLabel::Knows.as_i32(),
+        )
+        .await?;
+    engine
+        .insert_edge(
+            person_without_knows,
+            encoded(VertexLabel::Tag, 21),
+            EdgeLabel::HasInterest.as_i32(),
+        )
+        .await?;
+    engine
+        .insert_edge(
+            comment_knows,
+            encoded(VertexLabel::Person, 31),
+            EdgeLabel::Knows.as_i32(),
+        )
+        .await?;
+    engine.flush_active().await?;
+
+    let guard = engine.version_guard();
+    let l0 = &guard.version().levels[0];
+    let knows_meta = l0
+        .iter()
+        .find(|meta| meta.edge_type_partition == EdgeLabel::Knows.as_i32())
+        .expect("edge-type-only layout should keep a Knows segment");
+    assert_eq!(knows_meta.src_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(knows_meta.dst_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(knows_meta.degree_class, DegreeClass::Mixed);
+    assert!(!knows_meta.degree_class_exact);
+
+    engine.metrics().reset();
+    let knows = engine
+        .get_neighbors_typed(
+            person_without_knows,
+            EdgeLabel::Knows.as_i32(),
+            engine.current_snapshot(),
+        )
+        .await?;
+    assert!(knows.is_empty());
+    let candidates = engine.metrics().snapshot_json()["csr"]["candidate_l0_segments"]
+        .as_u64()
+        .unwrap_or_default();
+    assert_eq!(
+        candidates, 1,
+        "edge-type-only baseline should keep the Knows segment as a candidate even when the source label differs"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn degree_only_l0_exposes_only_degree_baseline() -> anyhow::Result<()> {
+    let tmp = target_tempdir("degree-only-l0-baseline-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::DegreeOnly);
+    let engine = Engine::create(config).await?;
+    let low_src = encoded(VertexLabel::Person, 10);
+    let medium_src = encoded(VertexLabel::Comment, 20);
+
+    engine
+        .insert_edge(
+            low_src,
+            encoded(VertexLabel::Person, 11),
+            EdgeLabel::Knows.as_i32(),
+        )
+        .await?;
+    for i in 0..20u64 {
+        engine
+            .insert_edge(
+                medium_src,
+                encoded(VertexLabel::Tag, 1_000 + i),
+                EdgeLabel::HasTag.as_i32(),
+            )
+            .await?;
+    }
+    engine.flush_active().await?;
+
+    let guard = engine.version_guard();
+    let l0 = &guard.version().levels[0];
+    let low_meta = l0
+        .iter()
+        .find(|meta| meta.degree_class == DegreeClass::Low)
+        .expect("degree-only layout should keep a low-degree segment");
+    assert_eq!(low_meta.src_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(low_meta.dst_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(low_meta.edge_type_partition, MIXED_EDGE_TYPE);
+    assert!(low_meta.degree_class_exact);
+    assert!(l0
+        .iter()
+        .any(|meta| meta.degree_class == DegreeClass::Medium && meta.degree_class_exact));
+
+    engine.metrics().reset();
+    let signature = GraphAccessSignature::neighbor_scan(low_src, Some(EdgeLabel::Knows.as_i32()))
+        .with_degree_class(DegreeClass::Low);
+    let neighbors = engine
+        .get_neighbors_by_signature(signature, engine.current_snapshot())
+        .await?;
+    assert_eq!(neighbors.len(), 1);
+    let candidates = engine.metrics().snapshot_json()["csr"]["candidate_l0_segments"]
+        .as_u64()
+        .unwrap_or_default();
+    assert_eq!(
+        candidates, 1,
+        "degree-only baseline should prune the medium-degree L0 segment but not use label or edge-type metadata"
     );
     Ok(())
 }
@@ -3595,5 +3796,469 @@ async fn incremental_semantic_index_matches_reopen_full_rebuild() -> anyhow::Res
         reopened_candidates, live_candidates,
         "incremental semantic index maintenance should match reopen-time full rebuild"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn layout_label_only_metadata_sanitized() -> anyhow::Result<()> {
+    let tmp = target_tempdir("label-only-metadata-sanitized-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::LabelOnly);
+    let engine = Engine::create(config).await?;
+
+    let person_src = encoded(VertexLabel::Person, 1);
+    let tag_src = encoded(VertexLabel::Tag, 2);
+
+    engine
+        .insert_edge(person_src, encoded(VertexLabel::Person, 100), EdgeLabel::Knows.as_i32())
+        .await?;
+    engine
+        .insert_edge(person_src, encoded(VertexLabel::Tag, 200), EdgeLabel::HasInterest.as_i32())
+        .await?;
+    engine
+        .insert_edge(tag_src, encoded(VertexLabel::Forum, 300), EdgeLabel::HasTag.as_i32())
+        .await?;
+    engine.flush_active().await?;
+
+    let guard = engine.version_guard();
+    let l0 = &guard.version().levels[0];
+
+    let person_segment = l0
+        .iter()
+        .find(|m| m.src_label == VertexLabel::Person as i32)
+        .expect("label-only layout should create a Person segment");
+
+    assert!(
+        person_segment.dst_label == UNKNOWN_SOURCE_LABEL,
+        "dst_label must be forced to UNKNOWN"
+    );
+    assert!(
+        person_segment.edge_type_partition == MIXED_EDGE_TYPE,
+        "edge_type_partition must be forced to MIXED"
+    );
+    assert!(
+        person_segment.degree_class == DegreeClass::Mixed,
+        "degree_class must be forced to Mixed"
+    );
+    assert!(
+        !person_segment.degree_class_exact,
+        "degree_class_exact must be false"
+    );
+    assert!(
+        person_segment.src_label == VertexLabel::Person as i32,
+        "src_label should be exact from vertex IDs"
+    );
+
+    let tag_segment = l0
+        .iter()
+        .find(|m| m.src_label == VertexLabel::Tag as i32)
+        .expect("label-only layout should create a Tag segment");
+
+    assert_eq!(tag_segment.src_label, VertexLabel::Tag as i32);
+    assert_eq!(tag_segment.dst_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(tag_segment.edge_type_partition, MIXED_EDGE_TYPE);
+    assert_eq!(tag_segment.degree_class, DegreeClass::Mixed);
+    assert!(!tag_segment.degree_class_exact);
+
+    let tag_signature = GraphAccessSignature::neighbor_scan(tag_src, None)
+        .with_degree_class(DegreeClass::Low);
+    let tag_neighbors = engine
+        .get_neighbors_by_signature(tag_signature, engine.current_snapshot())
+        .await?;
+    assert_eq!(tag_neighbors.len(), 1);
+    assert_eq!(tag_neighbors[0].dst, encoded(VertexLabel::Forum, 300));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn layout_edge_type_only_metadata_sanitized() -> anyhow::Result<()> {
+    let tmp = target_tempdir("edge-type-only-metadata-sanitized-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::EdgeTypeOnly);
+    let engine = Engine::create(config).await?;
+
+    let person_src = encoded(VertexLabel::Person, 1);
+    let comment_src = encoded(VertexLabel::Comment, 2);
+
+    engine
+        .insert_edge(person_src, encoded(VertexLabel::Person, 100), EdgeLabel::Knows.as_i32())
+        .await?;
+    engine
+        .insert_edge(person_src, encoded(VertexLabel::Tag, 200), EdgeLabel::HasInterest.as_i32())
+        .await?;
+    engine
+        .insert_edge(comment_src, encoded(VertexLabel::Person, 300), EdgeLabel::HasCreator.as_i32())
+        .await?;
+    engine.flush_active().await?;
+
+    let guard = engine.version_guard();
+    let l0 = &guard.version().levels[0];
+
+    let knows_segment = l0
+        .iter()
+        .find(|m| m.edge_type_partition == EdgeLabel::Knows.as_i32())
+        .expect("edge-type-only layout should create a Knows segment");
+
+    assert!(
+        knows_segment.src_label == UNKNOWN_SOURCE_LABEL,
+        "src_label must be forced to UNKNOWN"
+    );
+    assert!(
+        knows_segment.dst_label == UNKNOWN_SOURCE_LABEL,
+        "dst_label must be forced to UNKNOWN"
+    );
+    assert!(
+        knows_segment.degree_class == DegreeClass::Mixed,
+        "degree_class must be forced to Mixed"
+    );
+    assert!(
+        !knows_segment.degree_class_exact,
+        "degree_class_exact must be false"
+    );
+    assert!(
+        knows_segment.edge_type_partition == EdgeLabel::Knows.as_i32(),
+        "edge_type_partition should be exact from edges"
+    );
+
+    let has_creator_segment = l0
+        .iter()
+        .find(|m| m.edge_type_partition == EdgeLabel::HasCreator.as_i32())
+        .expect("edge-type-only layout should create a HasCreator segment");
+
+    assert_eq!(has_creator_segment.src_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(has_creator_segment.dst_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(has_creator_segment.edge_type_partition, EdgeLabel::HasCreator.as_i32());
+    assert_eq!(has_creator_segment.degree_class, DegreeClass::Mixed);
+    assert!(!has_creator_segment.degree_class_exact);
+
+    let query_src = encoded(VertexLabel::Comment, 2);
+    let signature =
+        GraphAccessSignature::neighbor_scan(query_src, Some(EdgeLabel::HasCreator.as_i32()));
+    let neighbors = engine
+        .get_neighbors_by_signature(signature, engine.current_snapshot())
+        .await?;
+    assert_eq!(neighbors.len(), 1);
+    assert_eq!(neighbors[0].dst, encoded(VertexLabel::Person, 300));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn layout_degree_only_metadata_sanitized() -> anyhow::Result<()> {
+    let tmp = target_tempdir("degree-only-metadata-sanitized-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::DegreeOnly);
+    let engine = Engine::create(config).await?;
+
+    let low_src = encoded(VertexLabel::Person, 1);
+    let medium_src = encoded(VertexLabel::Forum, 2);
+
+    engine
+        .insert_edge(low_src, encoded(VertexLabel::Person, 100), EdgeLabel::Knows.as_i32())
+        .await?;
+    for i in 0..30u64 {
+        engine
+            .insert_edge(
+                medium_src,
+                encoded(VertexLabel::Comment, 200 + i),
+                EdgeLabel::HasCreator.as_i32(),
+            )
+            .await?;
+    }
+    engine.flush_active().await?;
+
+    let guard = engine.version_guard();
+    let l0 = &guard.version().levels[0];
+
+    let low_segment = l0
+        .iter()
+        .find(|m| m.degree_class == DegreeClass::Low)
+        .expect("degree-only layout should create a Low segment");
+
+    assert!(
+        low_segment.src_label == UNKNOWN_SOURCE_LABEL,
+        "src_label must be forced to UNKNOWN"
+    );
+    assert!(
+        low_segment.dst_label == UNKNOWN_SOURCE_LABEL,
+        "dst_label must be forced to UNKNOWN"
+    );
+    assert!(
+        low_segment.edge_type_partition == MIXED_EDGE_TYPE,
+        "edge_type_partition must be forced to MIXED"
+    );
+    assert!(
+        low_segment.degree_class_exact,
+        "degree_class_exact must be true for degree-only"
+    );
+    assert!(
+        matches!(low_segment.degree_class, DegreeClass::Low),
+        "degree_class should be exact from degree stats"
+    );
+
+    let medium_segment = l0
+        .iter()
+        .find(|m| m.degree_class == DegreeClass::Medium)
+        .expect("degree-only layout should create a Medium segment");
+
+    assert_eq!(medium_segment.src_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(medium_segment.dst_label, UNKNOWN_SOURCE_LABEL);
+    assert_eq!(medium_segment.edge_type_partition, MIXED_EDGE_TYPE);
+    assert!(medium_segment.degree_class_exact);
+    assert!(matches!(medium_segment.degree_class, DegreeClass::Medium));
+
+    let signature =
+        GraphAccessSignature::neighbor_scan(low_src, Some(EdgeLabel::Knows.as_i32()))
+            .with_degree_class(DegreeClass::Low);
+    let neighbors = engine
+        .get_neighbors_by_signature(signature, engine.current_snapshot())
+        .await?;
+    assert_eq!(neighbors.len(), 1);
+    assert_eq!(neighbors[0].dst, encoded(VertexLabel::Person, 100));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn layout_combination_label_etype_no_cross_pruning() -> anyhow::Result<()> {
+    let label_tmp = target_tempdir("cross-prune-label-only-")?;
+    let label_config = LsmGraphConfig::new(label_tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::LabelOnly);
+    let label_engine = Engine::create(label_config).await?;
+
+    let label_src = encoded(VertexLabel::Person, 1);
+    let label_dst = encoded(VertexLabel::Tag, 2);
+
+    label_engine
+        .insert_edge(label_src, label_dst, EdgeLabel::HasInterest.as_i32())
+        .await?;
+    label_engine.flush_active().await?;
+
+    let etype_tmp = target_tempdir("cross-prune-etype-only-")?;
+    let etype_config = LsmGraphConfig::new(etype_tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::EdgeTypeOnly);
+    let etype_engine = Engine::create(etype_config).await?;
+
+    let etype_src = encoded(VertexLabel::Forum, 3);
+
+    etype_engine
+        .insert_edge(etype_src, encoded(VertexLabel::Person, 4), EdgeLabel::HasModerator.as_i32())
+        .await?;
+    etype_engine.flush_active().await?;
+
+    let label_guard = label_engine.version_guard();
+    let label_l0 = &label_guard.version().levels[0];
+    let label_segment = label_l0
+        .iter()
+        .find(|m| m.src_label == VertexLabel::Person as i32)
+        .expect("label-only should have Person segment");
+    assert_eq!(
+        label_segment.dst_label, UNKNOWN_SOURCE_LABEL,
+        "label-only segment must have UNKNOWN dst_label"
+    );
+
+    let etype_guard = etype_engine.version_guard();
+    let etype_l0 = &etype_guard.version().levels[0];
+    let etype_segment = etype_l0
+        .iter()
+        .find(|m| m.edge_type_partition == EdgeLabel::HasModerator.as_i32())
+        .expect("edge-type-only should have HasModerator segment");
+    assert_eq!(
+        etype_segment.src_label, UNKNOWN_SOURCE_LABEL,
+        "edge-type-only segment must have UNKNOWN src_label"
+    );
+
+    let query_with_dst_label =
+        GraphAccessSignature::neighbor_scan(label_src, Some(EdgeLabel::HasInterest.as_i32()));
+    let label_candidates = label_engine
+        .get_neighbors_by_signature(query_with_dst_label.clone(), label_engine.current_snapshot())
+        .await?;
+    assert_eq!(
+        label_candidates.len(), 1,
+        "label-only segment should NOT be pruned by dst_label filter since it has UNKNOWN dst_label"
+    );
+
+    let query_with_src_label =
+        GraphAccessSignature::neighbor_scan(etype_src, Some(EdgeLabel::HasModerator.as_i32()));
+    let etype_candidates = etype_engine
+        .get_neighbors_by_signature(query_with_src_label, etype_engine.current_snapshot())
+        .await?;
+    assert_eq!(
+        etype_candidates.len(), 1,
+        "edge-type-only segment should be found by its exact edge_type"
+    );
+
+    let mismatched_src_label =
+        GraphAccessSignature::neighbor_scan(encoded(VertexLabel::Person, 99), Some(EdgeLabel::HasModerator.as_i32()));
+    let etype_mismatch = etype_engine
+        .get_neighbors_by_signature(mismatched_src_label, etype_engine.current_snapshot())
+        .await?;
+    assert_eq!(
+        etype_mismatch.len(), 0,
+        "edge-type-only segment should not return false positives for src mismatch"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "LsmGraphStyle layout policy not yet implemented with semantic pruning disabled"]
+async fn layout_lsmgraph_style_no_semantic_pruning() -> anyhow::Result<()> {
+    let tmp = target_tempdir("lsmgraph-style-no-semantic-pruning-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::LsmGraphStyle);
+    let engine = Engine::create(config).await?;
+
+    let src = encoded(VertexLabel::Person, 1);
+
+    engine
+        .insert_edge(src, encoded(VertexLabel::Person, 100), EdgeLabel::Knows.as_i32())
+        .await?;
+    engine.flush_active().await?;
+
+    let guard = engine.version_guard();
+    let l0 = &guard.version().levels[0];
+
+    assert!(
+        !l0.is_empty(),
+        "LsmGraphStyle should produce at least one L0 segment"
+    );
+
+    let snapshot = engine.current_snapshot();
+    let neighbors = engine.get_neighbors_typed(src, EdgeLabel::Knows.as_i32(), snapshot).await?;
+    assert_eq!(neighbors.len(), 1, "basic neighbor lookup must work");
+
+    engine.metrics().reset();
+    let signature =
+        GraphAccessSignature::neighbor_scan(src, Some(EdgeLabel::Knows.as_i32()));
+    let by_sig = engine
+        .get_neighbors_by_signature(signature, snapshot)
+        .await?;
+    assert_eq!(
+        by_sig.len(), 1,
+        "signature-based lookup must return same results as typed lookup"
+    );
+
+    let label_guard = engine.version_guard();
+    let label_l0 = &label_guard.version().levels[0];
+    for meta in label_l0 {
+        assert!(
+            !meta.summary_completeness.allows_semantic_pruning(),
+            "LsmGraphStyle segments should NOT allow semantic pruning — conservative reads only"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn layout_single_dim_correctness_vs_schema() -> anyhow::Result<()> {
+    let schema_tmp = target_tempdir("correctness-schema-")?;
+    let label_tmp = target_tempdir("correctness-label-only-")?;
+    let etype_tmp = target_tempdir("correctness-etype-only-")?;
+    let degree_tmp = target_tempdir("correctness-degree-only-")?;
+
+    let schema_config = LsmGraphConfig::new(schema_tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::Schema);
+    let label_config = LsmGraphConfig::new(label_tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::LabelOnly);
+    let etype_config = LsmGraphConfig::new(etype_tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::EdgeTypeOnly);
+    let degree_config = LsmGraphConfig::new(degree_tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::DegreeOnly);
+
+    let schema_engine = Engine::create(schema_config).await?;
+    let label_engine = Engine::create(label_config).await?;
+    let etype_engine = Engine::create(etype_config).await?;
+    let degree_engine = Engine::create(degree_config).await?;
+
+    let src_a = encoded(VertexLabel::Person, 1);
+    let src_b = encoded(VertexLabel::Forum, 2);
+    let dst_a = encoded(VertexLabel::Person, 100);
+    let dst_b = encoded(VertexLabel::Tag, 200);
+    let edge_knows = EdgeLabel::Knows.as_i32();
+    let edge_has_tag = EdgeLabel::HasTag.as_i32();
+
+    let edges = vec![
+        (src_a, dst_a, edge_knows),
+        (src_a, dst_b, edge_has_tag),
+        (src_b, dst_a, edge_has_tag),
+    ];
+    for (src, dst, etype) in &edges {
+        schema_engine.insert_edge(*src, *dst, *etype).await?;
+        label_engine.insert_edge(*src, *dst, *etype).await?;
+        etype_engine.insert_edge(*src, *dst, *etype).await?;
+        degree_engine.insert_edge(*src, *dst, *etype).await?;
+    }
+
+    schema_engine.flush_active().await?;
+    label_engine.flush_active().await?;
+    etype_engine.flush_active().await?;
+    degree_engine.flush_active().await?;
+
+    let test_queries = vec![
+        GraphAccessSignature::neighbor_scan(src_a, Some(edge_knows)),
+        GraphAccessSignature::neighbor_scan(src_a, Some(edge_has_tag)),
+        GraphAccessSignature::neighbor_scan(src_a, None),
+        GraphAccessSignature::neighbor_scan(src_b, Some(edge_has_tag)),
+        GraphAccessSignature::neighbor_scan(src_b, None),
+    ];
+
+    for signature in test_queries {
+        let schema_result = schema_engine
+            .get_neighbors_by_signature(signature, schema_engine.current_snapshot())
+            .await?;
+
+        let label_result = label_engine
+            .get_neighbors_by_signature(signature, label_engine.current_snapshot())
+            .await?;
+
+        let etype_result = etype_engine
+            .get_neighbors_by_signature(signature, etype_engine.current_snapshot())
+            .await?;
+
+        let degree_result = degree_engine
+            .get_neighbors_by_signature(signature, degree_engine.current_snapshot())
+            .await?;
+
+        let mut schema_dsts: Vec<_> = schema_result.iter().map(|e| e.dst).collect();
+        schema_dsts.sort();
+        let mut label_dsts: Vec<_> = label_result.iter().map(|e| e.dst).collect();
+        label_dsts.sort();
+        let mut etype_dsts: Vec<_> = etype_result.iter().map(|e| e.dst).collect();
+        etype_dsts.sort();
+        let mut degree_dsts: Vec<_> = degree_result.iter().map(|e| e.dst).collect();
+        degree_dsts.sort();
+
+        assert_eq!(
+            schema_dsts, label_dsts,
+            "label-only must return correct results matching schema layout"
+        );
+        assert_eq!(
+            schema_dsts, etype_dsts,
+            "edge-type-only must return correct results matching schema layout"
+        );
+        assert_eq!(
+            schema_dsts, degree_dsts,
+            "degree-only must return correct results matching schema layout"
+        );
+
+        assert!(
+            label_dsts.len() <= 3,
+            "single-dim layouts may read extra data but must not return fewer results than schema"
+        );
+    }
+
     Ok(())
 }

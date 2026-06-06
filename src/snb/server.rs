@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
 use crate::error::Result;
+use crate::metrics::LatencyMetric;
 use crate::snb::props::SnbGraph;
 use crate::snb::queries::{run_dgs_http_query, run_dgs_http_update};
 
@@ -48,6 +49,11 @@ struct ServerMetrics {
     update_exec_us: AtomicU64,
     max_query_exec_us: AtomicU64,
     max_update_exec_us: AtomicU64,
+    // LatencyMetric fields for percentiles
+    read_lock_wait_latency: LatencyMetric,
+    write_lock_wait_latency: LatencyMetric,
+    query_exec_latency: LatencyMetric,
+    update_exec_latency: LatencyMetric,
     endpoints: Mutex<HashMap<String, Arc<EndpointMetrics>>>,
 }
 
@@ -83,12 +89,20 @@ impl ServerMetrics {
         ] {
             counter.store(0, Ordering::Relaxed);
         }
+        self.read_lock_wait_latency.reset();
+        self.write_lock_wait_latency.reset();
+        self.query_exec_latency.reset();
+        self.update_exec_latency.reset();
         self.endpoints.lock().clear();
     }
 
     fn snapshot(&self) -> Value {
         let queries = self.queries.load(Ordering::Relaxed);
         let updates = self.updates.load(Ordering::Relaxed);
+        let read_lock_snapshot = self.read_lock_wait_latency.snapshot();
+        let write_lock_snapshot = self.write_lock_wait_latency.snapshot();
+        let query_exec_snapshot = self.query_exec_latency.snapshot();
+        let update_exec_snapshot = self.update_exec_latency.snapshot();
         let endpoints = self.endpoint_snapshots();
         json!({
             "requests": self.requests.load(Ordering::Relaxed),
@@ -106,6 +120,18 @@ impl ServerMetrics {
             "update_exec_us_avg": avg(self.update_exec_us.load(Ordering::Relaxed), updates),
             "query_exec_us_max": self.max_query_exec_us.load(Ordering::Relaxed),
             "update_exec_us_max": self.max_update_exec_us.load(Ordering::Relaxed),
+            "read_lock_wait_p50_us": read_lock_snapshot.p50_us,
+            "read_lock_wait_p90_us": read_lock_snapshot.p90_us,
+            "read_lock_wait_p99_us": read_lock_snapshot.p99_us,
+            "write_lock_wait_p50_us": write_lock_snapshot.p50_us,
+            "write_lock_wait_p90_us": write_lock_snapshot.p90_us,
+            "write_lock_wait_p99_us": write_lock_snapshot.p99_us,
+            "query_exec_p50_us": query_exec_snapshot.p50_us,
+            "query_exec_p95_us": query_exec_snapshot.p90_us,
+            "query_exec_p99_us": query_exec_snapshot.p99_us,
+            "update_exec_p50_us": update_exec_snapshot.p50_us,
+            "update_exec_p95_us": update_exec_snapshot.p90_us,
+            "update_exec_p99_us": update_exec_snapshot.p99_us,
             "endpoints": endpoints,
         })
     }
@@ -126,6 +152,8 @@ impl ServerMetrics {
             self.update_exec_us.fetch_add(exec_us, Ordering::Relaxed);
             update_max(&self.max_write_lock_wait_us, lock_wait_us);
             update_max(&self.max_update_exec_us, exec_us);
+            self.write_lock_wait_latency.record_us(lock_wait_us);
+            self.update_exec_latency.record_us(exec_us);
         } else {
             self.queries.fetch_add(1, Ordering::Relaxed);
             self.read_lock_wait_us
@@ -133,6 +161,8 @@ impl ServerMetrics {
             self.query_exec_us.fetch_add(exec_us, Ordering::Relaxed);
             update_max(&self.max_read_lock_wait_us, lock_wait_us);
             update_max(&self.max_query_exec_us, exec_us);
+            self.read_lock_wait_latency.record_us(lock_wait_us);
+            self.query_exec_latency.record_us(exec_us);
         }
         let endpoint = {
             let mut endpoints = self.endpoints.lock();

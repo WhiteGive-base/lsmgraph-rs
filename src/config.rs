@@ -29,8 +29,20 @@ impl FromStr for IoBackendKind {
 pub enum L0LayoutPolicy {
     Naive,
     Schema,
+    LabelOnly,
+    EdgeTypeOnly,
+    DegreeOnly,
     Semantic,
     SemanticBudgeted,
+    LsmGraphStyle,
+    FullCompact,
+    OracleSemantic,
+    /// RocksDB-style KV-LSM baseline: CSR segments with conservative semantic metadata.
+    /// This simulates: "what if RocksDB encoded edges as KV but still had CSR segments?"
+    /// All semantic metadata is set to Unknown/Conservative, so may_contain_signature
+    /// always returns true (no semantic pruning benefit). This proves SemL0's contribution:
+    /// the semantic metadata is USELESS without the pruning logic in the read path.
+    RocksDbStyle,
 }
 
 impl FromStr for L0LayoutPolicy {
@@ -40,6 +52,13 @@ impl FromStr for L0LayoutPolicy {
         match s.to_ascii_lowercase().as_str() {
             "naive" | "plain" | "default" => Ok(Self::Naive),
             "schema" | "graph-aware" | "graph_aware" | "graph-aware-l0" => Ok(Self::Schema),
+            "label-only" | "label_only" | "src-label-only" | "src_label_only" => {
+                Ok(Self::LabelOnly)
+            }
+            "edge-type-only" | "edge_type_only" | "etype-only" | "etype_only" => {
+                Ok(Self::EdgeTypeOnly)
+            }
+            "degree-only" | "degree_only" => Ok(Self::DegreeOnly),
             "semantic" | "query-semantic" | "query_semantic" | "qslsm" => Ok(Self::Semantic),
             "semantic-budgeted"
             | "semantic_budgeted"
@@ -47,6 +66,14 @@ impl FromStr for L0LayoutPolicy {
             | "query_semantic_budgeted"
             | "qslsm-budgeted"
             | "qslsm_budgeted" => Ok(Self::SemanticBudgeted),
+            "lsmgraph-style" | "lsmgraph_style" | "lsmgraphstyle" | "lsmgraph" | "lsmsem-baseline"
+            | "seml0-baseline" => Ok(Self::LsmGraphStyle),
+            "full-compact" | "fullcompact" | "full_compact" | "write-optimized"
+            | "write_optimized" => Ok(Self::FullCompact),
+            "oracle-semantic" | "oracle_semantic" | "oracle" | "oracle-sem"
+            | "oracle_sem" => Ok(Self::OracleSemantic),
+            "rocksdb-style" | "rocksdb_style" | "rocksdbstyle" | "rocksdb" | "kv-lsm"
+            | "kv_lsm" | "kvbaseline" | "kv-baseline" => Ok(Self::RocksDbStyle),
             _ => anyhow::bail!("unknown L0 layout policy: {s}"),
         }
     }
@@ -202,5 +229,20 @@ impl LsmGraphConfig {
     pub fn with_semantic_budget_degree_weight(mut self, weight: f64) -> Self {
         self.semantic_budget_degree_weight = weight;
         self
+    }
+
+    pub fn with_rocksdb_style(mut self) -> Self {
+        self.l0_layout = L0LayoutPolicy::RocksDbStyle;
+        self
+    }
+
+    pub fn supports_feedback_compaction(&self) -> bool {
+        !matches!(
+            self.l0_layout,
+            L0LayoutPolicy::LsmGraphStyle
+                | L0LayoutPolicy::FullCompact
+                | L0LayoutPolicy::OracleSemantic
+                | L0LayoutPolicy::RocksDbStyle
+        )
     }
 }

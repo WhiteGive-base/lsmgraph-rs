@@ -47,6 +47,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         compact: bool,
         #[arg(long, default_value_t = false)]
+        compact_after_import: bool,
+        #[arg(long, default_value_t = false)]
         auto_compact: bool,
         #[arg(long, default_value_t = 0)]
         schema_epoch: u64,
@@ -303,6 +305,8 @@ enum Command {
         edge_types: Vec<i32>,
         #[arg(long, default_value_t = false)]
         semantic_degree_hint: bool,
+        #[arg(long, default_value_t = false)]
+        sample_plan_degree_hint: bool,
         #[arg(long)]
         sample_plan_in: Option<PathBuf>,
         #[arg(long)]
@@ -329,6 +333,18 @@ enum Command {
         right_semantic_degree_hint: bool,
         #[arg(long, default_value_t = 1)]
         max_mismatches: usize,
+    },
+    OracleIndex {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+    },
+    AdjCacheBench {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        samples: usize,
+        #[arg(long)]
+        edge_type: Option<i32>,
     },
 }
 
@@ -366,6 +382,7 @@ async fn main() -> Result<()> {
             relation,
             memgraph_bytes,
             compact,
+            compact_after_import,
             auto_compact,
             schema_epoch,
             graph_aware_l0,
@@ -424,6 +441,19 @@ async fn main() -> Result<()> {
             };
             if compact {
                 engine.compact_l0_to_l1().await?;
+            }
+            if compact_after_import
+                || matches!(l0_layout, L0LayoutPolicy::FullCompact)
+            {
+                let compact_start = Instant::now();
+                eprintln!(
+                    "[import] FullCompact: triggering post-import L0->L1 compaction"
+                );
+                engine.compact_l0_to_l1().await?;
+                eprintln!(
+                    "[import] FullCompact: compaction complete in {:.1}s",
+                    compact_start.elapsed().as_secs_f64()
+                );
             }
             println!(
                 "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{}}}",
@@ -861,6 +891,7 @@ async fn main() -> Result<()> {
             edge_type,
             edge_types,
             semantic_degree_hint,
+            sample_plan_degree_hint,
             sample_plan_in,
             sample_plan_out,
             scan,
@@ -902,6 +933,7 @@ async fn main() -> Result<()> {
                     &cli_requested_edge_types,
                     samples,
                     semantic_degree_hint,
+                    sample_plan_degree_hint,
                 )
             };
             if let Some(path) = &sample_plan_out {
@@ -983,6 +1015,7 @@ async fn main() -> Result<()> {
                     "edge_type": edge_type,
                     "edge_types": edge_types,
                     "semantic_degree_hint": semantic_degree_hint,
+                    "sample_plan_degree_hint": sample_plan_degree_hint,
                     "sample_plan_in": sample_plan_in,
                     "sample_plan_out": sample_plan_out,
                     "sample_plan_version": sample_plan.version,
@@ -1091,6 +1124,86 @@ async fn main() -> Result<()> {
                 }))?
             );
         }
+        Command::OracleIndex { data_dir } => {
+            let mut config = LsmGraphConfig::new(&data_dir).with_io_backend(io_backend);
+            config.l0_layout = L0LayoutPolicy::OracleSemantic;
+            let engine = Engine::open(config).await?;
+            let started = Instant::now();
+            eprintln!(
+                "[oracle-index] building oracle index from L0 segments"
+            );
+            let stats = engine.build_oracle_index().await?;
+            eprintln!(
+                "[oracle-index] built oracle index with {} entries in {:.1}ms",
+                stats.entry_count,
+                started.elapsed().as_millis() as f64
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "data_dir": data_dir,
+                    "oracle_index_stats": stats,
+                }))?
+            );
+        }
+        Command::AdjCacheBench {
+            data_dir,
+            samples,
+            edge_type,
+        } => {
+            let engine =
+                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let snapshot = engine.current_snapshot();
+            let scan_start = Instant::now();
+            let edges = engine.scan_edges(snapshot).await?;
+            let scan_elapsed_ms = scan_start.elapsed().as_millis();
+            let mut by_key: std::collections::HashMap<(u64, Option<i32>), Vec<u64>> =
+                std::collections::HashMap::new();
+            for edge in &edges {
+                by_key
+                    .entry((edge.src, Some(edge.edge_type)))
+                    .or_default()
+                    .push(edge.dst);
+            }
+            for dsts in by_key.values_mut() {
+                dsts.sort_unstable();
+                dsts.dedup();
+            }
+            let group_count = by_key.len();
+            let total_edges: usize = by_key.values().map(|v| v.len()).sum();
+            let cache_bytes = group_count * 24 + total_edges * 8;
+            let edge_type_filter = edge_type.map(|et| et as i32);
+            let sample_keys: Vec<_> = by_key
+                .keys()
+                .filter(|(_, et)| edge_type_filter.map(|f| *et == Some(f)).unwrap_or(true))
+                .copied()
+                .collect();
+            let step = (sample_keys.len() / samples.max(1)).max(1);
+            let query_start = Instant::now();
+            let mut query_count = 0usize;
+            for (idx, key) in sample_keys.iter().enumerate() {
+                if idx % step == 0 {
+                    let _ = by_key.get(key);
+                    query_count += 1;
+                }
+            }
+            let query_elapsed_ms = query_start.elapsed().as_millis();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "data_dir": data_dir,
+                    "snapshot": snapshot,
+                    "total_edges": edges.len(),
+                    "adjacency_groups": group_count,
+                    "unique_edges": total_edges,
+                    "cache_bytes": cache_bytes,
+                    "scan_elapsed_ms": scan_elapsed_ms,
+                    "query_count": query_count,
+                    "query_elapsed_ms": query_elapsed_ms,
+                    "edge_type": edge_type,
+                }))?
+            );
+        }
     }
     Ok(())
 }
@@ -1128,37 +1241,19 @@ fn build_storage_bench_sample_plan(
     requested_edge_types: &[Option<i32>],
     samples: usize,
     semantic_degree_hint: bool,
+    sample_plan_degree_hint: bool,
 ) -> StorageBenchSamplePlan {
+    let record_sample_degrees = semantic_degree_hint || sample_plan_degree_hint;
     let mut entries = Vec::new();
     for requested_edge_type in requested_edge_types {
-        let candidate_edges = edges
-            .iter()
-            .filter(|edge| {
-                requested_edge_type
-                    .map(|wanted| edge.edge_type == wanted)
-                    .unwrap_or(true)
-            })
-            .count();
-        let mut degree_by_src = HashMap::new();
-        if semantic_degree_hint {
-            for edge in edges {
-                if requested_edge_type
-                    .map(|wanted| edge.edge_type == wanted)
-                    .unwrap_or(true)
-                {
-                    *degree_by_src.entry(edge.src).or_default() += 1;
-                }
+        let mut candidate_edges = 0usize;
+        let mut candidate_srcs = Vec::new();
+        for edge in edges {
+            if storage_bench_edge_type_matches(edge, *requested_edge_type) {
+                candidate_edges += 1;
+                candidate_srcs.push(edge.src);
             }
         }
-        let mut candidate_srcs: Vec<_> = edges
-            .iter()
-            .filter(|edge| {
-                requested_edge_type
-                    .map(|wanted| edge.edge_type == wanted)
-                    .unwrap_or(true)
-            })
-            .map(|edge| edge.src)
-            .collect();
         candidate_srcs.sort_unstable();
         candidate_srcs.dedup();
         let candidate_sources = candidate_srcs.len();
@@ -1182,6 +1277,21 @@ fn build_storage_bench_sample_plan(
                 }
             }
         }
+        let mut degree_by_src = HashMap::new();
+        if record_sample_degrees {
+            for src in &sampled_srcs {
+                degree_by_src.insert(*src, 0);
+            }
+            if !degree_by_src.is_empty() {
+                for edge in edges {
+                    if storage_bench_edge_type_matches(edge, *requested_edge_type) {
+                        if let Some(degree) = degree_by_src.get_mut(&edge.src) {
+                            *degree += 1;
+                        }
+                    }
+                }
+            }
+        }
         let sampled = sampled_srcs
             .into_iter()
             .map(|src| StorageBenchSample {
@@ -1200,9 +1310,15 @@ fn build_storage_bench_sample_plan(
         version: 1,
         source: "scan".to_string(),
         samples_per_edge_type: samples,
-        semantic_degree_hint,
+        semantic_degree_hint: record_sample_degrees,
         entries,
     }
+}
+
+fn storage_bench_edge_type_matches(edge: &EdgeRecord, requested_edge_type: Option<i32>) -> bool {
+    requested_edge_type
+        .map(|wanted| edge.edge_type == wanted)
+        .unwrap_or(true)
 }
 
 fn parse_query_list(raw: &str) -> Vec<String> {

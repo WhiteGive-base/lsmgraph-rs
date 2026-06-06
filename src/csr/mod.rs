@@ -11,4 +11,6 @@ pub use reader::{
     AbsentPropertyPolicy, CsrDecodedPropertyValue, CsrEdgeRecordWithDecodedProperties,
     CsrEdgeRecordWithProperties, CsrEncodedPropertyValue, CsrPropertyValuePredicate, CsrReader,
 };
-pub use writer::{CsrWriter, EdgePropertyValue, EdgeRecordWithProperties};
+pub use writer::{
+    CsrSegmentSemanticOverrides, CsrWriter, EdgePropertyValue, EdgeRecordWithProperties,
+};
