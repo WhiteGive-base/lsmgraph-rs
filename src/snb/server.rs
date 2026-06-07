@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use crate::error::Result;
 use crate::snb::props::SnbGraph;
-use crate::snb::queries::{run_dgs_http_query, run_dgs_http_update};
+use crate::snb::queries::{fallback_hits_value, run_dgs_http_query, run_dgs_http_update};
 
 const SLOW_LOCK_WAIT_US: u64 = 5_000;
 const SLOW_EXEC_US: u64 = 50_000;
@@ -232,18 +232,36 @@ async fn handle_connection(
         HttpRequest::Get { path } if path == "/" => {
             http_response(200, "application/json", br#"{"status":"ok"}"#.to_vec())
         }
-        HttpRequest::Get { path } if path == "/metrics" => http_response(
-            200,
-            "application/json",
-            serde_json::to_vec(&metrics.snapshot()).expect("serialize metrics"),
-        ),
+        HttpRequest::Get { path } if path == "/metrics" => {
+            let mut snapshot =
+                serde_json::to_value(metrics.snapshot()).expect("serialize metrics");
+            let fallback = {
+                let guard = snb.read().await;
+                fallback_hits_value(&guard)
+            };
+            if let Value::Object(ref mut map) = snapshot {
+                map.insert("fallback_hits".to_string(), fallback);
+            }
+            http_response(
+                200,
+                "application/json",
+                serde_json::to_vec(&snapshot).expect("serialize metrics"),
+            )
+        }
         HttpRequest::Post { path, .. } if path == "/metrics/reset" => {
             metrics.reset();
+            snb.read().await.reset_fallback_hits();
             http_response(200, "application/json", br#"{"status":"ok"}"#.to_vec())
         }
         HttpRequest::Post { path, body } => {
             let params: Value = serde_json::from_slice(&body)?;
             let is_update = path.starts_with("/query/interactive_update_");
+            if std::env::var("LSMGRAPH_TRACE_REQUESTS").is_ok() {
+                eprintln!(
+                    "{}",
+                    json!({"event":"req_begin","path":path,"params":params})
+                );
+            }
             let lock_started = Instant::now();
             let (result, lock_wait_us, exec_us) = if is_update {
                 let mut guard = snb.write().await;

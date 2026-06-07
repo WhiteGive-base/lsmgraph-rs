@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::future::Future;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::base_graph::column::StringColumnReader;
 use crate::base_graph::ids::LabelId;
 use crate::base_graph::{BaseGraph, IoConfig};
-use crate::config::{IoBackendKind, LsmGraphConfig};
+use crate::config::IoBackendKind;
 use crate::delta::DeltaGraph;
 use crate::dynamic_view::DynamicGraphView;
 use crate::error::Result;
@@ -623,13 +623,16 @@ impl LegacySnbGraph {
 
 pub struct DynamicSnbGraph {
     view: DynamicGraphView,
-    fallback_engine: Option<Arc<Engine>>,
     base_vertices: Option<BaseSnbProperties>,
     vertices: HashMap<VertexId, VertexData>,
     edge_props: HashMap<(VertexId, EdgeType, VertexId), EdgeProp>,
     lookup_indexes: SnbLookupIndexes,
     delta_messages_by_creator: HashMap<VertexId, Vec<MessageRef>>,
     delta_replies_by_parent_creator: HashMap<VertexId, Vec<ReplyRef>>,
+    /// Instrumentation: counts neighbor lookups not served by BaseGraph CSR
+    /// routing (`base_neighbors_by_type` returned `None`), keyed by
+    /// (src_label, edge_type). Resolved as empty + DeltaGraph merge.
+    fallback_hits: Mutex<HashMap<(i32, EdgeType), u64>>,
 }
 
 struct BaseSnbProperties {
@@ -687,17 +690,6 @@ impl DynamicSnbGraph {
             "[dynamic-snb] base/delta view ready elapsed_s={:.1}",
             view_started.elapsed().as_secs_f64()
         );
-        let engine_started = Instant::now();
-        eprintln!("[dynamic-snb] opening fallback engine for not-yet-columnar edges");
-        let fallback_engine =
-            Engine::open(LsmGraphConfig::new(store_dir).with_io_backend(io_backend))
-                .await
-                .ok();
-        eprintln!(
-            "[dynamic-snb] fallback engine open={} elapsed_s={:.1}",
-            fallback_engine.is_some(),
-            engine_started.elapsed().as_secs_f64()
-        );
         let vertices_started = Instant::now();
         let (base_vertices, vertices) =
             if let Some(base) = view.base().filter(|base| base.has_vertex_properties()) {
@@ -739,13 +731,13 @@ impl DynamicSnbGraph {
         );
         Ok(Self {
             view,
-            fallback_engine,
             base_vertices,
             vertices,
             edge_props,
             lookup_indexes: SnbLookupIndexes::default(),
             delta_messages_by_creator: HashMap::new(),
             delta_replies_by_parent_creator: HashMap::new(),
+            fallback_hits: Mutex::new(HashMap::new()),
         })
         .map(|mut graph| {
             graph.rebuild_lookup_indexes();
@@ -757,11 +749,6 @@ impl DynamicSnbGraph {
         self.view
             .delta()
             .map(DeltaGraph::current_snapshot)
-            .or_else(|| {
-                self.fallback_engine
-                    .as_ref()
-                    .map(|engine| engine.current_snapshot())
-            })
             .unwrap_or(0)
     }
 
@@ -1428,11 +1415,7 @@ impl DynamicSnbGraph {
             }
         });
         if base_handled.is_none() {
-            for dst in self.fallback_neighbors(src, edge_type) {
-                if seen.insert(dst) {
-                    f(dst);
-                }
-            }
+            self.record_base_miss(src, edge_type);
         }
         for dst in self.delta_neighbors(src, edge_type) {
             if seen.insert(dst) {
@@ -1816,10 +1799,12 @@ impl DynamicSnbGraph {
     }
 
     fn neighbors_by_type(&self, src: VertexId, edge_type: EdgeType) -> Vec<VertexId> {
-        let mut out = if let Some(base_neighbors) = self.base_neighbors_by_type(src, edge_type) {
-            base_neighbors
-        } else {
-            self.fallback_neighbors(src, edge_type)
+        let mut out = match self.base_neighbors_by_type(src, edge_type) {
+            Some(base_neighbors) => base_neighbors,
+            None => {
+                self.record_base_miss(src, edge_type);
+                Vec::new()
+            }
         };
         out.extend(self.delta_neighbors(src, edge_type));
         dedup_vertices(out)
@@ -2482,20 +2467,38 @@ impl DynamicSnbGraph {
             .collect()
     }
 
-    fn fallback_neighbors(&self, src: VertexId, edge_type: EdgeType) -> Vec<VertexId> {
-        let Some(engine) = self.fallback_engine.clone() else {
-            return Vec::new();
-        };
-        let snapshot = engine.current_snapshot();
-        block_on_runtime(engine.get_neighbors_typed(src, edge_type, snapshot))
-            .map(|edges| {
-                edges
-                    .into_iter()
-                    .filter(|edge| edge.marker == EdgeMarker::Insert)
-                    .map(|edge| edge.dst)
+    /// Records a neighbor lookup whose `(src_label, edge_type)` was not served
+    /// by BaseGraph CSR routing (`base_neighbors_by_type` returned `None`).
+    /// These are now resolved as empty + DeltaGraph merge instead of probing
+    /// the removed legacy LSM `fallback_engine`; the counter lets validation
+    /// confirm no such lookup actually needed base topology.
+    fn record_base_miss(&self, src: VertexId, edge_type: EdgeType) {
+        let label = label_from_vid(src).map(|l| l as i32).unwrap_or(0);
+        if let Ok(mut hits) = self.fallback_hits.lock() {
+            *hits.entry((label, edge_type)).or_insert(0) += 1;
+        }
+    }
+
+    /// Snapshot of base-CSR misses accumulated so far, sorted by descending
+    /// count: `(src_label, edge_type, count)`.
+    pub fn fallback_hits_snapshot(&self) -> Vec<(i32, EdgeType, u64)> {
+        let mut out: Vec<(i32, EdgeType, u64)> = self
+            .fallback_hits
+            .lock()
+            .map(|hits| {
+                hits.iter()
+                    .map(|(&(label, edge_type), &count)| (label, edge_type, count))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        out.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+        out
+    }
+
+    pub fn reset_fallback_hits(&self) {
+        if let Ok(mut hits) = self.fallback_hits.lock() {
+            hits.clear();
+        }
     }
 }
 
@@ -2521,6 +2524,21 @@ impl SnbGraph {
 
     pub async fn build_adjacency_cache(engine: Arc<Engine>, store_dir: &Path) -> Result<usize> {
         LegacySnbGraph::build_adjacency_cache(engine, store_dir).await
+    }
+
+    /// Snapshot of legacy fallback-engine hits, `(src_label, edge_type, count)`.
+    /// Empty for the legacy variant (which does not route through BaseGraph CSR).
+    pub fn fallback_hits_snapshot(&self) -> Vec<(i32, EdgeType, u64)> {
+        match self {
+            Self::Legacy(_) => Vec::new(),
+            Self::Dynamic(graph) => graph.fallback_hits_snapshot(),
+        }
+    }
+
+    pub fn reset_fallback_hits(&self) {
+        if let Self::Dynamic(graph) = self {
+            graph.reset_fallback_hits();
+        }
     }
 
     pub fn lookup(&self, label: VertexLabel, external_id: i64) -> VertexId {

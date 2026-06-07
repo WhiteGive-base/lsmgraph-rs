@@ -309,7 +309,9 @@ pub async fn validate_ic1_ic14_dynamic(
     max_lines: usize,
 ) -> Result<ValidationReport> {
     let snb = SnbGraph::open_dynamic(store_dir, base_io, io_backend).await?;
-    validate_file_with_snb(&snb, validation_params, max_lines, None)
+    let report = validate_file_with_snb(&snb, validation_params, max_lines, None);
+    eprint_fallback_hits(&snb);
+    report
 }
 
 pub async fn validate_ic_batch(
@@ -412,6 +414,7 @@ pub async fn validate_ic_batch_dynamic(
     let passed = reports.iter().map(|r| r.passed).sum();
     let skipped = reports.iter().map(|r| r.skipped).sum();
     let failed = reports.iter().map(|r| r.failed).sum();
+    eprint_fallback_hits(&snb);
     Ok(BatchValidationReport {
         validation_dir: validation_dir.display().to_string(),
         max_lines_per_query,
@@ -441,7 +444,83 @@ pub async fn validate_mixed_tugraph_dynamic(
     max_lines: usize,
 ) -> Result<MixedValidationReport> {
     let mut snb = SnbGraph::open_dynamic(store_dir, base_io, io_backend).await?;
-    validate_mixed_file_with_snb(&mut snb, validation_params, max_lines)
+    let report = validate_mixed_file_with_snb(&mut snb, validation_params, max_lines);
+    eprint_fallback_hits(&snb);
+    report
+}
+
+fn vertex_label_name(label: i32) -> &'static str {
+    match label {
+        1 => "Person",
+        2 => "Comment",
+        3 => "Post",
+        4 => "Forum",
+        5 => "Organisation",
+        6 => "Place",
+        7 => "Tag",
+        8 => "TagClass",
+        _ => "Unknown",
+    }
+}
+
+fn edge_label_name(edge_type: i32) -> &'static str {
+    match edge_type.abs() {
+        1 => "Knows",
+        2 => "HasCreator",
+        3 => "HasTag",
+        4 => "HasType",
+        5 => "IsLocatedIn",
+        6 => "IsPartOf",
+        7 => "LikesComment",
+        8 => "LikesPost",
+        9 => "ReplyOfComment",
+        10 => "ReplyOfPost",
+        11 => "ContainerOf",
+        12 => "HasMember",
+        13 => "HasModerator",
+        14 => "HasInterest",
+        15 => "StudyAt",
+        16 => "WorkAt",
+        17 => "IsSubclassOf",
+        _ => "Unknown",
+    }
+}
+
+/// Build a JSON array describing the legacy fallback-engine hit snapshot, one
+/// entry per `(src_label, edge_type)` pair that still bypasses BaseGraph CSR.
+pub fn fallback_hits_value(snb: &SnbGraph) -> Value {
+    let hits = snb.fallback_hits_snapshot();
+    let detailed: Vec<Value> = hits
+        .iter()
+        .map(|&(label, edge_type, count)| {
+            let dir = if edge_type < 0 { "in" } else { "out" };
+            json!({
+                "src_label": vertex_label_name(label),
+                "src_label_id": label,
+                "edge": edge_label_name(edge_type),
+                "edge_type": edge_type,
+                "direction": dir,
+                "count": count,
+            })
+        })
+        .collect();
+    Value::Array(detailed)
+}
+
+/// Print the legacy fallback-engine hit snapshot to stderr so callers can see
+/// which `(src_label, edge_type)` pairs still bypass BaseGraph CSR routing.
+fn eprint_fallback_hits(snb: &SnbGraph) {
+    let hits = snb.fallback_hits_snapshot();
+    if hits.is_empty() {
+        eprintln!("[fallback-hits] none (all neighbor lookups served by BaseGraph CSR)");
+        return;
+    }
+    let total: u64 = hits.iter().map(|&(_, _, c)| c).sum();
+    eprintln!(
+        "[fallback-hits] total={total} distinct={} {}",
+        hits.len(),
+        serde_json::to_string(&fallback_hits_value(snb)).unwrap_or_default()
+    );
 }
 
 fn validate_mixed_file_with_snb(
@@ -2846,6 +2925,15 @@ fn shortest_path_parent_dag(
     Some((vids, parents, goal_idx?, goal_depth?))
 }
 
+/// Safety bound on the number of distinct shortest paths IC14 enumerates.
+/// LDBC IC14 results are tiny (typically well under a hundred paths), but a
+/// dense KNOWS neighbourhood can have a combinatorially explosive number of
+/// equal-length shortest paths between two persons. Enumerating them all is
+/// unbounded by design and has been observed to exhaust hundreds of GB of RAM.
+/// We cap enumeration far above any legitimate result so memory stays bounded
+/// (~tens of MB) while real answers are unaffected.
+const IC14_MAX_PATHS: usize = 1_000_000;
+
 fn enumerate_paths(
     vids: &[VertexId],
     parents: &[Vec<usize>],
@@ -2855,6 +2943,9 @@ fn enumerate_paths(
     current_rev: &mut Vec<VertexId>,
     out: &mut Vec<(Vec<VertexId>, f64)>,
 ) {
+    if out.len() >= IC14_MAX_PATHS {
+        return;
+    }
     current_rev.push(vids[cur]);
     if depth == 0 {
         let mut path = current_rev.clone();
@@ -2866,6 +2957,9 @@ fn enumerate_paths(
         out.push((path, weight));
     } else {
         for &parent in &parents[cur] {
+            if out.len() >= IC14_MAX_PATHS {
+                break;
+            }
             enumerate_paths(vids, parents, parent, depth - 1, cache, current_rev, out);
         }
     }
