@@ -639,8 +639,24 @@ struct BaseSnbProperties {
     persons: Vec<PersonProps>,
     places: Vec<PlaceProps>,
     organisations: Vec<OrgProps>,
-    posts: Vec<PostProps>,
-    comments: Vec<CommentProps>,
+    // Posts/Comments are kept as compact columns (SoA) rather than AoS
+    // `Vec<PostProps>`/`Vec<CommentProps>`. Their string fields (image_file,
+    // content, location_ip, browser_used, language) are always served lazily
+    // from `message_strings`, so an AoS row only stored empty `String` stubs
+    // (~24B/field/row of pure waste at SF30+ message counts). `post()`/
+    // `comment()` reconstruct the public struct on demand with empty strings.
+    post_creation_date: Vec<i64>,
+    post_length: Vec<i64>,
+    post_creator: Vec<i64>,
+    post_forum: Vec<i64>,
+    post_place: Vec<i64>,
+    comment_creation_date: Vec<i64>,
+    comment_length: Vec<i64>,
+    comment_creator: Vec<i64>,
+    comment_place: Vec<i64>,
+    // Raw reply-parent ids with `i64::MIN` sentinel for "none" (see optional_i64).
+    comment_reply_post: Vec<i64>,
+    comment_reply_comment: Vec<i64>,
     forums: Vec<ForumProps>,
     tags: Vec<TagProps>,
     tag_classes: Vec<TagClassProps>,
@@ -838,28 +854,28 @@ impl DynamicSnbGraph {
             .organisation(self.base_local(LabelId::Organisation, vid)?)
     }
 
-    pub fn post(&self, vid: VertexId) -> Option<&PostProps> {
+    pub fn post(&self, vid: VertexId) -> Option<PostProps> {
         if let Some(data) = self.vertices.get(&vid) {
             return match data {
-                VertexData::Post(p) => Some(p),
+                VertexData::Post(p) => Some(p.clone()),
                 _ => None,
             };
         }
-        self.base_vertices
-            .as_ref()?
-            .post(self.base_local(LabelId::Post, vid)?)
+        let local = self.base_local(LabelId::Post, vid)?;
+        self.base_vertices.as_ref()?.post(local, external_id(vid))
     }
 
-    pub fn comment(&self, vid: VertexId) -> Option<&CommentProps> {
+    pub fn comment(&self, vid: VertexId) -> Option<CommentProps> {
         if let Some(data) = self.vertices.get(&vid) {
             return match data {
-                VertexData::Comment(p) => Some(p),
+                VertexData::Comment(p) => Some(p.clone()),
                 _ => None,
             };
         }
+        let local = self.base_local(LabelId::Comment, vid)?;
         self.base_vertices
             .as_ref()?
-            .comment(self.base_local(LabelId::Comment, vid)?)
+            .comment(local, external_id(vid))
     }
 
     pub fn forum(&self, vid: VertexId) -> Option<&ForumProps> {
@@ -2614,16 +2630,16 @@ impl SnbGraph {
         }
     }
 
-    pub fn post(&self, vid: VertexId) -> Option<&PostProps> {
+    pub fn post(&self, vid: VertexId) -> Option<PostProps> {
         match self {
-            Self::Legacy(graph) => graph.post(vid),
+            Self::Legacy(graph) => graph.post(vid).cloned(),
             Self::Dynamic(graph) => graph.post(vid),
         }
     }
 
-    pub fn comment(&self, vid: VertexId) -> Option<&CommentProps> {
+    pub fn comment(&self, vid: VertexId) -> Option<CommentProps> {
         match self {
-            Self::Legacy(graph) => graph.comment(vid),
+            Self::Legacy(graph) => graph.comment(vid).cloned(),
             Self::Dynamic(graph) => graph.comment(vid),
         }
     }
@@ -3210,8 +3226,8 @@ impl BaseSnbProperties {
         self.persons.len()
             + self.places.len()
             + self.organisations.len()
-            + self.posts.len()
-            + self.comments.len()
+            + self.post_creation_date.len()
+            + self.comment_creation_date.len()
             + self.forums.len()
             + self.tags.len()
             + self.tag_classes.len()
@@ -3220,8 +3236,8 @@ impl BaseSnbProperties {
     fn len_for_label(&self, label: LabelId) -> usize {
         match label {
             LabelId::Person => self.persons.len(),
-            LabelId::Comment => self.comments.len(),
-            LabelId::Post => self.posts.len(),
+            LabelId::Comment => self.comment_creation_date.len(),
+            LabelId::Post => self.post_creation_date.len(),
             LabelId::Forum => self.forums.len(),
             LabelId::Organisation => self.organisations.len(),
             LabelId::Place => self.places.len(),
@@ -3246,12 +3262,43 @@ impl BaseSnbProperties {
         self.organisations.get(local as usize)
     }
 
-    fn post(&self, local: u32) -> Option<&PostProps> {
-        self.posts.get(local as usize)
+    /// Reconstruct a `PostProps` on demand from the compact columns. `id` is the
+    /// external id (carried in the caller's `VertexId`), so it is not duplicated
+    /// in a column. String fields are served lazily via `post_content_or_image`.
+    fn post(&self, local: u32, id: i64) -> Option<PostProps> {
+        let i = local as usize;
+        let creation_date = *self.post_creation_date.get(i)?;
+        Some(PostProps {
+            id,
+            image_file: String::new(),
+            creation_date,
+            location_ip: String::new(),
+            browser_used: String::new(),
+            language: String::new(),
+            content: String::new(),
+            length: self.post_length[i],
+            creator: self.post_creator[i],
+            forum_id: self.post_forum[i],
+            place: self.post_place[i],
+        })
     }
 
-    fn comment(&self, local: u32) -> Option<&CommentProps> {
-        self.comments.get(local as usize)
+    /// Reconstruct a `CommentProps` on demand from the compact columns. See `post`.
+    fn comment(&self, local: u32, id: i64) -> Option<CommentProps> {
+        let i = local as usize;
+        let creation_date = *self.comment_creation_date.get(i)?;
+        Some(CommentProps {
+            id,
+            creation_date,
+            location_ip: String::new(),
+            browser_used: String::new(),
+            content: String::new(),
+            length: self.comment_length[i],
+            creator: self.comment_creator[i],
+            place: self.comment_place[i],
+            reply_of_post: optional_i64(self.comment_reply_post[i]),
+            reply_of_comment: optional_i64(self.comment_reply_comment[i]),
+        })
     }
 
     fn forum(&self, local: u32) -> Option<&ForumProps> {
@@ -3458,12 +3505,26 @@ fn load_vertices_from_base_graph(base: &BaseGraph) -> Result<BaseSnbProperties> 
         );
     let tags_by_tag_class = build_base_tag_class_index(base, tag_classes.len(), &tags);
 
+    // The compact columns read above (post_*/comment_*) are what we keep
+    // resident; the AoS temporaries were only needed to feed the index builders.
+    drop(posts);
+    drop(comments);
+
     Ok(BaseSnbProperties {
         persons,
         places,
         organisations,
-        posts,
-        comments,
+        post_creation_date,
+        post_length,
+        post_creator,
+        post_forum,
+        post_place,
+        comment_creation_date,
+        comment_length,
+        comment_creator,
+        comment_place,
+        comment_reply_post,
+        comment_reply_comment,
         forums,
         tags,
         tag_classes,
