@@ -25,24 +25,43 @@ pub async fn import_snb_full(
 ) -> Result<ImportStats> {
     let import_started = Instant::now();
     fs::create_dir_all(store_dir)?;
+    // For the L0-layout ablation (SNB_SKIP_ADJ_CACHE=1) the vertex JSONL, edge-prop JSONL and
+    // adjacency cache are never consumed by storage-bench / neighbor-compare. Edge labels come
+    // from the file type (not a vertex lookup), so we can skip the 26GB vertex write, send the
+    // 30GB edge-prop stream to /dev/null, and stop the adjacency builder from retaining edges.
+    let skip_adj = std::env::var("SNB_SKIP_ADJ_CACHE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let vertex_path = store_dir.join("snb_vertices.jsonl");
-    let edge_prop_path = store_dir.join("snb_edge_props.jsonl");
-    let mut vertices = BufWriter::new(File::create(&vertex_path)?);
+    let edge_prop_path = if skip_adj {
+        std::path::PathBuf::from("/dev/null")
+    } else {
+        store_dir.join("snb_edge_props.jsonl")
+    };
     let mut edge_props = BufWriter::new(File::create(&edge_prop_path)?);
     let mut stats = ImportStats {
         input_rows: 0,
         directed_edges: 0,
     };
-    let mut adjacency = AdjacencyBuilder::default();
+    let mut adjacency = if skip_adj {
+        AdjacencyBuilder::new_disabled()
+    } else {
+        AdjacencyBuilder::default()
+    };
 
-    eprintln!("[snb-full] importing vertices from {}", csv_root.display());
-    import_vertices(csv_root, &mut vertices)?;
-    vertices.flush()?;
-    eprintln!(
-        "[snb-full] vertices written to {} elapsed_s={:.1}",
-        vertex_path.display(),
-        import_started.elapsed().as_secs_f64()
-    );
+    if skip_adj {
+        eprintln!("[snb-full] SKIP vertex JSONL + edge-prop persistence (SNB_SKIP_ADJ_CACHE set)");
+    } else {
+        eprintln!("[snb-full] importing vertices from {}", csv_root.display());
+        let mut vertices = BufWriter::new(File::create(&vertex_path)?);
+        import_vertices(csv_root, &mut vertices)?;
+        vertices.flush()?;
+        eprintln!(
+            "[snb-full] vertices written to {} elapsed_s={:.1}",
+            vertex_path.display(),
+            import_started.elapsed().as_secs_f64()
+        );
+    }
 
     let dynamic = csv_root.join("dynamic");
     let static_dir = csv_root.join("static");
@@ -319,6 +338,21 @@ pub async fn import_snb_full(
         "[snb-full] flush complete elapsed_s={:.1}",
         flush_started.elapsed().as_secs_f64()
     );
+    // For the SemL0 L0-layout ablation we only measure the LSM store (storage-bench /
+    // neighbor-compare open the Engine directly and never read snb_adjacency.bin), so the
+    // adjacency cache build+write is pure overhead. SNB_SKIP_ADJ_CACHE=1 skips it.
+    if std::env::var("SNB_SKIP_ADJ_CACHE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "[snb-full] SKIP adjacency cache (SNB_SKIP_ADJ_CACHE set) directed_edges={} total_elapsed_s={:.1}",
+            adjacency.directed_edges(),
+            import_started.elapsed().as_secs_f64()
+        );
+        drop(adjacency);
+        return Ok(stats);
+    }
     let cache_started = Instant::now();
     eprintln!(
         "[snb-full] building adjacency cache from import stream directed_edges={}",

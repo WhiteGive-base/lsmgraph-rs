@@ -2562,9 +2562,9 @@ impl SnbGraph {
         match self {
             Self::Legacy(graph) => graph.engine.metrics().reset(),
             Self::Dynamic(graph) => {
-                if let Some(engine) = &graph.fallback_engine {
-                    engine.metrics().reset();
-                }
+                // The legacy LSM `fallback_engine` was removed on the BaseGraph
+                // path (reads route through BaseGraph CSR + delta); only the
+                // delta engine still has resettable storage metrics.
                 if let Some(delta) = graph.view.delta() {
                     delta.engine().metrics().reset();
                 }
@@ -2578,10 +2578,6 @@ impl SnbGraph {
                 "engine": graph.engine.metrics().snapshot_json(),
             }),
             Self::Dynamic(graph) => json!({
-                "fallback": graph
-                    .fallback_engine
-                    .as_ref()
-                    .map(|engine| engine.metrics().snapshot_json()),
                 "delta": graph
                     .view
                     .delta()
@@ -3781,6 +3777,9 @@ pub struct AdjacencyCacheWriteStats {
 pub struct AdjacencyBuilder {
     grouped: HashMap<(VertexId, EdgeType), Vec<(VertexId, Timestamp)>>,
     directed_edges: usize,
+    /// When true, record_edge only counts and does not retain edges in memory
+    /// (used when the adjacency cache will not be built, e.g. the L0-layout ablation).
+    disabled: bool,
 }
 
 impl AdjacencyBuilder {
@@ -3798,6 +3797,13 @@ impl AdjacencyBuilder {
         builder
     }
 
+    pub fn new_disabled() -> Self {
+        Self {
+            disabled: true,
+            ..Default::default()
+        }
+    }
+
     pub fn record_edge(
         &mut self,
         src: VertexId,
@@ -3805,10 +3811,12 @@ impl AdjacencyBuilder {
         dst: VertexId,
         ts: Timestamp,
     ) {
-        self.grouped
-            .entry((src, edge_type))
-            .or_default()
-            .push((dst, ts));
+        if !self.disabled {
+            self.grouped
+                .entry((src, edge_type))
+                .or_default()
+                .push((dst, ts));
+        }
         self.directed_edges += 1;
     }
 

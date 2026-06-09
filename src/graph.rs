@@ -581,7 +581,19 @@ impl Engine {
             schema_catalog: RwLock::new(schema_catalog),
         });
         engine.rebuild_index().await?;
-        engine.rebuild_semantic_indexes().await?;
+        // rebuild_semantic_indexes is O(edges) (reads all L0 offsets -> per-(src,edge_type)
+        // degree map, ~260GB at SF100). The plan-gen pass only needs scan_edges to write the
+        // sample plan and never consults these indexes, so SNB_SKIP_SEM_INDEX=1 skips them to
+        // avoid OOM when scan_edges + the index build would otherwise coexist. Real measurement
+        // reads (--sample-plan-in, no scan) leave it unset so pruning stays correct.
+        if std::env::var("SNB_SKIP_SEM_INDEX")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            eprintln!("[engine] SKIP rebuild_semantic_indexes (SNB_SKIP_SEM_INDEX set)");
+        } else {
+            engine.rebuild_semantic_indexes().await?;
+        }
         Ok(engine)
     }
 
