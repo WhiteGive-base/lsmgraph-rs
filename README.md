@@ -235,6 +235,24 @@ Blocking/direct/io_uring backend smoke comparisons:
   --data-dir /data/WorkSpace/lsmgraph-rs/store/sf1-full
 ```
 
+BaseGraph/DynamicGraphView Linux build and benchmark entrypoints:
+
+```bash
+target/release/lsmgraph base-build \
+  --input /data/WorkSpace/ldbc-sf10/social_network \
+  --data-dir /data/WorkSpace/lsmgraph-rs/store/sf10-base-dynamic
+
+target/release/lsmgraph dynamic-stats \
+  --data-dir /data/WorkSpace/lsmgraph-rs/store/sf10-base-dynamic
+
+bash deps/ldbc_snb_interactive_impls/lsmgraph/run_linux_benchmarks.sh
+```
+
+`run_linux_benchmarks.sh` always runs SF10 BaseGraph build, storage I/O
+benchmarks and the copied Java driver benchmark. SF30 is conditional: it runs
+only when SF10 completes and meets `MIN_SF10_QPS` unless `RUN_SF30=true` is set.
+The script also writes an SF100 estimate report from the measured artifacts.
+
 ## Observed SF1 Results
 
 Expected SF1 `person_knows` result:
@@ -282,10 +300,3 @@ Observed I/O backend smoke results:
 - mmap the SNB adjacency cache to reduce validator startup memory copy cost.
 - Replace the functional `uring` backend with persistent ring workers and
   batched submissions.
-
-
-FORCE=1 INPUT=/data/WorkSpace/dgs/data/social_network_tugraph DATA_DIR=/data/WorkSpace/lsmgraph-rs/store/sf1-bench bash /data/WorkSpace/lsmgraph-rs/deps/ldbc_snb_interactive_impls/lsmgraph/prepare_validation_store.sh > /data/WorkSpace/lsmgraph-rs/logs/prepare-sf1-bench.log 2>&1 &
-
-FORCE=1 INPUT=/data/WorkSpace/ldbc-sf10/social_network DATA_DIR=/data/WorkSpace/lsmgraph-rs/store/sf10-bench bash /data/WorkSpace/lsmgraph-rs/deps/ldbc_snb_interactive_impls/lsmgraph/prepare_validation_store.sh > /data/WorkSpace/lsmgraph-rs/logs/prepare-sf10-bench.log 2>&1 &
-
-FORCE=1 INPUT=/data/WorkSpace/ldbc-sf30/social_network DATA_DIR=/data/WorkSpace/lsmgraph-rs/store/sf30-bench bash /data/WorkSpace/lsmgraph-rs/deps/ldbc_snb_interactive_impls/lsmgraph/prepare_validation_store.sh > /data/WorkSpace/lsmgraph-rs/logs/prepare-sf30-bench.log 2>&1 &

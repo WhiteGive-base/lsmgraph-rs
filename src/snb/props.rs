@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::base_graph::column::StringColumnReader;
 use crate::base_graph::ids::LabelId;
@@ -2554,6 +2555,38 @@ impl SnbGraph {
     pub fn reset_fallback_hits(&self) {
         if let Self::Dynamic(graph) = self {
             graph.reset_fallback_hits();
+        }
+    }
+
+    pub fn reset_storage_metrics(&self) {
+        match self {
+            Self::Legacy(graph) => graph.engine.metrics().reset(),
+            Self::Dynamic(graph) => {
+                if let Some(engine) = &graph.fallback_engine {
+                    engine.metrics().reset();
+                }
+                if let Some(delta) = graph.view.delta() {
+                    delta.engine().metrics().reset();
+                }
+            }
+        }
+    }
+
+    pub fn storage_metrics_snapshot_json(&self) -> Value {
+        match self {
+            Self::Legacy(graph) => json!({
+                "engine": graph.engine.metrics().snapshot_json(),
+            }),
+            Self::Dynamic(graph) => json!({
+                "fallback": graph
+                    .fallback_engine
+                    .as_ref()
+                    .map(|engine| engine.metrics().snapshot_json()),
+                "delta": graph
+                    .view
+                    .delta()
+                    .map(|delta| delta.engine().metrics().snapshot_json()),
+            }),
         }
     }
 

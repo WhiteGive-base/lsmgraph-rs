@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="920" viewBox="0 0 1600 920" role="img" aria-labelledby="title desc">
+  <title id="title">SemL0 system pipeline</title>
+  <desc id="desc">Writes create semantic L0 segments, reads compile query signatures for semantic pruning, and feedback drives selective semantic compaction.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1d4ed8"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c2410c"/>
+    </marker>
+    <style>
+      .bg { fill: #ffffff; }
+      .title { font: 700 34px Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 18px Arial, sans-serif; fill: #475569; }
+      .section { font: 700 17px Arial, sans-serif; fill: #334155; letter-spacing: 0; }
+      .box-text { font: 700 20px Arial, sans-serif; fill: #0f172a; text-anchor: middle; dominant-baseline: middle; letter-spacing: 0; }
+      .small-text { font: 600 15px Arial, sans-serif; fill: #334155; text-anchor: middle; dominant-baseline: middle; letter-spacing: 0; }
+      .legend-text { font: 600 15px Arial, sans-serif; fill: #334155; dominant-baseline: middle; letter-spacing: 0; }
+      .write-box { fill: #ecfdf5; stroke: #15803d; stroke-width: 2; }
+      .read-box { fill: #eff6ff; stroke: #1d4ed8; stroke-width: 2; }
+      .maint-box { fill: #fff7ed; stroke: #c2410c; stroke-width: 2; }
+      .meta-box { fill: #f8fafc; stroke: #64748b; stroke-width: 2; }
+      .badge { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.5; }
+      .arrow { fill: none; stroke: #334155; stroke-width: 2.6; marker-end: url(#arrow); }
+      .arrow-write { fill: none; stroke: #15803d; stroke-width: 2.8; marker-end: url(#arrow-green); }
+      .arrow-read { fill: none; stroke: #1d4ed8; stroke-width: 2.8; marker-end: url(#arrow-blue); }
+      .arrow-maint { fill: none; stroke: #c2410c; stroke-width: 2.8; marker-end: url(#arrow-orange); }
+      .arrow-dashed { fill: none; stroke: #64748b; stroke-width: 2.4; stroke-dasharray: 8 8; marker-end: url(#arrow); }
+      .lane { fill: none; stroke: #e2e8f0; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="920"/>
+  <text class="title" x="70" y="58">SemL0 Query-Semantic LSM Pipeline</text>
+  <text class="subtitle" x="70" y="88">Semantic metadata guides reads; feedback selectively rewrites hot L0 ranges.</text>
+
+  <text class="section" x="70" y="132">Write / flush path</text>
+  <line class="lane" x1="70" y1="146" x2="1540" y2="146"/>
+  <text class="section" x="70" y="342">Read path</text>
+  <line class="lane" x1="70" y1="356" x2="1540" y2="356"/>
+  <text class="section" x="70" y="612">Feedback / maintenance path</text>
+  <line class="lane" x1="70" y1="626" x2="1540" y2="626"/>
+
+  <g id="write-updates">
+    <rect class="write-box" x="70" y="170" width="210" height="82" rx="10"/>
+    <text class="box-text" x="175" y="202">Graph</text>
+    <text class="box-text" x="175" y="228">updates</text>
+  </g>
+  <g id="schema-catalog">
+    <rect class="write-box" x="330" y="170" width="210" height="82" rx="10"/>
+    <text class="box-text" x="435" y="202">Schema</text>
+    <text class="box-text" x="435" y="228">catalog</text>
+  </g>
+  <g id="l0-segment">
+    <rect class="write-box" x="590" y="170" width="210" height="82" rx="10"/>
+    <text class="box-text" x="695" y="202">L0</text>
+    <text class="box-text" x="695" y="228">segment</text>
+  </g>
+  <g id="semantic-metadata">
+    <rect class="meta-box" x="850" y="152" width="330" height="118" rx="10"/>
+    <text class="box-text" x="1015" y="182">Semantic metadata</text>
+    <rect class="badge" x="880" y="205" width="84" height="28" rx="7"/>
+    <text class="small-text" x="922" y="219">epoch</text>
+    <rect class="badge" x="976" y="205" width="94" height="28" rx="7"/>
+    <text class="small-text" x="1023" y="219">label/type</text>
+    <rect class="badge" x="1082" y="205" width="82" height="28" rx="7"/>
+    <text class="small-text" x="1123" y="219">degree</text>
+    <rect class="badge" x="902" y="238" width="96" height="28" rx="7"/>
+    <text class="small-text" x="950" y="252">property</text>
+    <rect class="badge" x="1010" y="238" width="112" height="28" rx="7"/>
+    <text class="small-text" x="1066" y="252">tombstone</text>
+  </g>
+
+  <g id="graph-query">
+    <rect class="read-box" x="70" y="390" width="210" height="82" rx="10"/>
+    <text class="box-text" x="175" y="422">Graph</text>
+    <text class="box-text" x="175" y="448">query</text>
+  </g>
+  <g id="signature">
+    <rect class="read-box" x="330" y="390" width="210" height="82" rx="10"/>
+    <text class="box-text" x="435" y="421">GraphAccess</text>
+    <text class="box-text" x="435" y="448">Signature</text>
+  </g>
+  <g id="semantic-index">
+    <rect class="read-box" x="590" y="390" width="210" height="82" rx="10"/>
+    <text class="box-text" x="695" y="421">Semantic</text>
+    <text class="box-text" x="695" y="448">L0 index</text>
+  </g>
+  <g id="prune">
+    <rect class="read-box" x="850" y="390" width="210" height="82" rx="10"/>
+    <text class="box-text" x="955" y="421">Prune</text>
+    <text class="box-text" x="955" y="448">candidates</text>
+  </g>
+  <g id="candidates">
+    <rect class="read-box" x="1110" y="390" width="210" height="82" rx="10"/>
+    <text class="box-text" x="1215" y="421">Candidate</text>
+    <text class="box-text" x="1215" y="448">segments</text>
+  </g>
+  <g id="snapshot-merge">
+    <rect class="read-box" x="1370" y="390" width="210" height="82" rx="10"/>
+    <text class="box-text" x="1475" y="421">Snapshot</text>
+    <text class="box-text" x="1475" y="448">merge</text>
+  </g>
+
+  <g id="feedback">
+    <rect class="maint-box" x="590" y="650" width="210" height="82" rx="10"/>
+    <text class="box-text" x="695" y="681">Runtime</text>
+    <text class="box-text" x="695" y="708">feedback</text>
+  </g>
+  <g id="score">
+    <rect class="maint-box" x="850" y="650" width="210" height="82" rx="10"/>
+    <text class="box-text" x="955" y="681">Benefit</text>
+    <text class="box-text" x="955" y="708">score</text>
+  </g>
+  <g id="select">
+    <rect class="maint-box" x="1110" y="650" width="210" height="82" rx="10"/>
+    <text class="box-text" x="1215" y="681">Select hot</text>
+    <text class="box-text" x="1215" y="708">range</text>
+  </g>
+  <g id="compaction">
+    <rect class="maint-box" x="1370" y="650" width="210" height="82" rx="10"/>
+    <text class="box-text" x="1475" y="681">Semantic</text>
+    <text class="box-text" x="1475" y="708">compaction</text>
+  </g>
+
+  <path class="arrow-write" d="M 280 211 L 330 211"/>
+  <path class="arrow-write" d="M 540 211 L 590 211"/>
+  <path class="arrow-write" d="M 800 211 L 850 211"/>
+  <path class="arrow-read" d="M 280 431 L 330 431"/>
+  <path class="arrow-read" d="M 540 431 L 590 431"/>
+  <path class="arrow-read" d="M 800 431 L 850 431"/>
+  <path class="arrow-read" d="M 1060 431 L 1110 431"/>
+  <path class="arrow-read" d="M 1320 431 L 1370 431"/>
+  <path class="arrow-maint" d="M 800 691 L 850 691"/>
+  <path class="arrow-maint" d="M 1060 691 L 1110 691"/>
+  <path class="arrow-maint" d="M 1320 691 L 1370 691"/>
+
+  <path class="arrow-dashed" d="M 1015 270 L 1015 320 L 695 320 L 695 390"/>
+  <path class="arrow-dashed" d="M 435 252 L 435 390"/>
+  <path class="arrow-dashed" d="M 1215 472 L 1215 540 L 695 540 L 695 650"/>
+  <path class="arrow-dashed" d="M 1475 650 L 1475 575 L 1180 575 L 1180 270"/>
+
+  <g id="legend">
+    <rect class="meta-box" x="70" y="805" width="1510" height="58" rx="10"/>
+    <rect class="write-box" x="96" y="823" width="24" height="18" rx="4"/>
+    <text class="legend-text" x="132" y="832">write / flush</text>
+    <rect class="read-box" x="285" y="823" width="24" height="18" rx="4"/>
+    <text class="legend-text" x="321" y="832">read / pruning</text>
+    <rect class="maint-box" x="486" y="823" width="24" height="18" rx="4"/>
+    <text class="legend-text" x="522" y="832">feedback / compaction</text>
+    <rect class="badge" x="762" y="823" width="24" height="18" rx="4"/>
+    <text class="legend-text" x="798" y="832">schema, property, degree, tombstone metadata</text>
+    <line x1="1165" y1="832" x2="1225" y2="832" stroke="#64748b" stroke-width="2.4" stroke-dasharray="8 8" marker-end="url(#arrow)"/>
+    <text class="legend-text" x="1240" y="832">metadata / feedback dependency</text>
+  </g>
+</svg>
