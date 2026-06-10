@@ -79,5 +79,18 @@ API 见 `deps/teseo/README.md`/`include/teseo.hpp`：`teseo::Teseo`，`start_tra
 - SF100 外部加载（LiveGraph/GraphOne 内存态可能 100GB+）必须在内部 SF100 主跑（峰值 ~219GB）**结束后**串行跑，避免 OOM（机器 503GB，单系统安全）。
 - 产物落 `remote-logs/external-<system>-<scale>-<date>/`，汇总进 `baseline/external-baseline-comparison.md` 数值表（过复现门槛者）。
 
+## 6b. 各系统语义（2026-06-10 实测 API，影响公平性）
+- **LiveGraph**（最匹配）：有 `label`(=edge type)、有向、持久事务。load=`begin_batch_loader`+`new_vertex×N`
+  （必须先建稠密顶点）+`put_edge(src,label,dst,"")`+`commit`；read=`get_edges(src,label)` 迭代。
+  **driver 已完成并通过合成图冒烟**（`baseline/external-drivers/livegraph_driver.cpp`+Makefile）。
+- **Teseo**：**无向、带权(double)、无 label、无多重边/自环**，顶点 ∈[0,2^64-2]。
+  → 每个 edge type 建**独立 Teseo 实例**（只灌该类型边，weight=1.0）；`insert_vertex`→`insert_edge(s,d,w)`；
+  read=`tx.iterator().edges(v, logical=false, cb(dst[,w]))`。**caveat：无向**（扫 src 得双向邻居）与 lsmgraph
+  有向 get_neighbors 不同，需在论文注明；自环/多重边需在转换器里去除。纯内存（比延迟/RSS，不比 read bytes）。
+- **GraphOne**：`batch_edge` + typekv schema + `graph_view`/`get_nebrs`（见 `deps/GraphOne/example.cpp`）；
+  也可直接用已构建的 `graphone32` 喂转换后的 bin。纯内存流式。
+- 结论：LiveGraph 进数值表最干净；Teseo/GraphOne 进表需带"无向/无 label/内存态"注脚，或保持定性。
+  → 建议主文：LiveGraph 数值 + Teseo/GraphOne 带注脚数值或定性。
+
 ## 7. 进入数值表的门槛（复用 external-baseline-comparison.md）
 构建+加载同一 SF100 边集+抽样 neighbor 工作负载+抽样正确性 → 通过才进表；否则保持定性。
