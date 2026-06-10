@@ -93,6 +93,17 @@ LDBC SF1/SF100 是复合实体文件格式（hasCreator/replyOf/containerOf 内�
   migrated-from-ablation-20260610/results/remote-logs/e11-normalized-20260608/e11-variants-sf100.tsv`
   → P1/P2/budget-sweep 表（合并复用 e11 的 naive/lsmgraph/label/degree 行）。
 
+## 主跑第二个 bug：read bench 漏了 --semantic-degree-hint（已修 6beda2b）
+首批 SF100 数发现异常：semantic 读 **9994 MiB（10GB）**，比 schema(149.7MiB) **差 66×**，与 SF1/SF30 相反。
+根因：`bench_variant` 的 storage-bench 读**没传 `--semantic-degree-hint`** → 查询只按 edge_type，
+degree 分区的 layout（semantic/budgeted）把每个 degree-class 段都当 candidate（爆炸），而非按 degree 剪枝。
+e11 参考 bench 一直带这个旗标（确认 5 处），我漏了。schema/edge-type-only/naive 无 degree 分区 → hint 无关
+（不受影响，数有效）。已给 bench_variant 加上，重启：schema 跳过导入+plan-gen（缓存），重新 bench schema
+（作 hint-invariance 校验）、重跑 semantic + budg-{64,256,1024}（带 hint）；edge-type-only 保留旧结果（hint 无关）。
+**有效 SF100 数（hint 无关，已确认）：** schema 149.7MiB / cand 5.93M / 3444 L0；
+edge-type-only 146.7MiB / cand 5.90M / 3446 L0（两者对 naive 26GB 均剪枝 ~99.4%；彼此差 2%，SF100 大样本下层级差被 body 读主导压扁）。
+**重启 PID 2307023（01:02），预计 ~9h → 明早 ~10:00；带 hint 的 semantic 应大幅低于 schema。**
+
 ## 待办（主跑结束后）
 阶段8 出 SF100 表 + 重写 sf100-strong-baseline-summary.md（去掉夸大表述、带 scale 列）；
 阶段4 edge-type-不够用 workload（storage-bench 加 property/signature 模式）；阶段5 feedback 专项；
