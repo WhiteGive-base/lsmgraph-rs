@@ -55,6 +55,25 @@ benefit_scored 未进表**（生成表时还没跑完）。→ SF100 的 SemL0 �
 budget sweep）必须用**修正后的二进制**重跑；schema/naive/label-only 可复用。
 e11 当前还在跑 benefit_scored import（默认参数=会复现 bug），之后还要 full_compact（有磁盘风险）—— 均属冗余/我会重做。
 
+## e11 自然结束（无需停）+ 关键发现
+2026-06-10 08:4x，e11 SF100 跑**自行结束**：benefit_scored import 完成→删；`import full_compact`
+在 L0→L1 compaction 阶段 **OOM**（dmesg 04:38 anon-rss 472GB）→ 进程全灭，worktree store 清空。
+→ **full_compact @ SF100 受内存限制不可行**（不只是磁盘）；harness 默认 RUN_FULL_COMPACT=0；上界引 SF30。
+机器现空闲（disk 541G→526G free、RAM 445G free），SF100 主跑解锁。
+真实 SF100 规模确认：**directed_edges=3,570,968,680（35.7亿）**。
+
+## 阶段 3/6（进行中）— SF100 主跑已启动
+`remote-logs/qslsm-sf100-strong-baseline-20260610/`（PID 1928457，s5000）：
+schema(参考+plan) + edge-type-only + semantic + budg-{64,256,1024}，用**修正二进制**；
+naive/lsmgraph-style/label-only/degree-only 复用 e11 staged 数。预计 ~10h。
+监控：persistent monitor（里程碑+失败）。汇总脚本 `baseline/summarize_strong_baseline.py`（合成数据已验证）就绪。
+
+## 阶段 7（已就绪+方案固定，待主跑释放内存后跑）
+4 个外部系统源码/库均就绪（LiveGraph .so / Teseo .a / GraphOne 可执行 / LLAMA 模板；TBB+g++9.4+cmake 齐）。
+实现方案+公平性方法学固定在 `baseline/external-driver-implementation-plan-cn.md`
+（全局 id 重映射、edge-type 映射、共享转换器、各系统薄 driver、先 SF10 验证后 SF100 串行跑避免 OOM）。
+
 ## 待办
-SF100 重活（budget sweep + edge-type-only + full-semantic + 阶段4/5/6/7）受 e11 占用磁盘/内存阻塞，
-需先决定 e11 去留（见与用户确认）。其余非阻塞项继续：外部系统构建(阶段7)、analysis 汇总管线、文档。
+SF100 主跑产出后：跑 summarize → 合并复用 e11 行 → 出 P1/P2/budget-sweep 表（阶段8）；
+阶段4 edge-type-不够用 workload（需 storage-bench 加 signature/property 查询模式）；
+阶段5 feedback 专项（p3-feedback-bench，主跑后串行）；阶段7 外部 driver 编码+跑；阶段9 释放 worktree。
