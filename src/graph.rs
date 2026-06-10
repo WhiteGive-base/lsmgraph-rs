@@ -1610,7 +1610,16 @@ impl Engine {
             let src_label = candidate.src_label;
             let edge_type = candidate.edge_type;
             if !candidate.selected {
-                let key = (src_label, MIXED_EDGE_TYPE, DegreeClass::Mixed);
+                // Unselected edge types keep their real edge_type (degree merged to
+                // Mixed) instead of collapsing to MIXED_EDGE_TYPE. This makes the
+                // budgeted layout a smooth schema->semantic interpolation: at budget 0
+                // every edge type is schema-style (src_label+edge_type, degree-mixed),
+                // and raising the file budget promotes high-benefit edge types to exact
+                // degree partitions. Collapsing to MIXED_EDGE_TYPE used to discard the
+                // edge-type pruning schema already provides, pushing intermediate
+                // budgets *below* the schema baseline (read-amp cliff). See
+                // baseline/progress-note: budgeted now stays <= schema at all budgets.
+                let key = (src_label, edge_type, DegreeClass::Mixed);
                 needs_sort.insert(key);
                 partitions.entry(key).or_default().extend_from_slice(group);
                 continue;
