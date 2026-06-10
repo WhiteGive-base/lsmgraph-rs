@@ -105,8 +105,14 @@ bench_variant() {  # name layout
   local name="$1" layout="$2"; local store="${STORE_ROOT}/${name}"
   run_logged "${name}-stats" "$BIN" --io-backend "$IO_BACKEND" stats --data-dir "$store" >/dev/null
   record_manifest "$name" "$layout" "stats" "$store" "${OUT_DIR}/${name}-stats.json"
+  # --semantic-degree-hint is REQUIRED: it makes the read query by full signature
+  # (incl. degree class), so degree-partitioned layouts (semantic/budgeted) prune by
+  # degree instead of treating every degree-class segment as a candidate. Without it,
+  # semantic explodes at SF100 (10GB vs schema 150MB). schema/edge-type-only/naive have
+  # no degree partitioning so they are hint-invariant. Matches the e11 reference bench.
   run_logged "${name}-bench" "$BIN" --io-backend "$IO_BACKEND" storage-bench \
-    --data-dir "$store" --edge-types "$EDGE_TYPES" --sample-plan-in "$PLAN" >/dev/null
+    --data-dir "$store" --edge-types "$EDGE_TYPES" --sample-plan-in "$PLAN" \
+    --semantic-degree-hint >/dev/null
   record_manifest "$name" "$layout" "bench" "$store" "${OUT_DIR}/${name}-bench.json"
 }
 
