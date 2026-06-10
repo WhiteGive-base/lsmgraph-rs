@@ -87,6 +87,11 @@ record_manifest() {  # variant layout kind store file
 import_variant() {  # name layout extra-flags...
   local name="$1" layout="$2"; shift 2
   local store="${STORE_ROOT}/${name}"
+  if [ -d "$store" ] && [ -n "$(ls -A "$store" 2>/dev/null)" ]; then
+    log "import ${name} SKIP (store already populated: ${store})"
+    record_manifest "$name" "$layout" "import" "$store" "EXISTS"
+    return 0
+  fi
   log "import ${name} (layout=${layout}) ${*}"
   SNB_SKIP_ADJ_CACHE=1 "$BIN" --io-backend "$IO_BACKEND" import \
     --input "$INPUT" --data-dir "$store" --relation snb-full \
@@ -97,7 +102,7 @@ import_variant() {  # name layout extra-flags...
 }
 
 bench_variant() {  # name layout
-  local name="$1" layout="$2" store="${STORE_ROOT}/${name}"
+  local name="$1" layout="$2"; local store="${STORE_ROOT}/${name}"
   run_logged "${name}-stats" "$BIN" --io-backend "$IO_BACKEND" stats --data-dir "$store" >/dev/null
   record_manifest "$name" "$layout" "stats" "$store" "${OUT_DIR}/${name}-stats.json"
   run_logged "${name}-bench" "$BIN" --io-backend "$IO_BACKEND" storage-bench \
@@ -107,7 +112,7 @@ bench_variant() {  # name layout
 
 compare_variant() {  # name
   [ "$RUN_COMPARE" = "1" ] || return 0
-  local name="$1" store="${STORE_ROOT}/${name}"
+  local name="$1"; local store="${STORE_ROOT}/${name}"
   log "neighbor-compare schema vs ${name} (SNB_SKIP_SEM_INDEX both sides)"
   SNB_SKIP_SEM_INDEX=1 "$BIN" --io-backend "$IO_BACKEND" neighbor-compare \
     --left-data-dir "$SCHEMA_STORE" --right-data-dir "$store" \
@@ -137,17 +142,19 @@ main() {
     echo "\"run_compare\":${RUN_COMPARE},\"started_at\":\"$(date -Is)\"}"
   } > "${OUT_DIR}/run-config.json"
 
-  # 1) schema reference first (kept for the whole run), then the shared sample plan.
+  # 1) schema reference first (kept for the whole run), then the shared sample plan,
+  #    then bench schema ON that plan (plan must exist before any --sample-plan-in bench).
   import_variant "schema" "schema"
+  if [ ! -s "$PLAN" ]; then
+    log "generate sample plan from schema (SNB_SKIP_SEM_INDEX for plan-gen only)"
+    SNB_SKIP_SEM_INDEX=1 "$BIN" --io-backend "$IO_BACKEND" storage-bench \
+      --data-dir "$SCHEMA_STORE" --edge-types "$EDGE_TYPES" --samples "$SAMPLES" \
+      --semantic-degree-hint --sample-plan-degree-hint --sample-plan-out "$PLAN" \
+      > "${OUT_DIR}/plan.stdout" 2> "${OUT_DIR}/plan.stderr" || die "plan-gen failed"
+  else
+    log "sample plan already exists: $PLAN (skip plan-gen)"
+  fi
   bench_variant "schema" "schema"
-  log "generate sample plan from schema (SNB_SKIP_SEM_INDEX for plan-gen only)"
-  SNB_SKIP_SEM_INDEX=1 "$BIN" --io-backend "$IO_BACKEND" storage-bench \
-    --data-dir "$SCHEMA_STORE" --edge-types "$EDGE_TYPES" --samples "$SAMPLES" \
-    --semantic-degree-hint --sample-plan-degree-hint --sample-plan-out "$PLAN" \
-    > "${OUT_DIR}/plan.stdout" 2> "${OUT_DIR}/plan.stderr" || die "plan-gen failed"
-  # re-bench schema on the shared plan for an apples-to-apples read-amp number
-  run_logged "schema-bench" "$BIN" --io-backend "$IO_BACKEND" storage-bench \
-    --data-dir "$SCHEMA_STORE" --edge-types "$EDGE_TYPES" --sample-plan-in "$PLAN" >/dev/null
 
   # 2) internal controllable baselines (import -> bench -> [compare] -> delete).
   want() { case " $BASELINE_VARIANTS " in *" $1 "*) return 0;; *) return 1;; esac; }
