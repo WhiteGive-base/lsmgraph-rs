@@ -104,6 +104,17 @@ e11 参考 bench 一直带这个旗标（确认 5 处），我漏了。schema/ed
 edge-type-only 146.7MiB / cand 5.90M / 3446 L0（两者对 naive 26GB 均剪枝 ~99.4%；彼此差 2%，SF100 大样本下层级差被 body 读主导压扁）。
 **重启 PID 2307023（01:02），预计 ~9h → 明早 ~10:00；带 hint 的 semantic 应大幅低于 schema。**
 
+## 重大发现：full semantic 在 SF100 反而比 schema 差（hint 无关）
+带 hint 重跑后 semantic 仍 **10GB 读**（与不带 hint 字节相同）→ 不是 hint 问题。逐 et 拆解（et=2 HasCreator）：
+schema 与 semantic 的 filter_passed(~9.3K)、body(160KB)、read_syscalls(~5.2K) 几乎相同，但
+**read_bytes 3GB vs 3MB** → semantic 每次 body pread **~590KB 但只用 ~32B**（add_read 计 pread 全长，
+record_body_read 只计用到的边）→ **~950× body 过读**。但**延迟只差 ~3×**（avg 1290us vs 409us，OS cache 吸收）。
+另外 candidate_l0 semantic 7.78M > schema 5.93M、L0 文件 6615 > 3444 = degree 分区**多产生段**（真实属性）。
+SF1/SF30 semantic 是最好的；SF100 反转 → 要么 scale 阈值、要么 merge 合并 reader.rs 引入的 body-read range 退化。
+**两面性：** 若 budgeted（受 file budget 限制分段）避开了这个爆炸 → "可控成本反而胜过 full upper bound" 是个强故事；
+若 budgeted 也爆 → reader body-read range 是真 bug 需修。**等 budg-b64（~2h）判定。**
+注：latency + candidate_l0 这两个指标有效；read_bytes 受过读影响需谨慎/或修 reader。
+
 ## 待办（主跑结束后）
 阶段8 出 SF100 表 + 重写 sf100-strong-baseline-summary.md（去掉夸大表述、带 scale 列）；
 阶段4 edge-type-不够用 workload（storage-bench 加 property/signature 模式）；阶段5 feedback 专项；
