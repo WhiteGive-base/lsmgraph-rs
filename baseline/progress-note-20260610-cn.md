@@ -73,7 +73,28 @@ naive/lsmgraph-style/label-only/degree-only 复用 e11 staged 数。预计 ~10h�
 实现方案+公平性方法学固定在 `baseline/external-driver-implementation-plan-cn.md`
 （全局 id 重映射、edge-type 映射、共享转换器、各系统薄 driver、先 SF10 验证后 SF100 串行跑避免 OOM）。
 
-## 待办
-SF100 主跑产出后：跑 summarize → 合并复用 e11 行 → 出 P1/P2/budget-sweep 表（阶段8）；
-阶段4 edge-type-不够用 workload（需 storage-bench 加 signature/property 查询模式）；
-阶段5 feedback 专项（p3-feedback-bench，主跑后串行）；阶段7 外部 driver 编码+跑；阶段9 释放 worktree。
+## 主跑 bug 修复（已提交 3106832）
+首跑在 schema 导入完成（132G，70min，**无损保留**）后崩在 harness：`bench_variant`/`compare_variant`
+一行内 `local name=$1 ... store=...${name}` 在 set -u 下 `${name}` 作为 local 实参提前展开=unbound；
+且 main() 在 plan 生成前就 bench schema。已修：拆成两条语句、重排 import→plan-gen→bench、import 加
+「store 已存在则跳过」断点续跑。**重启后 schema 导入跳过，正常进入 plan-gen**（PID 2043648）。
+
+## 外部对照边集来源（复查发现，已记入 external-driver-implementation-plan-cn.md §3b）
+LDBC SF1/SF100 是复合实体文件格式（hasCreator/replyOf/containerOf 内嵌列），且 lsmgraph 无批量边导出。
+干净 enabler = 给 lsmgraph 加 `scan --dump-edges`（纯增量）。**但不要在主跑期间 rebuild 二进制**
+（主跑会为后续变体 spawn 新进程）→ 外部实现整体安排在主跑结束后。
+
+## 会话末状态（2026-06-10）
+- 已提交（本会话）：merge(c08ca3f)→SF100补丁(9983d6f)→budgeted修法(0f044c5)→harness+summary工具(39e3a4e)
+  →外部方案+trace(c92a791)→harness修bug(3106832) + 本次文档更新。
+- 正在跑：SF100 强 baseline（PID 2043648，s5000），plan-gen 中，预计 ~7h；persistent monitor 看守。
+- 主跑产出后立即可做：`python3 baseline/summarize_strong_baseline.py --out-dir
+  remote-logs/qslsm-sf100-strong-baseline-20260610 --scale sf100 --reuse-tsv
+  migrated-from-ablation-20260610/results/remote-logs/e11-normalized-20260608/e11-variants-sf100.tsv`
+  → P1/P2/budget-sweep 表（合并复用 e11 的 naive/lsmgraph/label/degree 行）。
+
+## 待办（主跑结束后）
+阶段8 出 SF100 表 + 重写 sf100-strong-baseline-summary.md（去掉夸大表述、带 scale 列）；
+阶段4 edge-type-不够用 workload（storage-bench 加 property/signature 模式）；阶段5 feedback 专项；
+阶段7 外部：加 `scan --dump-edges` → 转换器 → LiveGraph/Teseo/GraphOne driver（先 SF10 后 SF100 串行）；
+阶段6 full_compact 上界引 SF30（SF100 OOM）；阶段9 迁移确认后 `git worktree remove` 释放 ~204G+。

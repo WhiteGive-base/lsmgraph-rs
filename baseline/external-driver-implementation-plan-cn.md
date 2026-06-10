@@ -34,7 +34,17 @@ LDBC CSV 源（src/snb/full_loader.rs）：person_knows_person→1；comment/pos
 *_hasTag_tag→3；person_likes_comment→7；person_likes_post→8；comment_replyOf_comment→9；
 comment_replyOf_post→10；forum_containerOf_post→11；forum_hasMember_person→12。
 
-## 4. 共享转换器（一次产出，供 4 个系统复用）
+## 3b. 边集来源（2026-06-10 复查，重要）
+LDBC SF1/SF100 是**复合实体文件**格式：hasCreator/replyOf/containerOf **内嵌在 comment/post/forum
+实体 CSV 的列里**，不是独立 edge 文件（只有 knows/hasTag/likes/hasMember 是独立文件）。直接重解析复杂
+且容易与 lsmgraph loader 不一致。lsmgraph 当前**无批量边导出**（`scan` 只报指标、`neighbors` 单点）。
+→ **干净的 enabler：给 lsmgraph 加 `scan --dump-edges <file>`**（scan 已遍历全部边，仅需把
+`(src, edge_type, dst)` 写出）。好处：外部系统加载与 lsmgraph **完全相同的边集 + 相同 vertex-id 空间**，
+sample plan 的 source 直接对齐，无需重解析 LDBC。该改动是**纯增量**（不碰 import/storage-bench），安全。
+注意：**不要在 SF100 主跑进行时重建 `target/release/lsmgraph`**（主跑会为后续变体 spawn 新进程，
+即便增量改动也应等主跑结束再 rebuild，杜绝风险）。→ 外部实现整体安排在主跑结束后。
+
+## 4. 共享转换器（消费 `scan --dump-edges` 输出，供 4 个系统复用）
 `deps/_external_work/convert_ldbc_edges.py`：
 - 入参 `--input <ldbc-sfN/social_network> --edge-types 1,2,3,7,8,9,10,11,12 --out <dir>`。
 - 输出：`edges.bin`（packed `u64 src_global, u16 etype, u64 dst_global`）+ `idmap.bin` +
