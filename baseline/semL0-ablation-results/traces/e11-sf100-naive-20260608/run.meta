@@ -1,0 +1,16 @@
+date=2026-06-09T15:18:33+08:00
+scale=sf100
+pwd=/data/WorkSpace/lsmgraph-ablation
+binary=target/release/lsmgraph
+io_backend=blocking
+data=/data/WorkSpace/ldbc-sf100/social_network
+store=store/e11-sf100-naive-20260608
+layout=naive
+date_tag=20260608
+memgraph_bytes=67108864
+core_samples=200
+alltypes_samples=50
+delete_candidates_after_capture=true
+delete_schema_after_all=true
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb1       2.0T  1.5T  359G  81% /data

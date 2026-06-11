@@ -1,0 +1,15 @@
+{
+  "checked": 1800,
+  "elapsed_ms": 2699,
+  "first_mismatch": null,
+  "left_data_dir": "store/e11-sf30-schema_only-20260608",
+  "left_edges_total": 146760,
+  "left_snapshot": 1087848423,
+  "mismatches": 0,
+  "passed": 1800,
+  "right_data_dir": "store/e11-sf30-benefit_scored-20260608",
+  "right_edges_total": 146760,
+  "right_semantic_degree_hint": true,
+  "right_snapshot": 1087848423,
+  "sample_plan": "remote-logs/e11-sf30-sample-plans-20260608/sf30-core-s200.plan.json"
+}

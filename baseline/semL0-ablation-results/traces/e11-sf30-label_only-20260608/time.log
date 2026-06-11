@@ -1,0 +1,23 @@
+	Command being timed: "target/release/lsmgraph --io-backend blocking import --input /data/WorkSpace/ldbc-sf30/social_network --data-dir store/e11-sf30-label_only-20260608 --relation snb-full --memgraph-bytes 67108864 --l0-layout label-only"
+	User time (seconds): 2009.12
+	System time (seconds): 334.77
+	Percent of CPU this job got: 201%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 19:24.20
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2467344
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 54801901
+	Voluntary context switches: 5110059
+	Involuntary context switches: 5672
+	Swaps: 0
+	File system inputs: 88
+	File system outputs: 83643944
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
