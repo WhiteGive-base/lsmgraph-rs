@@ -120,3 +120,6 @@ SF1/SF30 semantic 是最好的；SF100 反转 → 要么 scale 阈值、要么 m
 阶段4 edge-type-不够用 workload（storage-bench 加 property/signature 模式）；阶段5 feedback 专项；
 阶段7 外部：加 `scan --dump-edges` → 转换器 → LiveGraph/Teseo/GraphOne driver（先 SF10 后 SF100 串行）；
 阶段6 full_compact 上界引 SF30（SF100 OOM）；阶段9 迁移确认后 `git worktree remove` 释放 ~204G+。
+
+## 主跑完成（2026-06-11 18:26）
+6 变体全出。结论：full-semantic 在 SF100 过度分段退化(10GB/6615 L0)；budgeted 小预算受控≈schema 且延迟最快；层级在 read_bytes 上收敛(body 主导)。详见 `baseline/sf100-strong-baseline-summary.md`。后续：naive@s5000 补跑中、reader 过读根因+论文收益评估待做。
