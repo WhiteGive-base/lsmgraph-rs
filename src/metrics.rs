@@ -107,6 +107,11 @@ pub struct Metrics {
     pub csr_get_neighbors_latency: LatencyMetric,
     pub csr_read_all_edges_latency: LatencyMetric,
     pub csr_read_offsets_latency: LatencyMetric,
+    pub csr_probe_setup_latency: LatencyMetric,
+    pub csr_probe_bloom_latency: LatencyMetric,
+    pub csr_probe_offset_lookup_latency: LatencyMetric,
+    pub csr_probe_body_read_latency: LatencyMetric,
+    pub csr_probe_total_latency: LatencyMetric,
     pub csr_header_reads: AtomicU64,
     pub csr_offset_reads: AtomicU64,
     pub csr_body_reads: AtomicU64,
@@ -121,6 +126,9 @@ pub struct Metrics {
     pub matched_l0_segments: AtomicU64,
     pub csr_offset_cache_hits: AtomicU64,
     pub csr_offset_cache_misses: AtomicU64,
+    pub csr_probe_bloom_negative: AtomicU64,
+    pub csr_probe_offset_miss: AtomicU64,
+    pub csr_probe_body_hit: AtomicU64,
     pub l0_bloom_false_positive_probes: AtomicU64,
 
     pub io_semaphore_wait_latency: LatencyMetric,
@@ -192,6 +200,11 @@ impl Default for Metrics {
             csr_get_neighbors_latency: LatencyMetric::default(),
             csr_read_all_edges_latency: LatencyMetric::default(),
             csr_read_offsets_latency: LatencyMetric::default(),
+            csr_probe_setup_latency: LatencyMetric::default(),
+            csr_probe_bloom_latency: LatencyMetric::default(),
+            csr_probe_offset_lookup_latency: LatencyMetric::default(),
+            csr_probe_body_read_latency: LatencyMetric::default(),
+            csr_probe_total_latency: LatencyMetric::default(),
             csr_header_reads: AtomicU64::new(0),
             csr_offset_reads: AtomicU64::new(0),
             csr_body_reads: AtomicU64::new(0),
@@ -206,6 +219,9 @@ impl Default for Metrics {
             matched_l0_segments: AtomicU64::new(0),
             csr_offset_cache_hits: AtomicU64::new(0),
             csr_offset_cache_misses: AtomicU64::new(0),
+            csr_probe_bloom_negative: AtomicU64::new(0),
+            csr_probe_offset_miss: AtomicU64::new(0),
+            csr_probe_body_hit: AtomicU64::new(0),
             l0_bloom_false_positive_probes: AtomicU64::new(0),
             io_semaphore_wait_latency: LatencyMetric::default(),
             io_read_blocking_latency: LatencyMetric::default(),
@@ -339,6 +355,11 @@ impl Metrics {
                 "get_neighbors_latency": self.csr_get_neighbors_latency.snapshot(),
                 "read_all_edges_latency": self.csr_read_all_edges_latency.snapshot(),
                 "read_offsets_latency": self.csr_read_offsets_latency.snapshot(),
+                "probe_setup_latency": self.csr_probe_setup_latency.snapshot(),
+                "probe_bloom_latency": self.csr_probe_bloom_latency.snapshot(),
+                "probe_offset_lookup_latency": self.csr_probe_offset_lookup_latency.snapshot(),
+                "probe_body_read_latency": self.csr_probe_body_read_latency.snapshot(),
+                "probe_total_latency": self.csr_probe_total_latency.snapshot(),
                 "header_reads": self.load(&self.csr_header_reads),
                 "offset_reads": self.load(&self.csr_offset_reads),
                 "body_reads": self.load(&self.csr_body_reads),
@@ -353,6 +374,9 @@ impl Metrics {
                 "matched_l0_segments": self.load(&self.matched_l0_segments),
                 "offset_cache_hits": self.load(&self.csr_offset_cache_hits),
                 "offset_cache_misses": self.load(&self.csr_offset_cache_misses),
+                "probe_bloom_negative": self.load(&self.csr_probe_bloom_negative),
+                "probe_offset_miss": self.load(&self.csr_probe_offset_miss),
+                "probe_body_hit": self.load(&self.csr_probe_body_hit),
                 "bloom_false_positive_probes": self.load(&self.l0_bloom_false_positive_probes),
                 "l0_partitions": self.l0_partition_snapshots(),
             },
@@ -465,6 +489,9 @@ impl Metrics {
             &self.matched_l0_segments,
             &self.csr_offset_cache_hits,
             &self.csr_offset_cache_misses,
+            &self.csr_probe_bloom_negative,
+            &self.csr_probe_offset_miss,
+            &self.csr_probe_body_hit,
             &self.l0_bloom_false_positive_probes,
         ] {
             counter.store(0, Ordering::Relaxed);
@@ -498,6 +525,11 @@ impl Metrics {
             &self.csr_get_neighbors_latency,
             &self.csr_read_all_edges_latency,
             &self.csr_read_offsets_latency,
+            &self.csr_probe_setup_latency,
+            &self.csr_probe_bloom_latency,
+            &self.csr_probe_offset_lookup_latency,
+            &self.csr_probe_body_read_latency,
+            &self.csr_probe_total_latency,
             &self.io_semaphore_wait_latency,
             &self.io_read_blocking_latency,
             &self.io_write_blocking_latency,
@@ -796,10 +828,16 @@ mod tests {
             true,
         );
         metrics.storage_get_neighbors_latency.record_us(900);
+        metrics.csr_probe_setup_latency.record_us(33);
+        metrics
+            .csr_probe_bloom_negative
+            .fetch_add(1, Ordering::Relaxed);
 
         let before = metrics.snapshot_json();
         assert_eq!(before["io"]["read_bytes"], 128);
         assert_eq!(before["http"]["requests"], 1);
+        assert_eq!(before["csr"]["probe_setup_latency"]["count"], 1);
+        assert_eq!(before["csr"]["probe_bloom_negative"], 1);
         assert_eq!(
             before["http"]["endpoints"]["/query/interactive_complex_1"]["count"],
             1
@@ -810,6 +848,8 @@ mod tests {
         assert_eq!(after["io"]["read_bytes"], 0);
         assert_eq!(after["http"]["requests"], 0);
         assert_eq!(after["storage"]["get_neighbors_latency"]["count"], 0);
+        assert_eq!(after["csr"]["probe_setup_latency"]["count"], 0);
+        assert_eq!(after["csr"]["probe_bloom_negative"], 0);
         assert_eq!(
             after["http"]["endpoints"]["/query/interactive_complex_1"]["count"],
             0

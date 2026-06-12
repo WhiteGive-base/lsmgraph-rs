@@ -333,6 +333,8 @@ enum Command {
         scan: bool,
         #[arg(long, default_value_t = false)]
         auto_compact: bool,
+        #[arg(long)]
+        l0_layout: Option<L0LayoutPolicy>,
         #[arg(long, value_enum, default_value = "one-hop")]
         workload_mode: StorageBenchWorkloadMode,
         #[arg(long, value_enum, default_value = "none")]
@@ -1036,6 +1038,7 @@ async fn main() -> Result<()> {
             sample_plan_out,
             scan,
             auto_compact,
+            l0_layout,
             workload_mode,
             property_predicate_mode,
             property_id,
@@ -1050,10 +1053,18 @@ async fn main() -> Result<()> {
             let mut config = LsmGraphConfig::new(&data_dir)
                 .with_io_backend(io_backend)
                 .with_metadata_cache_entries(csr_metadata_cache_entries);
+            if let Some(l0_layout) = l0_layout {
+                config.l0_layout = l0_layout;
+            }
             config.l0_ra_min_queries = ra_min_queries;
             config.l0_ra_min_score = ra_min_score;
             config.l0_ra_min_l0_segments = ra_min_l0_segments;
             let engine = Engine::open(config).await?;
+            let oracle_index_stats = if matches!(l0_layout, Some(L0LayoutPolicy::OracleSemantic)) {
+                Some(engine.build_oracle_index().await?)
+            } else {
+                None
+            };
             let snapshot = engine.current_snapshot();
             let metrics = engine.metrics();
             let cache_state_before = storage_bench_cache_state();
@@ -1208,6 +1219,8 @@ async fn main() -> Result<()> {
                     "repeats": repeats,
                     "sample_plan_in": sample_plan_in,
                     "sample_plan_out": sample_plan_out,
+                    "l0_layout": l0_layout.map(|layout| format!("{:?}", layout)),
+                    "oracle_index_stats": oracle_index_stats,
                     "sample_plan_version": sample_plan.version,
                     "scan_requested": scan && sample_plan.source == "scan",
                     "scan_edges": scan_edges,

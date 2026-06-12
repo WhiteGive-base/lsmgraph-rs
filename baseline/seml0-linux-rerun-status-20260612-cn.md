@@ -225,3 +225,26 @@ smoke 证据：
 
 - SF100 full-compact 缺失是极端写优化 baseline 的实现/资源边界，不是 SemL0 layout 失败。
 - P4 LiveGraph SF100 driver 已终止并释放 RSS，但 SF100 full-compact 旧证据显示 max RSS=472,694,124 KB 且 signal 9；机器无 swap，当前仍不安全。除非先实现可验证的 stream/bucket full-compact 入口并单独做资源门限，否则不启动 SF100 full-compact 重跑。
+
+## W2 C10 profile / engine freeze prep
+
+状态：完成，等待 commit/tag freeze 后由 W6 单独会话发射。
+
+新增证据：
+
+- `baseline/w2-c10-profile-20260613-cn.md`
+- `remote-logs/w2-c10-20260613/sf30-stage-summary.tsv`
+- `remote-logs/w6-sf1-dryrun-20260613/DONE`
+
+关键结果：
+
+- CSR probe 插桩进入 bench JSON：setup / bloom / offset / body / total，以及 bloom-negative / offset-miss / body-hit。
+- SF30 schema import 19:04.36，MaxRSS 2,314,300 KB；budg-b64 import 19:11.32，MaxRSS 2,500,980 KB；final flush 1.6/1.7s。
+- SF30 fixed overhead 未低于 50us/probe：schema 671.06us，budg-b64 690.35us；主要开销在 offset lookup。
+- 4KB offset-window 优化尝试未达保留线且增加 read_bytes，已回滚。
+- W6 runner `baseline/run_w6_sf100_matrix_20260613.sh` SF1 dry-run 全绿：9 变体、3 repeats、A/B/A sentinel、8 个 compare 均 checked=180/mismatches=0；oracle bench 写出 `oracle_index_stats.entry_count=11330230`。
+
+W6 放行边界：
+
+- 本状态不代表已启动 W6/SF100；runner 默认拒绝 SF100，必须显式 `W6_ALLOW_SF100=1`。
+- W6 应单独会话启动，继续遵守单 SF100 任务原则、资源轮询和 abort 条件。

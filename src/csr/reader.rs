@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::csr::cache::{CachedCsrMetadata, CsrMetadataCache, SourceBloom};
 use crate::csr::format::{
@@ -207,8 +207,9 @@ impl<B: IoBackend> CsrReader<B> {
             return Ok(Vec::new());
         }
         let lookup = self.lookup_offset(meta, src).await?;
+        self.record_probe_lookup_stages(&lookup);
         let Some(offset) = lookup.offset else {
-            self.record_absent_offset_probe(lookup.cached_may_contain_src);
+            self.record_absent_offset_probe(lookup.cached_may_contain_src, started);
             self.record_csr_get_neighbors(started);
             return Ok(Vec::new());
         };
@@ -217,12 +218,15 @@ impl<B: IoBackend> CsrReader<B> {
         let body_offset =
             lookup.header.bodies_offset + offset.first_edge_idx * DISK_EDGE_BODY_LEN as u64;
         let body_len = offset.edge_count as usize * DISK_EDGE_BODY_LEN;
+        let body_started = Instant::now();
         let bodies = self.backend.read_at(&path, body_offset, body_len).await?;
         self.record_body_read(bodies.len());
+        self.record_probe_body_read(body_started);
         let mut out = Vec::with_capacity(offset.edge_count as usize);
         for chunk in bodies.chunks_exact(DISK_EDGE_BODY_LEN) {
             out.push(DiskEdgeBody::decode(chunk).to_edge_record(src));
         }
+        self.record_probe_body_hit(started);
         self.record_csr_get_neighbors(started);
         Ok(out)
     }
@@ -238,8 +242,9 @@ impl<B: IoBackend> CsrReader<B> {
             return Ok(Vec::new());
         }
         let lookup = self.lookup_offset(meta, src).await?;
+        self.record_probe_lookup_stages(&lookup);
         let Some(offset) = lookup.offset else {
-            self.record_absent_offset_probe(lookup.cached_may_contain_src);
+            self.record_absent_offset_probe(lookup.cached_may_contain_src, started);
             self.record_csr_get_neighbors(started);
             return Ok(Vec::new());
         };
@@ -248,8 +253,10 @@ impl<B: IoBackend> CsrReader<B> {
         let body_offset =
             lookup.header.bodies_offset + offset.first_edge_idx * DISK_EDGE_BODY_LEN as u64;
         let body_len = offset.edge_count as usize * DISK_EDGE_BODY_LEN;
+        let body_started = Instant::now();
         let bodies = self.backend.read_at(&path, body_offset, body_len).await?;
         self.record_body_read(bodies.len());
+        self.record_probe_body_read(body_started);
         let property_sections = if meta.has_property_value_section() {
             Some(self.read_property_sections(meta, &path).await?)
         } else {
@@ -272,6 +279,7 @@ impl<B: IoBackend> CsrReader<B> {
                 properties,
             });
         }
+        self.record_probe_body_hit(started);
         self.record_csr_get_neighbors(started);
         Ok(out)
     }
@@ -420,6 +428,7 @@ impl<B: IoBackend> CsrReader<B> {
     }
 
     async fn lookup_offset(&self, meta: &CsrSegmentMeta, src: VertexId) -> Result<CsrOffsetLookup> {
+        let setup_started = Instant::now();
         if let Some(cache) = &self.cache {
             if let Some(metadata) = cache.get(meta.file_id) {
                 if let Some(metrics) = &self.metrics {
@@ -427,14 +436,21 @@ impl<B: IoBackend> CsrReader<B> {
                         .csr_offset_cache_hits
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                let setup_elapsed = setup_started.elapsed();
+                let bloom_started = Instant::now();
                 let cached_may_contain_src = metadata.may_contain_src(src);
+                let bloom_elapsed = bloom_started.elapsed();
                 if matches!(cached_may_contain_src, Some(false)) {
                     return Ok(CsrOffsetLookup {
                         header: metadata.header,
                         offset: None,
                         cached_may_contain_src,
+                        setup_elapsed,
+                        bloom_elapsed,
+                        offset_lookup_elapsed: None,
                     });
                 }
+                let offset_started = Instant::now();
                 let offset = if let Some(offsets) = metadata.offsets() {
                     find_offset_in_offsets(offsets, src)
                 } else {
@@ -446,6 +462,9 @@ impl<B: IoBackend> CsrReader<B> {
                     header: metadata.header,
                     offset,
                     cached_may_contain_src,
+                    setup_elapsed,
+                    bloom_elapsed,
+                    offset_lookup_elapsed: Some(offset_started.elapsed()),
                 });
             }
             if let Some(metrics) = &self.metrics {
@@ -457,6 +476,8 @@ impl<B: IoBackend> CsrReader<B> {
 
         let path = self.path_for(meta);
         let header = self.read_header_from_disk(&path).await?;
+        let setup_elapsed = setup_started.elapsed();
+        let bloom_started = Instant::now();
         let source_bloom = self.read_source_bloom_from_disk(meta, &path).await?;
         let metadata = CachedCsrMetadata::new_light(header, source_bloom);
         let metadata = if let Some(cache) = &self.cache {
@@ -465,13 +486,18 @@ impl<B: IoBackend> CsrReader<B> {
             Arc::new(metadata)
         };
         let cached_may_contain_src = metadata.may_contain_src(src);
+        let bloom_elapsed = bloom_started.elapsed();
         if matches!(cached_may_contain_src, Some(false)) {
             return Ok(CsrOffsetLookup {
                 header: metadata.header,
                 offset: None,
                 cached_may_contain_src,
+                setup_elapsed,
+                bloom_elapsed,
+                offset_lookup_elapsed: None,
             });
         }
+        let offset_started = Instant::now();
         let offset = self
             .find_offset_on_disk(&path, &metadata.header, src)
             .await?;
@@ -479,6 +505,9 @@ impl<B: IoBackend> CsrReader<B> {
             header: metadata.header,
             offset,
             cached_may_contain_src,
+            setup_elapsed,
+            bloom_elapsed,
+            offset_lookup_elapsed: Some(offset_started.elapsed()),
         })
     }
 
@@ -653,12 +682,27 @@ impl<B: IoBackend> CsrReader<B> {
         Ok(None)
     }
 
-    fn record_absent_offset_probe(&self, cached_may_contain_src: Option<bool>) {
+    fn record_probe_lookup_stages(&self, lookup: &CsrOffsetLookup) {
+        if let Some(metrics) = &self.metrics {
+            metrics.csr_probe_setup_latency.record(lookup.setup_elapsed);
+            metrics.csr_probe_bloom_latency.record(lookup.bloom_elapsed);
+            if let Some(offset_lookup_elapsed) = lookup.offset_lookup_elapsed {
+                metrics
+                    .csr_probe_offset_lookup_latency
+                    .record(offset_lookup_elapsed);
+            }
+        }
+    }
+
+    fn record_absent_offset_probe(&self, cached_may_contain_src: Option<bool>, started: Instant) {
         match cached_may_contain_src {
             Some(true) => {
                 if let Some(metrics) = &self.metrics {
                     metrics
                         .l0_bloom_false_positive_probes
+                        .fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .csr_probe_offset_miss
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -667,9 +711,21 @@ impl<B: IoBackend> CsrReader<B> {
                     metrics
                         .bloom_filtered_segments
                         .fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .csr_probe_bloom_negative
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            None => {}
+            None => {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .csr_probe_offset_miss
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.csr_probe_total_latency.record_since(started);
         }
     }
 
@@ -700,6 +756,19 @@ impl<B: IoBackend> CsrReader<B> {
         }
     }
 
+    fn record_probe_body_read(&self, started: Instant) {
+        if let Some(metrics) = &self.metrics {
+            metrics.csr_probe_body_read_latency.record_since(started);
+        }
+    }
+
+    fn record_probe_body_hit(&self, started: Instant) {
+        if let Some(metrics) = &self.metrics {
+            metrics.csr_probe_body_hit.fetch_add(1, Ordering::Relaxed);
+            metrics.csr_probe_total_latency.record_since(started);
+        }
+    }
+
     fn record_csr_get_neighbors(&self, started: Instant) {
         if let Some(metrics) = &self.metrics {
             metrics.csr_get_neighbors_latency.record_since(started);
@@ -723,6 +792,9 @@ struct CsrOffsetLookup {
     header: CsrHeader,
     offset: Option<EdgeOffset>,
     cached_may_contain_src: Option<bool>,
+    setup_elapsed: Duration,
+    bloom_elapsed: Duration,
+    offset_lookup_elapsed: Option<Duration>,
 }
 
 struct CsrPropertySections {
@@ -888,6 +960,30 @@ mod tests {
             snapshot["csr"]["body_bytes"].as_u64().unwrap_or_default(),
             DISK_EDGE_BODY_LEN as u64
         );
+        assert_eq!(
+            snapshot["csr"]["probe_total_latency"]["count"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_offset_lookup_latency"]["count"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_body_read_latency"]["count"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_body_hit"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
         Ok(())
     }
 
@@ -932,6 +1028,30 @@ mod tests {
                 .unwrap_or_default(),
             1
         );
+        assert_eq!(
+            snapshot["csr"]["probe_bloom_negative"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_offset_miss"]
+                .as_u64()
+                .unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_total_latency"]["count"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_body_read_latency"]["count"]
+                .as_u64()
+                .unwrap_or_default(),
+            0
+        );
         Ok(())
     }
 
@@ -969,6 +1089,12 @@ mod tests {
             first["csr"]["offset_bytes"].as_u64().unwrap_or_default(),
             meta.source_bloom_len
         );
+        assert_eq!(
+            first["csr"]["probe_bloom_negative"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
 
         metrics.reset();
         assert!(reader.get_neighbors(&meta, absent_src).await?.is_empty());
@@ -984,6 +1110,94 @@ mod tests {
             warm["csr"]["offset_bytes"].as_u64().unwrap_or_default(),
             0,
             "warm Bloom-negative lookup should use the cached RAM Bloom and read no offset bytes"
+        );
+        assert_eq!(
+            warm["csr"]["probe_bloom_negative"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            warm["csr"]["probe_bloom_latency"]["count"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            warm["csr"]["probe_offset_lookup_latency"]["count"]
+                .as_u64()
+                .unwrap_or_default(),
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bloom_false_positive_absent_src_counts_offset_miss_without_body_read() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let backend = backend();
+        let writer = CsrWriter::new(backend.clone(), tmp.path(), 12);
+        let present_sources: Vec<_> = (0..2048u64).map(|idx| person_vid(idx * 2)).collect();
+        let edges = present_sources
+            .iter()
+            .enumerate()
+            .map(|(idx, src)| EdgeRecord::insert(*src, person_vid(40_000 + idx as u64), 2, 10))
+            .collect();
+        let meta = writer.write_segment(0, 35, edges).await?;
+        let bloom = SourceBloom::from_sources(present_sources.iter().copied());
+        let absent_src = (0..2048u64)
+            .map(|idx| person_vid(idx * 2 + 1))
+            .find(|src| bloom.may_contain(*src))
+            .expect("test data should have at least one Bloom false-positive absent source");
+
+        let metrics = Arc::new(Metrics::default());
+        let reader = CsrReader::with_metrics(backend, tmp.path(), metrics.clone());
+
+        assert!(reader.get_neighbors(&meta, absent_src).await?.is_empty());
+        let snapshot = metrics.snapshot_json();
+        assert_eq!(
+            snapshot["csr"]["probe_offset_miss"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            snapshot["csr"]["bloom_false_positive_probes"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_bloom_negative"]
+                .as_u64()
+                .unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_body_hit"]
+                .as_u64()
+                .unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            snapshot["csr"]["body_reads"].as_u64().unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_total_latency"]["count"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            snapshot["csr"]["probe_offset_lookup_latency"]["count"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert!(
+            snapshot["csr"]["offset_bytes"].as_u64().unwrap_or_default() > meta.source_bloom_len,
+            "false-positive Bloom probe should continue into offset binary search"
         );
         Ok(())
     }
