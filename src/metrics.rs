@@ -58,6 +58,7 @@ pub struct Metrics {
     pub compaction_count: AtomicU64,
     pub compaction_input_bytes: AtomicU64,
     pub compaction_output_bytes: AtomicU64,
+    pub degree_directory_sidecar_persists: AtomicU64,
 
     pub http_requests: AtomicU64,
     pub http_2xx: AtomicU64,
@@ -148,6 +149,7 @@ impl Default for Metrics {
             compaction_count: AtomicU64::new(0),
             compaction_input_bytes: AtomicU64::new(0),
             compaction_output_bytes: AtomicU64::new(0),
+            degree_directory_sidecar_persists: AtomicU64::new(0),
             http_requests: AtomicU64::new(0),
             http_2xx: AtomicU64::new(0),
             http_4xx: AtomicU64::new(0),
@@ -318,6 +320,7 @@ impl Metrics {
                 "compaction_latency": self.storage_compaction_latency.snapshot(),
                 "compaction_input_bytes": self.load(&self.compaction_input_bytes),
                 "compaction_output_bytes": self.load(&self.compaction_output_bytes),
+                "degree_directory_sidecar_persists": self.load(&self.degree_directory_sidecar_persists),
                 "rebuild_index_latency": self.storage_rebuild_index_latency.snapshot(),
             },
             "io": {
@@ -430,6 +433,7 @@ impl Metrics {
             &self.compaction_count,
             &self.compaction_input_bytes,
             &self.compaction_output_bytes,
+            &self.degree_directory_sidecar_persists,
             &self.http_requests,
             &self.http_2xx,
             &self.http_4xx,

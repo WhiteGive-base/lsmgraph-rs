@@ -9,8 +9,8 @@ use crate::types::{FileId, VertexId};
 #[derive(Debug)]
 pub struct CachedCsrMetadata {
     pub header: CsrHeader,
-    pub offsets: Arc<[EdgeOffset]>,
-    pub src_filter: SourceBloom,
+    pub offsets: Option<Arc<[EdgeOffset]>>,
+    pub src_filter: Option<SourceBloom>,
 }
 
 impl CachedCsrMetadata {
@@ -19,13 +19,27 @@ impl CachedCsrMetadata {
         let offsets = Arc::from(offsets.into_boxed_slice());
         Self {
             header,
-            offsets,
+            offsets: Some(offsets),
+            src_filter: Some(src_filter),
+        }
+    }
+
+    pub fn new_light(header: CsrHeader, src_filter: Option<SourceBloom>) -> Self {
+        Self {
+            header,
+            offsets: None,
             src_filter,
         }
     }
 
-    pub fn may_contain_src(&self, src: VertexId) -> bool {
-        self.src_filter.may_contain(src)
+    pub fn offsets(&self) -> Option<&Arc<[EdgeOffset]>> {
+        self.offsets.as_ref()
+    }
+
+    pub fn may_contain_src(&self, src: VertexId) -> Option<bool> {
+        self.src_filter
+            .as_ref()
+            .map(|src_filter| src_filter.may_contain(src))
     }
 }
 
@@ -118,7 +132,7 @@ impl CsrMetadataCache {
 
     pub fn cached_may_contain_src(&self, file_id: FileId, src: VertexId) -> Option<bool> {
         self.get(file_id)
-            .map(|metadata| metadata.may_contain_src(src))
+            .and_then(|metadata| metadata.may_contain_src(src))
     }
 
     #[cfg(test)]
@@ -128,7 +142,7 @@ impl CsrMetadataCache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SourceBloom {
     bits: Vec<u64>,
     bit_mask: u64,

@@ -910,10 +910,11 @@ async fn semantic_l0_degree_directory_sidecar_survives_reopen() -> anyhow::Resul
 
     engine.insert_edge(src, dst, edge_type).await?;
     engine.flush_active().await?;
+    engine.persist_semantic_sidecars()?;
     let sidecar = tmp.path().join("DEGREE_DIRECTORY");
     assert!(
         sidecar.exists() && std::fs::metadata(&sidecar)?.len() > 0,
-        "flush should persist the packed degree directory sidecar"
+        "explicit sidecar persist should write the packed degree directory"
     );
 
     drop(engine);
@@ -928,6 +929,63 @@ async fn semantic_l0_degree_directory_sidecar_survives_reopen() -> anyhow::Resul
         .as_u64()
         .unwrap_or_default();
     assert_eq!(candidates, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_flush_keeps_degree_directory_empty_and_persists_header_only_sidecar(
+) -> anyhow::Result<()> {
+    let tmp = target_tempdir("schema-degree-directory-header-only-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::Schema);
+    let engine = Engine::create(config).await?;
+    let src_a = encoded(VertexLabel::Person, 500);
+    let src_b = encoded(VertexLabel::Person, 501);
+    let edge_type = EdgeLabel::Knows.as_i32();
+
+    engine
+        .insert_edge(src_a, encoded(VertexLabel::Person, 600), edge_type)
+        .await?;
+    engine
+        .insert_edge(src_b, encoded(VertexLabel::Person, 601), edge_type)
+        .await?;
+    engine.flush_active().await?;
+
+    {
+        let guard = engine.version_guard();
+        let l0 = &guard.version().levels[0];
+        assert!(!l0.is_empty());
+        assert!(
+            l0.iter().all(|meta| {
+                meta.degree_class == DegreeClass::Mixed && !meta.degree_class_exact
+            }),
+            "schema layout must not admit coincidentally uniform degree partitions"
+        );
+    }
+
+    let before = engine.metrics().snapshot_json()["storage"]["degree_directory_sidecar_persists"]
+        .as_u64()
+        .unwrap_or_default();
+    assert_eq!(
+        before, 0,
+        "flush-time semantic index updates should not persist the whole sidecar"
+    );
+
+    engine.persist_semantic_sidecars()?;
+    let sidecar = tmp.path().join("DEGREE_DIRECTORY");
+    let sidecar_len = std::fs::metadata(&sidecar)?.len();
+    assert_eq!(
+        sidecar_len, 24,
+        "empty degree directory sidecar should contain only magic, file_count, and entry_count"
+    );
+    let after = engine.metrics().snapshot_json()["storage"]["degree_directory_sidecar_persists"]
+        .as_u64()
+        .unwrap_or_default();
+    assert_eq!(
+        after, 1,
+        "explicit final persist should be observable and bounded"
+    );
     Ok(())
 }
 
