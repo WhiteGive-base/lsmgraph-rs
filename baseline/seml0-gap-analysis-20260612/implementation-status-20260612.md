@@ -46,6 +46,14 @@
 
 ## Added In This Pass
 
+- W4 property/2-hop workload extension:
+  - extended `storage-bench` with explicit `--workload-mode one-hop|two-hop`;
+  - added `--property-predicate-mode none|required-property|presence|equality|absent-default`;
+  - added `--property-id`, `--property-value-i64`, `--property-default-i64`, and `--two-hop-fanout` (default 64);
+  - kept default `storage-bench` behavior as one-hop/no-property;
+  - added exact property-presence query support for the property workload path, while leaving ordinary neighbor reads unchanged;
+  - added round JSON fields for workload mode, property predicate mode, one-hop/two-hop counts, two-hop frontier count, and round-level candidate/body/latency summaries;
+  - added `baseline/run_w8_property_2hop_20260612.sh` for SF30 schema/budg-b64/semantic W8 runs with ETA, resource gates, progress messages, and timeout aborts.
 - C9 storage-bench protocol:
   - added `--warmup-runs` and `--repeats`;
   - records per-round measured output under `rounds`;
@@ -93,6 +101,15 @@
 
 ## Verification
 
+- W4 targeted property predicate test `cargo +nightly-2025-12-08-x86_64-pc-windows-msvc test --test engine_tests w4_property_predicates_match_bruteforce_filters -j 16`: passed.
+- W4 targeted 2-hop truncation test `cargo +nightly-2025-12-08-x86_64-pc-windows-msvc test --bin lsmgraph w4_two_hop_frontier_truncation_is_stable -j 16`: passed.
+- W4 full available Windows MSVC test run `cargo +nightly-2025-12-08-x86_64-pc-windows-msvc test -j 16`: passed.
+  - lib tests: 59 passed.
+  - `lsmgraph` bin tests: 1 passed.
+  - integration tests: 52 passed, 1 existing ignored.
+  - doc/bin auxiliary targets: no runnable tests.
+- W4 default Windows GNU `cargo test -j 16` could not run because the active `stable-x86_64-pc-windows-gnu` toolchain requires `dlltool.exe`, which is not installed in this local environment.
+- W4 CLI help smoke on Windows debug binary hit an existing stack overflow in the large clap command tree; no SF1/SF30/SF100 bench was started from this worker.
 - `cargo test -j 16` under `nice -n 10`: passed.
   - lib tests: 59 passed.
   - integration tests: 51 passed, 1 existing ignored.
@@ -124,6 +141,7 @@
 
 ## Still Open
 
+- W4 SF30/SF1 empirical property runs still require a store/import path that writes CSR property-value sections; the existing SNB JSONL edge-prop side file alone is not sufficient for equality/presence storage predicates.
 - C7 still needs SF1/SF30/SF100 empirical reruns to quantify the impact; the code path is implemented and debug-tested.
 - C4/C11 still need empirical open-time/RSS measurements on SF1/SF30/SF100 once user workloads finish; the sidecar code path is implemented and debug-tested.
 - C10 perf profiling of the CSR fixed per-probe cost remains open; C13 removes one rebuild-time offset clone but does not claim to solve per-query CSR fixed overhead.

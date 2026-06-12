@@ -28,6 +28,18 @@ fn target_tempdir(name: &str) -> anyhow::Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new().prefix(name).tempdir_in(root)?)
 }
 
+fn sort_records(edges: &mut [EdgeRecord]) {
+    edges.sort_unstable_by_key(|edge| {
+        (
+            edge.src,
+            edge.edge_type,
+            edge.dst,
+            edge.ts,
+            edge.marker as u8,
+        )
+    });
+}
+
 fn strip_manifest_property_summary_fields(store_dir: &std::path::Path) -> anyhow::Result<()> {
     let path = store_dir.join("MANIFEST");
     let manifest = std::fs::read_to_string(&path)?;
@@ -2806,6 +2818,119 @@ async fn typed_property_insert_prototype_uses_current_schema_encoding() -> anyho
             edge_type,
             second_snapshot
         )]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn w4_property_predicates_match_bruteforce_filters() -> anyhow::Result<()> {
+    let tmp = target_tempdir("w4-property-predicate-bruteforce-")?;
+    let config = LsmGraphConfig::new(tmp.path()).with_memgraph_capacity(64 * 1024 * 1024);
+    let src = encoded(VertexLabel::Person, 1_506);
+    let present_match_dst = encoded(VertexLabel::Person, 1_507);
+    let present_other_dst = encoded(VertexLabel::Person, 1_508);
+    let absent_dst = encoded(VertexLabel::Person, 1_509);
+    let edge_type = EdgeLabel::Knows.as_i32();
+    let property_id = 5;
+
+    let engine = Engine::create(config).await?;
+    engine.add_schema_property(NewPropertyEntry {
+        id: property_id,
+        owner: PropertyOwner::EdgeLabel(edge_type),
+        name: "strength".to_string(),
+        logical_type: "int64".to_string(),
+        physical_encoding: "plain_i64".to_string(),
+        encoding_version: 1,
+        default_or_null_rule: "default:42".to_string(),
+    })?;
+    let present_match_snapshot = engine
+        .insert_edge_with_property_values_prototype(
+            src,
+            present_match_dst,
+            edge_type,
+            vec![(property_id, PropertyValue::I64(42))],
+        )
+        .await?;
+    let present_other_snapshot = engine
+        .insert_edge_with_property_values_prototype(
+            src,
+            present_other_dst,
+            edge_type,
+            vec![(property_id, PropertyValue::I64(7))],
+        )
+        .await?;
+    let absent_snapshot = engine.insert_edge(src, absent_dst, edge_type).await?;
+    engine.flush_active().await?;
+
+    let mut brute_force = engine
+        .get_neighbors_typed(src, edge_type, engine.current_snapshot())
+        .await?;
+    sort_records(&mut brute_force);
+    assert_eq!(
+        brute_force,
+        vec![
+            EdgeRecord::insert(src, present_match_dst, edge_type, present_match_snapshot),
+            EdgeRecord::insert(src, present_other_dst, edge_type, present_other_snapshot),
+            EdgeRecord::insert(src, absent_dst, edge_type, absent_snapshot),
+        ]
+    );
+
+    let mut presence = engine
+        .get_neighbors_with_present_property_prototype(
+            src,
+            Some(edge_type),
+            engine.current_snapshot(),
+            property_id,
+        )
+        .await?;
+    sort_records(&mut presence);
+    assert_eq!(
+        presence,
+        brute_force
+            .iter()
+            .copied()
+            .filter(|edge| edge.dst != absent_dst)
+            .collect::<Vec<_>>()
+    );
+
+    let mut equality = engine
+        .get_neighbors_matching_csr_property_value_prototype(
+            src,
+            Some(edge_type),
+            engine.current_snapshot(),
+            CsrPropertyValuePredicate::equals(property_id, PropertyValue::I64(42)),
+        )
+        .await?;
+    sort_records(&mut equality);
+    assert_eq!(
+        equality,
+        vec![EdgeRecord::insert(
+            src,
+            present_match_dst,
+            edge_type,
+            present_match_snapshot,
+        )]
+    );
+
+    let mut absent_default = engine
+        .get_neighbors_matching_csr_property_value_prototype(
+            src,
+            Some(edge_type),
+            engine.current_snapshot(),
+            CsrPropertyValuePredicate::equals_with_schema_default(
+                property_id,
+                PropertyValue::I64(42),
+                PropertyValue::I64(42),
+            ),
+        )
+        .await?;
+    sort_records(&mut absent_default);
+    assert_eq!(
+        absent_default,
+        brute_force
+            .into_iter()
+            .filter(|edge| edge.dst == present_match_dst || edge.dst == absent_dst)
+            .collect::<Vec<_>>()
     );
     Ok(())
 }

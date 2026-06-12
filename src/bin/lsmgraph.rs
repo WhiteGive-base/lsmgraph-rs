@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use lsmgraph::base_graph::{build_from_snb, BuildConfig, IoConfig};
 use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig};
+use lsmgraph::csr::CsrPropertyValuePredicate;
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
 use lsmgraph::snb::{
@@ -17,7 +18,7 @@ use lsmgraph::snb::{
 use lsmgraph::types::{EdgeMarker, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
     DegreeClass, DynamicGraphView, EdgeRecord, GraphAccessSignature, NewPropertyEntry,
-    PropertyOwner,
+    PropertyOwner, PropertyValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -328,6 +329,18 @@ enum Command {
         scan: bool,
         #[arg(long, default_value_t = false)]
         auto_compact: bool,
+        #[arg(long, value_enum, default_value = "one-hop")]
+        workload_mode: StorageBenchWorkloadMode,
+        #[arg(long, value_enum, default_value = "none")]
+        property_predicate_mode: StorageBenchPropertyPredicateMode,
+        #[arg(long, default_value_t = 0)]
+        property_id: u32,
+        #[arg(long, default_value_t = 0)]
+        property_value_i64: i64,
+        #[arg(long, default_value_t = 0)]
+        property_default_i64: i64,
+        #[arg(long, default_value_t = 64)]
+        two_hop_fanout: usize,
         #[arg(long, default_value_t = 10)]
         ra_min_queries: u64,
         #[arg(long, default_value_t = 10.0)]
@@ -382,6 +395,23 @@ struct StorageBenchSampleEntry {
 struct StorageBenchSample {
     src: u64,
     degree: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum StorageBenchWorkloadMode {
+    OneHop,
+    TwoHop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum StorageBenchPropertyPredicateMode {
+    None,
+    RequiredProperty,
+    Presence,
+    Equality,
+    AbsentDefault,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -997,6 +1027,12 @@ async fn main() -> Result<()> {
             sample_plan_out,
             scan,
             auto_compact,
+            workload_mode,
+            property_predicate_mode,
+            property_id,
+            property_value_i64,
+            property_default_i64,
+            two_hop_fanout,
             ra_min_queries,
             ra_min_score,
             ra_min_l0_segments,
@@ -1056,16 +1092,36 @@ async fn main() -> Result<()> {
                 let srcs: Vec<u64> = entry.samples.iter().map(|sample| sample.src).collect();
                 let mut warmup_rounds = Vec::new();
                 for round in 0..warmup_runs {
-                    let result =
-                        run_storage_bench_round(&engine, snapshot, entry, semantic_degree_hint)
-                            .await?;
+                    let result = run_storage_bench_round(
+                        &engine,
+                        snapshot,
+                        entry,
+                        semantic_degree_hint,
+                        workload_mode,
+                        property_predicate_mode,
+                        property_id,
+                        property_value_i64,
+                        property_default_i64,
+                        two_hop_fanout,
+                    )
+                    .await?;
                     warmup_rounds.push(storage_bench_round_json("warmup", round + 1, result));
                 }
                 let mut measured_rounds = Vec::new();
                 for round in 0..repeats {
-                    let result =
-                        run_storage_bench_round(&engine, snapshot, entry, semantic_degree_hint)
-                            .await?;
+                    let result = run_storage_bench_round(
+                        &engine,
+                        snapshot,
+                        entry,
+                        semantic_degree_hint,
+                        workload_mode,
+                        property_predicate_mode,
+                        property_id,
+                        property_value_i64,
+                        property_default_i64,
+                        two_hop_fanout,
+                    )
+                    .await?;
                     measured_rounds.push(storage_bench_round_json("measured", round + 1, result));
                 }
                 let last_round = measured_rounds.last().cloned().unwrap_or_else(|| json!({}));
@@ -1100,6 +1156,12 @@ async fn main() -> Result<()> {
                     "candidate_edges_for_sampling": entry.candidate_edges_for_sampling,
                     "candidate_sources_for_sampling": entry.candidate_sources_for_sampling,
                     "semantic_degree_hint": semantic_degree_hint,
+                    "workload_mode": workload_mode,
+                    "property_predicate_mode": property_predicate_mode,
+                    "property_id": property_id,
+                    "property_value_i64": property_value_i64,
+                    "property_default_i64": property_default_i64,
+                    "two_hop_fanout": two_hop_fanout,
                     "sampled_vertices": srcs.len(),
                     "sampled_srcs": srcs,
                     "sample_degrees": entry.samples,
@@ -1127,6 +1189,12 @@ async fn main() -> Result<()> {
                     "edge_types": edge_types,
                     "semantic_degree_hint": semantic_degree_hint,
                     "sample_plan_degree_hint": sample_plan_degree_hint,
+                    "workload_mode": workload_mode,
+                    "property_predicate_mode": property_predicate_mode,
+                    "property_id": property_id,
+                    "property_value_i64": property_value_i64,
+                    "property_default_i64": property_default_i64,
+                    "two_hop_fanout": two_hop_fanout,
                     "warmup_runs": warmup_runs,
                     "repeats": repeats,
                     "sample_plan_in": sample_plan_in,
@@ -1363,7 +1431,16 @@ fn edge_preview(edges: &[EdgeRecord]) -> Vec<Value> {
 
 struct StorageBenchRoundResult {
     neighbor_edges: usize,
+    one_hop_edges: usize,
+    two_hop_edges: usize,
+    two_hop_sources: usize,
     get_neighbors_elapsed_ms: u64,
+    workload_mode: StorageBenchWorkloadMode,
+    property_predicate_mode: StorageBenchPropertyPredicateMode,
+    property_id: u32,
+    property_value_i64: i64,
+    property_default_i64: i64,
+    two_hop_fanout: usize,
     neighbor_summary: Value,
     neighbor_metrics: Value,
 }
@@ -1373,6 +1450,12 @@ async fn run_storage_bench_round(
     snapshot: u64,
     entry: &StorageBenchSampleEntry,
     semantic_degree_hint: bool,
+    workload_mode: StorageBenchWorkloadMode,
+    property_predicate_mode: StorageBenchPropertyPredicateMode,
+    property_id: u32,
+    property_value_i64: i64,
+    property_default_i64: i64,
+    two_hop_fanout: usize,
 ) -> Result<StorageBenchRoundResult> {
     let metrics = engine.metrics();
     metrics.reset();
@@ -1383,43 +1466,166 @@ async fn run_storage_bench_round(
         .map(|sample| (sample.src, sample.degree))
         .collect();
     let mut neighbor_edges = 0usize;
+    let mut one_hop_edges = 0usize;
+    let mut two_hop_edges = 0usize;
+    let mut two_hop_sources = 0usize;
     let neighbor_started = Instant::now();
     for sample in &entry.samples {
-        let neighbors = if let Some(edge_type) = requested_edge_type {
-            if semantic_degree_hint {
-                let degree = degree_by_src.get(&sample.src).copied().unwrap_or(0);
-                let signature = GraphAccessSignature::neighbor_scan(sample.src, Some(edge_type))
-                    .with_degree_class(DegreeClass::from_max_degree(degree));
-                engine
-                    .get_neighbors_by_signature(signature, snapshot)
-                    .await?
-            } else {
-                engine
-                    .get_neighbors_typed(sample.src, edge_type, snapshot)
-                    .await?
+        let first_hop = run_storage_bench_query(
+            engine,
+            snapshot,
+            sample.src,
+            requested_edge_type,
+            semantic_degree_hint,
+            degree_by_src.get(&sample.src).copied().unwrap_or(0),
+            property_predicate_mode,
+            property_id,
+            property_value_i64,
+            property_default_i64,
+        )
+        .await?;
+        one_hop_edges += first_hop.len();
+        neighbor_edges += first_hop.len();
+
+        if workload_mode == StorageBenchWorkloadMode::TwoHop {
+            for edge in truncated_two_hop_frontier(&first_hop, two_hop_fanout) {
+                let second_edge_type = requested_edge_type.or(Some(edge.edge_type));
+                let second_hop = run_storage_bench_query(
+                    engine,
+                    snapshot,
+                    edge.dst,
+                    second_edge_type,
+                    false,
+                    0,
+                    StorageBenchPropertyPredicateMode::None,
+                    property_id,
+                    property_value_i64,
+                    property_default_i64,
+                )
+                .await?;
+                two_hop_sources += 1;
+                two_hop_edges += second_hop.len();
+                neighbor_edges += second_hop.len();
             }
-        } else {
-            engine.get_neighbors(sample.src, snapshot).await?
-        };
-        neighbor_edges += neighbors.len();
+        }
     }
     let get_neighbors_elapsed_ms = neighbor_started.elapsed().as_millis() as u64;
     let neighbor_metrics = metrics.snapshot_json();
     let neighbor_summary = storage_bench_metric_summary(&neighbor_metrics);
     Ok(StorageBenchRoundResult {
         neighbor_edges,
+        one_hop_edges,
+        two_hop_edges,
+        two_hop_sources,
         get_neighbors_elapsed_ms,
+        workload_mode,
+        property_predicate_mode,
+        property_id,
+        property_value_i64,
+        property_default_i64,
+        two_hop_fanout,
         neighbor_summary,
         neighbor_metrics,
     })
+}
+
+async fn run_storage_bench_query(
+    engine: &Engine,
+    snapshot: u64,
+    src: u64,
+    requested_edge_type: Option<i32>,
+    semantic_degree_hint: bool,
+    degree: u64,
+    property_predicate_mode: StorageBenchPropertyPredicateMode,
+    property_id: u32,
+    property_value_i64: i64,
+    property_default_i64: i64,
+) -> Result<Vec<EdgeRecord>> {
+    match property_predicate_mode {
+        StorageBenchPropertyPredicateMode::None => {
+            if let Some(edge_type) = requested_edge_type {
+                if semantic_degree_hint {
+                    let signature = GraphAccessSignature::neighbor_scan(src, Some(edge_type))
+                        .with_degree_class(DegreeClass::from_max_degree(degree));
+                    engine.get_neighbors_by_signature(signature, snapshot).await
+                } else {
+                    engine.get_neighbors_typed(src, edge_type, snapshot).await
+                }
+            } else {
+                engine.get_neighbors(src, snapshot).await
+            }
+        }
+        StorageBenchPropertyPredicateMode::RequiredProperty => {
+            let signature = GraphAccessSignature::neighbor_scan(src, requested_edge_type)
+                .with_required_property(property_id);
+            engine.get_neighbors_by_signature(signature, snapshot).await
+        }
+        StorageBenchPropertyPredicateMode::Presence => {
+            engine
+                .get_neighbors_with_present_property_prototype(
+                    src,
+                    requested_edge_type,
+                    snapshot,
+                    property_id,
+                )
+                .await
+        }
+        StorageBenchPropertyPredicateMode::Equality => {
+            engine
+                .get_neighbors_matching_csr_property_value_prototype(
+                    src,
+                    requested_edge_type,
+                    snapshot,
+                    CsrPropertyValuePredicate::equals(
+                        property_id,
+                        PropertyValue::I64(property_value_i64),
+                    ),
+                )
+                .await
+        }
+        StorageBenchPropertyPredicateMode::AbsentDefault => {
+            engine
+                .get_neighbors_matching_csr_property_value_prototype(
+                    src,
+                    requested_edge_type,
+                    snapshot,
+                    CsrPropertyValuePredicate::equals_with_schema_default(
+                        property_id,
+                        PropertyValue::I64(property_value_i64),
+                        PropertyValue::I64(property_default_i64),
+                    ),
+                )
+                .await
+        }
+    }
+}
+
+fn truncated_two_hop_frontier(edges: &[EdgeRecord], limit: usize) -> Vec<EdgeRecord> {
+    let mut out = edges.to_vec();
+    out.sort_unstable_by_key(|edge| (edge.edge_type, edge.dst));
+    out.truncate(limit);
+    out
 }
 
 fn storage_bench_round_json(kind: &str, round: usize, result: StorageBenchRoundResult) -> Value {
     json!({
         "kind": kind,
         "round": round,
+        "workload_mode": result.workload_mode,
+        "property_predicate_mode": result.property_predicate_mode,
+        "property_id": result.property_id,
+        "property_value_i64": result.property_value_i64,
+        "property_default_i64": result.property_default_i64,
+        "two_hop_fanout": result.two_hop_fanout,
         "neighbor_edges": result.neighbor_edges,
+        "one_hop_edges": result.one_hop_edges,
+        "two_hop_edges": result.two_hop_edges,
+        "two_hop_sources": result.two_hop_sources,
         "get_neighbors_elapsed_ms": result.get_neighbors_elapsed_ms,
+        "candidate_l0_segments": result.neighbor_summary["candidate_l0_segments"].clone(),
+        "body_reads": result.neighbor_summary["body_reads"].clone(),
+        "body_bytes": result.neighbor_summary["body_bytes"].clone(),
+        "get_neighbors_latency_sum_us": result.neighbor_metrics["storage"]["get_neighbors_latency"]["sum_us"].clone(),
         "neighbor_summary": result.neighbor_summary,
         "neighbor_metrics": result.neighbor_metrics,
     })
@@ -1556,9 +1762,14 @@ fn storage_bench_repeat_summary(rounds: &[Value]) -> Value {
     json!({
         "elapsed_ms": series_stats(&round_field_series(rounds, "get_neighbors_elapsed_ms")),
         "neighbor_edges": series_stats(&round_field_series(rounds, "neighbor_edges")),
+        "one_hop_edges": series_stats(&round_field_series(rounds, "one_hop_edges")),
+        "two_hop_edges": series_stats(&round_field_series(rounds, "two_hop_edges")),
+        "two_hop_sources": series_stats(&round_field_series(rounds, "two_hop_sources")),
         "candidate_l0_segments": series_stats(&round_summary_series(rounds, "candidate_l0_segments")),
         "read_bytes": series_stats(&round_summary_series(rounds, "read_bytes")),
         "body_reads": series_stats(&round_summary_series(rounds, "body_reads")),
+        "body_bytes": series_stats(&round_summary_series(rounds, "body_bytes")),
+        "get_neighbors_latency_sum_us": series_stats(&round_metric_latency_series(rounds, "sum_us")),
         "get_neighbors_avg_us": series_stats(&round_summary_series(rounds, "get_neighbors_avg_us")),
         "get_neighbors_p50_us": series_stats(&round_summary_series(rounds, "get_neighbors_p50_us")),
         "get_neighbors_p90_us": series_stats(&round_summary_series(rounds, "get_neighbors_p90_us")),
@@ -1584,6 +1795,20 @@ fn round_summary_series(rounds: &[Value], key: &str) -> Vec<f64> {
             round
                 .get("neighbor_summary")
                 .and_then(|summary| summary.get(key))
+                .and_then(Value::as_f64)
+        })
+        .collect()
+}
+
+fn round_metric_latency_series(rounds: &[Value], key: &str) -> Vec<f64> {
+    rounds
+        .iter()
+        .filter_map(|round| {
+            round
+                .get("neighbor_metrics")
+                .and_then(|metrics| metrics.get("storage"))
+                .and_then(|storage| storage.get("get_neighbors_latency"))
+                .and_then(|latency| latency.get(key))
                 .and_then(Value::as_f64)
         })
         .collect()
@@ -1657,4 +1882,29 @@ fn metric_u64(metrics: &Value, path: &[&str]) -> u64 {
         current = next;
     }
     current.as_u64().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w4_two_hop_frontier_truncation_is_stable() {
+        let edges = vec![
+            EdgeRecord::insert(1, 30, 2, 1),
+            EdgeRecord::insert(1, 10, 1, 2),
+            EdgeRecord::insert(1, 20, 1, 3),
+            EdgeRecord::insert(1, 40, 2, 4),
+        ];
+
+        let truncated = truncated_two_hop_frontier(&edges, 3);
+        let keys: Vec<_> = truncated
+            .iter()
+            .map(|edge| (edge.edge_type, edge.dst))
+            .collect();
+
+        assert_eq!(keys, vec![(1, 10), (1, 20), (2, 30)]);
+        assert_eq!(truncated_two_hop_frontier(&edges, 64).len(), edges.len());
+        assert!(truncated_two_hop_frontier(&edges, 0).is_empty());
+    }
 }

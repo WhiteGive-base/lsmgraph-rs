@@ -2040,7 +2040,7 @@ impl Engine {
             self.metadata_cache.clone(),
         );
 
-        for level in &guard.version().levels {
+        for (level_id, level) in guard.version().levels.iter().enumerate() {
             for meta in level {
                 if !meta.may_contain_signature(&signature)
                     || src < meta.min_src
@@ -2050,6 +2050,11 @@ impl Engine {
                 }
                 if matches!(reader.cached_may_contain_src(meta, src), Some(false)) {
                     continue;
+                }
+                if level_id == L0 as usize {
+                    self.metrics
+                        .candidate_l0_segments
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 if meta.has_property_value_section()
                     && !meta.definitely_lacks_property(predicate.property_id)
@@ -2070,6 +2075,104 @@ impl Engine {
                         |edge| PropertyValueCandidateEdge {
                             edge,
                             matches_predicate: predicate.absent_property_matches(),
+                        },
+                    ));
+                }
+            }
+        }
+
+        let mut out = merge_visible_property_value_candidates(candidates, snapshot);
+        if let Some(edge_type) = edge_type {
+            out.retain(|edge| edge.edge_type == edge_type);
+        }
+        self.metrics
+            .storage_get_neighbors_latency
+            .record_since(started);
+        Ok(out)
+    }
+
+    /// Prototype Engine boundary for exact property-presence predicates.
+    ///
+    /// This complements `GraphAccessSignature::with_required_property`, which
+    /// is a segment-level pruning hint. The method keeps non-matching newer
+    /// rows as blockers during MVCC merge, then returns only the visible latest
+    /// rows that actually carry `property_id`.
+    pub async fn get_neighbors_with_present_property_prototype(
+        &self,
+        src: VertexId,
+        edge_type: Option<EdgeType>,
+        snapshot: SnapshotId,
+        property_id: PropertyId,
+    ) -> Result<Vec<EdgeRecord>> {
+        let started = Instant::now();
+        self.metrics
+            .get_neighbors_ops
+            .fetch_add(1, Ordering::Relaxed);
+        let _lock = self.vertex_locks.read_lock(src);
+        let guard = self.version_manager.pin_current();
+        let mut candidates = Vec::new();
+
+        for memgraph in &guard.version().memgraphs {
+            for record in memgraph.get_edges_with_properties_for_src(src) {
+                if edge_type
+                    .map(|ty| record.edge.edge_type != ty)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let matches_predicate = record
+                    .properties
+                    .iter()
+                    .any(|property| property.property_id == property_id);
+                candidates.push(PropertyValueCandidateEdge {
+                    edge: record.edge,
+                    matches_predicate,
+                });
+            }
+        }
+
+        let signature = GraphAccessSignature::neighbor_scan(src, edge_type);
+        let reader = CsrReader::with_metrics_and_cache(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.metrics.clone(),
+            self.metadata_cache.clone(),
+        );
+
+        for (level_id, level) in guard.version().levels.iter().enumerate() {
+            for meta in level {
+                if !meta.may_contain_signature(&signature)
+                    || src < meta.min_src
+                    || src > meta.max_src
+                {
+                    continue;
+                }
+                if matches!(reader.cached_may_contain_src(meta, src), Some(false)) {
+                    continue;
+                }
+                if level_id == L0 as usize {
+                    self.metrics
+                        .candidate_l0_segments
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if meta.has_property_value_section() && !meta.definitely_lacks_property(property_id)
+                {
+                    let rows = reader.get_neighbors_with_properties(meta, src).await?;
+                    candidates.extend(rows.into_iter().map(|row| {
+                        let matches_predicate = row
+                            .properties
+                            .iter()
+                            .any(|property| property.property_id == property_id);
+                        PropertyValueCandidateEdge {
+                            edge: row.edge,
+                            matches_predicate,
+                        }
+                    }));
+                } else {
+                    candidates.extend(reader.get_neighbors(meta, src).await?.into_iter().map(
+                        |edge| PropertyValueCandidateEdge {
+                            edge,
+                            matches_predicate: false,
                         },
                     ));
                 }
