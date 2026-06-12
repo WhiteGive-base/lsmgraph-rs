@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -316,7 +317,7 @@ fn degree_directory_class_for_l0(meta: &CsrSegmentMeta) -> Option<DegreeClass> {
 }
 
 const DEGREE_DIRECTORY_SIDECAR_FILE: &str = "DEGREE_DIRECTORY";
-const DEGREE_DIRECTORY_SIDECAR_TMP_FILE: &str = "DEGREE_DIRECTORY.tmp";
+static DEGREE_DIRECTORY_SIDECAR_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 const DEGREE_DIRECTORY_SIDECAR_MAGIC: &[u8; 8] = b"L0DGDIR1";
 const DEGREE_DIRECTORY_VALID_MASK: DegreeClassMask =
     DEGREE_CLASS_LOW_MASK | DEGREE_CLASS_MEDIUM_MASK | DEGREE_CLASS_HIGH_MASK;
@@ -326,7 +327,12 @@ fn degree_directory_sidecar_path(store_dir: &Path) -> PathBuf {
 }
 
 fn degree_directory_sidecar_tmp_path(store_dir: &Path) -> PathBuf {
-    store_dir.join(DEGREE_DIRECTORY_SIDECAR_TMP_FILE)
+    let seq = DEGREE_DIRECTORY_SIDECAR_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    store_dir.join(format!(
+        "{DEGREE_DIRECTORY_SIDECAR_FILE}.{}.{}.tmp",
+        process::id(),
+        seq
+    ))
 }
 
 fn degree_directory_sidecar_file_ids(levels: &[Vec<CsrSegmentMeta>]) -> Vec<FileId> {
@@ -426,9 +432,6 @@ fn write_degree_directory_sidecar(
     }
     let file = writer.into_inner()?;
     file.sync_all()?;
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
     fs::rename(tmp_path, path)?;
     Ok(())
 }
@@ -479,6 +482,7 @@ pub struct Engine {
     vertex_locks: Arc<VertexLockTable>,
     metadata_cache: Arc<CsrMetadataCache>,
     degree_directory: RwLock<HashMap<(VertexId, EdgeType), DegreeClassMask>>,
+    degree_directory_sidecar_persist_lock: Mutex<()>,
     semantic_l0_index: RwLock<SemanticL0Index>,
     oracle_l0_index: RwLock<OracleL0Index>,
     schema_catalog: RwLock<SchemaCatalog>,
@@ -763,6 +767,7 @@ impl Engine {
             vertex_locks: Arc::new(VertexLockTable::new(1 << 16)),
             metadata_cache: Arc::new(CsrMetadataCache::new(metadata_cache_entries)),
             degree_directory: RwLock::new(HashMap::new()),
+            degree_directory_sidecar_persist_lock: Mutex::new(()),
             semantic_l0_index: RwLock::new(SemanticL0Index::default()),
             oracle_l0_index: RwLock::new(OracleL0Index::default()),
             schema_catalog: RwLock::new(schema_catalog),
@@ -794,6 +799,10 @@ impl Engine {
 
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
+    }
+
+    pub fn persist_semantic_sidecars(&self) -> Result<()> {
+        self.persist_degree_directory_sidecar_for_current_version()
     }
 
     pub fn schema_catalog_snapshot(&self) -> SchemaCatalog {
@@ -1538,11 +1547,18 @@ impl Engine {
         let mut segments = Vec::new();
         for ((_, edge_type), mut group) in partitions {
             group.sort_by_key(|e| (e.src, e.edge_type, e.dst, e.ts));
-            let override_edge_type = (edge_type == MIXED_EDGE_TYPE).then_some(MIXED_EDGE_TYPE);
+            let semantic_overrides = CsrSegmentSemanticOverrides {
+                edge_type_partition: (edge_type == MIXED_EDGE_TYPE).then_some(MIXED_EDGE_TYPE),
+                degree_class: Some(DegreeClass::Mixed),
+                degree_class_exact: Some(false),
+                ..CsrSegmentSemanticOverrides::default()
+            };
             segments.extend(
                 split_range_bounded_segments(group, self.config.segment_target_bytes)
                     .into_iter()
-                    .map(|segment| L0FlushSegment::new(segment, override_edge_type)),
+                    .map(|segment| {
+                        L0FlushSegment::with_semantic_overrides(segment, semantic_overrides)
+                    }),
             );
         }
 
@@ -2878,10 +2894,15 @@ impl Engine {
     }
 
     fn persist_degree_directory_sidecar_for_current_version(&self) -> Result<()> {
+        let _persist_guard = self.degree_directory_sidecar_persist_lock.lock();
         let guard = self.version_manager.pin_current();
         let expected_file_ids = degree_directory_sidecar_file_ids(&guard.version().levels);
         let directory = self.degree_directory.read();
-        write_degree_directory_sidecar(&self.config.store_dir, &expected_file_ids, &directory)
+        write_degree_directory_sidecar(&self.config.store_dir, &expected_file_ids, &directory)?;
+        self.metrics
+            .degree_directory_sidecar_persists
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn persist_degree_directory_sidecar_best_effort(&self) {
@@ -2975,9 +2996,6 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         *self.semantic_l0_index.write() = SemanticL0Index::rebuild(&l0_files);
-        if has_updates {
-            self.persist_degree_directory_sidecar_best_effort();
-        }
         Ok(())
     }
 

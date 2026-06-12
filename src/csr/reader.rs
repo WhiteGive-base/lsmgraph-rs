@@ -335,7 +335,10 @@ impl<B: IoBackend> CsrReader<B> {
             metrics.csr_full_scan_reads.fetch_add(1, Ordering::Relaxed);
         }
         let mut out = Vec::with_capacity(metadata.header.edge_body_count as usize);
-        for offset in metadata.offsets.iter() {
+        let offsets = metadata
+            .offsets()
+            .ok_or_else(|| anyhow::anyhow!("CSR metadata cache returned light metadata"))?;
+        for offset in offsets.iter() {
             let start = offset.first_edge_idx as usize * DISK_EDGE_BODY_LEN;
             let end = start + offset.edge_count as usize * DISK_EDGE_BODY_LEN;
             for body_chunk in bodies[start..end].chunks_exact(DISK_EDGE_BODY_LEN) {
@@ -375,7 +378,10 @@ impl<B: IoBackend> CsrReader<B> {
             metrics.csr_full_scan_reads.fetch_add(1, Ordering::Relaxed);
         }
         let mut out = Vec::with_capacity(metadata.header.edge_body_count as usize);
-        for offset in metadata.offsets.iter() {
+        let offsets = metadata
+            .offsets()
+            .ok_or_else(|| anyhow::anyhow!("CSR metadata cache returned light metadata"))?;
+        for offset in offsets.iter() {
             let start = offset.first_edge_idx as usize * DISK_EDGE_BODY_LEN;
             let end = start + offset.edge_count as usize * DISK_EDGE_BODY_LEN;
             for body_chunk in bodies[start..end].chunks_exact(DISK_EDGE_BODY_LEN) {
@@ -401,8 +407,12 @@ impl<B: IoBackend> CsrReader<B> {
     pub async fn read_offsets(&self, meta: &CsrSegmentMeta) -> Result<Arc<[EdgeOffset]>> {
         let started = Instant::now();
         let metadata = self.metadata_for(meta).await?;
+        let offsets = metadata
+            .offsets()
+            .ok_or_else(|| anyhow::anyhow!("CSR metadata cache returned light metadata"))?
+            .clone();
         self.record_csr_read_offsets(started);
-        Ok(metadata.offsets.clone())
+        Ok(offsets)
     }
 
     fn path_for(&self, meta: &CsrSegmentMeta) -> PathBuf {
@@ -417,10 +427,25 @@ impl<B: IoBackend> CsrReader<B> {
                         .csr_offset_cache_hits
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                let cached_may_contain_src = metadata.may_contain_src(src);
+                if matches!(cached_may_contain_src, Some(false)) {
+                    return Ok(CsrOffsetLookup {
+                        header: metadata.header,
+                        offset: None,
+                        cached_may_contain_src,
+                    });
+                }
+                let offset = if let Some(offsets) = metadata.offsets() {
+                    find_offset_in_offsets(offsets, src)
+                } else {
+                    let path = self.path_for(meta);
+                    self.find_offset_on_disk(&path, &metadata.header, src)
+                        .await?
+                };
                 return Ok(CsrOffsetLookup {
                     header: metadata.header,
-                    offset: find_offset_in_offsets(&metadata.offsets, src),
-                    cached_may_contain_src: Some(metadata.may_contain_src(src)),
+                    offset,
+                    cached_may_contain_src,
                 });
             }
             if let Some(metrics) = &self.metrics {
@@ -432,21 +457,28 @@ impl<B: IoBackend> CsrReader<B> {
 
         let path = self.path_for(meta);
         let header = self.read_header_from_disk(&path).await?;
-        let source_bloom_may_contain = self
-            .read_source_bloom_may_contain_src(meta, &path, src)
-            .await?;
-        if matches!(source_bloom_may_contain, Some(false)) {
+        let source_bloom = self.read_source_bloom_from_disk(meta, &path).await?;
+        let metadata = CachedCsrMetadata::new_light(header, source_bloom);
+        let metadata = if let Some(cache) = &self.cache {
+            cache.insert(meta.file_id, metadata)
+        } else {
+            Arc::new(metadata)
+        };
+        let cached_may_contain_src = metadata.may_contain_src(src);
+        if matches!(cached_may_contain_src, Some(false)) {
             return Ok(CsrOffsetLookup {
-                header,
+                header: metadata.header,
                 offset: None,
-                cached_may_contain_src: Some(false),
+                cached_may_contain_src,
             });
         }
-        let offset = self.find_offset_on_disk(&path, &header, src).await?;
+        let offset = self
+            .find_offset_on_disk(&path, &metadata.header, src)
+            .await?;
         Ok(CsrOffsetLookup {
-            header,
+            header: metadata.header,
             offset,
-            cached_may_contain_src: source_bloom_may_contain,
+            cached_may_contain_src,
         })
     }
 
@@ -458,7 +490,9 @@ impl<B: IoBackend> CsrReader<B> {
                         .csr_offset_cache_hits
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                return Ok(metadata);
+                if metadata.offsets().is_some() {
+                    return Ok(metadata);
+                }
             }
             if let Some(metrics) = &self.metrics {
                 metrics
@@ -536,12 +570,11 @@ impl<B: IoBackend> CsrReader<B> {
         CsrHeader::decode(&header_bytes)
     }
 
-    async fn read_source_bloom_may_contain_src(
+    async fn read_source_bloom_from_disk(
         &self,
         meta: &CsrSegmentMeta,
         path: &Path,
-        src: VertexId,
-    ) -> Result<Option<bool>> {
+    ) -> Result<Option<SourceBloom>> {
         if !meta.has_source_bloom_section() {
             return Ok(None);
         }
@@ -558,8 +591,10 @@ impl<B: IoBackend> CsrReader<B> {
             );
         }
         self.record_offset_read(bloom_bytes.len());
-        let bloom = SourceBloom::from_words(meta.source_bloom_bit_count, &bloom_bytes)?;
-        Ok(Some(bloom.may_contain(src)))
+        Ok(Some(SourceBloom::from_words(
+            meta.source_bloom_bit_count,
+            &bloom_bytes,
+        )?))
     }
 
     async fn find_offset_on_disk(
@@ -896,6 +931,93 @@ mod tests {
                 .as_u64()
                 .unwrap_or_default(),
             1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_offset_miss_inserts_light_metadata_cache_for_absent_src() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let backend = backend();
+        let writer = CsrWriter::new(backend.clone(), tmp.path(), 12);
+        let present_sources: Vec<_> = (0..128u64).map(|idx| person_vid(idx * 2)).collect();
+        let edges = present_sources
+            .iter()
+            .enumerate()
+            .map(|(idx, src)| EdgeRecord::insert(*src, person_vid(20_000 + idx as u64), 2, 10))
+            .collect();
+        let meta = writer.write_segment(0, 33, edges).await?;
+        let bloom = SourceBloom::from_sources(present_sources.iter().copied());
+        let absent_src = (0..128u64)
+            .map(|idx| person_vid(idx * 2 + 1))
+            .find(|src| !bloom.may_contain(*src))
+            .expect("test data should have at least one Bloom-negative absent source");
+
+        let metrics = Arc::new(Metrics::default());
+        let cache = Arc::new(CsrMetadataCache::new(8));
+        let reader = CsrReader::with_metrics_and_cache(backend, tmp.path(), metrics.clone(), cache);
+
+        assert!(reader.get_neighbors(&meta, absent_src).await?.is_empty());
+        let first = metrics.snapshot_json();
+        assert_eq!(
+            first["csr"]["offset_cache_misses"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            first["csr"]["offset_bytes"].as_u64().unwrap_or_default(),
+            meta.source_bloom_len
+        );
+
+        metrics.reset();
+        assert!(reader.get_neighbors(&meta, absent_src).await?.is_empty());
+        let warm = metrics.snapshot_json();
+        assert_eq!(
+            warm["csr"]["offset_cache_hits"]
+                .as_u64()
+                .unwrap_or_default(),
+            1,
+            "second lookup of the same file must hit the light metadata cache"
+        );
+        assert_eq!(
+            warm["csr"]["offset_bytes"].as_u64().unwrap_or_default(),
+            0,
+            "warm Bloom-negative lookup should use the cached RAM Bloom and read no offset bytes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warm_light_metadata_cache_avoids_rereading_persisted_source_bloom() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let backend = backend();
+        let writer = CsrWriter::new(backend.clone(), tmp.path(), 12);
+        let edges = (0..1024u64)
+            .map(|idx| EdgeRecord::insert(person_vid(idx), person_vid(30_000 + idx), 2, 10 + idx))
+            .collect();
+        let meta = writer.write_segment(0, 34, edges).await?;
+        let src = person_vid(777);
+
+        let metrics = Arc::new(Metrics::default());
+        let cache = Arc::new(CsrMetadataCache::new(8));
+        let reader = CsrReader::with_metrics_and_cache(backend, tmp.path(), metrics.clone(), cache);
+
+        assert_eq!(reader.get_neighbors(&meta, src).await?.len(), 1);
+        metrics.reset();
+        assert_eq!(reader.get_neighbors(&meta, src).await?.len(), 1);
+        let warm = metrics.snapshot_json();
+        assert_eq!(
+            warm["csr"]["offset_cache_hits"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        let warm_offset_bytes = warm["csr"]["offset_bytes"].as_u64().unwrap_or_default();
+        assert!(
+            warm_offset_bytes < meta.source_bloom_len / 2,
+            "warm lookup should only do binary offset preads, not reread the persisted Bloom: got {warm_offset_bytes}, bloom_len={}",
+            meta.source_bloom_len
         );
         Ok(())
     }

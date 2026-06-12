@@ -466,6 +466,7 @@ async fn main() -> Result<()> {
                     compact_start.elapsed().as_secs_f64()
                 );
             }
+            engine.persist_semantic_sidecars()?;
             println!(
                 "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{}}}",
                 stats.input_rows,
