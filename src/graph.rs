@@ -636,6 +636,8 @@ struct BudgetedEdgeCandidate {
     group_edges: usize,
     group_sources: usize,
     estimated_exact_files: usize,
+    configured_query_weight: f64,
+    feedback_query_weight: f64,
     query_weight: f64,
     score: f64,
     selected: bool,
@@ -645,6 +647,8 @@ struct BudgetedEdgeCandidate {
 #[derive(Debug, Clone, Copy)]
 struct BudgetedEdgeTypeDecision {
     estimated_exact_files: usize,
+    configured_query_weight: f64,
+    feedback_query_weight: f64,
     query_weight: f64,
     score: f64,
     selected: bool,
@@ -1715,8 +1719,11 @@ impl Engine {
             BTreeMap::new();
         let mut needs_sort: BTreeSet<(i32, EdgeType, DegreeClass)> = BTreeSet::new();
         let mut candidates = Vec::new();
-        let feedback_edge_type_weights =
-            semantic_budget_feedback_edge_type_weights(&self.metrics.l0_partition_snapshots());
+        let feedback_edge_type_weights = if self.config.semantic_budget_disable_feedback {
+            HashMap::new()
+        } else {
+            semantic_budget_feedback_edge_type_weights(&self.metrics.l0_partition_snapshots())
+        };
         let mut group_start = 0usize;
         while group_start < edges.len() {
             let src_label = source_label_from_vertex_id(edges[group_start].src);
@@ -1739,6 +1746,7 @@ impl Engine {
                 self.config.semantic_budget_core_edge_weight,
                 self.config.semantic_budget_reverse_core_edge_weight,
                 self.config.semantic_budget_other_edge_weight,
+                self.config.semantic_budget_feedback_only,
                 feedback_edge_type_weights
                     .get(&(src_label, edge_type))
                     .copied(),
@@ -1752,6 +1760,8 @@ impl Engine {
                 group_edges: group.len(),
                 group_sources: count_sorted_group_sources(group),
                 estimated_exact_files: decision.estimated_exact_files,
+                configured_query_weight: decision.configured_query_weight,
+                feedback_query_weight: decision.feedback_query_weight,
                 query_weight: decision.query_weight,
                 score: decision.score,
                 selected: decision.selected,
@@ -1910,7 +1920,7 @@ impl Engine {
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         if needs_header {
             file.write_all(
-                b"flush_snapshot\tsrc_label\tedge_type\tgroup_edges\tgroup_sources\tgroup_bytes\testimated_exact_files\testimated_merged_files\tquery_weight\tscore\tselected\treason\n",
+                b"flush_snapshot\tsrc_label\tedge_type\tgroup_edges\tgroup_sources\tgroup_bytes\testimated_exact_files\testimated_merged_files\tquery_weight\tscore\tselected\treason\tconfigured_query_weight\tfeedback_query_weight\tfeedback_only\tfeedback_disabled\n",
             )?;
         }
         let snapshot = self.current_snapshot();
@@ -1924,7 +1934,7 @@ impl Engine {
             };
             writeln!(
                 file,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{}",
                 snapshot,
                 candidate.src_label,
                 candidate.edge_type,
@@ -1936,7 +1946,11 @@ impl Engine {
                 candidate.query_weight,
                 candidate.score,
                 candidate.selected,
-                candidate.reason
+                candidate.reason,
+                candidate.configured_query_weight,
+                candidate.feedback_query_weight,
+                self.config.semantic_budget_feedback_only,
+                self.config.semantic_budget_disable_feedback
             )?;
         }
         file.sync_all()?;
@@ -3040,25 +3054,36 @@ fn evaluate_budgeted_semantic_edge_type(
     core_edge_weight: f64,
     reverse_core_edge_weight: f64,
     other_edge_weight: f64,
+    feedback_only: bool,
     feedback_query_weight: Option<f64>,
 ) -> BudgetedEdgeTypeDecision {
     let estimated_exact_files =
         estimate_split_segment_count(group_bytes, target_segment_bytes).max(1);
-    let configured_query_weight = semantic_budget_edge_type_weight(
-        edge_type,
-        core_edge_weight,
-        reverse_core_edge_weight,
-        other_edge_weight,
-    );
+    let configured_query_weight = if feedback_only {
+        1.0
+    } else {
+        semantic_budget_edge_type_weight(
+            edge_type,
+            core_edge_weight,
+            reverse_core_edge_weight,
+            other_edge_weight,
+        )
+    };
     let feedback_query_weight = feedback_query_weight
         .filter(|weight| weight.is_finite() && *weight >= 0.0)
-        .unwrap_or(0.0);
-    let query_weight = configured_query_weight.max(feedback_query_weight);
+        .unwrap_or(if feedback_only { 1.0 } else { 0.0 });
+    let query_weight = if feedback_only {
+        feedback_query_weight
+    } else {
+        configured_query_weight.max(feedback_query_weight)
+    };
     let score = query_weight * (group_bytes as f64 / 1024.0) / estimated_exact_files as f64;
 
     if min_partition_bytes == 0 {
         return BudgetedEdgeTypeDecision {
             estimated_exact_files,
+            configured_query_weight,
+            feedback_query_weight,
             query_weight,
             score,
             selected: true,
@@ -3068,6 +3093,8 @@ fn evaluate_budgeted_semantic_edge_type(
     if group_bytes >= min_partition_bytes {
         return BudgetedEdgeTypeDecision {
             estimated_exact_files,
+            configured_query_weight,
+            feedback_query_weight,
             query_weight,
             score,
             selected: true,
@@ -3081,6 +3108,8 @@ fn evaluate_budgeted_semantic_edge_type(
     if !score_enabled {
         return BudgetedEdgeTypeDecision {
             estimated_exact_files,
+            configured_query_weight,
+            feedback_query_weight,
             query_weight,
             score,
             selected: false,
@@ -3090,6 +3119,8 @@ fn evaluate_budgeted_semantic_edge_type(
     if score >= min_edge_type_score {
         BudgetedEdgeTypeDecision {
             estimated_exact_files,
+            configured_query_weight,
+            feedback_query_weight,
             query_weight,
             score,
             selected: true,
@@ -3102,6 +3133,8 @@ fn evaluate_budgeted_semantic_edge_type(
     } else {
         BudgetedEdgeTypeDecision {
             estimated_exact_files,
+            configured_query_weight,
+            feedback_query_weight,
             query_weight,
             score,
             selected: false,

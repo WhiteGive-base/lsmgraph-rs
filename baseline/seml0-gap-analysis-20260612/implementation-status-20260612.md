@@ -89,6 +89,12 @@
   - `evaluate_budgeted_semantic_edge_type()` now scores candidates with `max(configured_static_weight, feedback_weight)`;
   - diagnostics mark feedback-promoted selections with `feedback_score_gate`;
   - added an integration regression where a non-core edge type is cold on the first flush, queried repeatedly, and exact-promoted on the next flush by feedback.
+- W3 C12 second-stage implementation:
+  - added opt-in `semantic_budget_feedback_only` config and `--semantic-budget-feedback-only` CLI flag; in this mode static LDBC edge-type weights are ignored and cold start uses uniform query weight;
+  - added `semantic_budget_disable_feedback` / `--semantic-budget-disable-feedback` for runner no-feedback controls without changing defaults;
+  - extended `budgeted-edge-candidates.tsv` with appended static/feedback weight and mode columns while preserving existing column positions;
+  - added `w3-workload-shift` synthetic runner for phase A to phase B edge-type workload shifts across feedback-only, static-budgeted, and no-feedback variants;
+  - added `baseline/run_w7_workload_shift_20260612.sh` with ETA, progress, resource gate, and timeout abort logic for future W7 SF30 scheduling.
 - Test repair during this pass: an intermediate stale local `engine_tests.rs` sync briefly restored outdated budgeted-layout assertions. The file was restored to the current test baseline, then updated so unselected budgeted edge types assert schema-style `edge_type + degree=Mixed` behavior, matching the implemented layout.
 
 ## Verification
@@ -104,6 +110,14 @@
 - Targeted C11 sidecar integration filter `cargo test --test engine_tests semantic_l0_degree_directory_sidecar_survives_reopen -j 16`: passed, 1 test.
 - Targeted C13 offset-sharing filter `cargo test --lib read_offsets_reuses_cached_arc_without_cloning_offset_vec -j 16`: passed, 1 test.
 - Targeted C12 feedback filter `cargo test --test engine_tests budgeted_semantic_feedback_promotes_hot_non_core_edge_type -j 16`: passed, 1 test.
+- Targeted W3 feedback-only filter `cargo +nightly-2025-12-08-x86_64-pc-windows-msvc test --test engine_tests budgeted_semantic_feedback_only -j 1`: passed, 2 tests.
+- W3 runner compile checks passed with MSVC toolchain and short temp target:
+  - `cargo +nightly-2025-12-08-x86_64-pc-windows-msvc check --bin w3-workload-shift -j 1`
+  - `cargo +nightly-2025-12-08-x86_64-pc-windows-msvc check --bin lsmgraph -j 1`
+- W3 synthetic SF1-class smoke passed:
+  - `cargo +nightly-2025-12-08-x86_64-pc-windows-msvc run --bin w3-workload-shift -- --store-dir target\w3-workload-shift-smoke-default --output target\w3-workload-shift-smoke-default.json --reset-store`
+  - feedback-only phase B promoted the new hot non-core edge type by `feedback_score_gate` at snapshot 16 with feedback weight 18.0 and score 0.5625.
+- Full local test on this Windows worktree passed with the usable MSVC toolchain and temp target: `cargo +nightly-2025-12-08-x86_64-pc-windows-msvc test -j 16` passed 59 lib tests, 53 integration tests, 1 ignored integration test, and bin/doc test targets. The requested `nice -n 10 cargo test -j 16` could not be run locally because PowerShell had no `nice`, and the active GNU Rust toolchain lacked `dlltool.exe` for proc-macro linking.
 - Targeted budgeted semantic filter `cargo test --test engine_tests budgeted_semantic -j 16`: passed, 8 tests.
 - Targeted rebuild/open filters passed:
   - `cargo test --test engine_tests incremental_semantic_index_matches_reopen_full_rebuild -j 16`
@@ -127,5 +141,5 @@
 - C7 still needs SF1/SF30/SF100 empirical reruns to quantify the impact; the code path is implemented and debug-tested.
 - C4/C11 still need empirical open-time/RSS measurements on SF1/SF30/SF100 once user workloads finish; the sidecar code path is implemented and debug-tested.
 - C10 perf profiling of the CSR fixed per-probe cost remains open; C13 removes one rebuild-time offset clone but does not claim to solve per-query CSR fixed overhead.
-- C12 still needs sustained workload validation and policy tuning, but the first runtime-feedback-to-budget scoring path is implemented and debug-tested.
+- C12 still needs W7 formal SF30 workload-shift validation and policy tuning; W3 now has the feedback-only code path, unit coverage, and SF1-class synthetic runner smoke.
 - SF100 matrix reruns and real kv-style runs remain blocked on user workload completion and explicit scheduling.

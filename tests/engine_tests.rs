@@ -1269,6 +1269,59 @@ async fn budgeted_semantic_edge_type_score_preserves_hot_core_edge() -> anyhow::
 }
 
 #[tokio::test]
+async fn budgeted_semantic_feedback_only_cold_start_has_no_core_static_advantage(
+) -> anyhow::Result<()> {
+    let tmp = target_tempdir("budgeted-semantic-feedback-only-cold-start-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::SemanticBudgeted)
+        .with_semantic_budget_min_edge_type_bytes(128 * 1024)
+        .with_semantic_budget_min_edge_type_score(0.01)
+        .with_semantic_budget_core_edge_weight(100.0)
+        .with_semantic_budget_other_edge_weight(0.0)
+        .with_semantic_budget_min_exact_bytes(0)
+        .with_semantic_budget_min_benefit_score(0.0)
+        .with_semantic_budget_feedback_only(true);
+    let engine = Engine::create(config).await?;
+    let src = encoded(VertexLabel::Person, 760);
+    engine
+        .insert_edge(
+            src,
+            encoded(VertexLabel::Person, 761),
+            EdgeLabel::Knows.as_i32(),
+        )
+        .await?;
+    engine
+        .insert_edge(src, encoded(VertexLabel::TagClass, 762), 4)
+        .await?;
+    engine.flush_active().await?;
+
+    let diagnostics = std::fs::read_to_string(tmp.path().join("budgeted-edge-candidates.tsv"))?;
+    let rows: Vec<Vec<&str>> = diagnostics
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect())
+        .collect();
+    let core_edge_type = EdgeLabel::Knows.as_i32().to_string();
+    let core_row = rows
+        .iter()
+        .find(|cols| cols.get(2).copied() == Some(core_edge_type.as_str()))
+        .expect("diagnostics should include the LDBC core edge type");
+    let non_core_row = rows
+        .iter()
+        .find(|cols| cols.get(2).copied() == Some("4"))
+        .expect("diagnostics should include the non-core edge type");
+
+    assert_eq!(core_row.get(8).copied(), Some("1.000000"));
+    assert_eq!(non_core_row.get(8).copied(), Some("1.000000"));
+    assert_eq!(core_row.get(10).copied(), non_core_row.get(10).copied());
+    assert_eq!(core_row.get(12).copied(), Some("1.000000"));
+    assert_eq!(non_core_row.get(12).copied(), Some("1.000000"));
+    assert_eq!(core_row.get(14).copied(), Some("true"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn budgeted_semantic_feedback_promotes_hot_non_core_edge_type() -> anyhow::Result<()> {
     let tmp = target_tempdir("budgeted-semantic-feedback-promotes-hot-non-core-")?;
     let config = LsmGraphConfig::new(tmp.path())
@@ -1342,6 +1395,85 @@ async fn budgeted_semantic_feedback_promotes_hot_non_core_edge_type() -> anyhow:
         last_edge_type_row.get(11).copied(),
         Some("feedback_score_gate")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn budgeted_semantic_feedback_only_promotes_hot_non_core_edge_type() -> anyhow::Result<()> {
+    let tmp = target_tempdir("budgeted-semantic-feedback-only-promotes-hot-non-core-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::SemanticBudgeted)
+        .with_semantic_budget_min_edge_type_bytes(128 * 1024)
+        .with_semantic_budget_min_edge_type_score(0.05)
+        .with_semantic_budget_core_edge_weight(100.0)
+        .with_semantic_budget_reverse_core_edge_weight(100.0)
+        .with_semantic_budget_other_edge_weight(0.0)
+        .with_semantic_budget_min_exact_bytes(1)
+        .with_semantic_budget_min_benefit_score(0.0)
+        .with_semantic_budget_feedback_only(true);
+    let engine = Engine::create(config).await?;
+    let src = encoded(VertexLabel::Person, 790);
+    let edge_type = 42;
+
+    engine
+        .insert_edge(src, encoded(VertexLabel::TagClass, 791), edge_type)
+        .await?;
+    engine.flush_active().await?;
+    {
+        let guard = engine.version_guard();
+        let first = guard.version().levels[0]
+            .iter()
+            .find(|meta| {
+                meta.edge_type_partition == edge_type && meta.min_src == src && meta.max_src == src
+            })
+            .expect("cold first flush should create a schema-style partition");
+        assert_eq!(first.degree_class, DegreeClass::Mixed);
+        assert!(!first.degree_class_exact);
+    }
+
+    for _ in 0..4 {
+        let neighbors = engine
+            .get_neighbors_typed(src, edge_type, engine.current_snapshot())
+            .await?;
+        assert_eq!(neighbors.len(), 1);
+    }
+
+    engine
+        .insert_edge(src, encoded(VertexLabel::TagClass, 792), edge_type)
+        .await?;
+    engine.flush_active().await?;
+    {
+        let guard = engine.version_guard();
+        assert!(
+            guard.version().levels[0].iter().any(|meta| {
+                meta.edge_type_partition == edge_type
+                    && meta.min_src == src
+                    && meta.max_src == src
+                    && meta.degree_class == DegreeClass::Low
+                    && meta.degree_class_exact
+            }),
+            "feedback-only mode should promote the next hot non-core edge-type flush to exact degree"
+        );
+    }
+
+    let diagnostics = std::fs::read_to_string(tmp.path().join("budgeted-edge-candidates.tsv"))?;
+    let rows: Vec<Vec<&str>> = diagnostics
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect())
+        .collect();
+    let last_edge_type_row = rows
+        .iter()
+        .filter(|cols| cols.get(2).copied() == Some("42"))
+        .last()
+        .expect("diagnostics should include the feedback-promoted edge type");
+    assert_eq!(last_edge_type_row.get(10).copied(), Some("true"));
+    assert_eq!(
+        last_edge_type_row.get(11).copied(),
+        Some("feedback_score_gate")
+    );
+    assert_eq!(last_edge_type_row.get(14).copied(), Some("true"));
     Ok(())
 }
 

@@ -107,6 +107,8 @@ pub struct LsmGraphConfig {
     pub semantic_budget_min_exact_bytes: usize,
     pub semantic_budget_min_benefit_score: f64,
     pub semantic_budget_degree_weight: f64,
+    pub semantic_budget_feedback_only: bool,
+    pub semantic_budget_disable_feedback: bool,
     pub l0_ra_range_bucket_size: u64,
     pub l0_ra_min_queries: u64,
     pub l0_ra_min_l0_segments: usize,
@@ -145,6 +147,8 @@ impl LsmGraphConfig {
             semantic_budget_min_exact_bytes: 4 * 1024 * 1024,
             semantic_budget_min_benefit_score: 1.0,
             semantic_budget_degree_weight: 1.0,
+            semantic_budget_feedback_only: false,
+            semantic_budget_disable_feedback: false,
             l0_ra_range_bucket_size: 1 << 20,
             l0_ra_min_queries: 10,
             l0_ra_min_l0_segments: 2,
@@ -239,6 +243,16 @@ impl LsmGraphConfig {
 
     pub fn with_semantic_budget_degree_weight(mut self, weight: f64) -> Self {
         self.semantic_budget_degree_weight = weight;
+        self
+    }
+
+    pub fn with_semantic_budget_feedback_only(mut self, enabled: bool) -> Self {
+        self.semantic_budget_feedback_only = enabled;
+        self
+    }
+
+    pub fn with_semantic_budget_disable_feedback(mut self, enabled: bool) -> Self {
+        self.semantic_budget_disable_feedback = enabled;
         self
     }
 

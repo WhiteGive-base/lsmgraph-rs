@@ -16,8 +16,8 @@ name = "p3-feedback-bench"
 path = "src/bin/p3_feedback_bench.rs"
 
 [[bin]]
-name = "p3-feedback-sustained"
-path = "src/bin/p3_feedback_sustained.rs"
+name = "w3-workload-shift"
+path = "src/bin/w3_workload_shift.rs"
 
 [dependencies]
 anyhow = "1.0"
