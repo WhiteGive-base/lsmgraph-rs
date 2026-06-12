@@ -83,6 +83,10 @@ enum Command {
         semantic_budget_min_benefit_score: f64,
         #[arg(long, default_value_t = 1.0)]
         semantic_budget_degree_weight: f64,
+        #[arg(long, default_value_t = false)]
+        semantic_budget_feedback_only: bool,
+        #[arg(long, default_value_t = false)]
+        semantic_budget_disable_feedback: bool,
     },
     BaseBuild {
         #[arg(long, default_value = DEFAULT_DATA)]
@@ -411,6 +415,8 @@ async fn main() -> Result<()> {
             semantic_budget_min_exact_bytes,
             semantic_budget_min_benefit_score,
             semantic_budget_degree_weight,
+            semantic_budget_feedback_only,
+            semantic_budget_disable_feedback,
         } => {
             if matches!(relation.as_str(), "snb-base" | "base" | "base-graph") {
                 let output_dir = data_dir.join("base_graph");
@@ -442,7 +448,9 @@ async fn main() -> Result<()> {
                 .with_semantic_budget_edge_type_allowlist(semantic_budget_edge_type_allowlist)
                 .with_semantic_budget_min_exact_bytes(semantic_budget_min_exact_bytes)
                 .with_semantic_budget_min_benefit_score(semantic_budget_min_benefit_score)
-                .with_semantic_budget_degree_weight(semantic_budget_degree_weight);
+                .with_semantic_budget_degree_weight(semantic_budget_degree_weight)
+                .with_semantic_budget_feedback_only(semantic_budget_feedback_only)
+                .with_semantic_budget_disable_feedback(semantic_budget_disable_feedback);
             let engine = Engine::create(config).await?;
             let stats = match relation.as_str() {
                 "person_knows" => import_person_knows(engine.clone(), &input).await?,
