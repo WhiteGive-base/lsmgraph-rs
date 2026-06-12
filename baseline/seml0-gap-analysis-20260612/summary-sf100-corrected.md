@@ -15,7 +15,9 @@
 | budg-b64 | 146.70 | 6,022,519 | 532,193 | 0 | 3658.3 | 3,483 | measured |
 | budg-b256 | 146.70 | 6,486,337 | 532,193 | 0 | 3681.1 | 3,675 | measured |
 | budg-b1024 | 700.07 | 7,676,875 | 532,193 | 258 | 4060.6 | 4,451 | measured |
-| kv-style | 167.79 | 45,000 | 4,807,169 | 45,000 | 4906.2 | N/A | measured |
+| kv-style | 167.79 | 45,000 | 4,807,169 | 45,000 | 4906.2 | N/A | simulated(model) |
+
+`simulated(model)` rows are derived analytically (kv_style_baseline.py) from the schema bench json — not a real engine run; do not quote them as measured numbers. A real run is available via `--l0-layout kv-lsm`.
 
 ## P2 — Maintenance cost
 
@@ -28,7 +30,7 @@
 | budg-b64 | 131.5 | 3,483 | 4106.1 | measured |
 | budg-b256 | 131.5 | 3,675 | 4100.2 | measured |
 | budg-b1024 | 131.5 | 4,451 | 4103.4 | measured |
-| kv-style | N/A | N/A | N/A | measured |
+| kv-style | N/A | N/A | N/A | simulated(model) |
 
 ## Budget sweep (SemL0 controllable cost)
 

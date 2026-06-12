@@ -66,12 +66,13 @@ impl FromStr for L0LayoutPolicy {
             | "query_semantic_budgeted"
             | "qslsm-budgeted"
             | "qslsm_budgeted" => Ok(Self::SemanticBudgeted),
-            "lsmgraph-style" | "lsmgraph_style" | "lsmgraphstyle" | "lsmgraph" | "lsmsem-baseline"
-            | "seml0-baseline" => Ok(Self::LsmGraphStyle),
+            "lsmgraph-style" | "lsmgraph_style" | "lsmgraphstyle" | "lsmgraph"
+            | "lsmsem-baseline" | "seml0-baseline" => Ok(Self::LsmGraphStyle),
             "full-compact" | "fullcompact" | "full_compact" | "write-optimized"
             | "write_optimized" => Ok(Self::FullCompact),
-            "oracle-semantic" | "oracle_semantic" | "oracle" | "oracle-sem"
-            | "oracle_sem" => Ok(Self::OracleSemantic),
+            "oracle-semantic" | "oracle_semantic" | "oracle" | "oracle-sem" | "oracle_sem" => {
+                Ok(Self::OracleSemantic)
+            }
             "rocksdb-style" | "rocksdb_style" | "rocksdbstyle" | "rocksdb" | "kv-lsm"
             | "kv_lsm" | "kvbaseline" | "kv-baseline" => Ok(Self::RocksDbStyle),
             _ => anyhow::bail!("unknown L0 layout policy: {s}"),
@@ -110,6 +111,10 @@ pub struct LsmGraphConfig {
     pub l0_ra_min_queries: u64,
     pub l0_ra_min_l0_segments: usize,
     pub l0_ra_min_score: f64,
+    /// Capacity (entries) of the CSR metadata cache (header + offset array +
+    /// SourceBloom per L0/L1 file). Layouts whose L0 file count exceeds this
+    /// thrash the cache and re-read whole offset arrays on every miss.
+    pub metadata_cache_entries: usize,
 }
 
 impl LsmGraphConfig {
@@ -144,7 +149,13 @@ impl LsmGraphConfig {
             l0_ra_min_queries: 10,
             l0_ra_min_l0_segments: 2,
             l0_ra_min_score: 10.0,
+            metadata_cache_entries: 4096,
         }
+    }
+
+    pub fn with_metadata_cache_entries(mut self, entries: usize) -> Self {
+        self.metadata_cache_entries = entries.max(1);
+        self
     }
 
     pub fn with_memgraph_capacity(mut self, bytes: usize) -> Self {

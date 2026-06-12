@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::csr::cache::SourceBloom;
 use crate::csr::format::{
     property_presence_bit, CsrHeader, CsrSegmentMeta, DiskEdgeBody, DiskPropertyListHeader,
     DiskPropertyValueIndexEntry, EdgeOffset, CSR_HEADER_LEN, CSR_MAGIC, CSR_VERSION,
-    DISK_EDGE_BODY_LEN,
+    DISK_EDGE_BODY_LEN, EDGE_OFFSET_LEN,
 };
 use crate::error::Result;
 use crate::io::IoBackend;
@@ -210,6 +211,7 @@ impl<B: IoBackend> CsrWriter<B> {
         let mut property_presence_bitmap = 0u64;
         let mut all_property_ids_representable = true;
         let mut min_property_encoding_epoch = None;
+        let mut offset_sources = Vec::new();
         let mut idx = 0usize;
         while idx < records.len() {
             let src = records[idx].edge.src;
@@ -238,6 +240,7 @@ impl<B: IoBackend> CsrWriter<B> {
                 edge_count: count,
             }
             .encode(&mut offsets);
+            offset_sources.push(src);
         }
 
         let offsets_offset = CSR_HEADER_LEN as u64;
@@ -251,6 +254,25 @@ impl<B: IoBackend> CsrWriter<B> {
             0
         } else {
             property_index_offset + property_index.len() as u64
+        };
+        let source_bloom = if offset_sources.is_empty() {
+            None
+        } else {
+            Some(SourceBloom::from_sources(offset_sources.iter().copied()))
+        };
+        let source_bloom_bytes = source_bloom
+            .as_ref()
+            .map(SourceBloom::encode_words)
+            .unwrap_or_default();
+        let source_bloom_base = if property_index.is_empty() {
+            bodies_offset + bodies.len() as u64
+        } else {
+            property_values_offset + property_values.len() as u64
+        };
+        let source_bloom_offset = if source_bloom_bytes.is_empty() {
+            0
+        } else {
+            source_bloom_base
         };
         let header = CsrHeader {
             magic: CSR_MAGIC,
@@ -266,7 +288,7 @@ impl<B: IoBackend> CsrWriter<B> {
             edge_type_partition,
             min_src,
             max_src,
-            edge_offset_count: (offsets.len() / crate::csr::format::EDGE_OFFSET_LEN) as u64,
+            edge_offset_count: (offsets.len() / EDGE_OFFSET_LEN) as u64,
             edge_body_count: edges.len() as u64,
             offsets_offset,
             offsets_len: offsets.len() as u64,
@@ -282,13 +304,15 @@ impl<B: IoBackend> CsrWriter<B> {
                 + offsets.len()
                 + bodies.len()
                 + property_index.len()
-                + property_values.len(),
+                + property_values.len()
+                + source_bloom_bytes.len(),
         );
         bytes.extend_from_slice(&header.encode());
         bytes.extend_from_slice(&offsets);
         bytes.extend_from_slice(&bodies);
         bytes.extend_from_slice(&property_index);
         bytes.extend_from_slice(&property_values);
+        bytes.extend_from_slice(&source_bloom_bytes);
         let segment_bytes = bytes.len() as u64;
         let property_summary_completeness = if all_property_ids_representable {
             SemanticSummaryCompleteness::Exact
@@ -318,6 +342,12 @@ impl<B: IoBackend> CsrWriter<B> {
             property_index_len: property_index.len() as u64,
             property_values_offset,
             property_values_len: property_values.len() as u64,
+            source_bloom_offset,
+            source_bloom_len: source_bloom_bytes.len() as u64,
+            source_bloom_bit_count: source_bloom
+                .as_ref()
+                .map(SourceBloom::bit_count)
+                .unwrap_or(0),
             may_contain_tombstones: edges.iter().any(|edge| edge.marker == EdgeMarker::Delete),
             edge_type_partition,
             direction: EdgeDirection::Out,

@@ -263,8 +263,7 @@ async fn handle_connection(
             http_response(200, "application/json", br#"{"status":"ok"}"#.to_vec())
         }
         HttpRequest::Get { path } if path == "/metrics" => {
-            let mut snapshot =
-                serde_json::to_value(metrics.snapshot()).expect("serialize metrics");
+            let mut snapshot = serde_json::to_value(metrics.snapshot()).expect("serialize metrics");
             let fallback = {
                 let guard = snb.read().await;
                 fallback_hits_value(&guard)

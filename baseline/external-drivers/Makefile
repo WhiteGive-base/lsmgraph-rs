@@ -2,10 +2,18 @@
 LG := ../../deps/LiveGraph
 CXX := g++
 CXXFLAGS := -O2 -std=c++17 -Wall
-.PHONY: all livegraph clean
-all: livegraph
+
+.PHONY: all livegraph livegraph_stream clean
+
+all: livegraph livegraph_stream
+
 livegraph: livegraph_driver.cpp
 	$(CXX) $(CXXFLAGS) -I$(LG)/bind $< -L$(LG)/build -llivegraph -lpthread -o livegraph_driver
 	@echo "built livegraph_driver (run with LD_LIBRARY_PATH=$(LG)/build)"
+
+livegraph_stream: livegraph_driver_stream.cpp
+	$(CXX) $(CXXFLAGS) -I$(LG)/bind $< -L$(LG)/build -llivegraph -lpthread -o livegraph_driver_stream
+	@echo "built livegraph_driver_stream (run with LD_LIBRARY_PATH=$(LG)/build)"
+
 clean:
-	rm -f livegraph_driver
+	rm -f livegraph_driver livegraph_driver_stream

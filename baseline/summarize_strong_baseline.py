@@ -43,8 +43,13 @@ def agg_bench(path: pathlib.Path) -> dict | None:
     out = {k: 0 for k in NSUM_SUM_KEYS}
     out["weighted_avg_us"] = 0.0
     out["max_p99_us"] = 0.0
+    out["simulated"] = False
     for b in d.get("benchmarks", []):
         s = b.get("neighbor_summary") or {}
+        # kv_style_baseline.py emits model-derived JSONs (kv_* fields) that must
+        # never be presented as measured numbers.
+        if any(k.startswith("kv_") for k in s):
+            out["simulated"] = True
         ops = s.get("get_neighbors_ops", 0) or 0
         for k in NSUM_SUM_KEYS:
             out[k] += s.get(k, 0) or 0
@@ -193,20 +198,29 @@ def main() -> None:
           "",
           "| Variant | read MiB | candidate L0 | body reads | header reads | avg us | L0 files | source |",
           "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]
+    def src_label(r):
+        if r.get("reused"):
+            return "reused-e11"
+        if r.get("simulated"):
+            return "simulated(model)"
+        return "measured"
+
     for v in ordered:
         r = rows[v]
-        src = "reused-e11" if r.get("reused") else "measured"
         md.append(f"| {v} | {mib(r.get('read_bytes'))} | {fmt(r.get('candidate_l0_segments'))} | "
                   f"{fmt(r.get('body_reads'))} | {fmt(r.get('header_reads'))} | "
-                  f"{r.get('avg_us','N/A')} | {fmt(r.get('l0_files'))} | {src} |")
+                  f"{r.get('avg_us','N/A')} | {fmt(r.get('l0_files'))} | {src_label(r)} |")
+    if any(rows[v].get("simulated") for v in ordered):
+        md += ["", "`simulated(model)` rows are derived analytically (kv_style_baseline.py) "
+                   "from the schema bench json — not a real engine run; do not quote them as "
+                   "measured numbers. A real run is available via `--l0-layout kv-lsm`."]
     md += ["", "## P2 — Maintenance cost", "",
            "| Variant | store GiB | L0 files | import s | source |",
            "| --- | ---: | ---: | ---: | --- |"]
     for v in ordered:
         r = rows[v]
-        src = "reused-e11" if r.get("reused") else "measured"
         md.append(f"| {v} | {gib(r.get('store_bytes'))} | {fmt(r.get('l0_files'))} | "
-                  f"{r.get('import_s') or 'N/A'} | {src} |")
+                  f"{r.get('import_s') or 'N/A'} | {src_label(r)} |")
 
     schema_rb = rows.get("schema", {}).get("read_bytes")
     sem_rb = rows.get("semantic", {}).get("read_bytes")
@@ -228,10 +242,11 @@ def main() -> None:
 
     report = pathlib.Path(args.report) if args.report else out_dir / f"summary-{args.scale}.md"
     report.write_text("\n".join(md) + "\n", encoding="utf-8")
-    # machine-readable
-    tsv = out_dir / f"summary-{args.scale}.tsv"
+    # machine-readable; lands next to --report so regeneration never overwrites
+    # the original run dir's TSV unless explicitly asked to.
+    tsv = report.parent / f"summary-{args.scale}.tsv" if args.report else out_dir / f"summary-{args.scale}.tsv"
     cols = ["variant", "read_bytes", "candidate_l0_segments", "body_reads", "header_reads",
-            "avg_us", "l0_files", "store_bytes", "directed_edges", "import_s", "reused"]
+            "avg_us", "l0_files", "store_bytes", "directed_edges", "import_s", "reused", "simulated"]
     with tsv.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, delimiter="\t", extrasaction="ignore")
         w.writeheader()

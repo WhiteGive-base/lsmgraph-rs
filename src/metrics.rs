@@ -9,21 +9,37 @@ use serde_json::{json, Value};
 
 use crate::types::{EdgeType, VertexId};
 
-const LATENCY_BUCKET_US: [u64; 16] = [
+const LATENCY_BUCKET_US: [u64; 32] = [
+    25,
+    50,
+    75,
     100,
+    150,
+    200,
     250,
+    350,
     500,
+    750,
     1_000,
+    1_500,
     2_000,
+    3_000,
     5_000,
+    7_500,
     10_000,
+    15_000,
     20_000,
+    30_000,
     50_000,
+    75_000,
     100_000,
+    150_000,
     250_000,
     500_000,
     1_000_000,
+    2_000_000,
     5_000_000,
+    10_000_000,
     30_000_000,
     u64::MAX,
 ];
@@ -760,7 +776,7 @@ mod tests {
         assert_eq!(snapshot.count, 3);
         assert_eq!(snapshot.min_us, 10);
         assert_eq!(snapshot.max_us, 80_000);
-        assert_eq!(snapshot.p50_us, 5_000);
+        assert_eq!(snapshot.p50_us, 3_000);
         assert_eq!(snapshot.p90_us, 100_000);
         assert_eq!(snapshot.p99_us, 100_000);
     }

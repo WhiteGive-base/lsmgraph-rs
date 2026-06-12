@@ -898,6 +898,40 @@ async fn semantic_l0_degree_pruning_keeps_edges_across_flushes() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn semantic_l0_degree_directory_sidecar_survives_reopen() -> anyhow::Result<()> {
+    let tmp = target_tempdir("semantic-l0-degree-directory-sidecar-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::Semantic);
+    let engine = Engine::create(config.clone()).await?;
+    let src = encoded(VertexLabel::Person, 420);
+    let dst = encoded(VertexLabel::Person, 421);
+    let edge_type = EdgeLabel::Knows.as_i32();
+
+    engine.insert_edge(src, dst, edge_type).await?;
+    engine.flush_active().await?;
+    let sidecar = tmp.path().join("DEGREE_DIRECTORY");
+    assert!(
+        sidecar.exists() && std::fs::metadata(&sidecar)?.len() > 0,
+        "flush should persist the packed degree directory sidecar"
+    );
+
+    drop(engine);
+    let reopened = Engine::open(config).await?;
+    reopened.metrics().reset();
+    let neighbors = reopened
+        .get_neighbors_typed(src, edge_type, reopened.current_snapshot())
+        .await?;
+    assert_eq!(neighbors.len(), 1);
+    let metrics = reopened.metrics().snapshot_json();
+    let candidates = metrics["csr"]["candidate_l0_segments"]
+        .as_u64()
+        .unwrap_or_default();
+    assert_eq!(candidates, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn label_only_l0_exposes_only_source_label_baseline() -> anyhow::Result<()> {
     let tmp = target_tempdir("label-only-l0-baseline-")?;
     let config = LsmGraphConfig::new(tmp.path())
@@ -1099,7 +1133,8 @@ async fn degree_only_l0_exposes_only_degree_baseline() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn budgeted_semantic_l0_merges_low_value_small_partitions() -> anyhow::Result<()> {
+async fn budgeted_semantic_l0_keeps_edge_type_for_unselected_small_partitions() -> anyhow::Result<()>
+{
     let tmp = target_tempdir("budgeted-semantic-l0-merges-low-value-small-partitions-")?;
     let config = LsmGraphConfig::new(tmp.path())
         .with_memgraph_capacity(64 * 1024 * 1024)
@@ -1124,25 +1159,23 @@ async fn budgeted_semantic_l0_merges_low_value_small_partitions() -> anyhow::Res
 
     let guard = engine.version_guard();
     let l0 = &guard.version().levels[0];
-    assert!(
-        l0.iter().any(|meta| meta.edge_type_partition == MIXED_EDGE_TYPE
-            && meta.edge_count == 3
-            && meta.min_src == src
-            && meta.max_src == src),
-        "budgeted semantic L0 should merge small signatures when the cost model predicts low benefit"
-    );
+    for edge_type in [EdgeLabel::Knows.as_i32(), 4, 6] {
+        let meta = l0
+            .iter()
+            .find(|meta| {
+                meta.edge_type_partition == edge_type && meta.min_src == src && meta.max_src == src
+            })
+            .expect("unselected small edge types should keep schema-style edge-type partitions");
+        assert_eq!(meta.degree_class, DegreeClass::Mixed);
+        assert!(!meta.degree_class_exact);
+    }
     assert!(
         !l0.iter()
-            .any(|meta| meta.edge_type_partition == EdgeLabel::Knows.as_i32()),
-        "small Knows partitions should no longer bypass the cost model through a fixed priority list"
-    );
-    assert!(
-        !l0.iter().any(|meta| meta.edge_type_partition == 4),
-        "small low-value edge type 4 should not receive an exact L0 partition"
-    );
-    assert!(
-        !l0.iter().any(|meta| meta.edge_type_partition == 6),
-        "small low-value edge type 6 should not receive an exact L0 partition"
+            .any(|meta| meta.edge_type_partition == MIXED_EDGE_TYPE
+                && meta.edge_count == 3
+                && meta.min_src == src
+                && meta.max_src == src),
+        "budgeted semantic L0 should not collapse unselected edge types below schema-style pruning"
     );
 
     let neighbors = engine
@@ -1192,22 +1225,16 @@ async fn budgeted_semantic_edge_type_score_preserves_hot_core_edge() -> anyhow::
             .any(|meta| meta.edge_type_partition == EdgeLabel::Knows.as_i32()),
         "benefit score should preserve a hot core edge type even below the byte gate"
     );
-    assert!(
-        l0.iter()
-            .any(|meta| meta.edge_type_partition == MIXED_EDGE_TYPE
-                && meta.edge_count == 2
-                && meta.min_src == src
-                && meta.max_src == src),
-        "low-weight cold edge types should remain merged"
-    );
-    assert!(
-        !l0.iter().any(|meta| meta.edge_type_partition == 4),
-        "cold edge type 4 should not be selected by the score path"
-    );
-    assert!(
-        !l0.iter().any(|meta| meta.edge_type_partition == 6),
-        "cold edge type 6 should not be selected by the score path"
-    );
+    for edge_type in [4, 6] {
+        let meta = l0
+            .iter()
+            .find(|meta| {
+                meta.edge_type_partition == edge_type && meta.min_src == src && meta.max_src == src
+            })
+            .expect("low-weight cold edge types should keep schema-style partitions");
+        assert_eq!(meta.degree_class, DegreeClass::Mixed);
+        assert!(!meta.degree_class_exact);
+    }
 
     let diagnostics = std::fs::read_to_string(tmp.path().join("budgeted-edge-candidates.tsv"))?;
     let rows: Vec<Vec<&str>> = diagnostics
@@ -1238,6 +1265,83 @@ async fn budgeted_semantic_edge_type_score_preserves_hot_core_edge() -> anyhow::
         .get_neighbors_typed(src, 4, engine.current_snapshot())
         .await?;
     assert_eq!(cold_neighbors.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn budgeted_semantic_feedback_promotes_hot_non_core_edge_type() -> anyhow::Result<()> {
+    let tmp = target_tempdir("budgeted-semantic-feedback-promotes-hot-non-core-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::SemanticBudgeted)
+        .with_semantic_budget_min_edge_type_bytes(128 * 1024)
+        .with_semantic_budget_min_edge_type_score(0.05)
+        .with_semantic_budget_core_edge_weight(0.0)
+        .with_semantic_budget_reverse_core_edge_weight(0.0)
+        .with_semantic_budget_other_edge_weight(0.0)
+        .with_semantic_budget_min_exact_bytes(1)
+        .with_semantic_budget_min_benefit_score(0.0);
+    let engine = Engine::create(config).await?;
+    let src = encoded(VertexLabel::Person, 780);
+    let edge_type = 4;
+
+    engine
+        .insert_edge(src, encoded(VertexLabel::TagClass, 781), edge_type)
+        .await?;
+    engine.flush_active().await?;
+    {
+        let guard = engine.version_guard();
+        let first = guard.version().levels[0]
+            .iter()
+            .find(|meta| {
+                meta.edge_type_partition == edge_type && meta.min_src == src && meta.max_src == src
+            })
+            .expect("cold first flush should create a schema-style partition");
+        assert_eq!(first.degree_class, DegreeClass::Mixed);
+        assert!(!first.degree_class_exact);
+    }
+
+    for _ in 0..4 {
+        let neighbors = engine
+            .get_neighbors_typed(src, edge_type, engine.current_snapshot())
+            .await?;
+        assert_eq!(neighbors.len(), 1);
+    }
+
+    engine
+        .insert_edge(src, encoded(VertexLabel::TagClass, 782), edge_type)
+        .await?;
+    engine.flush_active().await?;
+    {
+        let guard = engine.version_guard();
+        assert!(
+            guard.version().levels[0].iter().any(|meta| {
+                meta.edge_type_partition == edge_type
+                    && meta.min_src == src
+                    && meta.max_src == src
+                    && meta.degree_class == DegreeClass::Low
+                    && meta.degree_class_exact
+            }),
+            "observed query feedback should promote the next hot non-core edge-type flush to exact degree"
+        );
+    }
+
+    let diagnostics = std::fs::read_to_string(tmp.path().join("budgeted-edge-candidates.tsv"))?;
+    let rows: Vec<Vec<&str>> = diagnostics
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect())
+        .collect();
+    let last_edge_type_row = rows
+        .iter()
+        .filter(|cols| cols.get(2).copied() == Some("4"))
+        .last()
+        .expect("diagnostics should include the feedback-promoted edge type");
+    assert_eq!(last_edge_type_row.get(10).copied(), Some("true"));
+    assert_eq!(
+        last_edge_type_row.get(11).copied(),
+        Some("feedback_score_gate")
+    );
     Ok(())
 }
 
@@ -1279,19 +1383,18 @@ async fn budgeted_semantic_edge_type_allowlist_limits_exact_materialization() ->
             .any(|meta| meta.edge_type_partition == EdgeLabel::Knows.as_i32()),
         "the allowlisted edge type should be exact-materialized"
     );
-    assert!(
-        !l0.iter()
-            .any(|meta| meta.edge_type_partition == EdgeLabel::HasCreator.as_i32()),
-        "a score-eligible but non-allowlisted edge type should stay merged"
-    );
-    assert!(
-        l0.iter()
-            .any(|meta| meta.edge_type_partition == MIXED_EDGE_TYPE
-                && meta.edge_count == 1
+    let non_allowlisted = l0
+        .iter()
+        .find(|meta| {
+            meta.edge_type_partition == EdgeLabel::HasCreator.as_i32()
                 && meta.min_src == src
-                && meta.max_src == src),
-        "the non-allowlisted edge should remain readable through a mixed partition"
-    );
+                && meta.max_src == src
+        })
+        .expect(
+            "a score-eligible but non-allowlisted edge type should keep a schema-style partition",
+        );
+    assert_eq!(non_allowlisted.degree_class, DegreeClass::Mixed);
+    assert!(!non_allowlisted.degree_class_exact);
 
     let diagnostics = std::fs::read_to_string(tmp.path().join("budgeted-edge-candidates.tsv"))?;
     let rows: Vec<Vec<&str>> = diagnostics
@@ -1380,19 +1483,22 @@ async fn budgeted_semantic_hard_file_budget_keeps_highest_score_candidate() -> a
             .any(|meta| meta.edge_type_partition == EdgeLabel::Knows.as_i32()),
         "the highest score core edge type should consume the one-file budget"
     );
-    assert!(
-        !l0.iter()
-            .any(|meta| meta.edge_type_partition == EdgeLabel::HasCreator.as_i32()),
-        "the second score-eligible core edge type should be merged after budget exhaustion"
-    );
-    assert!(
-        l0.iter()
-            .any(|meta| meta.edge_type_partition == MIXED_EDGE_TYPE
-                && meta.edge_count == 2
+    let budget_rejected = l0
+        .iter()
+        .find(|meta| {
+            meta.edge_type_partition == EdgeLabel::HasCreator.as_i32()
                 && meta.min_src == src
-                && meta.max_src == src),
-        "budget-rejected and cold edge types should remain readable through mixed partition"
-    );
+                && meta.max_src == src
+        })
+        .expect("the second score-eligible core edge type should keep a schema-style partition");
+    assert_eq!(budget_rejected.degree_class, DegreeClass::Mixed);
+    assert!(!budget_rejected.degree_class_exact);
+    let cold = l0
+        .iter()
+        .find(|meta| meta.edge_type_partition == 6 && meta.min_src == src && meta.max_src == src)
+        .expect("cold edge types should remain readable through schema-style partitions");
+    assert_eq!(cold.degree_class, DegreeClass::Mixed);
+    assert!(!cold.degree_class_exact);
 
     let diagnostics = std::fs::read_to_string(tmp.path().join("budgeted-edge-candidates.tsv"))?;
     let rows: Vec<Vec<&str>> = diagnostics
@@ -1486,11 +1592,16 @@ async fn budgeted_semantic_hard_file_budget_persists_across_flushes() -> anyhow:
             .any(|meta| meta.edge_type_partition == EdgeLabel::Knows.as_i32()),
         "the first flush should reserve the single global exact-file budget"
     );
-    assert!(
-        !l0.iter()
-            .any(|meta| meta.edge_type_partition == EdgeLabel::HasCreator.as_i32()),
-        "the second flush should not reset the hard budget"
-    );
+    let second_flush = l0
+        .iter()
+        .find(|meta| {
+            meta.edge_type_partition == EdgeLabel::HasCreator.as_i32()
+                && meta.min_src == src
+                && meta.max_src == src
+        })
+        .expect("the second flush should keep HasCreator as a schema-style partition");
+    assert_eq!(second_flush.degree_class, DegreeClass::Mixed);
+    assert!(!second_flush.degree_class_exact);
 
     let diagnostics = std::fs::read_to_string(tmp.path().join("budgeted-edge-candidates.tsv"))?;
     let has_creator_edge_type = EdgeLabel::HasCreator.as_i32().to_string();
@@ -3578,9 +3689,7 @@ async fn new_edge_label_prunes_exact_segments_but_reads_mixed_segments() -> anyh
     let mixed_tmp = target_tempdir("new-edge-label-keeps-mixed-")?;
     let mixed_config = LsmGraphConfig::new(mixed_tmp.path())
         .with_memgraph_capacity(64 * 1024 * 1024)
-        .with_l0_layout(L0LayoutPolicy::SemanticBudgeted)
-        .with_semantic_budget_min_edge_type_bytes(128 * 1024)
-        .with_semantic_budget_min_exact_bytes(1);
+        .with_l0_layout(L0LayoutPolicy::LabelOnly);
     let mixed_engine = Engine::create(mixed_config).await?;
     mixed_engine
         .insert_edge(src, encoded(VertexLabel::Person, 1_702), old_edge_type)
@@ -3811,13 +3920,25 @@ async fn layout_label_only_metadata_sanitized() -> anyhow::Result<()> {
     let tag_src = encoded(VertexLabel::Tag, 2);
 
     engine
-        .insert_edge(person_src, encoded(VertexLabel::Person, 100), EdgeLabel::Knows.as_i32())
+        .insert_edge(
+            person_src,
+            encoded(VertexLabel::Person, 100),
+            EdgeLabel::Knows.as_i32(),
+        )
         .await?;
     engine
-        .insert_edge(person_src, encoded(VertexLabel::Tag, 200), EdgeLabel::HasInterest.as_i32())
+        .insert_edge(
+            person_src,
+            encoded(VertexLabel::Tag, 200),
+            EdgeLabel::HasInterest.as_i32(),
+        )
         .await?;
     engine
-        .insert_edge(tag_src, encoded(VertexLabel::Forum, 300), EdgeLabel::HasTag.as_i32())
+        .insert_edge(
+            tag_src,
+            encoded(VertexLabel::Forum, 300),
+            EdgeLabel::HasTag.as_i32(),
+        )
         .await?;
     engine.flush_active().await?;
 
@@ -3861,8 +3982,8 @@ async fn layout_label_only_metadata_sanitized() -> anyhow::Result<()> {
     assert_eq!(tag_segment.degree_class, DegreeClass::Mixed);
     assert!(!tag_segment.degree_class_exact);
 
-    let tag_signature = GraphAccessSignature::neighbor_scan(tag_src, None)
-        .with_degree_class(DegreeClass::Low);
+    let tag_signature =
+        GraphAccessSignature::neighbor_scan(tag_src, None).with_degree_class(DegreeClass::Low);
     let tag_neighbors = engine
         .get_neighbors_by_signature(tag_signature, engine.current_snapshot())
         .await?;
@@ -3884,13 +4005,25 @@ async fn layout_edge_type_only_metadata_sanitized() -> anyhow::Result<()> {
     let comment_src = encoded(VertexLabel::Comment, 2);
 
     engine
-        .insert_edge(person_src, encoded(VertexLabel::Person, 100), EdgeLabel::Knows.as_i32())
+        .insert_edge(
+            person_src,
+            encoded(VertexLabel::Person, 100),
+            EdgeLabel::Knows.as_i32(),
+        )
         .await?;
     engine
-        .insert_edge(person_src, encoded(VertexLabel::Tag, 200), EdgeLabel::HasInterest.as_i32())
+        .insert_edge(
+            person_src,
+            encoded(VertexLabel::Tag, 200),
+            EdgeLabel::HasInterest.as_i32(),
+        )
         .await?;
     engine
-        .insert_edge(comment_src, encoded(VertexLabel::Person, 300), EdgeLabel::HasCreator.as_i32())
+        .insert_edge(
+            comment_src,
+            encoded(VertexLabel::Person, 300),
+            EdgeLabel::HasCreator.as_i32(),
+        )
         .await?;
     engine.flush_active().await?;
 
@@ -3930,7 +4063,10 @@ async fn layout_edge_type_only_metadata_sanitized() -> anyhow::Result<()> {
 
     assert_eq!(has_creator_segment.src_label, UNKNOWN_SOURCE_LABEL);
     assert_eq!(has_creator_segment.dst_label, UNKNOWN_SOURCE_LABEL);
-    assert_eq!(has_creator_segment.edge_type_partition, EdgeLabel::HasCreator.as_i32());
+    assert_eq!(
+        has_creator_segment.edge_type_partition,
+        EdgeLabel::HasCreator.as_i32()
+    );
     assert_eq!(has_creator_segment.degree_class, DegreeClass::Mixed);
     assert!(!has_creator_segment.degree_class_exact);
 
@@ -3958,7 +4094,11 @@ async fn layout_degree_only_metadata_sanitized() -> anyhow::Result<()> {
     let medium_src = encoded(VertexLabel::Forum, 2);
 
     engine
-        .insert_edge(low_src, encoded(VertexLabel::Person, 100), EdgeLabel::Knows.as_i32())
+        .insert_edge(
+            low_src,
+            encoded(VertexLabel::Person, 100),
+            EdgeLabel::Knows.as_i32(),
+        )
         .await?;
     for i in 0..30u64 {
         engine
@@ -4011,9 +4151,8 @@ async fn layout_degree_only_metadata_sanitized() -> anyhow::Result<()> {
     assert!(medium_segment.degree_class_exact);
     assert!(matches!(medium_segment.degree_class, DegreeClass::Medium));
 
-    let signature =
-        GraphAccessSignature::neighbor_scan(low_src, Some(EdgeLabel::Knows.as_i32()))
-            .with_degree_class(DegreeClass::Low);
+    let signature = GraphAccessSignature::neighbor_scan(low_src, Some(EdgeLabel::Knows.as_i32()))
+        .with_degree_class(DegreeClass::Low);
     let neighbors = engine
         .get_neighbors_by_signature(signature, engine.current_snapshot())
         .await?;
@@ -4048,7 +4187,11 @@ async fn layout_combination_label_etype_no_cross_pruning() -> anyhow::Result<()>
     let etype_src = encoded(VertexLabel::Forum, 3);
 
     etype_engine
-        .insert_edge(etype_src, encoded(VertexLabel::Person, 4), EdgeLabel::HasModerator.as_i32())
+        .insert_edge(
+            etype_src,
+            encoded(VertexLabel::Person, 4),
+            EdgeLabel::HasModerator.as_i32(),
+        )
         .await?;
     etype_engine.flush_active().await?;
 
@@ -4077,7 +4220,10 @@ async fn layout_combination_label_etype_no_cross_pruning() -> anyhow::Result<()>
     let query_with_dst_label =
         GraphAccessSignature::neighbor_scan(label_src, Some(EdgeLabel::HasInterest.as_i32()));
     let label_candidates = label_engine
-        .get_neighbors_by_signature(query_with_dst_label.clone(), label_engine.current_snapshot())
+        .get_neighbors_by_signature(
+            query_with_dst_label.clone(),
+            label_engine.current_snapshot(),
+        )
         .await?;
     assert_eq!(
         label_candidates.len(), 1,
@@ -4090,17 +4236,21 @@ async fn layout_combination_label_etype_no_cross_pruning() -> anyhow::Result<()>
         .get_neighbors_by_signature(query_with_src_label, etype_engine.current_snapshot())
         .await?;
     assert_eq!(
-        etype_candidates.len(), 1,
+        etype_candidates.len(),
+        1,
         "edge-type-only segment should be found by its exact edge_type"
     );
 
-    let mismatched_src_label =
-        GraphAccessSignature::neighbor_scan(encoded(VertexLabel::Person, 99), Some(EdgeLabel::HasModerator.as_i32()));
+    let mismatched_src_label = GraphAccessSignature::neighbor_scan(
+        encoded(VertexLabel::Person, 99),
+        Some(EdgeLabel::HasModerator.as_i32()),
+    );
     let etype_mismatch = etype_engine
         .get_neighbors_by_signature(mismatched_src_label, etype_engine.current_snapshot())
         .await?;
     assert_eq!(
-        etype_mismatch.len(), 0,
+        etype_mismatch.len(),
+        0,
         "edge-type-only segment should not return false positives for src mismatch"
     );
 
@@ -4119,7 +4269,11 @@ async fn layout_lsmgraph_style_no_semantic_pruning() -> anyhow::Result<()> {
     let src = encoded(VertexLabel::Person, 1);
 
     engine
-        .insert_edge(src, encoded(VertexLabel::Person, 100), EdgeLabel::Knows.as_i32())
+        .insert_edge(
+            src,
+            encoded(VertexLabel::Person, 100),
+            EdgeLabel::Knows.as_i32(),
+        )
         .await?;
     engine.flush_active().await?;
 
@@ -4132,17 +4286,19 @@ async fn layout_lsmgraph_style_no_semantic_pruning() -> anyhow::Result<()> {
     );
 
     let snapshot = engine.current_snapshot();
-    let neighbors = engine.get_neighbors_typed(src, EdgeLabel::Knows.as_i32(), snapshot).await?;
+    let neighbors = engine
+        .get_neighbors_typed(src, EdgeLabel::Knows.as_i32(), snapshot)
+        .await?;
     assert_eq!(neighbors.len(), 1, "basic neighbor lookup must work");
 
     engine.metrics().reset();
-    let signature =
-        GraphAccessSignature::neighbor_scan(src, Some(EdgeLabel::Knows.as_i32()));
+    let signature = GraphAccessSignature::neighbor_scan(src, Some(EdgeLabel::Knows.as_i32()));
     let by_sig = engine
         .get_neighbors_by_signature(signature, snapshot)
         .await?;
     assert_eq!(
-        by_sig.len(), 1,
+        by_sig.len(),
+        1,
         "signature-based lookup must return same results as typed lookup"
     );
 

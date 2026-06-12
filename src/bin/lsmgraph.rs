@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -13,7 +14,7 @@ use lsmgraph::snb::{
     import_snb_full, import_snb_updates, rebuild_snb_edge_props, start_dgs_compatible_server,
     validate_ic1_ic14_dynamic, validate_ic_batch_dynamic, validate_mixed_tugraph_dynamic, SnbGraph,
 };
-use lsmgraph::types::UNKNOWN_SOURCE_LABEL;
+use lsmgraph::types::{EdgeMarker, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
     DegreeClass, DynamicGraphView, EdgeRecord, GraphAccessSignature, NewPropertyEntry,
     PropertyOwner,
@@ -29,6 +30,12 @@ const DEFAULT_STORE: &str = "/data/WorkSpace/lsmgraph-rs/store/sf1";
 struct Cli {
     #[arg(long, default_value = "blocking")]
     io_backend: IoBackendKind,
+    /// Capacity (entries) of the CSR metadata cache (header + offsets +
+    /// SourceBloom per file). Raise it when an L0 layout produces more files
+    /// than this, otherwise reads thrash the cache and re-load whole offset
+    /// arrays on every miss.
+    #[arg(long, default_value_t = 4096)]
+    csr_metadata_cache_entries: usize,
     #[command(subcommand)]
     command: Command,
 }
@@ -98,6 +105,8 @@ enum Command {
     Scan {
         #[arg(long, default_value = DEFAULT_STORE)]
         data_dir: PathBuf,
+        #[arg(long)]
+        dump_edges: Option<PathBuf>,
     },
     Stats {
         #[arg(long, default_value = DEFAULT_STORE)]
@@ -299,6 +308,10 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long, default_value_t = 100)]
         samples: usize,
+        #[arg(long, default_value_t = 0)]
+        warmup_runs: usize,
+        #[arg(long, default_value_t = 1)]
+        repeats: usize,
         #[arg(long)]
         edge_type: Option<i32>,
         #[arg(long, value_delimiter = ',')]
@@ -375,6 +388,7 @@ struct StorageBenchSample {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let io_backend = cli.io_backend;
+    let csr_metadata_cache_entries = cli.csr_metadata_cache_entries;
     match cli.command {
         Command::Import {
             input,
@@ -413,6 +427,7 @@ async fn main() -> Result<()> {
             let config = LsmGraphConfig::new(&data_dir)
                 .with_memgraph_capacity(memgraph_bytes)
                 .with_io_backend(io_backend)
+                .with_metadata_cache_entries(csr_metadata_cache_entries)
                 .with_auto_compaction(auto_compact)
                 .with_schema_epoch(schema_epoch)
                 .with_l0_layout(l0_layout)
@@ -442,13 +457,9 @@ async fn main() -> Result<()> {
             if compact {
                 engine.compact_l0_to_l1().await?;
             }
-            if compact_after_import
-                || matches!(l0_layout, L0LayoutPolicy::FullCompact)
-            {
+            if compact_after_import || matches!(l0_layout, L0LayoutPolicy::FullCompact) {
                 let compact_start = Instant::now();
-                eprintln!(
-                    "[import] FullCompact: triggering post-import L0->L1 compaction"
-                );
+                eprintln!("[import] FullCompact: triggering post-import L0->L1 compaction");
                 engine.compact_l0_to_l1().await?;
                 eprintln!(
                     "[import] FullCompact: compaction complete in {:.1}s",
@@ -493,8 +504,12 @@ async fn main() -> Result<()> {
             src,
             edge_type,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let snapshot = engine.current_snapshot();
             let neighbors = if let Some(edge_type) = edge_type {
                 engine.get_neighbors_typed(src, edge_type, snapshot).await?
@@ -503,11 +518,27 @@ async fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&neighbors)?);
         }
-        Command::Scan { data_dir } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+        Command::Scan {
+            data_dir,
+            dump_edges,
+        } => {
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let snapshot = engine.current_snapshot();
             let edges = engine.scan_edges(snapshot).await?;
+            if let Some(path) = dump_edges {
+                let mut writer = BufWriter::new(fs::File::create(&path)?);
+                for edge in &edges {
+                    if edge.marker == EdgeMarker::Insert {
+                        writeln!(writer, "{} {} {}", edge.src, edge.edge_type, edge.dst)?;
+                    }
+                }
+                writer.flush()?;
+            }
             println!(
                 "{{\"snapshot\":{},\"directed_edges\":{}}}",
                 snapshot,
@@ -515,8 +546,12 @@ async fn main() -> Result<()> {
             );
         }
         Command::Stats { data_dir } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let levels = engine.live_file_count_by_level();
             let metrics = engine.metrics();
             println!(
@@ -529,24 +564,36 @@ async fn main() -> Result<()> {
             );
         }
         Command::SchemaShow { data_dir } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&engine.schema_catalog_snapshot())?
             );
         }
         Command::SchemaEvolutionReport { data_dir } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&engine.schema_evolution_report())?
             );
         }
         Command::SchemaAddVertexLabel { data_dir, id, name } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.add_schema_vertex_label(id, name)?;
             println!(
                 "{}",
@@ -563,8 +610,12 @@ async fn main() -> Result<()> {
             src_label_id,
             dst_label_id,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.add_schema_edge_label(id, name, src_label_id, dst_label_id)?;
             println!(
                 "{}",
@@ -592,8 +643,12 @@ async fn main() -> Result<()> {
                     "unsupported --owner-kind {owner_kind}; use vertex-label or edge-label"
                 ),
             };
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.add_schema_property(NewPropertyEntry {
                 id,
                 owner,
@@ -617,8 +672,12 @@ async fn main() -> Result<()> {
             name,
             canonical_id,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.alias_schema_vertex_label(id, name, canonical_id)?;
             println!(
                 "{}",
@@ -634,8 +693,12 @@ async fn main() -> Result<()> {
             name,
             canonical_id,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.alias_schema_edge_label(id, name, canonical_id)?;
             println!(
                 "{}",
@@ -651,8 +714,12 @@ async fn main() -> Result<()> {
             name,
             canonical_id,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.alias_schema_property(id, name, canonical_id)?;
             println!(
                 "{}",
@@ -663,8 +730,12 @@ async fn main() -> Result<()> {
             );
         }
         Command::SchemaDropVertexLabel { data_dir, id } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.drop_schema_vertex_label(id)?;
             println!(
                 "{}",
@@ -675,8 +746,12 @@ async fn main() -> Result<()> {
             );
         }
         Command::SchemaDropEdgeLabel { data_dir, id } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.drop_schema_edge_label(id)?;
             println!(
                 "{}",
@@ -687,8 +762,12 @@ async fn main() -> Result<()> {
             );
         }
         Command::SchemaDropProperty { data_dir, id } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.drop_schema_property(id)?;
             println!(
                 "{}",
@@ -706,8 +785,12 @@ async fn main() -> Result<()> {
             encoding_version,
             default_or_null_rule,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let epoch = engine.change_schema_property_encoding(
                 id,
                 logical_type,
@@ -731,8 +814,12 @@ async fn main() -> Result<()> {
             min_src,
             max_src,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             if auto_pick {
                 let decision = engine.compact_best_l0_partition_by_score().await?;
                 println!("{}", serde_json::to_string_pretty(&decision)?);
@@ -772,8 +859,12 @@ async fn main() -> Result<()> {
             data_dir,
             max_vertices,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let stats = validate_person_knows(engine, &input, max_vertices).await?;
             println!(
                 "{{\"checked_vertices\":{},\"expected_directed_edges\":{},\"actual_directed_edges\":{}}}",
@@ -852,8 +943,12 @@ async fn main() -> Result<()> {
             start_dgs_compatible_server(snb, &format!("{host}:{port}")).await?;
         }
         Command::SnbCache { data_dir } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(&data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let groups = SnbGraph::build_adjacency_cache(engine.clone(), &data_dir).await?;
             let metrics = engine.metrics();
             println!(
@@ -875,8 +970,12 @@ async fn main() -> Result<()> {
             );
         }
         Command::SnbUpdates { input, data_dir } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(&data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let stats = import_snb_updates(engine.clone(), &input, &data_dir).await?;
             println!(
                 "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{}}}",
@@ -888,6 +987,8 @@ async fn main() -> Result<()> {
         Command::StorageBench {
             data_dir,
             samples,
+            warmup_runs,
+            repeats,
             edge_type,
             edge_types,
             semantic_degree_hint,
@@ -900,13 +1001,17 @@ async fn main() -> Result<()> {
             ra_min_score,
             ra_min_l0_segments,
         } => {
-            let mut config = LsmGraphConfig::new(&data_dir).with_io_backend(io_backend);
+            let repeats = repeats.max(1);
+            let mut config = LsmGraphConfig::new(&data_dir)
+                .with_io_backend(io_backend)
+                .with_metadata_cache_entries(csr_metadata_cache_entries);
             config.l0_ra_min_queries = ra_min_queries;
             config.l0_ra_min_score = ra_min_score;
             config.l0_ra_min_l0_segments = ra_min_l0_segments;
             let engine = Engine::open(config).await?;
             let snapshot = engine.current_snapshot();
             let metrics = engine.metrics();
+            let cache_state_before = storage_bench_cache_state();
             let cli_requested_edge_types: Vec<Option<i32>> = if edge_types.is_empty() {
                 vec![edge_type]
             } else {
@@ -948,38 +1053,38 @@ async fn main() -> Result<()> {
             let mut benchmarks = Vec::new();
             for entry in &sample_plan.entries {
                 let requested_edge_type = entry.edge_type;
-                metrics.reset();
-                let degree_by_src: HashMap<u64, u64> = entry
-                    .samples
-                    .iter()
-                    .map(|sample| (sample.src, sample.degree))
-                    .collect();
                 let srcs: Vec<u64> = entry.samples.iter().map(|sample| sample.src).collect();
-                let mut neighbor_edges = 0usize;
-                let neighbor_started = Instant::now();
-                for src in &srcs {
-                    let neighbors = if let Some(edge_type) = requested_edge_type {
-                        if semantic_degree_hint {
-                            let degree = degree_by_src.get(src).copied().unwrap_or(0);
-                            let signature =
-                                GraphAccessSignature::neighbor_scan(*src, Some(edge_type))
-                                    .with_degree_class(DegreeClass::from_max_degree(degree));
-                            engine
-                                .get_neighbors_by_signature(signature, snapshot)
-                                .await?
-                        } else {
-                            engine
-                                .get_neighbors_typed(*src, edge_type, snapshot)
-                                .await?
-                        }
-                    } else {
-                        engine.get_neighbors(*src, snapshot).await?
-                    };
-                    neighbor_edges += neighbors.len();
+                let mut warmup_rounds = Vec::new();
+                for round in 0..warmup_runs {
+                    let result =
+                        run_storage_bench_round(&engine, snapshot, entry, semantic_degree_hint)
+                            .await?;
+                    warmup_rounds.push(storage_bench_round_json("warmup", round + 1, result));
                 }
-                let get_neighbors_elapsed_ms = neighbor_started.elapsed().as_millis();
-                let neighbor_metrics = metrics.snapshot_json();
-                let neighbor_summary = storage_bench_metric_summary(&neighbor_metrics);
+                let mut measured_rounds = Vec::new();
+                for round in 0..repeats {
+                    let result =
+                        run_storage_bench_round(&engine, snapshot, entry, semantic_degree_hint)
+                            .await?;
+                    measured_rounds.push(storage_bench_round_json("measured", round + 1, result));
+                }
+                let last_round = measured_rounds.last().cloned().unwrap_or_else(|| json!({}));
+                let neighbor_edges = last_round
+                    .get("neighbor_edges")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let get_neighbors_elapsed_ms = last_round
+                    .get("get_neighbors_elapsed_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let neighbor_summary = last_round
+                    .get("neighbor_summary")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let neighbor_metrics = last_round
+                    .get("neighbor_metrics")
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 let auto_compaction = if auto_compact {
                     engine.compact_best_l0_partition_by_score().await?
                 } else {
@@ -1000,7 +1105,13 @@ async fn main() -> Result<()> {
                     "sample_degrees": entry.samples,
                     "neighbor_edges": neighbor_edges,
                     "get_neighbors_elapsed_ms": get_neighbors_elapsed_ms,
+                    "warmup_runs": warmup_runs,
+                    "repeats": repeats,
+                    "warmup_rounds": warmup_rounds,
+                    "rounds": measured_rounds,
+                    "repeat_summary": storage_bench_repeat_summary(&measured_rounds),
                     "auto_compaction": auto_compaction,
+                    "auto_compaction_metrics_source": if auto_compact { Some("last_measured_repeat") } else { None },
                     "levels_after_run": engine.live_file_count_by_level(),
                     "neighbor_summary": neighbor_summary,
                     "neighbor_metrics": neighbor_metrics,
@@ -1016,6 +1127,8 @@ async fn main() -> Result<()> {
                     "edge_types": edge_types,
                     "semantic_degree_hint": semantic_degree_hint,
                     "sample_plan_degree_hint": sample_plan_degree_hint,
+                    "warmup_runs": warmup_runs,
+                    "repeats": repeats,
                     "sample_plan_in": sample_plan_in,
                     "sample_plan_out": sample_plan_out,
                     "sample_plan_version": sample_plan.version,
@@ -1025,6 +1138,8 @@ async fn main() -> Result<()> {
                     "levels": engine.live_file_count_by_level(),
                     "scan_summary": scan_summary,
                     "scan_metrics": scan_metrics,
+                    "cache_state_before": cache_state_before,
+                    "cache_state_after": storage_bench_cache_state(),
                     "benchmarks": benchmarks,
                 }))?
             );
@@ -1038,12 +1153,18 @@ async fn main() -> Result<()> {
         } => {
             let plan: StorageBenchSamplePlan =
                 serde_json::from_str(&fs::read_to_string(&sample_plan)?)?;
-            let left =
-                Engine::open(LsmGraphConfig::new(&left_data_dir).with_io_backend(io_backend))
-                    .await?;
-            let right =
-                Engine::open(LsmGraphConfig::new(&right_data_dir).with_io_backend(io_backend))
-                    .await?;
+            let left = Engine::open(
+                LsmGraphConfig::new(&left_data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
+            let right = Engine::open(
+                LsmGraphConfig::new(&right_data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let left_snapshot = left.current_snapshot();
             let right_snapshot = right.current_snapshot();
             let started = Instant::now();
@@ -1125,13 +1246,13 @@ async fn main() -> Result<()> {
             );
         }
         Command::OracleIndex { data_dir } => {
-            let mut config = LsmGraphConfig::new(&data_dir).with_io_backend(io_backend);
+            let mut config = LsmGraphConfig::new(&data_dir)
+                .with_io_backend(io_backend)
+                .with_metadata_cache_entries(csr_metadata_cache_entries);
             config.l0_layout = L0LayoutPolicy::OracleSemantic;
             let engine = Engine::open(config).await?;
             let started = Instant::now();
-            eprintln!(
-                "[oracle-index] building oracle index from L0 segments"
-            );
+            eprintln!("[oracle-index] building oracle index from L0 segments");
             let stats = engine.build_oracle_index().await?;
             eprintln!(
                 "[oracle-index] built oracle index with {} entries in {:.1}ms",
@@ -1151,8 +1272,12 @@ async fn main() -> Result<()> {
             samples,
             edge_type,
         } => {
-            let engine =
-                Engine::open(LsmGraphConfig::new(&data_dir).with_io_backend(io_backend)).await?;
+            let engine = Engine::open(
+                LsmGraphConfig::new(&data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
             let snapshot = engine.current_snapshot();
             let scan_start = Instant::now();
             let edges = engine.scan_edges(snapshot).await?;
@@ -1234,6 +1359,70 @@ fn edge_preview(edges: &[EdgeRecord]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+struct StorageBenchRoundResult {
+    neighbor_edges: usize,
+    get_neighbors_elapsed_ms: u64,
+    neighbor_summary: Value,
+    neighbor_metrics: Value,
+}
+
+async fn run_storage_bench_round(
+    engine: &Engine,
+    snapshot: u64,
+    entry: &StorageBenchSampleEntry,
+    semantic_degree_hint: bool,
+) -> Result<StorageBenchRoundResult> {
+    let metrics = engine.metrics();
+    metrics.reset();
+    let requested_edge_type = entry.edge_type;
+    let degree_by_src: HashMap<u64, u64> = entry
+        .samples
+        .iter()
+        .map(|sample| (sample.src, sample.degree))
+        .collect();
+    let mut neighbor_edges = 0usize;
+    let neighbor_started = Instant::now();
+    for sample in &entry.samples {
+        let neighbors = if let Some(edge_type) = requested_edge_type {
+            if semantic_degree_hint {
+                let degree = degree_by_src.get(&sample.src).copied().unwrap_or(0);
+                let signature = GraphAccessSignature::neighbor_scan(sample.src, Some(edge_type))
+                    .with_degree_class(DegreeClass::from_max_degree(degree));
+                engine
+                    .get_neighbors_by_signature(signature, snapshot)
+                    .await?
+            } else {
+                engine
+                    .get_neighbors_typed(sample.src, edge_type, snapshot)
+                    .await?
+            }
+        } else {
+            engine.get_neighbors(sample.src, snapshot).await?
+        };
+        neighbor_edges += neighbors.len();
+    }
+    let get_neighbors_elapsed_ms = neighbor_started.elapsed().as_millis() as u64;
+    let neighbor_metrics = metrics.snapshot_json();
+    let neighbor_summary = storage_bench_metric_summary(&neighbor_metrics);
+    Ok(StorageBenchRoundResult {
+        neighbor_edges,
+        get_neighbors_elapsed_ms,
+        neighbor_summary,
+        neighbor_metrics,
+    })
+}
+
+fn storage_bench_round_json(kind: &str, round: usize, result: StorageBenchRoundResult) -> Value {
+    json!({
+        "kind": kind,
+        "round": round,
+        "neighbor_edges": result.neighbor_edges,
+        "get_neighbors_elapsed_ms": result.get_neighbors_elapsed_ms,
+        "neighbor_summary": result.neighbor_summary,
+        "neighbor_metrics": result.neighbor_metrics,
+    })
 }
 
 fn build_storage_bench_sample_plan(
@@ -1360,6 +1549,102 @@ fn storage_bench_metric_summary(metrics: &Value) -> Value {
         "csr_get_neighbors_p50_us": metric_u64(metrics, &["csr", "get_neighbors_latency", "p50_us"]),
         "csr_get_neighbors_p90_us": metric_u64(metrics, &["csr", "get_neighbors_latency", "p90_us"]),
         "csr_get_neighbors_p99_us": metric_u64(metrics, &["csr", "get_neighbors_latency", "p99_us"]),
+    })
+}
+
+fn storage_bench_repeat_summary(rounds: &[Value]) -> Value {
+    json!({
+        "elapsed_ms": series_stats(&round_field_series(rounds, "get_neighbors_elapsed_ms")),
+        "neighbor_edges": series_stats(&round_field_series(rounds, "neighbor_edges")),
+        "candidate_l0_segments": series_stats(&round_summary_series(rounds, "candidate_l0_segments")),
+        "read_bytes": series_stats(&round_summary_series(rounds, "read_bytes")),
+        "body_reads": series_stats(&round_summary_series(rounds, "body_reads")),
+        "get_neighbors_avg_us": series_stats(&round_summary_series(rounds, "get_neighbors_avg_us")),
+        "get_neighbors_p50_us": series_stats(&round_summary_series(rounds, "get_neighbors_p50_us")),
+        "get_neighbors_p90_us": series_stats(&round_summary_series(rounds, "get_neighbors_p90_us")),
+        "get_neighbors_p99_us": series_stats(&round_summary_series(rounds, "get_neighbors_p99_us")),
+        "csr_get_neighbors_avg_us": series_stats(&round_summary_series(rounds, "csr_get_neighbors_avg_us")),
+        "csr_get_neighbors_p50_us": series_stats(&round_summary_series(rounds, "csr_get_neighbors_p50_us")),
+        "csr_get_neighbors_p90_us": series_stats(&round_summary_series(rounds, "csr_get_neighbors_p90_us")),
+        "csr_get_neighbors_p99_us": series_stats(&round_summary_series(rounds, "csr_get_neighbors_p99_us")),
+    })
+}
+
+fn round_field_series(rounds: &[Value], key: &str) -> Vec<f64> {
+    rounds
+        .iter()
+        .filter_map(|round| round.get(key).and_then(Value::as_f64))
+        .collect()
+}
+
+fn round_summary_series(rounds: &[Value], key: &str) -> Vec<f64> {
+    rounds
+        .iter()
+        .filter_map(|round| {
+            round
+                .get("neighbor_summary")
+                .and_then(|summary| summary.get(key))
+                .and_then(Value::as_f64)
+        })
+        .collect()
+}
+
+fn series_stats(values: &[f64]) -> Value {
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let count = values.len() as f64;
+    let sum: f64 = values.iter().sum();
+    let mean = sum / count;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / count;
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    json!({
+        "count": values.len(),
+        "mean": mean,
+        "stddev": variance.sqrt(),
+        "min": min,
+        "max": max,
+    })
+}
+
+fn storage_bench_cache_state() -> Value {
+    let mut meminfo = serde_json::Map::new();
+    if let Ok(text) = fs::read_to_string("/proc/meminfo") {
+        for line in text.lines() {
+            let Some((key, rest)) = line.split_once(':') else {
+                continue;
+            };
+            if matches!(
+                key,
+                "MemAvailable" | "MemFree" | "Buffers" | "Cached" | "SwapFree" | "SwapTotal"
+            ) {
+                if let Some(value) = rest.split_whitespace().next() {
+                    if let Ok(kib) = value.parse::<u64>() {
+                        meminfo.insert(key.to_string(), json!(kib));
+                    }
+                }
+            }
+        }
+    }
+    let loadavg = fs::read_to_string("/proc/loadavg")
+        .ok()
+        .map(|text| text.trim().to_string());
+    let unix_epoch_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs());
+    json!({
+        "unix_epoch_s": unix_epoch_s,
+        "loadavg": loadavg,
+        "meminfo_kib": meminfo,
     })
 }
 

@@ -131,6 +131,12 @@ pub struct CsrSegmentMeta {
     pub property_values_offset: u64,
     #[serde(default)]
     pub property_values_len: u64,
+    #[serde(default)]
+    pub source_bloom_offset: u64,
+    #[serde(default)]
+    pub source_bloom_len: u64,
+    #[serde(default)]
+    pub source_bloom_bit_count: u64,
     #[serde(default = "default_may_contain_tombstones")]
     pub may_contain_tombstones: bool,
     #[serde(default = "default_mixed_edge_type")]
@@ -172,6 +178,10 @@ impl CsrSegmentMeta {
 
     pub fn has_property_value_section(&self) -> bool {
         self.property_index_len > 0
+    }
+
+    pub fn has_source_bloom_section(&self) -> bool {
+        self.source_bloom_offset > 0 && self.source_bloom_len > 0 && self.source_bloom_bit_count > 0
     }
 
     pub fn may_contain_signature(&self, signature: &GraphAccessSignature) -> bool {
@@ -435,6 +445,9 @@ mod tests {
             property_index_len: 0,
             property_values_offset: 0,
             property_values_len: 0,
+            source_bloom_offset: 0,
+            source_bloom_len: 0,
+            source_bloom_bit_count: 0,
             may_contain_tombstones: false,
             edge_type_partition: edge_type,
             direction: EdgeDirection::Out,

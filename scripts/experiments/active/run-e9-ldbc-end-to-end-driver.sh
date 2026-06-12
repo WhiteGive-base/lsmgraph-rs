@@ -17,6 +17,17 @@ OPERATION_COUNT="${OPERATION_COUNT:-5000}"
 IO_BACKEND="${IO_BACKEND:-direct}"
 BUILD_RELEASE="${BUILD_RELEASE:-true}"
 
+abs_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$(pwd)" "$1" ;;
+  esac
+}
+
+ROOT_LOG="$(abs_path "$ROOT_LOG")"
+BENCH_OUT="$(abs_path "$BENCH_OUT")"
+SUMMARY_OUT="$(abs_path "$SUMMARY_OUT")"
+
 mkdir -p "$ROOT_LOG" "$SUMMARY_OUT"
 
 {

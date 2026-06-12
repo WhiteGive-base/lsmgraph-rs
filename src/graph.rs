@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -88,7 +88,7 @@ impl SemanticL0Index {
     fn candidates_with_degree_classes(
         &self,
         signature: &GraphAccessSignature,
-        degree_classes_override: Option<&[DegreeClass]>,
+        degree_classes_override: Option<DegreeClassMask>,
     ) -> Vec<CsrSegmentMeta> {
         let Some(edge_type) = signature.edge_type else {
             return Vec::new();
@@ -101,7 +101,7 @@ impl SemanticL0Index {
         };
         let edge_types = [edge_type, MIXED_EDGE_TYPE];
         let degree_classes = match degree_classes_override {
-            Some(classes) => degree_classes_that_may_contain_queries(classes),
+            Some(mask) => degree_classes_that_may_contain_query_mask(mask),
             None => match signature.degree_class {
                 Some(DegreeClass::Low) => {
                     vec![DegreeClass::Low, DegreeClass::Mixed, DegreeClass::Unknown]
@@ -163,36 +163,24 @@ pub struct OracleL0Index {
 }
 
 impl OracleL0Index {
-    pub fn build_from_edges(
-        edges: &[EdgeRecord],
-        l0_files: &[CsrSegmentMeta],
-    ) -> Self {
-        let mut index: HashMap<(VertexId, Option<EdgeType>), HashSet<FileId>> =
-            HashMap::new();
+    pub fn build_from_edges(edges: &[EdgeRecord], l0_files: &[CsrSegmentMeta]) -> Self {
+        let mut index: HashMap<(VertexId, Option<EdgeType>), HashSet<FileId>> = HashMap::new();
 
-        let mut file_edges: HashMap<FileId, Vec<EdgeRecord>> = HashMap::new();
         for edge in edges {
             for meta in l0_files {
                 if meta.file_id == 0 {
                     continue;
                 }
-                if edge.src >= meta.min_src
-                    && edge.src <= meta.max_src
-                    && (meta.edge_type_partition == MIXED_EDGE_TYPE
-                        || meta.edge_type_partition == edge.edge_type)
-                    && meta.src_label == UNKNOWN_SOURCE_LABEL
-                        || source_label_from_vertex_id(edge.src) == meta.src_label
-                {
-                    file_edges.entry(meta.file_id).or_default().push(*edge);
-                }
-            }
-        }
-
-        for edge in edges {
-            for (file_id, file_edge_list) in &file_edges {
-                if file_edge_list.contains(edge) {
-                    let key = (edge.src, Some(edge.edge_type));
-                    index.entry(key).or_default().insert(*file_id);
+                let range_ok = edge.src >= meta.min_src && edge.src <= meta.max_src;
+                let type_ok = meta.edge_type_partition == MIXED_EDGE_TYPE
+                    || meta.edge_type_partition == edge.edge_type;
+                let label_ok = meta.src_label == UNKNOWN_SOURCE_LABEL
+                    || source_label_from_vertex_id(edge.src) == meta.src_label;
+                if range_ok && type_ok && label_ok {
+                    index
+                        .entry((edge.src, Some(edge.edge_type)))
+                        .or_default()
+                        .insert(meta.file_id);
                 }
             }
         }
@@ -213,8 +201,7 @@ impl OracleL0Index {
         l0_files: &[CsrSegmentMeta],
         reader: &CsrReader<AnyIoBackend>,
     ) -> Result<Self> {
-        let mut index: HashMap<(VertexId, Option<EdgeType>), HashSet<FileId>> =
-            HashMap::new();
+        let mut index: HashMap<(VertexId, Option<EdgeType>), HashSet<FileId>> = HashMap::new();
 
         for meta in l0_files {
             let edges = reader.read_all_edges(meta).await?;
@@ -252,9 +239,39 @@ impl OracleL0Index {
     }
 }
 
-fn degree_classes_that_may_contain_queries(query_classes: &[DegreeClass]) -> Vec<DegreeClass> {
+type DegreeClassMask = u8;
+
+const DEGREE_CLASS_LOW_MASK: DegreeClassMask = 1 << 0;
+const DEGREE_CLASS_MEDIUM_MASK: DegreeClassMask = 1 << 1;
+const DEGREE_CLASS_HIGH_MASK: DegreeClassMask = 1 << 2;
+
+fn degree_class_mask(degree_class: DegreeClass) -> DegreeClassMask {
+    match degree_class {
+        DegreeClass::Low => DEGREE_CLASS_LOW_MASK,
+        DegreeClass::Medium => DEGREE_CLASS_MEDIUM_MASK,
+        DegreeClass::High => DEGREE_CLASS_HIGH_MASK,
+        DegreeClass::Mixed | DegreeClass::Unknown => 0,
+    }
+}
+
+fn insert_degree_class_mask(mask: &mut DegreeClassMask, degree_class: DegreeClass) {
+    *mask |= degree_class_mask(degree_class);
+}
+
+fn degree_class_mask_count(mask: DegreeClassMask) -> u32 {
+    mask.count_ones()
+}
+
+fn degree_classes_that_may_contain_query_mask(mask: DegreeClassMask) -> Vec<DegreeClass> {
     let mut out = Vec::new();
-    for query_class in query_classes {
+    for (bit, query_class) in [
+        (DEGREE_CLASS_LOW_MASK, DegreeClass::Low),
+        (DEGREE_CLASS_MEDIUM_MASK, DegreeClass::Medium),
+        (DEGREE_CLASS_HIGH_MASK, DegreeClass::High),
+    ] {
+        if mask & bit == 0 {
+            continue;
+        }
         match query_class {
             DegreeClass::Low => out.push(DegreeClass::Low),
             DegreeClass::Medium => {
@@ -273,11 +290,180 @@ fn degree_classes_that_may_contain_queries(query_classes: &[DegreeClass]) -> Vec
             }
         }
     }
+    if mask == 0 {
+        out.push(DegreeClass::Low);
+        out.push(DegreeClass::Medium);
+        out.push(DegreeClass::High);
+    }
     out.push(DegreeClass::Mixed);
     out.push(DegreeClass::Unknown);
     out.sort_unstable();
     out.dedup();
     out
+}
+
+fn degree_directory_class_for_l0(meta: &CsrSegmentMeta) -> Option<DegreeClass> {
+    if meta.level != L0
+        || !meta.summary_completeness.allows_semantic_pruning()
+        || meta.edge_type_partition == MIXED_EDGE_TYPE
+        || !meta.degree_class_exact
+        || matches!(meta.degree_class, DegreeClass::Mixed | DegreeClass::Unknown)
+    {
+        None
+    } else {
+        Some(meta.degree_class)
+    }
+}
+
+const DEGREE_DIRECTORY_SIDECAR_FILE: &str = "DEGREE_DIRECTORY";
+const DEGREE_DIRECTORY_SIDECAR_TMP_FILE: &str = "DEGREE_DIRECTORY.tmp";
+const DEGREE_DIRECTORY_SIDECAR_MAGIC: &[u8; 8] = b"L0DGDIR1";
+const DEGREE_DIRECTORY_VALID_MASK: DegreeClassMask =
+    DEGREE_CLASS_LOW_MASK | DEGREE_CLASS_MEDIUM_MASK | DEGREE_CLASS_HIGH_MASK;
+
+fn degree_directory_sidecar_path(store_dir: &Path) -> PathBuf {
+    store_dir.join(DEGREE_DIRECTORY_SIDECAR_FILE)
+}
+
+fn degree_directory_sidecar_tmp_path(store_dir: &Path) -> PathBuf {
+    store_dir.join(DEGREE_DIRECTORY_SIDECAR_TMP_FILE)
+}
+
+fn degree_directory_sidecar_file_ids(levels: &[Vec<CsrSegmentMeta>]) -> Vec<FileId> {
+    let mut file_ids: Vec<_> = levels
+        .get(L0 as usize)
+        .into_iter()
+        .flat_map(|metas| metas.iter())
+        .filter(|meta| degree_directory_class_for_l0(meta).is_some())
+        .map(|meta| meta.file_id)
+        .collect();
+    file_ids.sort_unstable();
+    file_ids
+}
+
+fn read_degree_directory_sidecar(
+    store_dir: &Path,
+    expected_file_ids: &[FileId],
+) -> Result<Option<HashMap<(VertexId, EdgeType), DegreeClassMask>>> {
+    let path = degree_directory_sidecar_path(store_dir);
+    if !path.exists() {
+        return Ok(if expected_file_ids.is_empty() {
+            Some(HashMap::new())
+        } else {
+            None
+        });
+    }
+    match read_degree_directory_sidecar_inner(&path, expected_file_ids) {
+        Ok(directory) => Ok(directory),
+        Err(_) => Ok(None),
+    }
+}
+
+fn read_degree_directory_sidecar_inner(
+    path: &Path,
+    expected_file_ids: &[FileId],
+) -> Result<Option<HashMap<(VertexId, EdgeType), DegreeClassMask>>> {
+    let mut file = File::open(path)?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)?;
+    if &magic != DEGREE_DIRECTORY_SIDECAR_MAGIC {
+        return Ok(None);
+    }
+
+    let file_count = read_u64_le(&mut file)?;
+    let entry_count = read_u64_le(&mut file)?;
+    if usize::try_from(file_count).ok() != Some(expected_file_ids.len()) {
+        return Ok(None);
+    }
+    for expected_file_id in expected_file_ids {
+        if read_u64_le(&mut file)? != *expected_file_id {
+            return Ok(None);
+        }
+    }
+
+    let capacity = usize::try_from(entry_count)
+        .map_err(|_| anyhow::anyhow!("degree directory sidecar entry_count is too large"))?;
+    let mut directory = HashMap::with_capacity(capacity);
+    for _ in 0..entry_count {
+        let src = read_u64_le(&mut file)?;
+        let edge_type = read_i32_le(&mut file)?;
+        let mask = read_u8(&mut file)?;
+        if mask == 0 || mask & !DEGREE_DIRECTORY_VALID_MASK != 0 {
+            return Ok(None);
+        }
+        *directory.entry((src, edge_type)).or_default() |= mask;
+    }
+    Ok(Some(directory))
+}
+
+fn write_degree_directory_sidecar(
+    store_dir: &Path,
+    expected_file_ids: &[FileId],
+    directory: &HashMap<(VertexId, EdgeType), DegreeClassMask>,
+) -> Result<()> {
+    fs::create_dir_all(store_dir)?;
+    let tmp_path = degree_directory_sidecar_tmp_path(store_dir);
+    let path = degree_directory_sidecar_path(store_dir);
+    let mut entries: Vec<_> = directory.iter().filter(|(_, mask)| **mask != 0).collect();
+    entries.sort_by_key(|((src, edge_type), _)| (*src, *edge_type));
+
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(DEGREE_DIRECTORY_SIDECAR_MAGIC)?;
+    write_u64_le(&mut writer, expected_file_ids.len() as u64)?;
+    write_u64_le(&mut writer, entries.len() as u64)?;
+    for file_id in expected_file_ids {
+        write_u64_le(&mut writer, *file_id)?;
+    }
+    for ((src, edge_type), mask) in entries {
+        write_u64_le(&mut writer, *src)?;
+        write_i32_le(&mut writer, *edge_type)?;
+        write_u8(&mut writer, *mask)?;
+    }
+    let file = writer.into_inner()?;
+    file.sync_all()?;
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+fn read_u64_le(reader: &mut impl Read) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn read_i32_le(reader: &mut impl Read) -> Result<i32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(i32::from_le_bytes(buf))
+}
+
+fn read_u8(reader: &mut impl Read) -> Result<u8> {
+    let mut buf = [0u8; 1];
+    reader.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+fn write_u64_le(writer: &mut impl Write, value: u64) -> Result<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_i32_le(writer: &mut impl Write, value: i32) -> Result<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_u8(writer: &mut impl Write, value: u8) -> Result<()> {
+    writer.write_all(&[value])?;
+    Ok(())
 }
 
 pub struct Engine {
@@ -292,7 +478,7 @@ pub struct Engine {
     index: Arc<MultiLevelIndex>,
     vertex_locks: Arc<VertexLockTable>,
     metadata_cache: Arc<CsrMetadataCache>,
-    degree_directory: RwLock<HashMap<(VertexId, EdgeType), Vec<DegreeClass>>>,
+    degree_directory: RwLock<HashMap<(VertexId, EdgeType), DegreeClassMask>>,
     semantic_l0_index: RwLock<SemanticL0Index>,
     oracle_l0_index: RwLock<OracleL0Index>,
     schema_catalog: RwLock<SchemaCatalog>,
@@ -557,6 +743,7 @@ impl Engine {
             memgraphs: vec![active.clone()],
             levels,
         };
+        let metadata_cache_entries = config.metadata_cache_entries;
 
         let engine = Arc::new(Self {
             config,
@@ -574,7 +761,7 @@ impl Engine {
             timestamp: AtomicU64::new(manifest_state.max_ts),
             index: Arc::new(MultiLevelIndex::default()),
             vertex_locks: Arc::new(VertexLockTable::new(1 << 16)),
-            metadata_cache: Arc::new(CsrMetadataCache::new(4096)),
+            metadata_cache: Arc::new(CsrMetadataCache::new(metadata_cache_entries)),
             degree_directory: RwLock::new(HashMap::new()),
             semantic_l0_index: RwLock::new(SemanticL0Index::default()),
             oracle_l0_index: RwLock::new(OracleL0Index::default()),
@@ -592,7 +779,7 @@ impl Engine {
         {
             eprintln!("[engine] SKIP rebuild_semantic_indexes (SNB_SKIP_SEM_INDEX set)");
         } else {
-            engine.rebuild_semantic_indexes().await?;
+            engine.load_or_rebuild_semantic_indexes().await?;
         }
         Ok(engine)
     }
@@ -1498,19 +1685,14 @@ impl Engine {
     ///
     /// Note: We still partition by key range to keep file sizes reasonable, but all partitions
     /// share the same conservative semantic metadata.
-    fn build_rocksdb_style_l0_flush_segments(
-        &self,
-        edges: Vec<EdgeRecord>,
-    ) -> Vec<L0FlushSegment> {
+    fn build_rocksdb_style_l0_flush_segments(&self, edges: Vec<EdgeRecord>) -> Vec<L0FlushSegment> {
         // RocksDB-style: sort by (src, edge_type, dst, ts) to enable range scans
         let mut sorted = edges;
         sorted.sort_by_key(|e| (e.src, e.edge_type, e.dst, e.ts));
 
         // Split into range-bounded segments (same as Naive, but with conservative metadata)
         let mut segments = Vec::new();
-        for group in
-            split_range_bounded_segments(sorted, self.config.segment_target_bytes)
-        {
+        for group in split_range_bounded_segments(sorted, self.config.segment_target_bytes) {
             segments.push(L0FlushSegment::fully_mixed(group));
         }
         segments
@@ -1533,6 +1715,8 @@ impl Engine {
             BTreeMap::new();
         let mut needs_sort: BTreeSet<(i32, EdgeType, DegreeClass)> = BTreeSet::new();
         let mut candidates = Vec::new();
+        let feedback_edge_type_weights =
+            semantic_budget_feedback_edge_type_weights(&self.metrics.l0_partition_snapshots());
         let mut group_start = 0usize;
         while group_start < edges.len() {
             let src_label = source_label_from_vertex_id(edges[group_start].src);
@@ -1555,6 +1739,9 @@ impl Engine {
                 self.config.semantic_budget_core_edge_weight,
                 self.config.semantic_budget_reverse_core_edge_weight,
                 self.config.semantic_budget_other_edge_weight,
+                feedback_edge_type_weights
+                    .get(&(src_label, edge_type))
+                    .copied(),
             );
             candidates.push(BudgetedEdgeCandidate {
                 src_label,
@@ -1678,11 +1865,25 @@ impl Engine {
             if needs_sort.contains(&key) {
                 group.sort_by_key(|e| (e.src, e.edge_type, e.dst, e.ts));
             }
-            let override_edge_type = (key.1 == MIXED_EDGE_TYPE).then_some(MIXED_EDGE_TYPE);
+            // Partitions whose degree was merged by policy (unselected edge types,
+            // or low-benefit degree classes of selected ones) must say so
+            // explicitly: segment content can be coincidentally uniform, and a
+            // content-computed degree_class_exact=true would both enable degree
+            // pruning the policy never paid for and be charged against the file
+            // budget on reopen.
+            let degree_merged = matches!(key.2, DegreeClass::Mixed | DegreeClass::Unknown);
+            let semantic_overrides = CsrSegmentSemanticOverrides {
+                edge_type_partition: (key.1 == MIXED_EDGE_TYPE).then_some(MIXED_EDGE_TYPE),
+                degree_class: degree_merged.then_some(DegreeClass::Mixed),
+                degree_class_exact: degree_merged.then_some(false),
+                ..CsrSegmentSemanticOverrides::default()
+            };
             segments.extend(
                 split_range_bounded_segments(group, self.config.segment_target_bytes)
                     .into_iter()
-                    .map(|segment| L0FlushSegment::new(segment, override_edge_type)),
+                    .map(|segment| {
+                        L0FlushSegment::with_semantic_overrides(segment, semantic_overrides)
+                    }),
             );
         }
 
@@ -1983,11 +2184,11 @@ impl Engine {
     ) -> Result<Vec<EdgeRecord>> {
         let signature = GraphAccessSignature::neighbor_scan(src, edge_type);
         let degree_classes = edge_type
-            .and_then(|edge_type| self.degree_directory.read().get(&(src, edge_type)).cloned());
+            .and_then(|edge_type| self.degree_directory.read().get(&(src, edge_type)).copied());
         self.get_neighbors_signature_internal_with_l0_degree_classes(
             signature,
             snapshot,
-            degree_classes.as_deref(),
+            degree_classes,
         )
         .await
     }
@@ -2001,12 +2202,11 @@ impl Engine {
             self.degree_directory
                 .read()
                 .get(&(signature.src, edge_type))
-                .cloned()
+                .copied()
         });
         let signature = if signature.degree_class.is_some()
             && degree_classes
-                .as_ref()
-                .map(|classes| classes.len() > 1)
+                .map(|mask| degree_class_mask_count(mask) > 1)
                 .unwrap_or(false)
         {
             signature.without_degree_class()
@@ -2016,7 +2216,7 @@ impl Engine {
         self.get_neighbors_signature_internal_with_l0_degree_classes(
             signature,
             snapshot,
-            degree_classes.as_deref(),
+            degree_classes,
         )
         .await
     }
@@ -2025,7 +2225,7 @@ impl Engine {
         &self,
         signature: GraphAccessSignature,
         snapshot: SnapshotId,
-        l0_degree_classes: Option<&[DegreeClass]>,
+        l0_degree_classes: Option<DegreeClassMask>,
     ) -> Result<Vec<EdgeRecord>> {
         let src = signature.src;
         let edge_type = signature.edge_type;
@@ -2048,10 +2248,7 @@ impl Engine {
         );
         if matches!(self.config.l0_layout, L0LayoutPolicy::LsmGraphStyle) {
             if let Some(l0) = guard.version().levels.get(L0 as usize) {
-                updates.extend(
-                    self.get_neighbors_lsmgraph_style(l0, src)
-                        .await?,
-                );
+                updates.extend(self.get_neighbors_lsmgraph_style(l0, src).await?);
             }
         } else if matches!(self.config.l0_layout, L0LayoutPolicy::OracleSemantic) {
             if let Some(l0) = guard.version().levels.get(L0 as usize) {
@@ -2205,8 +2402,7 @@ impl Engine {
         if oracle_file_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let oracle_meta_set: HashSet<FileId> =
-            oracle_file_ids.iter().copied().collect();
+        let oracle_meta_set: HashSet<FileId> = oracle_file_ids.iter().copied().collect();
         let mut results = Vec::new();
         for meta in l0 {
             if !oracle_meta_set.contains(&meta.file_id) {
@@ -2223,7 +2419,9 @@ impl Engine {
                 .fetch_add(1, Ordering::Relaxed);
             let edges: Vec<EdgeRecord> = reader.get_neighbors(meta, src).await?;
             if !edges.is_empty() {
-                self.metrics.matched_l0_segments.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .matched_l0_segments
+                    .fetch_add(1, Ordering::Relaxed);
                 results.extend(edges);
             }
         }
@@ -2643,7 +2841,11 @@ impl Engine {
                 continue;
             }
             for meta in level {
-                for offset in reader.read_offsets(meta).await.unwrap_or_default() {
+                // This index is used as a pruning structure for L1+ lookups; an
+                // incomplete rebuild can skip live segments, so offset IO errors
+                // must be surfaced instead of silently treated as an empty file.
+                let offsets = reader.read_offsets(meta).await?;
+                for offset in offsets.iter() {
                     entries.entry(offset.src).or_default().push(*meta);
                 }
             }
@@ -2655,6 +2857,39 @@ impl Engine {
         Ok(())
     }
 
+    async fn load_or_rebuild_semantic_indexes(&self) -> Result<()> {
+        let guard = self.version_manager.pin_current();
+        let l0_files = guard
+            .version()
+            .levels
+            .get(L0 as usize)
+            .cloned()
+            .unwrap_or_default();
+        let expected_file_ids = degree_directory_sidecar_file_ids(&guard.version().levels);
+        if let Some(degree_directory) =
+            read_degree_directory_sidecar(&self.config.store_dir, &expected_file_ids)?
+        {
+            *self.degree_directory.write() = degree_directory;
+            *self.semantic_l0_index.write() = SemanticL0Index::rebuild(&l0_files);
+            return Ok(());
+        }
+        drop(guard);
+        self.rebuild_semantic_indexes().await
+    }
+
+    fn persist_degree_directory_sidecar_for_current_version(&self) -> Result<()> {
+        let guard = self.version_manager.pin_current();
+        let expected_file_ids = degree_directory_sidecar_file_ids(&guard.version().levels);
+        let directory = self.degree_directory.read();
+        write_degree_directory_sidecar(&self.config.store_dir, &expected_file_ids, &directory)
+    }
+
+    fn persist_degree_directory_sidecar_best_effort(&self) {
+        if let Err(error) = self.persist_degree_directory_sidecar_for_current_version() {
+            eprintln!("[engine] failed to persist degree directory sidecar: {error}");
+        }
+    }
+
     async fn rebuild_semantic_indexes(&self) -> Result<()> {
         let guard = self.version_manager.pin_current();
         let reader = CsrReader::with_metrics_and_cache(
@@ -2663,36 +2898,28 @@ impl Engine {
             self.metrics.clone(),
             self.metadata_cache.clone(),
         );
-        let mut degree_classes: HashMap<(VertexId, EdgeType), HashSet<DegreeClass>> =
-            HashMap::new();
+        let mut degree_directory: HashMap<(VertexId, EdgeType), DegreeClassMask> = HashMap::new();
         if let Some(l0_files) = guard.version().levels.get(L0 as usize) {
             for meta in l0_files {
-                if !meta.summary_completeness.allows_semantic_pruning()
-                    || meta.edge_type_partition == MIXED_EDGE_TYPE
-                {
+                let Some(degree_class) = degree_directory_class_for_l0(meta) else {
                     continue;
-                }
-                let degree_class = if meta.degree_class_exact {
-                    meta.degree_class
-                } else {
-                    DegreeClass::Mixed
                 };
-                for offset in reader.read_offsets(meta).await.unwrap_or_default() {
-                    degree_classes
-                        .entry((offset.src, meta.edge_type_partition))
-                        .or_default()
-                        .insert(degree_class);
+                // A partially built degree directory must be a hard error: degree-hint
+                // routing prunes against it, so silently skipping a tracked exact
+                // segment here could turn an IO error into a missed-edge read (false
+                // negative). Non-exact/Mixed-degree segments deliberately have no
+                // directory entry; the semantic index still reads them conservatively.
+                let offsets = reader.read_offsets(meta).await?;
+                for offset in offsets.iter() {
+                    insert_degree_class_mask(
+                        degree_directory
+                            .entry((offset.src, meta.edge_type_partition))
+                            .or_default(),
+                        degree_class,
+                    );
                 }
             }
         }
-        let degree_directory = degree_classes
-            .into_iter()
-            .map(|(key, classes)| {
-                let mut classes: Vec<_> = classes.into_iter().collect();
-                classes.sort_unstable();
-                (key, classes)
-            })
-            .collect();
         *self.degree_directory.write() = degree_directory;
 
         let l0_files = guard
@@ -2702,6 +2929,7 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         *self.semantic_l0_index.write() = SemanticL0Index::rebuild(&l0_files);
+        self.persist_degree_directory_sidecar_best_effort();
         Ok(())
     }
 
@@ -2712,34 +2940,29 @@ impl Engine {
             self.metrics.clone(),
             self.metadata_cache.clone(),
         );
-        let mut updates: HashMap<(VertexId, EdgeType), HashSet<DegreeClass>> = HashMap::new();
+        let mut updates: HashMap<(VertexId, EdgeType), DegreeClassMask> = HashMap::new();
         for meta in metas {
-            if meta.level != L0
-                || !meta.summary_completeness.allows_semantic_pruning()
-                || meta.edge_type_partition == MIXED_EDGE_TYPE
-            {
+            let Some(degree_class) = degree_directory_class_for_l0(meta) else {
                 continue;
-            }
-            let degree_class = if meta.degree_class_exact {
-                meta.degree_class
-            } else {
-                DegreeClass::Mixed
             };
-            for offset in reader.read_offsets(meta).await.unwrap_or_default() {
-                updates
-                    .entry((offset.src, meta.edge_type_partition))
-                    .or_default()
-                    .insert(degree_class);
+            // Same contract as rebuild_semantic_indexes: never leave the degree
+            // directory silently incomplete for tracked exact segments.
+            let offsets = reader.read_offsets(meta).await?;
+            for offset in offsets.iter() {
+                insert_degree_class_mask(
+                    updates
+                        .entry((offset.src, meta.edge_type_partition))
+                        .or_default(),
+                    degree_class,
+                );
             }
         }
 
-        if !updates.is_empty() {
+        let has_updates = !updates.is_empty();
+        if has_updates {
             let mut directory = self.degree_directory.write();
-            for (key, classes) in updates {
-                let entry = directory.entry(key).or_default();
-                entry.extend(classes);
-                entry.sort_unstable();
-                entry.dedup();
+            for (key, mask) in updates {
+                *directory.entry(key).or_default() |= mask;
             }
         }
 
@@ -2752,6 +2975,9 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         *self.semantic_l0_index.write() = SemanticL0Index::rebuild(&l0_files);
+        if has_updates {
+            self.persist_degree_directory_sidecar_best_effort();
+        }
         Ok(())
     }
 
@@ -2814,15 +3040,20 @@ fn evaluate_budgeted_semantic_edge_type(
     core_edge_weight: f64,
     reverse_core_edge_weight: f64,
     other_edge_weight: f64,
+    feedback_query_weight: Option<f64>,
 ) -> BudgetedEdgeTypeDecision {
     let estimated_exact_files =
         estimate_split_segment_count(group_bytes, target_segment_bytes).max(1);
-    let query_weight = semantic_budget_edge_type_weight(
+    let configured_query_weight = semantic_budget_edge_type_weight(
         edge_type,
         core_edge_weight,
         reverse_core_edge_weight,
         other_edge_weight,
     );
+    let feedback_query_weight = feedback_query_weight
+        .filter(|weight| weight.is_finite() && *weight >= 0.0)
+        .unwrap_or(0.0);
+    let query_weight = configured_query_weight.max(feedback_query_weight);
     let score = query_weight * (group_bytes as f64 / 1024.0) / estimated_exact_files as f64;
 
     if min_partition_bytes == 0 {
@@ -2862,7 +3093,11 @@ fn evaluate_budgeted_semantic_edge_type(
             query_weight,
             score,
             selected: true,
-            reason: "score_gate",
+            reason: if feedback_query_weight > configured_query_weight {
+                "feedback_score_gate"
+            } else {
+                "score_gate"
+            },
         }
     } else {
         BudgetedEdgeTypeDecision {
@@ -2873,6 +3108,23 @@ fn evaluate_budgeted_semantic_edge_type(
             reason: "below_score_gate",
         }
     }
+}
+
+fn semantic_budget_feedback_edge_type_weights(
+    snapshots: &[L0PartitionSnapshot],
+) -> HashMap<(i32, EdgeType), f64> {
+    let mut weights: HashMap<(i32, EdgeType), f64> = HashMap::new();
+    for snapshot in snapshots {
+        if snapshot.query_count == 0 || snapshot.key.edge_type == MIXED_EDGE_TYPE {
+            continue;
+        }
+        let candidate_pressure = snapshot.avg_candidate_segments.max(1.0);
+        let weight = (snapshot.query_count as f64 * candidate_pressure).min(1_000_000.0);
+        *weights
+            .entry((snapshot.key.src_label, snapshot.key.edge_type))
+            .or_default() += weight;
+    }
+    weights
 }
 
 fn apply_budgeted_semantic_edge_type_file_budget(
@@ -2944,11 +3196,21 @@ fn initial_semantic_budget_used_extra_l0_files(
     if max_extra_l0_files.is_none() {
         return 0;
     }
+    // Flush-time accounting (apply_budgeted_semantic_edge_type_file_budget) only
+    // charges the budget for groups promoted to exact degree partitions; unselected
+    // groups still keep their real edge_type with degree merged to Mixed, at zero
+    // cost. Reopen must mirror that: counting every non-MIXED file here (the old
+    // behavior) charged thousands of schema-style files against budgets of ~64 and
+    // permanently exhausted them after a restart.
     levels
         .get(L0 as usize)
         .map(|l0| {
             l0.iter()
-                .filter(|meta| meta.edge_type_partition != MIXED_EDGE_TYPE)
+                .filter(|meta| {
+                    meta.edge_type_partition != MIXED_EDGE_TYPE
+                        && meta.degree_class_exact
+                        && !matches!(meta.degree_class, DegreeClass::Mixed | DegreeClass::Unknown)
+                })
                 .count()
         })
         .unwrap_or(0)
@@ -3467,8 +3729,104 @@ mod tests {
             avg_degree_x100: 100,
             max_degree: 1,
             segment_bytes: 1,
+            source_bloom_offset: 0,
+            source_bloom_len: 0,
+            source_bloom_bit_count: 0,
             max_ts: 1,
         }
+    }
+
+    fn assert_degree_class_candidates(mask: DegreeClassMask, expected: &[DegreeClass]) {
+        let actual: BTreeSet<_> = degree_classes_that_may_contain_query_mask(mask)
+            .into_iter()
+            .collect();
+        let expected: BTreeSet<_> = expected.iter().copied().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn degree_class_mask_preserves_query_candidate_semantics() {
+        assert_degree_class_candidates(
+            degree_class_mask(DegreeClass::Low),
+            &[DegreeClass::Low, DegreeClass::Mixed, DegreeClass::Unknown],
+        );
+        assert_degree_class_candidates(
+            degree_class_mask(DegreeClass::Medium),
+            &[
+                DegreeClass::Low,
+                DegreeClass::Medium,
+                DegreeClass::Mixed,
+                DegreeClass::Unknown,
+            ],
+        );
+        assert_degree_class_candidates(
+            degree_class_mask(DegreeClass::High),
+            &[
+                DegreeClass::Low,
+                DegreeClass::Medium,
+                DegreeClass::High,
+                DegreeClass::Mixed,
+                DegreeClass::Unknown,
+            ],
+        );
+
+        let mut mask = 0;
+        insert_degree_class_mask(&mut mask, DegreeClass::Medium);
+        insert_degree_class_mask(&mut mask, DegreeClass::Medium);
+        assert_eq!(degree_class_mask_count(mask), 1);
+
+        insert_degree_class_mask(&mut mask, DegreeClass::High);
+        assert_eq!(degree_class_mask_count(mask), 2);
+        assert_degree_class_candidates(
+            mask,
+            &[
+                DegreeClass::Low,
+                DegreeClass::Medium,
+                DegreeClass::High,
+                DegreeClass::Mixed,
+                DegreeClass::Unknown,
+            ],
+        );
+    }
+
+    #[test]
+    fn degree_directory_sidecar_round_trips_and_rejects_stale_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        fs::create_dir_all(&root).unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("degree-directory-sidecar-")
+            .tempdir_in(root)
+            .unwrap();
+
+        let file_ids = vec![11, 12];
+        let mut mask = 0;
+        insert_degree_class_mask(&mut mask, DegreeClass::Low);
+        insert_degree_class_mask(&mut mask, DegreeClass::High);
+        let mut directory = HashMap::new();
+        directory.insert((42, 7), mask);
+
+        write_degree_directory_sidecar(tmp.path(), &file_ids, &directory).unwrap();
+        let loaded = read_degree_directory_sidecar(tmp.path(), &file_ids)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.get(&(42, 7)), Some(&mask));
+
+        assert!(
+            read_degree_directory_sidecar(tmp.path(), &[11])
+                .unwrap()
+                .is_none(),
+            "sidecar must be ignored when the tracked L0 file set is stale"
+        );
+
+        fs::write(degree_directory_sidecar_path(tmp.path()), b"not-a-sidecar").unwrap();
+        assert!(
+            read_degree_directory_sidecar(tmp.path(), &file_ids)
+                .unwrap()
+                .is_none(),
+            "corrupt sidecar should fall back to rebuild"
+        );
     }
 
     #[test]
@@ -3480,8 +3838,10 @@ mod tests {
         let index = SemanticL0Index::rebuild(&[mixed_low, exact_medium]);
         let signature = GraphAccessSignature::neighbor_scan(src, Some(edge_type));
 
-        let candidates =
-            index.candidates_with_degree_classes(&signature, Some(&[DegreeClass::Medium]));
+        let candidates = index.candidates_with_degree_classes(
+            &signature,
+            Some(degree_class_mask(DegreeClass::Medium)),
+        );
         let file_ids: Vec<_> = candidates.iter().map(|meta| meta.file_id).collect();
 
         assert!(
@@ -3489,6 +3849,111 @@ mod tests {
             "mixed low-degree segments can still contain edges for a medium global query"
         );
         assert!(file_ids.contains(&exact_medium.file_id));
+    }
+
+    #[test]
+    fn degree_directory_tracks_only_exact_degree_l0_semantic_files() {
+        let exact_low = test_meta(1, 7, DegreeClass::Low, true);
+        assert_eq!(
+            degree_directory_class_for_l0(&exact_low),
+            Some(DegreeClass::Low)
+        );
+
+        let schema_style = test_meta(2, 7, DegreeClass::Mixed, false);
+        assert_eq!(degree_directory_class_for_l0(&schema_style), None);
+
+        let mixed_edge_type = test_meta(3, MIXED_EDGE_TYPE, DegreeClass::Low, true);
+        assert_eq!(degree_directory_class_for_l0(&mixed_edge_type), None);
+
+        let exact_flag_but_mixed_class = test_meta(4, 7, DegreeClass::Mixed, true);
+        assert_eq!(
+            degree_directory_class_for_l0(&exact_flag_but_mixed_class),
+            None
+        );
+
+        let mut l1_exact = test_meta(5, 7, DegreeClass::Low, true);
+        l1_exact.level = L1;
+        assert_eq!(degree_directory_class_for_l0(&l1_exact), None);
+
+        let mut legacy_unknown = test_meta(6, 7, DegreeClass::Low, true);
+        legacy_unknown.summary_completeness = crate::schema::SemanticSummaryCompleteness::Unknown;
+        assert_eq!(degree_directory_class_for_l0(&legacy_unknown), None);
+    }
+
+    #[test]
+    fn missing_degree_directory_override_still_reads_schema_style_mixed_segments() {
+        let src = 360287970189640353;
+        let edge_type = 7;
+        let schema_style = test_meta(1, edge_type, DegreeClass::Mixed, false);
+        let exact_medium = test_meta(2, edge_type, DegreeClass::Medium, true);
+        let index = SemanticL0Index::rebuild(&[schema_style, exact_medium]);
+        let signature = GraphAccessSignature::neighbor_scan(src, Some(edge_type))
+            .with_degree_class(DegreeClass::Low);
+
+        let candidates = index.candidates_with_degree_classes(&signature, None);
+        let file_ids: Vec<_> = candidates.iter().map(|meta| meta.file_id).collect();
+
+        assert!(
+            file_ids.contains(&schema_style.file_id),
+            "schema-style degree-mixed segments remain conservative candidates without a directory entry"
+        );
+        assert!(
+            !file_ids.contains(&exact_medium.file_id),
+            "exact medium partitions can still be pruned for an explicit low-degree query"
+        );
+    }
+
+    #[test]
+    fn initial_budget_only_counts_exact_degree_partitions() {
+        // schema-style files (real edge type, degree merged to Mixed) are free at
+        // flush time, so reopen must not charge them against the budget.
+        let exact_low = test_meta(1, 7, DegreeClass::Low, true);
+        let schema_style = test_meta(2, 7, DegreeClass::Mixed, false);
+        let mixed_type = test_meta(3, MIXED_EDGE_TYPE, DegreeClass::Low, true);
+        let exact_flag_but_mixed_class = test_meta(4, 7, DegreeClass::Mixed, true);
+        let levels = vec![vec![
+            exact_low,
+            schema_style,
+            mixed_type,
+            exact_flag_but_mixed_class,
+        ]];
+
+        assert_eq!(
+            initial_semantic_budget_used_extra_l0_files(&levels, Some(64)),
+            1
+        );
+        assert_eq!(
+            initial_semantic_budget_used_extra_l0_files(&levels, None),
+            0
+        );
+    }
+
+    #[test]
+    fn oracle_build_from_edges_requires_range_and_type_not_just_label() {
+        // Regression for the old `a && b && c || d` precedence bug: a segment
+        // whose src_label matched was indexed even when the edge was outside its
+        // src range or edge-type partition.
+        let src = 360287970189640353u64; // label 5, inside test_meta's src range
+        let in_range_t7 = test_meta(1, 7, DegreeClass::Mixed, false);
+        let mut out_of_range_t7 = test_meta(2, 7, DegreeClass::Mixed, false);
+        out_of_range_t7.min_src = src + 100_000;
+        out_of_range_t7.max_src = src + 200_000;
+        let in_range_t9 = test_meta(3, 9, DegreeClass::Mixed, false);
+        let in_range_mixed_type = test_meta(4, MIXED_EDGE_TYPE, DegreeClass::Mixed, false);
+
+        let edge = EdgeRecord::insert(src, 42, 7, 1);
+        let index = OracleL0Index::build_from_edges(
+            &[edge],
+            &[
+                in_range_t7,
+                out_of_range_t7,
+                in_range_t9,
+                in_range_mixed_type,
+            ],
+        );
+
+        assert_eq!(index.get(src, Some(7)), vec![1, 4]);
+        assert!(index.get(src, Some(9)).is_empty());
     }
 
     #[test]

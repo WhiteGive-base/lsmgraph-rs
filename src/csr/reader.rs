@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::csr::cache::{CachedCsrMetadata, CsrMetadataCache};
+use crate::csr::cache::{CachedCsrMetadata, CsrMetadataCache, SourceBloom};
 use crate::csr::format::{
     CsrHeader, CsrSegmentMeta, DiskEdgeBody, DiskPropertyListHeader, DiskPropertyValueIndexEntry,
     EdgeOffset, CSR_HEADER_LEN, DISK_EDGE_BODY_LEN, DISK_PROPERTY_LIST_HEADER_LEN,
@@ -206,27 +206,16 @@ impl<B: IoBackend> CsrReader<B> {
             self.record_csr_get_neighbors(started);
             return Ok(Vec::new());
         }
-        let metadata = self.metadata_for(meta).await?;
-        let offset = find_offset_in_offsets(&metadata.offsets, src);
-        let Some(offset) = offset else {
-            if metadata.may_contain_src(src) {
-                if let Some(metrics) = &self.metrics {
-                    metrics
-                        .l0_bloom_false_positive_probes
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            } else if let Some(metrics) = &self.metrics {
-                metrics
-                    .bloom_filtered_segments
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+        let lookup = self.lookup_offset(meta, src).await?;
+        let Some(offset) = lookup.offset else {
+            self.record_absent_offset_probe(lookup.cached_may_contain_src);
             self.record_csr_get_neighbors(started);
             return Ok(Vec::new());
         };
 
         let path = self.path_for(meta);
         let body_offset =
-            metadata.header.bodies_offset + offset.first_edge_idx * DISK_EDGE_BODY_LEN as u64;
+            lookup.header.bodies_offset + offset.first_edge_idx * DISK_EDGE_BODY_LEN as u64;
         let body_len = offset.edge_count as usize * DISK_EDGE_BODY_LEN;
         let bodies = self.backend.read_at(&path, body_offset, body_len).await?;
         self.record_body_read(bodies.len());
@@ -248,27 +237,16 @@ impl<B: IoBackend> CsrReader<B> {
             self.record_csr_get_neighbors(started);
             return Ok(Vec::new());
         }
-        let metadata = self.metadata_for(meta).await?;
-        let offset = find_offset_in_offsets(&metadata.offsets, src);
-        let Some(offset) = offset else {
-            if metadata.may_contain_src(src) {
-                if let Some(metrics) = &self.metrics {
-                    metrics
-                        .l0_bloom_false_positive_probes
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            } else if let Some(metrics) = &self.metrics {
-                metrics
-                    .bloom_filtered_segments
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+        let lookup = self.lookup_offset(meta, src).await?;
+        let Some(offset) = lookup.offset else {
+            self.record_absent_offset_probe(lookup.cached_may_contain_src);
             self.record_csr_get_neighbors(started);
             return Ok(Vec::new());
         };
 
         let path = self.path_for(meta);
         let body_offset =
-            metadata.header.bodies_offset + offset.first_edge_idx * DISK_EDGE_BODY_LEN as u64;
+            lookup.header.bodies_offset + offset.first_edge_idx * DISK_EDGE_BODY_LEN as u64;
         let body_len = offset.edge_count as usize * DISK_EDGE_BODY_LEN;
         let bodies = self.backend.read_at(&path, body_offset, body_len).await?;
         self.record_body_read(bodies.len());
@@ -357,7 +335,7 @@ impl<B: IoBackend> CsrReader<B> {
             metrics.csr_full_scan_reads.fetch_add(1, Ordering::Relaxed);
         }
         let mut out = Vec::with_capacity(metadata.header.edge_body_count as usize);
-        for offset in &metadata.offsets {
+        for offset in metadata.offsets.iter() {
             let start = offset.first_edge_idx as usize * DISK_EDGE_BODY_LEN;
             let end = start + offset.edge_count as usize * DISK_EDGE_BODY_LEN;
             for body_chunk in bodies[start..end].chunks_exact(DISK_EDGE_BODY_LEN) {
@@ -397,7 +375,7 @@ impl<B: IoBackend> CsrReader<B> {
             metrics.csr_full_scan_reads.fetch_add(1, Ordering::Relaxed);
         }
         let mut out = Vec::with_capacity(metadata.header.edge_body_count as usize);
-        for offset in &metadata.offsets {
+        for offset in metadata.offsets.iter() {
             let start = offset.first_edge_idx as usize * DISK_EDGE_BODY_LEN;
             let end = start + offset.edge_count as usize * DISK_EDGE_BODY_LEN;
             for body_chunk in bodies[start..end].chunks_exact(DISK_EDGE_BODY_LEN) {
@@ -420,7 +398,7 @@ impl<B: IoBackend> CsrReader<B> {
         Ok(out)
     }
 
-    pub async fn read_offsets(&self, meta: &CsrSegmentMeta) -> Result<Vec<EdgeOffset>> {
+    pub async fn read_offsets(&self, meta: &CsrSegmentMeta) -> Result<Arc<[EdgeOffset]>> {
         let started = Instant::now();
         let metadata = self.metadata_for(meta).await?;
         self.record_csr_read_offsets(started);
@@ -429,6 +407,47 @@ impl<B: IoBackend> CsrReader<B> {
 
     fn path_for(&self, meta: &CsrSegmentMeta) -> PathBuf {
         self.store_dir.join(meta.relative_path())
+    }
+
+    async fn lookup_offset(&self, meta: &CsrSegmentMeta, src: VertexId) -> Result<CsrOffsetLookup> {
+        if let Some(cache) = &self.cache {
+            if let Some(metadata) = cache.get(meta.file_id) {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .csr_offset_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(CsrOffsetLookup {
+                    header: metadata.header,
+                    offset: find_offset_in_offsets(&metadata.offsets, src),
+                    cached_may_contain_src: Some(metadata.may_contain_src(src)),
+                });
+            }
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .csr_offset_cache_misses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let path = self.path_for(meta);
+        let header = self.read_header_from_disk(&path).await?;
+        let source_bloom_may_contain = self
+            .read_source_bloom_may_contain_src(meta, &path, src)
+            .await?;
+        if matches!(source_bloom_may_contain, Some(false)) {
+            return Ok(CsrOffsetLookup {
+                header,
+                offset: None,
+                cached_may_contain_src: Some(false),
+            });
+        }
+        let offset = self.find_offset_on_disk(&path, &header, src).await?;
+        Ok(CsrOffsetLookup {
+            header,
+            offset,
+            cached_may_contain_src: source_bloom_may_contain,
+        })
     }
 
     async fn metadata_for(&self, meta: &CsrSegmentMeta) -> Result<Arc<CachedCsrMetadata>> {
@@ -498,9 +517,7 @@ impl<B: IoBackend> CsrReader<B> {
 
     async fn read_metadata_from_disk(&self, meta: &CsrSegmentMeta) -> Result<CachedCsrMetadata> {
         let path = self.path_for(meta);
-        let header_bytes = self.backend.read_at(&path, 0, CSR_HEADER_LEN).await?;
-        self.record_header_read(header_bytes.len());
-        let header = CsrHeader::decode(&header_bytes)?;
+        let header = self.read_header_from_disk(&path).await?;
         let offsets_bytes = self
             .backend
             .read_at(&path, header.offsets_offset, header.offsets_len as usize)
@@ -511,6 +528,114 @@ impl<B: IoBackend> CsrReader<B> {
             .map(EdgeOffset::decode)
             .collect();
         Ok(CachedCsrMetadata::new(header, offsets))
+    }
+
+    async fn read_header_from_disk(&self, path: &Path) -> Result<CsrHeader> {
+        let header_bytes = self.backend.read_at(path, 0, CSR_HEADER_LEN).await?;
+        self.record_header_read(header_bytes.len());
+        CsrHeader::decode(&header_bytes)
+    }
+
+    async fn read_source_bloom_may_contain_src(
+        &self,
+        meta: &CsrSegmentMeta,
+        path: &Path,
+        src: VertexId,
+    ) -> Result<Option<bool>> {
+        if !meta.has_source_bloom_section() {
+            return Ok(None);
+        }
+        let bloom_len = checked_usize(meta.source_bloom_len, "source_bloom_len")?;
+        let bloom_bytes = self
+            .backend
+            .read_at(path, meta.source_bloom_offset, bloom_len)
+            .await?;
+        if bloom_bytes.len() != bloom_len {
+            anyhow::bail!(
+                "CSR SourceBloom read was short: expected {} bytes, got {}",
+                bloom_len,
+                bloom_bytes.len()
+            );
+        }
+        self.record_offset_read(bloom_bytes.len());
+        let bloom = SourceBloom::from_words(meta.source_bloom_bit_count, &bloom_bytes)?;
+        Ok(Some(bloom.may_contain(src)))
+    }
+
+    async fn find_offset_on_disk(
+        &self,
+        path: &Path,
+        header: &CsrHeader,
+        src: VertexId,
+    ) -> Result<Option<EdgeOffset>> {
+        let count = checked_usize(header.edge_offset_count, "edge_offset_count")?;
+        let offsets_len = checked_usize(header.offsets_len, "offsets_len")?;
+        let expected_offsets_len = count
+            .checked_mul(EDGE_OFFSET_LEN)
+            .ok_or_else(|| anyhow::anyhow!("CSR offset section byte length overflow"))?;
+        if expected_offsets_len > offsets_len {
+            anyhow::bail!(
+                "CSR offset section too short: expected at least {} bytes for {} offsets, got {}",
+                expected_offsets_len,
+                count,
+                offsets_len
+            );
+        }
+
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let mid_bytes = mid
+                .checked_mul(EDGE_OFFSET_LEN)
+                .ok_or_else(|| anyhow::anyhow!("CSR offset lookup byte offset overflow"))?;
+            let disk_offset = header
+                .offsets_offset
+                .checked_add(mid_bytes as u64)
+                .ok_or_else(|| anyhow::anyhow!("CSR offset lookup disk offset overflow"))?;
+            let bytes = self
+                .backend
+                .read_at(path, disk_offset, EDGE_OFFSET_LEN)
+                .await?;
+            if bytes.len() != EDGE_OFFSET_LEN {
+                anyhow::bail!(
+                    "CSR offset lookup read was short: expected {} bytes, got {}",
+                    EDGE_OFFSET_LEN,
+                    bytes.len()
+                );
+            }
+            self.record_offset_read(bytes.len());
+            let offset = EdgeOffset::decode(&bytes);
+            if offset.src == src {
+                return Ok(Some(offset));
+            }
+            if offset.src < src {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(None)
+    }
+
+    fn record_absent_offset_probe(&self, cached_may_contain_src: Option<bool>) {
+        match cached_may_contain_src {
+            Some(true) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .l0_bloom_false_positive_probes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Some(false) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .bloom_filtered_segments
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            None => {}
+        }
     }
 
     fn record_header_read(&self, bytes: usize) {
@@ -557,6 +682,12 @@ impl<B: IoBackend> CsrReader<B> {
             metrics.csr_read_offsets_latency.record_since(started);
         }
     }
+}
+
+struct CsrOffsetLookup {
+    header: CsrHeader,
+    offset: Option<EdgeOffset>,
+    cached_may_contain_src: Option<bool>,
 }
 
 struct CsrPropertySections {
@@ -692,6 +823,102 @@ mod tests {
 
     fn backend() -> Arc<BlockingPreadBackend> {
         Arc::new(BlockingPreadBackend::new(8, Arc::new(Metrics::default())))
+    }
+
+    #[tokio::test]
+    async fn get_neighbors_cache_miss_reads_precise_offset_without_full_offset_array() -> Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let backend = backend();
+        let writer = CsrWriter::new(backend.clone(), tmp.path(), 12);
+        let edges = (0..64u64)
+            .map(|idx| EdgeRecord::insert(person_vid(idx), person_vid(1_000 + idx), 2, 10 + idx))
+            .collect();
+        let meta = writer.write_segment(0, 30, edges).await?;
+
+        let metrics = Arc::new(Metrics::default());
+        let reader = CsrReader::with_metrics(backend, tmp.path(), metrics.clone());
+        let rows = reader.get_neighbors(&meta, person_vid(32)).await?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].dst, person_vid(1_032));
+        let snapshot = metrics.snapshot_json();
+        let offset_bytes = snapshot["csr"]["offset_bytes"].as_u64().unwrap_or_default();
+        let full_offset_bytes = meta.unique_src_count * EDGE_OFFSET_LEN as u64;
+        assert!(
+            offset_bytes < full_offset_bytes,
+            "cache-miss neighbor lookup should binary-read offsets, got {offset_bytes} bytes vs full {full_offset_bytes}"
+        );
+        assert_eq!(
+            snapshot["csr"]["body_bytes"].as_u64().unwrap_or_default(),
+            DISK_EDGE_BODY_LEN as u64
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persisted_source_bloom_filters_absent_src_before_offset_search() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let backend = backend();
+        let writer = CsrWriter::new(backend.clone(), tmp.path(), 12);
+        let present_sources: Vec<_> = (0..64u64).map(|idx| person_vid(idx * 2)).collect();
+        let edges = present_sources
+            .iter()
+            .enumerate()
+            .map(|(idx, src)| EdgeRecord::insert(*src, person_vid(10_000 + idx as u64), 2, 10))
+            .collect();
+        let meta = writer.write_segment(0, 31, edges).await?;
+        assert!(meta.has_source_bloom_section());
+
+        let bloom = SourceBloom::from_sources(present_sources.iter().copied());
+        let absent_src = (0..64u64)
+            .map(|idx| person_vid(idx * 2 + 1))
+            .find(|src| !bloom.may_contain(*src))
+            .expect("test data should have at least one Bloom-negative absent source");
+
+        let metrics = Arc::new(Metrics::default());
+        let reader = CsrReader::with_metrics(backend, tmp.path(), metrics.clone());
+        let rows = reader.get_neighbors(&meta, absent_src).await?;
+
+        assert!(rows.is_empty());
+        let snapshot = metrics.snapshot_json();
+        assert_eq!(
+            snapshot["csr"]["offset_bytes"].as_u64().unwrap_or_default(),
+            meta.source_bloom_len,
+            "Bloom-negative source should avoid all offset-section binary-search reads"
+        );
+        assert_eq!(
+            snapshot["csr"]["body_reads"].as_u64().unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            snapshot["csr"]["bloom_filtered_segments"]
+                .as_u64()
+                .unwrap_or_default(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_offsets_reuses_cached_arc_without_cloning_offset_vec() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let backend = backend();
+        let writer = CsrWriter::new(backend.clone(), tmp.path(), 12);
+        let edges = (0..8u64)
+            .map(|idx| EdgeRecord::insert(person_vid(idx), person_vid(100 + idx), 2, idx + 1))
+            .collect();
+        let meta = writer.write_segment(0, 32, edges).await?;
+
+        let metrics = Arc::new(Metrics::default());
+        let cache = Arc::new(CsrMetadataCache::new(8));
+        let reader = CsrReader::with_metrics_and_cache(backend, tmp.path(), metrics, cache);
+        let first = reader.read_offsets(&meta).await?;
+        let second = reader.read_offsets(&meta).await?;
+
+        assert_eq!(first.len(), meta.unique_src_count as usize);
+        assert!(Arc::ptr_eq(&first, &second));
+        Ok(())
     }
 
     #[tokio::test]
