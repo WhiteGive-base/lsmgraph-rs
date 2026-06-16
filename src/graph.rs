@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -347,6 +347,42 @@ fn degree_directory_sidecar_file_ids(levels: &[Vec<CsrSegmentMeta>]) -> Vec<File
     file_ids
 }
 
+/// Emit a single line breaking down `Engine::open` into its phases. Gated behind
+/// `LSMGRAPH_LOG_OPEN_PHASES=1` so that `cargo test` (which opens many engines) stays quiet;
+/// the SF30/SF100 bench runners set it to confirm whether compare timeout is dominated by
+/// manifest/index/semantic-index initialization rather than by the queries themselves.
+fn log_open_phase_timings(
+    store_dir: &Path,
+    manifest_load: Duration,
+    schema_load: Duration,
+    rebuild_index: Duration,
+    semantic_index: Duration,
+    semantic_index_skipped: bool,
+    total_open: Duration,
+) {
+    let enabled = std::env::var("LSMGRAPH_LOG_OPEN_PHASES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    eprintln!(
+        "[engine] open phases store={} manifest_load_s={:.3} schema_load_s={:.3} \
+rebuild_index_s={:.3} semantic_index_s={:.3}{} total_open_s={:.3}",
+        store_dir.display(),
+        manifest_load.as_secs_f64(),
+        schema_load.as_secs_f64(),
+        rebuild_index.as_secs_f64(),
+        semantic_index.as_secs_f64(),
+        if semantic_index_skipped {
+            " (skipped)"
+        } else {
+            ""
+        },
+        total_open.as_secs_f64(),
+    );
+}
+
 fn read_degree_directory_sidecar(
     store_dir: &Path,
     expected_file_ids: &[FileId],
@@ -369,20 +405,25 @@ fn read_degree_directory_sidecar_inner(
     path: &Path,
     expected_file_ids: &[FileId],
 ) -> Result<Option<HashMap<(VertexId, EdgeType), DegreeClassMask>>> {
-    let mut file = File::open(path)?;
+    // The sidecar is read field-by-field (read_u64_le/read_i32_le/read_u8); at SF1 this is ~11M
+    // entries x 3 reads. A raw File would issue one syscall per field (~33M), which dominated
+    // Engine::open (measured ~75s on SF1, surfaced by the open-phase timing log). Wrap it in a
+    // BufReader so the parse becomes a handful of sequential block reads. The write path already
+    // uses BufWriter; this mirrors it.
+    let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 8];
-    file.read_exact(&mut magic)?;
+    reader.read_exact(&mut magic)?;
     if &magic != DEGREE_DIRECTORY_SIDECAR_MAGIC {
         return Ok(None);
     }
 
-    let file_count = read_u64_le(&mut file)?;
-    let entry_count = read_u64_le(&mut file)?;
+    let file_count = read_u64_le(&mut reader)?;
+    let entry_count = read_u64_le(&mut reader)?;
     if usize::try_from(file_count).ok() != Some(expected_file_ids.len()) {
         return Ok(None);
     }
     for expected_file_id in expected_file_ids {
-        if read_u64_le(&mut file)? != *expected_file_id {
+        if read_u64_le(&mut reader)? != *expected_file_id {
             return Ok(None);
         }
     }
@@ -391,9 +432,9 @@ fn read_degree_directory_sidecar_inner(
         .map_err(|_| anyhow::anyhow!("degree directory sidecar entry_count is too large"))?;
     let mut directory = HashMap::with_capacity(capacity);
     for _ in 0..entry_count {
-        let src = read_u64_le(&mut file)?;
-        let edge_type = read_i32_le(&mut file)?;
-        let mask = read_u8(&mut file)?;
+        let src = read_u64_le(&mut reader)?;
+        let edge_type = read_i32_le(&mut reader)?;
+        let mask = read_u8(&mut reader)?;
         if mask == 0 || mask & !DEGREE_DIRECTORY_VALID_MASK != 0 {
             return Ok(None);
         }
@@ -410,8 +451,7 @@ fn write_degree_directory_sidecar(
     fs::create_dir_all(store_dir)?;
     let tmp_path = degree_directory_sidecar_tmp_path(store_dir);
     let path = degree_directory_sidecar_path(store_dir);
-    let mut entries: Vec<_> = directory.iter().filter(|(_, mask)| **mask != 0).collect();
-    entries.sort_by_key(|((src, edge_type), _)| (*src, *edge_type));
+    let entry_count = directory.values().filter(|mask| **mask != 0).count();
 
     let file = OpenOptions::new()
         .create(true)
@@ -421,11 +461,11 @@ fn write_degree_directory_sidecar(
     let mut writer = BufWriter::new(file);
     writer.write_all(DEGREE_DIRECTORY_SIDECAR_MAGIC)?;
     write_u64_le(&mut writer, expected_file_ids.len() as u64)?;
-    write_u64_le(&mut writer, entries.len() as u64)?;
+    write_u64_le(&mut writer, entry_count as u64)?;
     for file_id in expected_file_ids {
         write_u64_le(&mut writer, *file_id)?;
     }
-    for ((src, edge_type), mask) in entries {
+    for ((src, edge_type), mask) in directory.iter().filter(|(_, mask)| **mask != 0) {
         write_u64_le(&mut writer, *src)?;
         write_i32_le(&mut writer, *edge_type)?;
         write_u8(&mut writer, *mask)?;
@@ -718,6 +758,7 @@ impl Engine {
     }
 
     async fn open_inner(config: LsmGraphConfig, fresh: bool) -> Result<Arc<Self>> {
+        let open_started = Instant::now();
         let metrics = Arc::new(Metrics::default());
         let backend = Arc::new(AnyIoBackend::new(
             config.io_backend,
@@ -725,6 +766,7 @@ impl Engine {
             metrics.clone(),
         )?);
         let manifest = Manifest::new(&config.store_dir);
+        let manifest_load_started = Instant::now();
         let manifest_state = if fresh {
             crate::csr::manifest::ManifestState {
                 live_files: Vec::new(),
@@ -734,8 +776,11 @@ impl Engine {
         } else {
             manifest.load()?
         };
+        let manifest_load_elapsed = manifest_load_started.elapsed();
+        let schema_started = Instant::now();
         let schema_catalog =
             load_or_initialize_schema_catalog(&config.store_dir, fresh, config.schema_epoch)?;
+        let schema_load_elapsed = schema_started.elapsed();
 
         let active = Arc::new(MemGraph::new(
             config.memgraph_capacity_bytes,
@@ -776,20 +821,33 @@ impl Engine {
             oracle_l0_index: RwLock::new(OracleL0Index::default()),
             schema_catalog: RwLock::new(schema_catalog),
         });
+        let rebuild_index_started = Instant::now();
         engine.rebuild_index().await?;
+        let rebuild_index_elapsed = rebuild_index_started.elapsed();
         // rebuild_semantic_indexes is O(edges) (reads all L0 offsets -> per-(src,edge_type)
         // degree map, ~260GB at SF100). The plan-gen pass only needs scan_edges to write the
         // sample plan and never consults these indexes, so SNB_SKIP_SEM_INDEX=1 skips them to
         // avoid OOM when scan_edges + the index build would otherwise coexist. Real measurement
         // reads (--sample-plan-in, no scan) leave it unset so pruning stays correct.
-        if std::env::var("SNB_SKIP_SEM_INDEX")
+        let semantic_index_started = Instant::now();
+        let semantic_index_skipped = std::env::var("SNB_SKIP_SEM_INDEX")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if semantic_index_skipped {
             eprintln!("[engine] SKIP rebuild_semantic_indexes (SNB_SKIP_SEM_INDEX set)");
         } else {
             engine.load_or_rebuild_semantic_indexes().await?;
         }
+        let semantic_index_elapsed = semantic_index_started.elapsed();
+        log_open_phase_timings(
+            &engine.config.store_dir,
+            manifest_load_elapsed,
+            schema_load_elapsed,
+            rebuild_index_elapsed,
+            semantic_index_elapsed,
+            semantic_index_skipped,
+            open_started.elapsed(),
+        );
         Ok(engine)
     }
 
@@ -2409,7 +2467,13 @@ impl Engine {
                 &fallback_l0
             };
             for meta in candidate_l0 {
-                if !meta.may_contain_signature(&signature) {
+                let decision = meta.signature_pruning_decision(&signature);
+                self.metrics.record_signature_pruning_decision(
+                    decision.reason,
+                    decision.pruned,
+                    meta.segment_bytes,
+                );
+                if decision.pruned {
                     continue;
                 }
                 let partition_key = self.l0_partition_key(src, edge_type, meta);
@@ -2455,7 +2519,7 @@ impl Engine {
                     .filter_passed_segments
                     .fetch_add(1, Ordering::Relaxed);
                 partition_probe.filter_passed_segments = 1;
-                let edges = retain_edges_for_property_predicate(
+                let edges = retain_edges_for_signature(
                     meta,
                     &signature,
                     reader.get_neighbors(meta, src).await?,
@@ -2475,10 +2539,16 @@ impl Engine {
             }
         }
         for meta in self.index.get_positions(src) {
-            if !meta.may_contain_signature(&signature) {
+            let decision = meta.signature_pruning_decision(&signature);
+            self.metrics.record_signature_pruning_decision(
+                decision.reason,
+                decision.pruned,
+                meta.segment_bytes,
+            );
+            if decision.pruned {
                 continue;
             }
-            updates.extend(retain_edges_for_property_predicate(
+            updates.extend(retain_edges_for_signature(
                 &meta,
                 &signature,
                 reader.get_neighbors(&meta, src).await?,
@@ -2488,6 +2558,7 @@ impl Engine {
         if let Some(edge_type) = edge_type {
             updates.retain(|edge| edge.edge_type == edge_type);
         }
+        updates = retain_edges_for_dst_label(&signature, updates);
         let out = merge_visible(updates, snapshot);
         self.metrics
             .storage_get_neighbors_latency
@@ -3714,6 +3785,28 @@ fn retain_edges_for_property_predicate(
     }
 }
 
+fn retain_edges_for_signature(
+    meta: &CsrSegmentMeta,
+    signature: &GraphAccessSignature,
+    edges: Vec<EdgeRecord>,
+) -> Vec<EdgeRecord> {
+    let edges = retain_edges_for_property_predicate(meta, signature, edges);
+    retain_edges_for_dst_label(signature, edges)
+}
+
+fn retain_edges_for_dst_label(
+    signature: &GraphAccessSignature,
+    edges: Vec<EdgeRecord>,
+) -> Vec<EdgeRecord> {
+    let Some(dst_label) = signature.dst_label else {
+        return edges;
+    };
+    edges
+        .into_iter()
+        .filter(|edge| source_label_from_vertex_id(edge.dst) == dst_label)
+        .collect()
+}
+
 fn merge_latest_records(
     mut updates: Vec<EdgeRecord>,
     snapshot: SnapshotId,
@@ -3896,6 +3989,21 @@ mod tests {
             .collect();
         let expected: BTreeSet<_> = expected.iter().copied().collect();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn dst_label_signature_filters_returned_edges() {
+        let dst_label_3 = (3u64 << 56) | 11;
+        let dst_label_4 = (4u64 << 56) | 12;
+        let signature =
+            GraphAccessSignature::neighbor_scan((5u64 << 56) | 1, Some(7)).with_dst_label(3);
+
+        let filtered = retain_edges_for_dst_label(
+            &signature,
+            vec![insert(dst_label_3, 1), insert(dst_label_4, 1)],
+        );
+
+        assert_eq!(filtered, vec![insert(dst_label_3, 1)]);
     }
 
     #[test]

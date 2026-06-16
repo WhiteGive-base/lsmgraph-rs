@@ -15,7 +15,7 @@ use lsmgraph::snb::{
     import_snb_full, import_snb_updates, rebuild_snb_edge_props, start_dgs_compatible_server,
     validate_ic1_ic14_dynamic, validate_ic_batch_dynamic, validate_mixed_tugraph_dynamic, SnbGraph,
 };
-use lsmgraph::types::{EdgeMarker, UNKNOWN_SOURCE_LABEL};
+use lsmgraph::types::{source_label_from_vertex_id, EdgeMarker, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
     DegreeClass, DynamicGraphView, EdgeRecord, GraphAccessSignature, NewPropertyEntry,
     PropertyOwner, PropertyValue,
@@ -321,8 +321,19 @@ enum Command {
         edge_type: Option<i32>,
         #[arg(long, value_delimiter = ',')]
         edge_types: Vec<i32>,
+        #[arg(long)]
+        src_label: Option<i32>,
+        #[arg(long)]
+        dst_label: Option<i32>,
         #[arg(long, default_value_t = false)]
         semantic_degree_hint: bool,
+        #[arg(long, default_value_t = false)]
+        force_signature: bool,
+        /// Emit a deterministic per-sample result digest (stable hash over the sorted visible
+        /// EdgeRecords) so schema vs variant correctness can be compared from the bench JSON
+        /// directly, without re-opening two engines via `neighbor-compare`.
+        #[arg(long, default_value_t = false)]
+        emit_result_digests: bool,
         #[arg(long, default_value_t = false)]
         sample_plan_degree_hint: bool,
         #[arg(long)]
@@ -363,6 +374,14 @@ enum Command {
         sample_plan: PathBuf,
         #[arg(long, default_value_t = false)]
         right_semantic_degree_hint: bool,
+        #[arg(long, value_enum, default_value = "none")]
+        property_predicate_mode: StorageBenchPropertyPredicateMode,
+        #[arg(long, default_value_t = 0)]
+        property_id: u32,
+        #[arg(long, default_value_t = 0)]
+        property_value_i64: i64,
+        #[arg(long, default_value_t = 0)]
+        property_default_i64: i64,
         #[arg(long, default_value_t = 1)]
         max_mismatches: usize,
     },
@@ -386,12 +405,22 @@ struct StorageBenchSamplePlan {
     source: String,
     samples_per_edge_type: usize,
     semantic_degree_hint: bool,
+    #[serde(default)]
+    force_signature: bool,
+    #[serde(default)]
+    src_label: Option<i32>,
+    #[serde(default)]
+    dst_label: Option<i32>,
     entries: Vec<StorageBenchSampleEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StorageBenchSampleEntry {
     edge_type: Option<i32>,
+    #[serde(default)]
+    src_label: Option<i32>,
+    #[serde(default)]
+    dst_label: Option<i32>,
     candidate_edges_for_sampling: usize,
     candidate_sources_for_sampling: usize,
     samples: Vec<StorageBenchSample>,
@@ -506,7 +535,16 @@ async fn main() -> Result<()> {
                     compact_start.elapsed().as_secs_f64()
                 );
             }
+            let sidecar_start = Instant::now();
+            eprintln!(
+                "[import] persist semantic sidecars start elapsed_s={:.1}",
+                sidecar_start.elapsed().as_secs_f64()
+            );
             engine.persist_semantic_sidecars()?;
+            eprintln!(
+                "[import] persist semantic sidecars complete elapsed_s={:.1}",
+                sidecar_start.elapsed().as_secs_f64()
+            );
             println!(
                 "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{}}}",
                 stats.input_rows,
@@ -1032,7 +1070,11 @@ async fn main() -> Result<()> {
             repeats,
             edge_type,
             edge_types,
+            src_label,
+            dst_label,
             semantic_degree_hint,
+            force_signature,
+            emit_result_digests,
             sample_plan_degree_hint,
             sample_plan_in,
             sample_plan_out,
@@ -1093,10 +1135,14 @@ async fn main() -> Result<()> {
                     &edges,
                     &cli_requested_edge_types,
                     samples,
+                    src_label,
+                    dst_label,
                     semantic_degree_hint,
+                    force_signature,
                     sample_plan_degree_hint,
                 )
             };
+            let effective_force_signature = force_signature || sample_plan.force_signature;
             if let Some(path) = &sample_plan_out {
                 if let Some(parent) = path
                     .parent()
@@ -1117,6 +1163,7 @@ async fn main() -> Result<()> {
                         snapshot,
                         entry,
                         semantic_degree_hint,
+                        effective_force_signature,
                         workload_mode,
                         property_predicate_mode,
                         property_id,
@@ -1134,6 +1181,7 @@ async fn main() -> Result<()> {
                         snapshot,
                         entry,
                         semantic_degree_hint,
+                        effective_force_signature,
                         workload_mode,
                         property_predicate_mode,
                         property_id,
@@ -1171,11 +1219,63 @@ async fn main() -> Result<()> {
                 } else {
                     None
                 };
+                // Optional correctness piggyback: re-run each sample's measured query path once
+                // (deterministic, single pass) and emit a stable digest over the sorted visible
+                // EdgeRecords. The schema baseline and each variant produce comparable digests,
+                // so W14 correctness can be checked from the bench JSON instead of re-opening two
+                // engines through `neighbor-compare`.
+                let (result_digests, entry_result_digest) = if emit_result_digests {
+                    let degree_by_src: HashMap<u64, u64> = entry
+                        .samples
+                        .iter()
+                        .map(|sample| (sample.src, sample.degree))
+                        .collect();
+                    let mut digests = Vec::with_capacity(entry.samples.len());
+                    let mut folded: Vec<(u64, u64)> = Vec::with_capacity(entry.samples.len());
+                    for sample in &entry.samples {
+                        let mut edges = run_storage_bench_query(
+                            &engine,
+                            snapshot,
+                            sample.src,
+                            requested_edge_type,
+                            semantic_degree_hint,
+                            effective_force_signature,
+                            degree_by_src.get(&sample.src).copied().unwrap_or(0),
+                            entry.dst_label,
+                            property_predicate_mode,
+                            property_id,
+                            property_value_i64,
+                            property_default_i64,
+                        )
+                        .await?;
+                        let digest = storage_bench_result_digest(&mut edges);
+                        folded.push((sample.src, digest));
+                        digests.push(json!({
+                            "src": sample.src,
+                            "degree": sample.degree,
+                            "edge_type": requested_edge_type,
+                            "dst_label": entry.dst_label,
+                            "property_predicate_mode": property_predicate_mode,
+                            "result_count": edges.len(),
+                            "result_digest": format!("{:016x}", digest),
+                        }));
+                    }
+                    let aggregate = storage_bench_entry_digest(&folded);
+                    (
+                        Some(Value::Array(digests)),
+                        Some(format!("{:016x}", aggregate)),
+                    )
+                } else {
+                    (None, None)
+                };
                 benchmarks.push(json!({
                     "edge_type": requested_edge_type,
+                    "src_label": entry.src_label,
+                    "dst_label": entry.dst_label,
                     "candidate_edges_for_sampling": entry.candidate_edges_for_sampling,
                     "candidate_sources_for_sampling": entry.candidate_sources_for_sampling,
                     "semantic_degree_hint": semantic_degree_hint,
+                    "force_signature": effective_force_signature,
                     "workload_mode": workload_mode,
                     "property_predicate_mode": property_predicate_mode,
                     "property_id": property_id,
@@ -1198,6 +1298,9 @@ async fn main() -> Result<()> {
                     "neighbor_summary": neighbor_summary,
                     "neighbor_metrics": neighbor_metrics,
                     "post_auto_compaction_metrics": post_auto_compaction_metrics,
+                    "emit_result_digests": emit_result_digests,
+                    "entry_result_digest": entry_result_digest,
+                    "result_digests": result_digests,
                 }));
             }
             println!(
@@ -1207,7 +1310,11 @@ async fn main() -> Result<()> {
                     "snapshot": snapshot,
                     "edge_type": edge_type,
                     "edge_types": edge_types,
+                    "src_label": src_label,
+                    "dst_label": dst_label,
                     "semantic_degree_hint": semantic_degree_hint,
+                    "force_signature": effective_force_signature,
+                    "emit_result_digests": emit_result_digests,
                     "sample_plan_degree_hint": sample_plan_degree_hint,
                     "workload_mode": workload_mode,
                     "property_predicate_mode": property_predicate_mode,
@@ -1239,6 +1346,10 @@ async fn main() -> Result<()> {
             right_data_dir,
             sample_plan,
             right_semantic_degree_hint,
+            property_predicate_mode,
+            property_id,
+            property_value_i64,
+            property_default_i64,
             max_mismatches,
         } => {
             let plan: StorageBenchSamplePlan =
@@ -1268,28 +1379,36 @@ async fn main() -> Result<()> {
             'outer: for entry in &plan.entries {
                 for sample in &entry.samples {
                     checked += 1;
-                    let mut left_edges = if let Some(edge_type) = entry.edge_type {
-                        left.get_neighbors_typed(sample.src, edge_type, left_snapshot)
-                            .await?
-                    } else {
-                        left.get_neighbors(sample.src, left_snapshot).await?
-                    };
-                    let mut right_edges = if let Some(edge_type) = entry.edge_type {
-                        if right_semantic_degree_hint {
-                            let signature =
-                                GraphAccessSignature::neighbor_scan(sample.src, Some(edge_type))
-                                    .with_degree_class(DegreeClass::from_max_degree(sample.degree));
-                            right
-                                .get_neighbors_by_signature(signature, right_snapshot)
-                                .await?
-                        } else {
-                            right
-                                .get_neighbors_typed(sample.src, edge_type, right_snapshot)
-                                .await?
-                        }
-                    } else {
-                        right.get_neighbors(sample.src, right_snapshot).await?
-                    };
+                    let mut left_edges = run_storage_bench_query(
+                        &left,
+                        left_snapshot,
+                        sample.src,
+                        entry.edge_type,
+                        false,
+                        plan.force_signature,
+                        sample.degree,
+                        entry.dst_label,
+                        property_predicate_mode,
+                        property_id,
+                        property_value_i64,
+                        property_default_i64,
+                    )
+                    .await?;
+                    let mut right_edges = run_storage_bench_query(
+                        &right,
+                        right_snapshot,
+                        sample.src,
+                        entry.edge_type,
+                        right_semantic_degree_hint,
+                        plan.force_signature,
+                        sample.degree,
+                        entry.dst_label,
+                        property_predicate_mode,
+                        property_id,
+                        property_value_i64,
+                        property_default_i64,
+                    )
+                    .await?;
                     sort_edge_records(&mut left_edges);
                     sort_edge_records(&mut right_edges);
                     left_edges_total += left_edges.len();
@@ -1301,6 +1420,8 @@ async fn main() -> Result<()> {
                         if first_mismatch.is_none() {
                             first_mismatch = Some(json!({
                                 "edge_type": entry.edge_type,
+                                "src_label": entry.src_label,
+                                "dst_label": entry.dst_label,
                                 "src": sample.src,
                                 "degree": sample.degree,
                                 "left_count": left_edges.len(),
@@ -1323,6 +1444,10 @@ async fn main() -> Result<()> {
                     "right_data_dir": right_data_dir,
                     "sample_plan": sample_plan,
                     "right_semantic_degree_hint": right_semantic_degree_hint,
+                    "property_predicate_mode": property_predicate_mode,
+                    "property_id": property_id,
+                    "property_value_i64": property_value_i64,
+                    "property_default_i64": property_default_i64,
                     "left_snapshot": left_snapshot,
                     "right_snapshot": right_snapshot,
                     "checked": checked,
@@ -1435,6 +1560,44 @@ fn sort_edge_records(edges: &mut [EdgeRecord]) {
     });
 }
 
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= *byte as u64;
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+/// Deterministic digest over the canonical (sorted) visible EdgeRecords for one sample query.
+/// Stable across processes/machines: plain FNV-1a over the little-endian field bytes, no random
+/// seed. Sorting first makes the digest order-independent so schema and variant agree whenever
+/// they return the same logical edge set.
+fn storage_bench_result_digest(edges: &mut Vec<EdgeRecord>) -> u64 {
+    sort_edge_records(edges);
+    let mut hash = FNV_OFFSET_BASIS;
+    for edge in edges.iter() {
+        fnv1a_update(&mut hash, &edge.src.to_le_bytes());
+        fnv1a_update(&mut hash, &edge.dst.to_le_bytes());
+        fnv1a_update(&mut hash, &edge.edge_type.to_le_bytes());
+        fnv1a_update(&mut hash, &edge.ts.to_le_bytes());
+        fnv1a_update(&mut hash, &[edge.marker as u8]);
+    }
+    hash
+}
+
+/// Fold the per-sample (src, digest) pairs into one entry-level digest so a whole edge-type
+/// entry can be compared with a single value before drilling into per-sample digests.
+fn storage_bench_entry_digest(samples: &[(u64, u64)]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for (src, digest) in samples {
+        fnv1a_update(&mut hash, &src.to_le_bytes());
+        fnv1a_update(&mut hash, &digest.to_le_bytes());
+    }
+    hash
+}
+
 fn edge_preview(edges: &[EdgeRecord]) -> Vec<Value> {
     edges
         .iter()
@@ -1472,6 +1635,7 @@ async fn run_storage_bench_round(
     snapshot: u64,
     entry: &StorageBenchSampleEntry,
     semantic_degree_hint: bool,
+    force_signature: bool,
     workload_mode: StorageBenchWorkloadMode,
     property_predicate_mode: StorageBenchPropertyPredicateMode,
     property_id: u32,
@@ -1499,7 +1663,9 @@ async fn run_storage_bench_round(
             sample.src,
             requested_edge_type,
             semantic_degree_hint,
+            force_signature,
             degree_by_src.get(&sample.src).copied().unwrap_or(0),
+            entry.dst_label,
             property_predicate_mode,
             property_id,
             property_value_i64,
@@ -1518,7 +1684,9 @@ async fn run_storage_bench_round(
                     edge.dst,
                     second_edge_type,
                     false,
+                    false,
                     0,
+                    None,
                     StorageBenchPropertyPredicateMode::None,
                     property_id,
                     property_value_i64,
@@ -1557,7 +1725,9 @@ async fn run_storage_bench_query(
     src: u64,
     requested_edge_type: Option<i32>,
     semantic_degree_hint: bool,
+    force_signature: bool,
     degree: u64,
+    dst_label: Option<i32>,
     property_predicate_mode: StorageBenchPropertyPredicateMode,
     property_id: u32,
     property_value_i64: i64,
@@ -1566,34 +1736,50 @@ async fn run_storage_bench_query(
     match property_predicate_mode {
         StorageBenchPropertyPredicateMode::None => {
             if let Some(edge_type) = requested_edge_type {
-                if semantic_degree_hint {
-                    let signature = GraphAccessSignature::neighbor_scan(src, Some(edge_type))
-                        .with_degree_class(DegreeClass::from_max_degree(degree));
+                if force_signature || semantic_degree_hint || dst_label.is_some() {
+                    let signature = storage_bench_signature(
+                        src,
+                        Some(edge_type),
+                        semantic_degree_hint,
+                        degree,
+                        dst_label,
+                    );
                     engine.get_neighbors_by_signature(signature, snapshot).await
                 } else {
                     engine.get_neighbors_typed(src, edge_type, snapshot).await
                 }
+            } else if force_signature || dst_label.is_some() {
+                let signature =
+                    storage_bench_signature(src, None, semantic_degree_hint, degree, dst_label);
+                engine.get_neighbors_by_signature(signature, snapshot).await
             } else {
                 engine.get_neighbors(src, snapshot).await
             }
         }
         StorageBenchPropertyPredicateMode::RequiredProperty => {
-            let signature = GraphAccessSignature::neighbor_scan(src, requested_edge_type)
-                .with_required_property(property_id);
+            let signature = storage_bench_signature(
+                src,
+                requested_edge_type,
+                semantic_degree_hint,
+                degree,
+                dst_label,
+            )
+            .with_required_property(property_id);
             engine.get_neighbors_by_signature(signature, snapshot).await
         }
         StorageBenchPropertyPredicateMode::Presence => {
-            engine
+            let edges = engine
                 .get_neighbors_with_present_property_prototype(
                     src,
                     requested_edge_type,
                     snapshot,
                     property_id,
                 )
-                .await
+                .await?;
+            Ok(storage_bench_filter_dst_label(dst_label, edges))
         }
         StorageBenchPropertyPredicateMode::Equality => {
-            engine
+            let edges = engine
                 .get_neighbors_matching_csr_property_value_prototype(
                     src,
                     requested_edge_type,
@@ -1603,10 +1789,11 @@ async fn run_storage_bench_query(
                         PropertyValue::I64(property_value_i64),
                     ),
                 )
-                .await
+                .await?;
+            Ok(storage_bench_filter_dst_label(dst_label, edges))
         }
         StorageBenchPropertyPredicateMode::AbsentDefault => {
-            engine
+            let edges = engine
                 .get_neighbors_matching_csr_property_value_prototype(
                     src,
                     requested_edge_type,
@@ -1617,9 +1804,40 @@ async fn run_storage_bench_query(
                         PropertyValue::I64(property_default_i64),
                     ),
                 )
-                .await
+                .await?;
+            Ok(storage_bench_filter_dst_label(dst_label, edges))
         }
     }
+}
+
+fn storage_bench_signature(
+    src: u64,
+    requested_edge_type: Option<i32>,
+    semantic_degree_hint: bool,
+    degree: u64,
+    dst_label: Option<i32>,
+) -> GraphAccessSignature {
+    let mut signature = GraphAccessSignature::neighbor_scan(src, requested_edge_type);
+    if semantic_degree_hint {
+        signature = signature.with_degree_class(DegreeClass::from_max_degree(degree));
+    }
+    if let Some(dst_label) = dst_label {
+        signature = signature.with_dst_label(dst_label);
+    }
+    signature
+}
+
+fn storage_bench_filter_dst_label(
+    dst_label: Option<i32>,
+    edges: Vec<EdgeRecord>,
+) -> Vec<EdgeRecord> {
+    let Some(dst_label) = dst_label else {
+        return edges;
+    };
+    edges
+        .into_iter()
+        .filter(|edge| source_label_from_vertex_id(edge.dst) == dst_label)
+        .collect()
 }
 
 fn truncated_two_hop_frontier(edges: &[EdgeRecord], limit: usize) -> Vec<EdgeRecord> {
@@ -1657,7 +1875,10 @@ fn build_storage_bench_sample_plan(
     edges: &[EdgeRecord],
     requested_edge_types: &[Option<i32>],
     samples: usize,
+    src_label: Option<i32>,
+    dst_label: Option<i32>,
     semantic_degree_hint: bool,
+    force_signature: bool,
     sample_plan_degree_hint: bool,
 ) -> StorageBenchSamplePlan {
     let record_sample_degrees = semantic_degree_hint || sample_plan_degree_hint;
@@ -1666,7 +1887,7 @@ fn build_storage_bench_sample_plan(
         let mut candidate_edges = 0usize;
         let mut candidate_srcs = Vec::new();
         for edge in edges {
-            if storage_bench_edge_type_matches(edge, *requested_edge_type) {
+            if storage_bench_edge_matches(edge, *requested_edge_type, src_label, dst_label) {
                 candidate_edges += 1;
                 candidate_srcs.push(edge.src);
             }
@@ -1701,7 +1922,8 @@ fn build_storage_bench_sample_plan(
             }
             if !degree_by_src.is_empty() {
                 for edge in edges {
-                    if storage_bench_edge_type_matches(edge, *requested_edge_type) {
+                    if storage_bench_edge_matches(edge, *requested_edge_type, src_label, dst_label)
+                    {
                         if let Some(degree) = degree_by_src.get_mut(&edge.src) {
                             *degree += 1;
                         }
@@ -1718,6 +1940,8 @@ fn build_storage_bench_sample_plan(
             .collect();
         entries.push(StorageBenchSampleEntry {
             edge_type: *requested_edge_type,
+            src_label,
+            dst_label,
             candidate_edges_for_sampling: candidate_edges,
             candidate_sources_for_sampling: candidate_sources,
             samples: sampled,
@@ -1728,14 +1952,28 @@ fn build_storage_bench_sample_plan(
         source: "scan".to_string(),
         samples_per_edge_type: samples,
         semantic_degree_hint: record_sample_degrees,
+        force_signature,
+        src_label,
+        dst_label,
         entries,
     }
 }
 
-fn storage_bench_edge_type_matches(edge: &EdgeRecord, requested_edge_type: Option<i32>) -> bool {
+fn storage_bench_edge_matches(
+    edge: &EdgeRecord,
+    requested_edge_type: Option<i32>,
+    src_label: Option<i32>,
+    dst_label: Option<i32>,
+) -> bool {
     requested_edge_type
         .map(|wanted| edge.edge_type == wanted)
         .unwrap_or(true)
+        && src_label
+            .map(|wanted| source_label_from_vertex_id(edge.src) == wanted)
+            .unwrap_or(true)
+        && dst_label
+            .map(|wanted| source_label_from_vertex_id(edge.dst) == wanted)
+            .unwrap_or(true)
 }
 
 fn parse_query_list(raw: &str) -> Vec<String> {
@@ -1777,6 +2015,7 @@ fn storage_bench_metric_summary(metrics: &Value) -> Value {
         "csr_get_neighbors_p50_us": metric_u64(metrics, &["csr", "get_neighbors_latency", "p50_us"]),
         "csr_get_neighbors_p90_us": metric_u64(metrics, &["csr", "get_neighbors_latency", "p90_us"]),
         "csr_get_neighbors_p99_us": metric_u64(metrics, &["csr", "get_neighbors_latency", "p99_us"]),
+        "pruning_reasons": metrics["csr"]["pruning_reasons"].clone(),
     })
 }
 
@@ -1928,5 +2167,52 @@ mod tests {
         assert_eq!(keys, vec![(1, 10), (1, 20), (2, 30)]);
         assert_eq!(truncated_two_hop_frontier(&edges, 64).len(), edges.len());
         assert!(truncated_two_hop_frontier(&edges, 0).is_empty());
+    }
+
+    #[test]
+    fn result_digest_is_order_independent_and_deterministic() {
+        let mut a = vec![
+            EdgeRecord::insert(1, 30, 2, 1),
+            EdgeRecord::insert(1, 10, 1, 2),
+            EdgeRecord::insert(1, 20, 1, 3),
+        ];
+        let mut b = vec![
+            EdgeRecord::insert(1, 20, 1, 3),
+            EdgeRecord::insert(1, 30, 2, 1),
+            EdgeRecord::insert(1, 10, 1, 2),
+        ];
+        let digest_a = storage_bench_result_digest(&mut a);
+        let digest_b = storage_bench_result_digest(&mut b);
+        assert_eq!(digest_a, digest_b, "digest must be order-independent");
+        // Recomputing the (now sorted) input is stable.
+        assert_eq!(digest_a, storage_bench_result_digest(&mut a));
+        // A fixed hex width so schema/variant JSON strings compare byte-for-byte.
+        assert_eq!(format!("{:016x}", digest_a).len(), 16);
+    }
+
+    #[test]
+    fn result_digest_detects_edge_set_changes() {
+        let mut base = vec![EdgeRecord::insert(1, 10, 1, 2), EdgeRecord::insert(1, 20, 1, 3)];
+        let mut extra = base.clone();
+        extra.push(EdgeRecord::insert(1, 30, 1, 4));
+        let mut dst_changed = vec![EdgeRecord::insert(1, 11, 1, 2), EdgeRecord::insert(1, 20, 1, 3)];
+        let mut marker_changed = vec![EdgeRecord::delete(1, 10, 1, 2), EdgeRecord::insert(1, 20, 1, 3)];
+        let baseline = storage_bench_result_digest(&mut base);
+        assert_ne!(baseline, storage_bench_result_digest(&mut extra));
+        assert_ne!(baseline, storage_bench_result_digest(&mut dst_changed));
+        assert_ne!(baseline, storage_bench_result_digest(&mut marker_changed));
+        // Empty result is well-defined and distinct from any non-empty set.
+        let mut empty: Vec<EdgeRecord> = Vec::new();
+        assert_ne!(baseline, storage_bench_result_digest(&mut empty));
+    }
+
+    #[test]
+    fn entry_digest_folds_per_sample_digests() {
+        let samples = vec![(1u64, 0xaaaa_aaaa_aaaa_aaaau64), (2u64, 0xbbbb_bbbb_bbbb_bbbbu64)];
+        let folded = storage_bench_entry_digest(&samples);
+        // Stable and sensitive to per-sample order (each src is keyed in).
+        assert_eq!(folded, storage_bench_entry_digest(&samples));
+        let reordered = vec![samples[1], samples[0]];
+        assert_ne!(folded, storage_bench_entry_digest(&reordered));
     }
 }
