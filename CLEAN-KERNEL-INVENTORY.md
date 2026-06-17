@@ -14,7 +14,8 @@
 
 已经带入的内核改动是 L0/semantic pruning 方向的稳定代码：
 pruning decision/reason、pruning reason metrics、以及目标点 label 查询签名。
-没有带入 W7/W14 等实验 runner，也没有实现 K4 完整链路。
+没有带入 W7/W14 等实验 runner。当前新增了最小 engine-level K4 lifecycle：
+flush -> semantic sidecar -> read feedback -> feedback merge -> schema-safe reopen。
 
 ## Purpose
 
@@ -22,7 +23,8 @@ This branch is a clean DB-kernel branch. It removes paper material, experiment
 logs, baseline runners, historical plans, and one-off research binaries from the
 tracked tree.
 
-It does not implement K4. It prepares a smaller kernel base for future K4 work.
+It now implements the minimum engine-level K4 lifecycle API while keeping the
+branch free of paper runners and experiment artifacts.
 
 ## Kept
 
@@ -90,9 +92,10 @@ Not carried in:
 | pruning reason observability | present |
 | budgeted materialization machinery | present in kernel/config history |
 | stable latency proof | not a branch concern |
-| semantic-aware merge retention | not implemented |
-| DB-native feedback-to-merge loop | not implemented |
+| semantic-aware merge retention | present for the K4 L0->L1 path |
+| DB-native feedback-to-merge loop | present through `Engine::run_k4_lifecycle*` |
 | schema lifecycle cost model | not implemented |
+| automatic SNB mixed-update integration | not implemented |
 
 ## Validation Target
 
@@ -101,6 +104,7 @@ Minimum checks for this branch:
 ```text
 cargo test --lib
 cargo test --bin lsmgraph
+cargo test --test engine_tests k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe
 cargo build --release --bin lsmgraph
 ```
 

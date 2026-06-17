@@ -4,29 +4,33 @@
 >
 > Scope: clean DB kernel only. This document describes the engine, storage
 > format, query path, update path, semantic-pruning boundary, and the current
-> gap to a future K4 lifecycle design. It intentionally excludes paper drafts,
-> benchmark logs, one-off experiment runners, and submission artifacts.
+> K4 lifecycle API. It intentionally excludes paper drafts, benchmark logs,
+> one-off experiment runners, and submission artifacts.
 
 ## 中文主线摘要
 
-这个分支的目标不是先实现 K4，而是先得到一个可以继续做 K4 的干净
-DB 内核基线。它只保留 LSMGraph 的内核源码、测试、Cargo 构建文件、
+这个分支先完成了干净 DB 内核基线，然后在内核里补了一个最小完整的
+K4 lifecycle API。它只保留 LSMGraph 的内核源码、测试、Cargo 构建文件、
 README/启动文档，以及本架构文档；历史实验脚本、baseline 结果、论文草稿、
-图片和一次性 benchmark runner 都从 tracked tree 里移除。
+图片和一次性 benchmark runner 都不属于这个分支的 tracked tree。
 
 当前带入的内核改动只限于 L0/semantic pruning 已经比较确定的部分：
 `src/csr/format.rs` 的 pruning decision/reason、
 `src/metrics.rs` 的 pruning reason metrics，以及
 `src/semantic.rs` 的 `with_dst_label()` 查询语义签名扩展。
 
-K4 的完整 DB 链路仍然是后续目标：
+当前 K4 API 覆盖的 DB 链路是：
 
 ```text
 write -> flush -> semantic metadata -> read pruning -> feedback
       -> merge/compaction -> schema-safe recovery/reopen
 ```
 
-也就是说，这个分支是“干净内核起点”，不是“K4 已完成实现”。
+实现边界在 `Engine::run_k4_lifecycle_with_repetitions()`：
+它会 flush 当前 MemGraph、持久化 semantic sidecar、执行 query signatures
+产生 L0 feedback、用 feedback 选择 L0 partition 合并到 L1，并返回
+`K4LifecycleReport`。SNB HTTP server 还没有自动把 mixed update workload
+接入这条 lifecycle，这是后续集成点。
 
 ## 1. Scope
 
@@ -34,15 +38,15 @@ This branch is the clean kernel line for LSMGraph. It keeps the database engine
 and the minimum product-facing CLI/server code needed to build, test, import,
 query, and serve the graph store.
 
-It does not try to implement K4 yet. K4 means a DB-native lifecycle loop:
+The branch now includes the minimum DB-native K4 lifecycle API. K4 means:
 
 ```text
 write -> flush -> semantic metadata -> read pruning -> feedback
       -> merge/compaction -> schema-safe recovery/reopen
 ```
 
-The current clean branch preserves the existing kernel foundation and prepares
-the codebase for K4 work by removing research artifacts from the branch.
+The current clean branch preserves the kernel foundation, exposes the K4
+lifecycle through `Engine`, and keeps research artifacts out of the branch.
 
 ## 2. Repository Boundary
 
@@ -229,8 +233,8 @@ These reasons are also exposed through `Metrics` as pruning-reason counters.
 
 ## 8. Metrics
 
-The clean kernel keeps metrics that are useful for engine operation and future
-K4 work:
+The clean kernel keeps metrics that are useful for engine operation and K4
+lifecycle reports:
 
 | Metric group | Examples |
 |---|---|
@@ -243,11 +247,27 @@ K4 work:
 
 These are kernel metrics, not paper-only counters.
 
-## 9. Write, Flush, and Current Compaction Boundary
+## 9. K4 Lifecycle Boundary
 
-The clean kernel supports write buffering and flush to L0 CSR segments. Existing
-compaction functionality is retained from the current engine, but this branch
-does not claim a full K4 semantic-aware merge policy.
+The clean kernel supports a minimum K4 lifecycle through:
+
+```rust
+Engine::run_k4_lifecycle(signatures)
+Engine::run_k4_lifecycle_with_repetitions(signatures, repetitions)
+```
+
+The lifecycle does not create a separate experiment path. It uses the same
+production Engine operations:
+
+| K4 phase | Engine operation |
+|---|---|
+| write | `insert_edge*` / `delete_edge` into `MemGraph` |
+| flush | `flush_active()` writes L0 CSR segments |
+| semantic metadata | CSR segment metadata plus degree-directory sidecar |
+| read pruning | `get_neighbors_by_signature()` with exact-proof pruning |
+| feedback | `Metrics::record_l0_partition_query/probe` |
+| merge/compaction | `compact_best_l0_partition_by_score()` |
+| schema-safe recovery/reopen | manifest + schema catalog + sidecar replay through `Engine::open()` |
 
 Current status:
 
@@ -257,13 +277,17 @@ Current status:
 | flush to L0 CSR segment | present |
 | segment-level semantic metadata | present |
 | exact-proof read pruning | present |
-| query feedback counters | partially present |
-| semantic-aware merge retention | not implemented as K4 |
-| multi-level semantic pruning proof retention | not implemented as K4 |
-| schema-aware merge policy | not implemented as K4 |
+| query feedback counters | present |
+| feedback-selected L0 merge | present |
+| snapshot/tombstone-safe merge retention | present |
+| schema catalog recovery | present |
+| K4 lifecycle report | present |
+| automatic SNB server integration | not implemented |
+| multi-level semantic proof propagation beyond L1 | not implemented |
 
-The K4 work should start from this boundary, not from the historical experiment
-scripts.
+The K4 API is intentionally an Engine boundary. SNB validation can run before
+and after this lifecycle, but the Java driver path is not yet wired to trigger
+K4 automatically during mixed update workloads.
 
 ## 10. Schema and Tombstone Safety
 
@@ -291,20 +315,22 @@ The CLI remains the entry point for import, validation, storage benchmarks,
 server startup, base graph building, and maintenance commands that are part of
 the DB product surface.
 
-## 12. K4 Gap
+## 12. Remaining K4 Gaps
 
-K4 is the next architecture target, not part of this cleanup.
+The branch contains a functional minimum K4 lifecycle, but it is not the final
+SIGMOD-grade lifecycle system.
 
-Required future additions:
+Remaining additions:
 
 | K4 area | Required kernel addition |
 |---|---|
-| semantic state machine | exact/mixed/unknown/tombstone/schema-uncertain states |
-| merge metadata propagation | deterministic metadata merge and downgrade rules |
-| LmergePolicy | query-signature-aware compaction selection |
+| semantic state machine | explicit exact/mixed/unknown/tombstone/schema-uncertain states |
+| merge metadata propagation | deterministic metadata downgrade rules across all levels |
+| LmergePolicy | production policy for scheduling K4 cycles continuously |
 | retention metrics | exact ratio, fallback ratio, pruning surface before/after merge |
 | write lifecycle metrics | flush latency, write amp, stall, backlog, open/recovery |
 | schema lifecycle | schema-change cost, epoch fallback, metadata repair |
-| feedback loop | query feedback -> compaction choice -> measured benefit |
+| SNB integration | Java driver mixed updates should drive DB-native K4, not only cache updates |
 
-The clean branch exists so K4 can be implemented on a stable kernel base.
+The current correctness proof is the engine-level test
+`k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe`.

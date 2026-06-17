@@ -651,6 +651,38 @@ pub struct L0CompactionDecision {
     pub outputs: Vec<CsrSegmentMeta>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct K4LifecycleReadReport {
+    pub iteration: usize,
+    pub query_index: usize,
+    pub src: VertexId,
+    pub edge_type: Option<EdgeType>,
+    pub result_count: usize,
+    pub candidate_l0_segments_delta: u64,
+    pub matched_l0_segments_delta: u64,
+    pub range_filtered_segments_delta: u64,
+    pub bloom_filtered_segments_delta: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct K4LifecycleReport {
+    pub initial_snapshot: SnapshotId,
+    pub final_snapshot: SnapshotId,
+    pub schema_epoch_before: SchemaEpoch,
+    pub schema_epoch_after: SchemaEpoch,
+    pub flush_count_delta: u64,
+    pub compaction_count_delta: u64,
+    pub degree_directory_sidecar_persists_delta: u64,
+    pub l0_segments_before: usize,
+    pub l1_segments_before: usize,
+    pub l0_segments_after_flush: usize,
+    pub l1_segments_after_flush: usize,
+    pub l0_segments_after_compaction: usize,
+    pub l1_segments_after_compaction: usize,
+    pub reads: Vec<K4LifecycleReadReport>,
+    pub feedback_compaction: Option<L0CompactionDecision>,
+}
+
 #[derive(Debug, Clone)]
 struct PickedL0Partition {
     key: L0PartitionKey,
@@ -865,6 +897,112 @@ impl Engine {
 
     pub fn persist_semantic_sidecars(&self) -> Result<()> {
         self.persist_degree_directory_sidecar_for_current_version()
+    }
+
+    pub async fn run_k4_lifecycle(
+        self: &Arc<Self>,
+        signatures: &[GraphAccessSignature],
+    ) -> Result<K4LifecycleReport> {
+        self.run_k4_lifecycle_with_repetitions(signatures, 1).await
+    }
+
+    pub async fn run_k4_lifecycle_with_repetitions(
+        self: &Arc<Self>,
+        signatures: &[GraphAccessSignature],
+        repetitions: usize,
+    ) -> Result<K4LifecycleReport> {
+        let repetitions = repetitions.max(1);
+        let initial_snapshot = self.current_snapshot();
+        let schema_epoch_before = self.current_schema_epoch();
+        let before_levels = self.live_file_count_by_level();
+        let before_flush_count = self.metrics.flush_count.load(Ordering::Relaxed);
+        let before_compaction_count = self.metrics.compaction_count.load(Ordering::Relaxed);
+        let before_sidecar_persists = self
+            .metrics
+            .degree_directory_sidecar_persists
+            .load(Ordering::Relaxed);
+
+        self.flush_active().await?;
+        self.persist_semantic_sidecars()?;
+        let after_flush_levels = self.live_file_count_by_level();
+        let read_snapshot = self.current_snapshot();
+        let mut reads = Vec::new();
+
+        for iteration in 0..repetitions {
+            for (query_index, signature) in signatures.iter().copied().enumerate() {
+                let before_candidate_l0 =
+                    self.metrics.candidate_l0_segments.load(Ordering::Relaxed);
+                let before_matched_l0 = self.metrics.matched_l0_segments.load(Ordering::Relaxed);
+                let before_range_filtered =
+                    self.metrics.range_filtered_segments.load(Ordering::Relaxed);
+                let before_bloom_filtered =
+                    self.metrics.bloom_filtered_segments.load(Ordering::Relaxed);
+                let result = self
+                    .get_neighbors_by_signature(signature, read_snapshot)
+                    .await?;
+                reads.push(K4LifecycleReadReport {
+                    iteration,
+                    query_index,
+                    src: signature.src,
+                    edge_type: signature.edge_type,
+                    result_count: result.len(),
+                    candidate_l0_segments_delta: self
+                        .metrics
+                        .candidate_l0_segments
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(before_candidate_l0),
+                    matched_l0_segments_delta: self
+                        .metrics
+                        .matched_l0_segments
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(before_matched_l0),
+                    range_filtered_segments_delta: self
+                        .metrics
+                        .range_filtered_segments
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(before_range_filtered),
+                    bloom_filtered_segments_delta: self
+                        .metrics
+                        .bloom_filtered_segments
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(before_bloom_filtered),
+                });
+            }
+        }
+
+        let feedback_compaction = self.compact_best_l0_partition_by_score().await?;
+        self.persist_semantic_sidecars()?;
+        let after_compaction_levels = self.live_file_count_by_level();
+
+        Ok(K4LifecycleReport {
+            initial_snapshot,
+            final_snapshot: self.current_snapshot(),
+            schema_epoch_before,
+            schema_epoch_after: self.current_schema_epoch(),
+            flush_count_delta: self
+                .metrics
+                .flush_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(before_flush_count),
+            compaction_count_delta: self
+                .metrics
+                .compaction_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(before_compaction_count),
+            degree_directory_sidecar_persists_delta: self
+                .metrics
+                .degree_directory_sidecar_persists
+                .load(Ordering::Relaxed)
+                .saturating_sub(before_sidecar_persists),
+            l0_segments_before: level_count(&before_levels, L0),
+            l1_segments_before: level_count(&before_levels, L1),
+            l0_segments_after_flush: level_count(&after_flush_levels, L0),
+            l1_segments_after_flush: level_count(&after_flush_levels, L1),
+            l0_segments_after_compaction: level_count(&after_compaction_levels, L0),
+            l1_segments_after_compaction: level_count(&after_compaction_levels, L1),
+            reads,
+            feedback_compaction,
+        })
     }
 
     pub fn schema_catalog_snapshot(&self) -> SchemaCatalog {
@@ -4359,4 +4497,8 @@ fn ensure_level(levels: &mut Vec<Vec<CsrSegmentMeta>>, level: u8) {
     if levels.len() <= idx {
         levels.resize(idx + 1, Vec::new());
     }
+}
+
+fn level_count(levels: &[usize], level: u8) -> usize {
+    levels.get(level as usize).copied().unwrap_or(0)
 }

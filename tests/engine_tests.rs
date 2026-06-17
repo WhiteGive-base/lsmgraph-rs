@@ -4091,6 +4091,136 @@ async fn feedback_compaction_picks_hot_l0_partition_and_reduces_candidates() -> 
 }
 
 #[tokio::test]
+async fn k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-lifecycle-db-chain-")?;
+    let config = feedback_compaction_config(tmp.path());
+    let engine = Engine::create(config.clone()).await?;
+    let src = encoded(VertexLabel::Person, 70_000);
+    let edge_type = EdgeLabel::Knows.as_i32();
+    let property_id = 77;
+
+    engine.add_schema_edge_label(
+        edge_type,
+        "KNOWS",
+        VertexLabel::Person as i32,
+        VertexLabel::Person as i32,
+    )?;
+    let property_epoch = engine.add_schema_property(NewPropertyEntry {
+        id: property_id,
+        owner: PropertyOwner::EdgeLabel(edge_type),
+        name: "weight".to_string(),
+        logical_type: "int64".to_string(),
+        physical_encoding: "plain_i64".to_string(),
+        encoding_version: 1,
+        default_or_null_rule: "null".to_string(),
+    })?;
+
+    let dsts = [
+        encoded(VertexLabel::Person, 71_000),
+        encoded(VertexLabel::Person, 71_001),
+        encoded(VertexLabel::Person, 71_002),
+    ];
+    for (idx, dst) in dsts.iter().copied().enumerate() {
+        engine
+            .insert_edge_with_property_values_prototype(
+                src,
+                dst,
+                edge_type,
+                vec![(property_id, PropertyValue::I64(idx as i64))],
+            )
+            .await?;
+        engine.flush_active().await?;
+    }
+
+    let delete_snapshot = engine.delete_edge(src, dsts[0], edge_type).await?;
+    engine.metrics().reset();
+    let signature = GraphAccessSignature::neighbor_scan(src, Some(edge_type))
+        .with_degree_class(DegreeClass::Low);
+    let report = engine
+        .run_k4_lifecycle_with_repetitions(&[signature], 3)
+        .await?;
+
+    assert_eq!(report.initial_snapshot, delete_snapshot);
+    assert_eq!(report.schema_epoch_before, property_epoch);
+    assert_eq!(report.schema_epoch_after, property_epoch);
+    assert_eq!(report.flush_count_delta, 1);
+    assert!(
+        report.degree_directory_sidecar_persists_delta >= 2,
+        "K4 should persist semantic metadata after flush and after merge"
+    );
+    assert_eq!(report.reads.len(), 3);
+    assert!(
+        report
+            .reads
+            .iter()
+            .all(|read| read.result_count == 2 && read.candidate_l0_segments_delta >= 3),
+        "K4 reads should observe the tombstone-filtered result while collecting L0 feedback"
+    );
+    let decision = report
+        .feedback_compaction
+        .as_ref()
+        .expect("K4 feedback phase should select the hot L0 partition");
+    assert_eq!(decision.key.edge_type, edge_type);
+    assert!(decision.key.range_start <= src && src <= decision.key.range_end);
+    assert!(decision.selected_l0_segments >= 3);
+    assert!(report.compaction_count_delta >= 1);
+    assert_eq!(
+        report.l0_segments_after_compaction, 0,
+        "the only L0 partition in this store should be merged into L1"
+    );
+    assert!(report.l1_segments_after_compaction > 0);
+
+    let after_k4 = engine
+        .get_neighbors_typed(src, edge_type, engine.current_snapshot())
+        .await?;
+    let mut after_dsts: Vec<_> = after_k4.iter().map(|edge| edge.dst).collect();
+    after_dsts.sort_unstable();
+    assert_eq!(after_dsts, vec![dsts[1], dsts[2]]);
+    let property_match = engine
+        .get_neighbors_matching_property_value(
+            src,
+            edge_type,
+            engine.current_snapshot(),
+            property_id,
+            PropertyValue::I64(1),
+        )
+        .await?;
+    assert_eq!(property_match.len(), 1);
+    assert_eq!(property_match[0].dst, dsts[1]);
+
+    drop(engine);
+    let reopened = Engine::open(config).await?;
+    assert_eq!(reopened.current_schema_epoch(), property_epoch);
+    assert_eq!(reopened.live_file_count_by_level().get(0).copied(), Some(0));
+    assert!(
+        reopened
+            .live_file_count_by_level()
+            .get(1)
+            .copied()
+            .unwrap_or_default()
+            > 0
+    );
+    let reopened_neighbors = reopened
+        .get_neighbors_typed(src, edge_type, reopened.current_snapshot())
+        .await?;
+    let mut reopened_dsts: Vec<_> = reopened_neighbors.iter().map(|edge| edge.dst).collect();
+    reopened_dsts.sort_unstable();
+    assert_eq!(reopened_dsts, vec![dsts[1], dsts[2]]);
+    let reopened_property_match = reopened
+        .get_neighbors_matching_property_value(
+            src,
+            edge_type,
+            reopened.current_snapshot(),
+            property_id,
+            PropertyValue::I64(2),
+        )
+        .await?;
+    assert_eq!(reopened_property_match.len(), 1);
+    assert_eq!(reopened_property_match[0].dst, dsts[2]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn feedback_compaction_priority_shifts_after_metrics_reset() -> anyhow::Result<()> {
     let tmp = target_tempdir("feedback-compaction-workload-shift-")?;
     let config = feedback_compaction_config(tmp.path());
