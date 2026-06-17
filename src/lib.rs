@@ -21,7 +21,9 @@ pub mod version;
 pub use config::{L0LayoutPolicy, LsmGraphConfig};
 pub use delta::DeltaGraph;
 pub use dynamic_view::DynamicGraphView;
-pub use graph::{Engine, K4LifecycleReadReport, K4LifecycleReport};
+pub use graph::{
+    Engine, K4LevelCompactionDecision, K4LifecycleReadReport, K4LifecycleReport, K4MergePolicy,
+};
 pub use property_encoding::{
     parse_default_or_null_rule, PropertyEncodingRegistry, PropertyEncodingSpec,
     PropertyPhysicalEncoding, PropertyValue,

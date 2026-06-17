@@ -33,8 +33,9 @@ Engine::run_k4_lifecycle_with_repetitions(signatures, repetitions)
 3. 执行 query signatures，触发 segment-level read pruning。
 4. 记录 L0 partition feedback。
 5. 根据 feedback 选择 hot L0 partition 并 merge 到 L1。
-6. 再次持久化 semantic sidecar。
-7. 通过 manifest、schema catalog、sidecar 支持 reopen 后恢复。
+6. 如果 L1+ 超过 K4 fanout，则按 LmergePolicy cascade 到下一层。
+7. 再次持久化 semantic sidecar。
+8. 通过 manifest、schema catalog、sidecar 支持 reopen 后恢复。
 
 注意：SNB HTTP server 的 mixed update workload 目前还没有自动触发这条
 K4 lifecycle。当前 K4 是 Engine 层能力，SNB 集成是后续工作。
@@ -68,6 +69,11 @@ flowchart TD
     T --> U["L1 CSR Segment"]
     U --> G
     U --> H
+    U --> X{"L1+ fanout 超限?"}
+    X -->|yes| Y["K4 LmergePolicy<br/>按 (src_label, edge_type) 重分区"]
+    Y --> Z["L2/L3... semantic CSR Segment"]
+    Z --> G
+    Z --> H
 
     G --> V["Engine::open()"]
     H --> V
@@ -139,7 +145,7 @@ CSR storage + IO backend
 
 | 文件 | 责任 |
 |---|---|
-| `src/graph.rs` | Engine 主体，写入、flush、读取、semantic index、feedback compaction、K4 lifecycle |
+| `src/graph.rs` | Engine 主体，写入、flush、读取、semantic index、feedback compaction、K4 lifecycle、LmergePolicy |
 | `src/memgraph/mod.rs` | 内存写缓冲 |
 | `src/csr/format.rs` | CSR segment metadata、semantic summary、pruning decision |
 | `src/csr/writer.rs` | CSR segment 写入 |
@@ -246,7 +252,7 @@ SignaturePruningDecision {
 
 这些 reason 会进入 `Metrics`，用于解释 pruning 是否真的发生，以及为什么没有发生。
 
-## 8. Feedback 与 K4 Merge
+## 8. Feedback、LmergePolicy 与 L1+ Filter
 
 读取 L0 时，Engine 会记录：
 
@@ -258,7 +264,9 @@ SignaturePruningDecision {
 | `bloom_filtered_segments` | 被 source bloom 过滤的 segment |
 | `l0_partitions` | 按 src label、edge type、range bucket 统计的反馈 |
 
-K4 merge 使用：
+K4 的 merge policy 分为两段。
+
+第一段是 L0 feedback merge：
 
 ```rust
 compact_best_l0_partition_by_score()
@@ -267,13 +275,65 @@ compact_best_l0_partition_by_score()
 它会从 metrics 中选择 hot L0 partition，读取对应 L0 和 overlap 的 L1，
 再通过 snapshot/tombstone-safe retention 生成新的 L1 CSR segment。
 
+第二段是 L1+ cascade merge：
+
+```rust
+K4MergePolicy
+compact_k4_levels()
+compact_k4_levels_with_policy(policy)
+```
+
+当前策略是保守正确的 fanout policy：
+
+| 策略项 | 当前实现 |
+|---|---|
+| 触发条件 | 某个 L1+ source level 的 segment 数超过 `fanout` |
+| 输入 | source level 全部 segment + target level 全部 segment |
+| 输出层 | `source_level + 1` |
+| 输出布局 | 默认按 `(src_label, edge_type)` 语义分区 |
+| 保留规则 | snapshot/tombstone-safe retention |
+| metadata | 由 CSR writer 对输出 segment 重新推导 exact semantic metadata |
+| manifest | 新 segment 写 `CreateFile`，旧 segment 写 `DeleteFile` |
+
+这个策略牺牲一部分 write amplification，换取实现边界清楚和功能正确：
+只要 L1+ 被 cascade，输出就不会退化成一个 mixed 大段，而是保持可被
+`GraphAccessSignature` 过滤的 semantic segment。
+
+L1+ filter 路径如下：
+
+1. `MultiLevelIndex` 根据 `src` 找到包含该 source 的 L1+ segment。
+2. 每个候选 segment 再调用 `signature_pruning_decision()`。
+3. 如果 edge type、src label、dst label、degree、property absence 等证明 disjoint，
+   直接跳过该 segment。
+4. 只有保留下来的 segment 才进入 CSR reader 的 bloom/offset/body probe。
+
+因此 L1+ 的 filter 不是单独新增一个 paper-only 索引，而是复用并制度化了：
+
+```text
+source index -> semantic metadata filter -> CSR bloom/offset/body probe
+```
+
+新增 L1+ 测试：
+
+```text
+k4_lmerge_cascades_l1_to_l2_with_semantic_filters
+```
+
+该测试构造同一个 source 的 3 个不同 edge type 的 L1 segment，触发
+K4 L1->L2 cascade，然后验证：
+
+1. L1 被清空，L2 生成 3 个 segment。
+2. L2 segment 保持 exact `src_label` 和 exact `edge_type_partition`。
+3. 查询某一个 edge type 时，其他 L2 segment 会产生 `edge_type` pruning。
+4. reopen 后 L2 查询结果仍正确。
+
 这个路径不是 paper runner，而是 Engine 内核 API。新增测试：
 
 ```text
 k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe
 ```
 
-该测试验证：
+`k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe` 验证：
 
 1. schema 变更能持久化。
 2. 未 flush 的 tombstone 由 K4 lifecycle flush。
@@ -335,11 +395,12 @@ K4 的正确性必须包含 reopen，因为只在内存里正确不能证明 DB 
 | 方向 | 状态 |
 |---|---|
 | SNB mixed update 自动触发 K4 lifecycle | 未实现 |
-| 连续后台 LmergePolicy 调度 | 未实现 |
-| 多层级 L1/L2/... semantic proof 传播 | 未实现 |
+| 连续后台 LmergePolicy 调度 | 未实现，当前为显式调用 |
+| L1/L2/... semantic segment/filter | 已实现 fanout cascade + exact metadata filter |
 | schema lifecycle cost model | 未实现 |
-| metadata downgrade/repair 的显式状态机 | 未实现 |
+| metadata downgrade/repair 的显式状态机 | 部分由 CSR writer 重新推导，尚未抽象为独立状态机 |
 | paper 级稳定延迟和写放大指标 | 需要后续实验 |
 
-因此，当前分支可以支撑“DB 内核已经具备最小 K4 lifecycle 且功能正确”的说法；
-但还不能声称“完整 SNB mixed workload 已经自动走 K4 生命周期”。
+因此，当前分支可以支撑“DB 内核已经具备 K4 lifecycle、LmergePolicy
+显式调用、L1+ semantic segment/filter，且功能正确”的说法；但还不能声称
+“完整 SNB mixed workload 已经自动走 K4 生命周期”或“后台调度器已经生产化”。

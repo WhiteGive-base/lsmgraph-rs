@@ -32,8 +32,8 @@ use crate::schema::{
 };
 use crate::semantic::{DegreeClass, GraphAccessSignature, PropertyPredicate};
 use crate::types::{
-    source_label_from_vertex_id, EdgeMarker, EdgeRecord, EdgeType, FileId, SnapshotId, VertexId,
-    MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL,
+    source_label_from_vertex_id, EdgeMarker, EdgeRecord, EdgeType, FileId, LevelId, SnapshotId,
+    VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL,
 };
 use crate::version::{Version, VersionGuard, VersionManager};
 
@@ -664,6 +664,36 @@ pub struct K4LifecycleReadReport {
     pub bloom_filtered_segments_delta: u64,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct K4MergePolicy {
+    pub fanout: usize,
+    pub min_input_segments: usize,
+    pub max_output_level: LevelId,
+    pub semantic_partition_outputs: bool,
+}
+
+impl K4MergePolicy {
+    pub fn from_config(config: &LsmGraphConfig) -> Self {
+        Self {
+            fanout: config.level_fanout.max(2),
+            min_input_segments: 2,
+            max_output_level: config.max_levels.saturating_sub(1).max(1) as LevelId,
+            semantic_partition_outputs: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct K4LevelCompactionDecision {
+    pub source_level: LevelId,
+    pub target_level: LevelId,
+    pub input_segments: usize,
+    pub output_segments: usize,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub semantic_partition_outputs: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct K4LifecycleReport {
     pub initial_snapshot: SnapshotId,
@@ -681,6 +711,7 @@ pub struct K4LifecycleReport {
     pub l1_segments_after_compaction: usize,
     pub reads: Vec<K4LifecycleReadReport>,
     pub feedback_compaction: Option<L0CompactionDecision>,
+    pub level_compactions: Vec<K4LevelCompactionDecision>,
 }
 
 #[derive(Debug, Clone)]
@@ -971,6 +1002,7 @@ impl Engine {
         }
 
         let feedback_compaction = self.compact_best_l0_partition_by_score().await?;
+        let level_compactions = self.compact_k4_levels().await?;
         self.persist_semantic_sidecars()?;
         let after_compaction_levels = self.live_file_count_by_level();
 
@@ -1002,6 +1034,7 @@ impl Engine {
             l1_segments_after_compaction: level_count(&after_compaction_levels, L1),
             reads,
             feedback_compaction,
+            level_compactions,
         })
     }
 
@@ -2890,6 +2923,44 @@ impl Engine {
         }))
     }
 
+    pub async fn compact_k4_levels(&self) -> Result<Vec<K4LevelCompactionDecision>> {
+        self.compact_k4_levels_with_policy(K4MergePolicy::from_config(&self.config))
+            .await
+    }
+
+    pub async fn compact_k4_levels_with_policy(
+        &self,
+        policy: K4MergePolicy,
+    ) -> Result<Vec<K4LevelCompactionDecision>> {
+        let mut decisions = Vec::new();
+        let max_output_level = policy
+            .max_output_level
+            .min(self.config.max_levels.saturating_sub(1).max(1) as LevelId);
+        if max_output_level <= L1 {
+            return Ok(decisions);
+        }
+        for source_level in L1..max_output_level {
+            let source_count = self
+                .version_manager
+                .pin_current()
+                .version()
+                .levels
+                .get(source_level as usize)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if source_count < policy.min_input_segments || source_count <= policy.fanout {
+                continue;
+            }
+            if let Some(decision) = self
+                .compact_k4_level_to_next(source_level, source_level + 1, policy)
+                .await?
+            {
+                decisions.push(decision);
+            }
+        }
+        Ok(decisions)
+    }
+
     fn pick_l0_partition_by_score(&self) -> Option<PickedL0Partition> {
         let guard = self.version_manager.pin_current();
         let l0_files = guard.version().levels.get(L0 as usize)?;
@@ -3068,6 +3139,125 @@ impl Engine {
             .storage_compaction_latency
             .record_since(started);
         Ok(outputs)
+    }
+
+    async fn compact_k4_level_to_next(
+        &self,
+        source_level: LevelId,
+        target_level: LevelId,
+        policy: K4MergePolicy,
+    ) -> Result<Option<K4LevelCompactionDecision>> {
+        let started = Instant::now();
+        self.wait_for_flushes().await?;
+        let guard = self.version_manager.pin_current();
+        let selected_source = guard
+            .version()
+            .levels
+            .get(source_level as usize)
+            .cloned()
+            .unwrap_or_default();
+        if selected_source.is_empty() {
+            self.metrics
+                .storage_compaction_latency
+                .record_since(started);
+            return Ok(None);
+        }
+        let selected_target = guard
+            .version()
+            .levels
+            .get(target_level as usize)
+            .cloned()
+            .unwrap_or_default();
+        let input_segments = selected_source.len() + selected_target.len();
+        let reader = CsrReader::with_metrics_and_cache(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.metrics.clone(),
+            self.metadata_cache.clone(),
+        );
+        let mut updates = Vec::new();
+        let mut input_bytes = 0u64;
+        for meta in selected_source.iter().chain(selected_target.iter()) {
+            input_bytes += estimated_meta_bytes(meta);
+            updates.extend(
+                reader
+                    .read_all_edges_with_properties(meta)
+                    .await?
+                    .into_iter()
+                    .map(edge_record_with_properties_from_csr),
+            );
+        }
+
+        let snapshot = self.current_snapshot();
+        let compacted = retain_property_history_for_safe_snapshot(
+            updates,
+            snapshot,
+            self.snapshot_gc_safe_point(),
+        );
+        let writer = CsrWriter::new(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.current_schema_epoch(),
+        );
+        let segments = if policy.semantic_partition_outputs {
+            split_k4_semantic_compaction_segments(compacted, self.config.segment_target_bytes)
+        } else {
+            split_property_compaction_segments(compacted, self.config.segment_target_bytes)
+        };
+        let mut outputs = Vec::new();
+        for segment_edges in segments {
+            let file_id = self.alloc_file_id();
+            let output = writer
+                .write_segment_with_properties(target_level, file_id, segment_edges)
+                .await?;
+            self.append_manifest(&ManifestRecord::CreateFile { meta: output })?;
+            outputs.push(output);
+        }
+        for meta in selected_source.iter().chain(selected_target.iter()) {
+            self.append_manifest(&ManifestRecord::DeleteFile {
+                file_id: meta.file_id,
+            })?;
+        }
+
+        let old = self.version_manager.pin_current();
+        let selected_source_ids: HashSet<_> = selected_source.iter().map(|m| m.file_id).collect();
+        let selected_target_ids: HashSet<_> = selected_target.iter().map(|m| m.file_id).collect();
+        let mut levels = old.version().levels.clone();
+        ensure_level(&mut levels, target_level);
+        levels[source_level as usize].retain(|meta| !selected_source_ids.contains(&meta.file_id));
+        levels[target_level as usize].retain(|meta| !selected_target_ids.contains(&meta.file_id));
+        levels[target_level as usize].extend(outputs.iter().copied());
+        sort_level(&mut levels[source_level as usize]);
+        sort_level(&mut levels[target_level as usize]);
+        self.version_manager.publish(Version {
+            id: old.version().id + 1,
+            memgraphs: old.version().memgraphs.clone(),
+            levels,
+        });
+        self.metrics
+            .compaction_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .compaction_input_bytes
+            .fetch_add(input_bytes, Ordering::Relaxed);
+        let output_bytes = outputs.iter().map(estimated_meta_bytes).sum::<u64>();
+        self.metrics
+            .compaction_output_bytes
+            .fetch_add(output_bytes, Ordering::Relaxed);
+        self.rebuild_index().await?;
+        self.rebuild_semantic_indexes().await?;
+        self.metrics
+            .storage_compaction_latency
+            .record_since(started);
+        Ok(Some(K4LevelCompactionDecision {
+            source_level,
+            target_level,
+            input_segments,
+            output_segments: outputs.len(),
+            input_bytes,
+            output_bytes,
+            semantic_partition_outputs: policy.semantic_partition_outputs,
+        }))
     }
 
     async fn compact_l0_to_l1_inner(&self, force: bool) -> Result<Option<CsrSegmentMeta>> {
@@ -3755,6 +3945,43 @@ fn split_property_compaction_segments(
     }
     if !current.is_empty() {
         segments.push(current);
+    }
+    segments
+}
+
+fn split_k4_semantic_compaction_segments(
+    mut records: Vec<EdgeRecordWithProperties>,
+    target_segment_bytes: usize,
+) -> Vec<Vec<EdgeRecordWithProperties>> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+    records.sort_by_key(|record| {
+        (
+            source_label_from_vertex_id(record.edge.src),
+            record.edge.edge_type,
+            record.edge.src,
+            record.edge.dst,
+            record.edge.ts,
+            record.edge.marker as u8,
+        )
+    });
+    let mut groups: BTreeMap<(i32, EdgeType), Vec<EdgeRecordWithProperties>> = BTreeMap::new();
+    for record in records {
+        groups
+            .entry((
+                source_label_from_vertex_id(record.edge.src),
+                record.edge.edge_type,
+            ))
+            .or_default()
+            .push(record);
+    }
+    let mut segments = Vec::new();
+    for (_, group) in groups {
+        segments.extend(split_property_compaction_segments(
+            group,
+            target_segment_bytes,
+        ));
     }
     segments
 }

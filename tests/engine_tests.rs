@@ -11,8 +11,8 @@ use lsmgraph::metrics::Metrics;
 use lsmgraph::property_encoding::PropertyValue;
 use lsmgraph::types::{EdgeLabel, EdgeRecord, VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
-    DegreeClass, GraphAccessSignature, NewPropertyEntry, PropertyOwner, SchemaCatalog,
-    SemanticSummaryCompleteness, VertexLabel,
+    DegreeClass, GraphAccessSignature, K4MergePolicy, NewPropertyEntry, PropertyOwner,
+    SchemaCatalog, SemanticSummaryCompleteness, VertexLabel,
 };
 use serde_json::Value;
 
@@ -4217,6 +4217,98 @@ async fn k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe() -> any
         .await?;
     assert_eq!(reopened_property_match.len(), 1);
     assert_eq!(reopened_property_match[0].dst, dsts[2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn k4_lmerge_cascades_l1_to_l2_with_semantic_filters() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-lmerge-l1-l2-semantic-filter-")?;
+    let mut config = feedback_compaction_config(tmp.path());
+    config.level_fanout = 2;
+    let engine = Engine::create(config.clone()).await?;
+    let src = encoded(VertexLabel::Person, 72_000);
+    let edge_types = [101, 102, 103];
+
+    for (idx, edge_type) in edge_types.iter().copied().enumerate() {
+        engine
+            .insert_edge(
+                src,
+                encoded(VertexLabel::Person, 73_000 + idx as u64),
+                edge_type,
+            )
+            .await?;
+        engine.flush_active().await?;
+        let outputs = engine
+            .compact_l0_partition_to_l1(VertexLabel::Person as i32, Some(edge_type))
+            .await?;
+        assert_eq!(outputs.len(), 1);
+    }
+
+    let before = engine.live_file_count_by_level();
+    assert_eq!(before.get(0).copied(), Some(0));
+    assert_eq!(before.get(1).copied(), Some(3));
+
+    let decisions = engine
+        .compact_k4_levels_with_policy(K4MergePolicy {
+            fanout: 2,
+            min_input_segments: 2,
+            max_output_level: 2,
+            semantic_partition_outputs: true,
+        })
+        .await?;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].source_level, 1);
+    assert_eq!(decisions[0].target_level, 2);
+    assert_eq!(decisions[0].input_segments, 3);
+    assert_eq!(decisions[0].output_segments, 3);
+
+    let after = engine.live_file_count_by_level();
+    assert_eq!(after.get(1).copied(), Some(0));
+    assert_eq!(after.get(2).copied(), Some(3));
+    let guard = engine.version_guard();
+    let l2 = guard
+        .version()
+        .levels
+        .get(2)
+        .expect("K4 cascade should create L2");
+    assert!(
+        l2.iter()
+            .all(|meta| meta.src_label == VertexLabel::Person as i32
+                && meta.summary_completeness.allows_semantic_pruning()
+                && meta.edge_type_partition != MIXED_EDGE_TYPE),
+        "K4 L1+ outputs should preserve exact semantic partitions"
+    );
+    for edge_type in edge_types {
+        assert!(
+            l2.iter().any(|meta| meta.edge_type_partition == edge_type),
+            "K4 L2 outputs should keep edge type {edge_type} as an exact partition"
+        );
+    }
+    drop(guard);
+
+    engine.metrics().reset();
+    let result = engine
+        .get_neighbors_typed(src, edge_types[0], engine.current_snapshot())
+        .await?;
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].edge_type, edge_types[0]);
+    let snapshot = engine.metrics().snapshot_json();
+    let edge_type_prunes = snapshot["csr"]["pruning_reasons"]["edge_type"]["pruned_segments"]
+        .as_u64()
+        .unwrap_or_default();
+    assert!(
+        edge_type_prunes >= 2,
+        "L1+ source index should feed exact semantic segment filters for disjoint edge types"
+    );
+
+    drop(engine);
+    let reopened = Engine::open(config).await?;
+    let reopened_result = reopened
+        .get_neighbors_typed(src, edge_types[1], reopened.current_snapshot())
+        .await?;
+    assert_eq!(reopened_result.len(), 1);
+    assert_eq!(reopened_result[0].edge_type, edge_types[1]);
+    assert_eq!(reopened.live_file_count_by_level().get(2).copied(), Some(3));
     Ok(())
 }
 
