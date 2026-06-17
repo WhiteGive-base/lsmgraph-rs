@@ -5,13 +5,13 @@
 > 目录：`/data/WorkSpace/lsmgraph-rs-clean-kernel`
 >
 > 范围：本文只描述 DB 内核、存储格式、查询路径、写入路径、语义剪枝边界、
-> K4 lifecycle API 和当前验证边界。论文草稿、实验脚本、baseline trace、
+> LSM lifecycle API 和当前验证边界。论文草稿、实验脚本、baseline trace、
 > 绘图文件和一次性 runner 不属于这个干净分支。
 
 ## 1. 主线目标
 
 这个分支先完成了“干净 DB 内核分支”，随后在内核里补了一个最小完整的
-K4 lifecycle API。当前目标不是把所有论文实验都放进这个分支，而是让
+LSM lifecycle API。当前目标不是把所有论文实验都放进这个分支，而是让
 LSMGraph 内核本身具备一条可验证的 DB-native 生命周期链路：
 
 ```text
@@ -22,12 +22,12 @@ write -> flush -> semantic metadata -> read pruning -> feedback
 当前实现落点是：
 
 ```rust
-Engine::run_k4_lifecycle(signatures)
-Engine::run_k4_lifecycle_with_repetitions(signatures, repetitions)
-Engine::run_k4_maintenance()
+Engine::run_lifecycle(signatures)
+Engine::run_lifecycle_with_repetitions(signatures, repetitions)
+Engine::run_maintenance()
 ```
 
-自动维护通过 `auto_compaction` 或 `with_k4_auto_maintenance(true)` 开启。
+自动维护通过 `auto_compaction` 或 `with_auto_maintenance(true)` 开启。
 
 它会使用真实 Engine 路径完成：
 
@@ -36,13 +36,13 @@ Engine::run_k4_maintenance()
 3. 执行 query signatures，触发 segment-level read pruning。
 4. 记录 L0 partition feedback。
 5. 根据 feedback 选择 hot L0 partition 并 merge 到 L1。
-6. 如果 L1+ 超过 K4 fanout，则按 LmergePolicy cascade 到下一层。
+6. 如果 L1+ 超过 LSM compaction fanout，则按 LmergePolicy cascade 到下一层。
 7. 再次持久化 semantic sidecar。
 8. 通过 manifest、schema catalog、sidecar 支持 reopen 后恢复。
 
-注意：SNB HTTP server 不直接调用 `Engine::run_k4_lifecycle*`，而是通过
+注意：SNB HTTP server 不直接调用 `Engine::run_lifecycle*`，而是通过
 `DynamicSnbGraph -> DynamicGraphView -> DeltaGraph -> Engine` 的普通读写路径
-自然触发 K4 maintenance。也就是说，SNB 仍然只是 workload/adapter，K4 策略在
+自然触发 LSM maintenance。也就是说，SNB 仍然只是 workload/adapter，LSM compaction 策略在
 Engine 内核里。
 
 ## 2. 系统流程图
@@ -68,7 +68,7 @@ flowchart TD
     O --> P["查询结果"]
 
     N --> Q["Metrics Feedback<br/>L0 partition query/probe counters"]
-    E --> AA["K4 Maintenance Scheduler<br/>flush / feedback / fanout trigger"]
+    E --> AA["LSM compaction Maintenance Scheduler<br/>flush / feedback / fanout trigger"]
     Q --> AA
     AA --> R["compact_best_l0_partition_by_score()"]
     R --> S["L0 + overlapping L1 read all versions"]
@@ -77,7 +77,7 @@ flowchart TD
     U --> G
     U --> H
     U --> X{"L1+ fanout 超限?"}
-    X -->|yes| Y["K4 LmergePolicy<br/>按 (src_label, edge_type) 重分区"]
+    X -->|yes| Y["LevelMergePolicy<br/>按 (src_label, edge_type) 重分区"]
     Y --> Z["L2/L3... semantic CSR Segment"]
     Z --> G
     Z --> H
@@ -139,7 +139,7 @@ Engine
   - MemGraph write buffer
   - VersionManager MVCC snapshots
   - L0/L1 CSR segment metadata
-  - semantic pruning / feedback / K4 lifecycle
+  - semantic pruning / feedback / LSM lifecycle
         |
         v
 CSR storage + IO backend
@@ -152,7 +152,7 @@ CSR storage + IO backend
 
 | 文件 | 责任 |
 |---|---|
-| `src/graph.rs` | Engine 主体，写入、flush、读取、semantic index、feedback compaction、K4 lifecycle、LmergePolicy |
+| `src/graph.rs` | Engine 主体，写入、flush、读取、semantic index、feedback compaction、LSM lifecycle、LmergePolicy |
 | `src/memgraph/mod.rs` | 内存写缓冲 |
 | `src/csr/format.rs` | CSR segment metadata、semantic summary、pruning decision |
 | `src/csr/writer.rs` | CSR segment 写入 |
@@ -261,16 +261,16 @@ SignaturePruningDecision {
 
 ## 8. Feedback、LmergePolicy 与 L1+ Filter
 
-K4 maintenance scheduler 已经进入 Engine 内核。默认关闭；当配置打开
-`auto_compaction` 或调用 `with_k4_auto_maintenance(true)` 后，Engine 会在普通
+LSM maintenance scheduler 已经进入 Engine 内核。默认关闭；当配置打开
+`auto_compaction` 或调用 `with_auto_maintenance(true)` 后，Engine 会在普通
 DB 路径中自动检查是否需要维护：
 
 | 触发点 | 行为 |
 |---|---|
 | flush 完成 | 检查 L0 文件数阈值和 L1+ fanout |
-| 后台 flush task 完成 | 提交一次异步 K4 maintenance 触发 |
+| 后台 flush task 完成 | 提交一次异步 LSM maintenance 触发 |
 | read feedback 更新后 | 检查 hot L0 partition 是否达到 feedback score |
-| 手动维护 | `Engine::run_k4_maintenance()` 返回可序列化 report |
+| 手动维护 | `Engine::run_maintenance()` 返回可序列化 report |
 
 调度器有内核级互斥保护，避免多个 flush/read 同时执行 compaction。自动触发不会
 绕过 Engine API，也不会引入 SNB 专用逻辑。
@@ -285,7 +285,7 @@ DB 路径中自动检查是否需要维护：
 | `bloom_filtered_segments` | 被 source bloom 过滤的 segment |
 | `l0_partitions` | 按 src label、edge type、range bucket 统计的反馈 |
 
-K4 的 merge policy 分为两段。
+LSM-tree 的 merge policy 分为两段。
 
 第一段是 L0 feedback merge：
 
@@ -299,9 +299,9 @@ compact_best_l0_partition_by_score()
 第二段是 L1+ cascade merge：
 
 ```rust
-K4MergePolicy
-compact_k4_levels()
-compact_k4_levels_with_policy(policy)
+LevelMergePolicy
+compact_levels()
+compact_levels_with_policy(policy)
 ```
 
 当前策略是保守正确的 fanout policy：
@@ -337,49 +337,49 @@ source index -> semantic metadata filter -> CSR bloom/offset/body probe
 新增 L1+ 测试：
 
 ```text
-k4_lmerge_cascades_l1_to_l2_with_semantic_filters
-k4_auto_maintenance_read_feedback_compacts_hot_l0_partition
-k4_auto_maintenance_flush_cascades_l1_to_l2
-k4_delta_graph_normal_api_triggers_auto_maintenance
+lmerge_cascades_l1_to_l2_with_semantic_filters
+auto_maintenance_read_feedback_compacts_hot_l0_partition
+auto_maintenance_flush_cascades_l1_to_l2
+delta_graph_normal_api_triggers_auto_maintenance
 ```
 
 该测试构造同一个 source 的 3 个不同 edge type 的 L1 segment，触发
-K4 L1->L2 cascade，然后验证：
+L1->L2 cascade，然后验证：
 
 1. L1 被清空，L2 生成 3 个 segment。
 2. L2 segment 保持 exact `src_label` 和 exact `edge_type_partition`。
 3. 查询某一个 edge type 时，其他 L2 segment 会产生 `edge_type` pruning。
 4. reopen 后 L2 查询结果仍正确。
 
-`k4_auto_maintenance_read_feedback_compacts_hot_l0_partition` 验证 hot read feedback
+`auto_maintenance_read_feedback_compacts_hot_l0_partition` 验证 hot read feedback
 达到阈值后，普通 `get_neighbors_typed()` 会自动触发 L0 feedback merge。
 
-`k4_auto_maintenance_flush_cascades_l1_to_l2` 验证 flush 后的自动维护会发现
+`auto_maintenance_flush_cascades_l1_to_l2` 验证 flush 后的自动维护会发现
 L1 fanout 超限，并 cascade 到 L2。
 
-`k4_delta_graph_normal_api_triggers_auto_maintenance` 验证 Dynamic/SNB 使用的
-DeltaGraph 普通 API 会创建 K4 auto maintenance Engine，并通过普通
+`delta_graph_normal_api_triggers_auto_maintenance` 验证 Dynamic/SNB 使用的
+DeltaGraph 普通 API 会创建 automatic LSM maintenance Engine，并通过普通
 insert/flush/read 路径触发维护。
 
 SNB dynamic server 使用：
 
 ```text
 DynamicSnbGraph::open()
-  -> DynamicGraphView::open_or_create_k4_delta()
-  -> DeltaGraph::create/open_with_k4_auto_maintenance()
-  -> Engine with semantic-budgeted L0 + K4 auto maintenance
+  -> DynamicGraphView::open_or_create_delta_with_auto_maintenance()
+  -> DeltaGraph::create/open_with_auto_maintenance()
+  -> Engine with semantic-budgeted L0 + automatic LSM maintenance
 ```
 
 这个路径不是 paper runner，而是 Engine 内核 API。新增测试：
 
 ```text
-k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe
+lifecycle_flushes_feedback_compacts_and_reopens_schema_safe
 ```
 
-`k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe` 验证：
+`lifecycle_flushes_feedback_compacts_and_reopens_schema_safe` 验证：
 
 1. schema 变更能持久化。
-2. 未 flush 的 tombstone 由 K4 lifecycle flush。
+2. 未 flush 的 tombstone 由 LSM lifecycle flush。
 3. query signatures 能产生 L0 feedback。
 4. feedback compaction 能选择 hot partition。
 5. L0 merge 到 L1 后结果仍正确。
@@ -410,7 +410,7 @@ snapshot 都不会读错。
 | L0 semantic index | L0 metadata + degree directory |
 | degree directory | sidecar，缺失时可 rebuild |
 
-K4 的正确性必须包含 reopen，因为只在内存里正确不能证明 DB 生命周期正确。
+LSM 生命周期正确性必须包含 reopen，因为只在内存里正确不能证明 DB 生命周期正确。
 
 ## 11. LDBC / SNB 验证边界
 
@@ -428,9 +428,9 @@ K4 的正确性必须包含 reopen，因为只在内存里正确不能证明 DB 
 | `cargo test --lib` | 64 passed |
 | `cargo test --bin lsmgraph` | 4 passed |
 | `cargo test --test engine_tests` | 60 passed, 1 ignored |
-| K4 lifecycle 单测 | passed |
-| K4 auto maintenance 单测 | passed |
-| K4 DeltaGraph 普通路径单测 | passed |
+| LSM lifecycle 单测 | passed |
+| automatic LSM maintenance 单测 | passed |
+| DeltaGraph 普通路径单测 | passed |
 | release build | passed |
 | Rust `snb-validate --max-lines 20` | checked=20, passed=20, failed=0 |
 | Java LDBC mixed validation smoke, `MAX_LINES=5` | Validation Result: PASS |
@@ -439,14 +439,14 @@ K4 的正确性必须包含 reopen，因为只在内存里正确不能证明 DB 
 
 | 方向 | 状态 |
 |---|---|
-| SNB mixed update 自动触发 K4 lifecycle | 已实现为 DynamicGraphView/DeltaGraph 普通路径自动触发，不把 SNB 逻辑写进 Engine |
-| 连续后台 LmergePolicy 调度 | 已实现事件驱动 K4 maintenance scheduler；复杂常驻线程调度不在本阶段声称 |
+| SNB mixed update 自动触发 LSM lifecycle | 已实现为 DynamicGraphView/DeltaGraph 自动维护路径自动触发，不把 SNB 逻辑写进 Engine |
+| 连续后台 LmergePolicy 调度 | 已实现事件驱动 LSM maintenance scheduler；复杂常驻线程调度不在本阶段声称 |
 | L1/L2/... semantic segment/filter | 已实现 fanout cascade + exact metadata filter |
 | schema lifecycle cost model | 未实现 |
 | metadata downgrade/repair 的显式状态机 | 部分由 CSR writer 重新推导，尚未抽象为独立状态机 |
 | paper 级稳定延迟和写放大指标 | 需要后续实验 |
 
-因此，当前分支可以支撑“DB 内核已经具备 K4 lifecycle、事件驱动 K4
+因此，当前分支可以支撑“DB 内核已经具备 LSM lifecycle、事件驱动 LSM compaction
 maintenance scheduler、SNB dynamic delta 自然触发、LmergePolicy、L1+
 semantic segment/filter，且功能正确”的说法；但还不能声称“paper 级 cost model
 和写放大优化策略已经完成”。

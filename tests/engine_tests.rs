@@ -11,8 +11,8 @@ use lsmgraph::metrics::Metrics;
 use lsmgraph::property_encoding::PropertyValue;
 use lsmgraph::types::{EdgeLabel, EdgeRecord, VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
-    DegreeClass, DeltaGraph, GraphAccessSignature, K4MergePolicy, NewPropertyEntry, PropertyOwner,
-    SchemaCatalog, SemanticSummaryCompleteness, VertexLabel,
+    DegreeClass, DeltaGraph, GraphAccessSignature, LevelMergePolicy, NewPropertyEntry,
+    PropertyOwner, SchemaCatalog, SemanticSummaryCompleteness, VertexLabel,
 };
 use serde_json::Value;
 
@@ -4091,7 +4091,7 @@ async fn feedback_compaction_picks_hot_l0_partition_and_reduces_candidates() -> 
 }
 
 #[tokio::test]
-async fn k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe() -> anyhow::Result<()> {
+async fn lifecycle_flushes_feedback_compacts_and_reopens_schema_safe() -> anyhow::Result<()> {
     let tmp = target_tempdir("k4-lifecycle-db-chain-")?;
     let config = feedback_compaction_config(tmp.path());
     let engine = Engine::create(config.clone()).await?;
@@ -4137,7 +4137,7 @@ async fn k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe() -> any
     let signature = GraphAccessSignature::neighbor_scan(src, Some(edge_type))
         .with_degree_class(DegreeClass::Low);
     let report = engine
-        .run_k4_lifecycle_with_repetitions(&[signature], 3)
+        .run_lifecycle_with_repetitions(&[signature], 3)
         .await?;
 
     assert_eq!(report.initial_snapshot, delete_snapshot);
@@ -4146,7 +4146,7 @@ async fn k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe() -> any
     assert_eq!(report.flush_count_delta, 1);
     assert!(
         report.degree_directory_sidecar_persists_delta >= 2,
-        "K4 should persist semantic metadata after flush and after merge"
+        "LSM compaction should persist semantic metadata after flush and after merge"
     );
     assert_eq!(report.reads.len(), 3);
     assert!(
@@ -4154,12 +4154,12 @@ async fn k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe() -> any
             .reads
             .iter()
             .all(|read| read.result_count == 2 && read.candidate_l0_segments_delta >= 3),
-        "K4 reads should observe the tombstone-filtered result while collecting L0 feedback"
+        "LSM reads should observe the tombstone-filtered result while collecting L0 feedback"
     );
     let decision = report
         .feedback_compaction
         .as_ref()
-        .expect("K4 feedback phase should select the hot L0 partition");
+        .expect("feedback phase should select the hot L0 partition");
     assert_eq!(decision.key.edge_type, edge_type);
     assert!(decision.key.range_start <= src && src <= decision.key.range_end);
     assert!(decision.selected_l0_segments >= 3);
@@ -4221,7 +4221,7 @@ async fn k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe() -> any
 }
 
 #[tokio::test]
-async fn k4_lmerge_cascades_l1_to_l2_with_semantic_filters() -> anyhow::Result<()> {
+async fn lmerge_cascades_l1_to_l2_with_semantic_filters() -> anyhow::Result<()> {
     let tmp = target_tempdir("k4-lmerge-l1-l2-semantic-filter-")?;
     let mut config = feedback_compaction_config(tmp.path());
     config.level_fanout = 2;
@@ -4249,7 +4249,7 @@ async fn k4_lmerge_cascades_l1_to_l2_with_semantic_filters() -> anyhow::Result<(
     assert_eq!(before.get(1).copied(), Some(3));
 
     let decisions = engine
-        .compact_k4_levels_with_policy(K4MergePolicy {
+        .compact_levels_with_policy(LevelMergePolicy {
             fanout: 2,
             min_input_segments: 2,
             max_output_level: 2,
@@ -4270,18 +4270,18 @@ async fn k4_lmerge_cascades_l1_to_l2_with_semantic_filters() -> anyhow::Result<(
         .version()
         .levels
         .get(2)
-        .expect("K4 cascade should create L2");
+        .expect("level compaction should create L2");
     assert!(
         l2.iter()
             .all(|meta| meta.src_label == VertexLabel::Person as i32
                 && meta.summary_completeness.allows_semantic_pruning()
                 && meta.edge_type_partition != MIXED_EDGE_TYPE),
-        "K4 L1+ outputs should preserve exact semantic partitions"
+        "L1+ outputs should preserve exact semantic partitions"
     );
     for edge_type in edge_types {
         assert!(
             l2.iter().any(|meta| meta.edge_type_partition == edge_type),
-            "K4 L2 outputs should keep edge type {edge_type} as an exact partition"
+            "L2 outputs should keep edge type {edge_type} as an exact partition"
         );
     }
     drop(guard);
@@ -4313,9 +4313,9 @@ async fn k4_lmerge_cascades_l1_to_l2_with_semantic_filters() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn k4_auto_maintenance_read_feedback_compacts_hot_l0_partition() -> anyhow::Result<()> {
+async fn auto_maintenance_read_feedback_compacts_hot_l0_partition() -> anyhow::Result<()> {
     let tmp = target_tempdir("k4-auto-read-feedback-")?;
-    let mut config = feedback_compaction_config(tmp.path()).with_k4_auto_maintenance(true);
+    let mut config = feedback_compaction_config(tmp.path()).with_auto_maintenance(true);
     config.l0_file_threshold = 100;
     let engine = Engine::create(config).await?;
     let src = encoded(VertexLabel::Person, 82_000);
@@ -4340,7 +4340,7 @@ async fn k4_auto_maintenance_read_feedback_compacts_hot_l0_partition() -> anyhow
     assert_eq!(
         levels.get(0).copied(),
         Some(0),
-        "read feedback should automatically trigger K4 L0 feedback merge"
+        "read feedback should automatically trigger L0 feedback merge"
     );
     assert!(
         levels.get(1).copied().unwrap_or_default() >= 1,
@@ -4350,9 +4350,9 @@ async fn k4_auto_maintenance_read_feedback_compacts_hot_l0_partition() -> anyhow
 }
 
 #[tokio::test]
-async fn k4_auto_maintenance_flush_cascades_l1_to_l2() -> anyhow::Result<()> {
+async fn auto_maintenance_flush_cascades_l1_to_l2() -> anyhow::Result<()> {
     let tmp = target_tempdir("k4-auto-flush-l1-l2-")?;
-    let mut config = feedback_compaction_config(tmp.path()).with_k4_auto_maintenance(true);
+    let mut config = feedback_compaction_config(tmp.path()).with_auto_maintenance(true);
     config.level_fanout = 2;
     config.max_levels = 3;
     config.l0_file_threshold = 100;
@@ -4385,18 +4385,17 @@ async fn k4_auto_maintenance_flush_cascades_l1_to_l2() -> anyhow::Result<()> {
     assert_eq!(
         levels.get(1).copied(),
         Some(0),
-        "flush-triggered K4 maintenance should cascade over-fanout L1"
+        "flush-triggered maintenance should cascade over-fanout L1"
     );
     assert_eq!(levels.get(2).copied(), Some(3));
     Ok(())
 }
 
 #[tokio::test]
-async fn k4_delta_graph_normal_api_triggers_auto_maintenance() -> anyhow::Result<()> {
+async fn delta_graph_normal_api_triggers_auto_maintenance() -> anyhow::Result<()> {
     let tmp = target_tempdir("k4-delta-auto-maintenance-")?;
     let delta =
-        DeltaGraph::create_with_k4_auto_maintenance(tmp.path(), IoBackendKind::Blocking, 1024)
-            .await?;
+        DeltaGraph::create_with_auto_maintenance(tmp.path(), IoBackendKind::Blocking, 1024).await?;
     let src = encoded(VertexLabel::Person, 87_000);
     let edge_type = EdgeLabel::Knows.as_i32();
 
@@ -4422,7 +4421,7 @@ async fn k4_delta_graph_normal_api_triggers_auto_maintenance() -> anyhow::Result
     assert_eq!(
         levels.get(0).copied(),
         Some(0),
-        "DeltaGraph should use ordinary Engine reads to trigger K4 feedback maintenance"
+        "DeltaGraph should use ordinary Engine reads to trigger feedback maintenance"
     );
     assert!(levels.get(1).copied().unwrap_or_default() >= 1);
     Ok(())

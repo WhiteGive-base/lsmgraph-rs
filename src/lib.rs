@@ -22,8 +22,8 @@ pub use config::{L0LayoutPolicy, LsmGraphConfig};
 pub use delta::DeltaGraph;
 pub use dynamic_view::DynamicGraphView;
 pub use graph::{
-    Engine, K4LevelCompactionDecision, K4LifecycleReadReport, K4LifecycleReport,
-    K4MaintenanceReport, K4MaintenanceTrigger, K4MergePolicy,
+    Engine, LevelCompactionDecision, LevelMergePolicy, LifecycleReadReport, LifecycleReport,
+    MaintenanceReport, MaintenanceTrigger,
 };
 pub use property_encoding::{
     parse_default_or_null_rule, PropertyEncodingRegistry, PropertyEncodingSpec,
