@@ -1,85 +1,118 @@
-# LSMGraph Clean Kernel Architecture
+# LSMGraph 干净内核架构文档
 
-> Branch target: `codex/k4-clean-kernel`
+> 分支：`codex/k4-clean-kernel`
 >
-> Scope: clean DB kernel only. This document describes the engine, storage
-> format, query path, update path, semantic-pruning boundary, and the current
-> K4 lifecycle API. It intentionally excludes paper drafts, benchmark logs,
-> one-off experiment runners, and submission artifacts.
+> 目录：`/data/WorkSpace/lsmgraph-rs-clean-kernel`
+>
+> 范围：本文只描述 DB 内核、存储格式、查询路径、写入路径、语义剪枝边界、
+> K4 lifecycle API 和当前验证边界。论文草稿、实验脚本、baseline trace、
+> 绘图文件和一次性 runner 不属于这个干净分支。
 
-## 中文主线摘要
+## 1. 主线目标
 
-这个分支先完成了干净 DB 内核基线，然后在内核里补了一个最小完整的
-K4 lifecycle API。它只保留 LSMGraph 的内核源码、测试、Cargo 构建文件、
-README/启动文档，以及本架构文档；历史实验脚本、baseline 结果、论文草稿、
-图片和一次性 benchmark runner 都不属于这个分支的 tracked tree。
-
-当前带入的内核改动只限于 L0/semantic pruning 已经比较确定的部分：
-`src/csr/format.rs` 的 pruning decision/reason、
-`src/metrics.rs` 的 pruning reason metrics，以及
-`src/semantic.rs` 的 `with_dst_label()` 查询语义签名扩展。
-
-当前 K4 API 覆盖的 DB 链路是：
+这个分支先完成了“干净 DB 内核分支”，随后在内核里补了一个最小完整的
+K4 lifecycle API。当前目标不是把所有论文实验都放进这个分支，而是让
+LSMGraph 内核本身具备一条可验证的 DB-native 生命周期链路：
 
 ```text
 write -> flush -> semantic metadata -> read pruning -> feedback
       -> merge/compaction -> schema-safe recovery/reopen
 ```
 
-实现边界在 `Engine::run_k4_lifecycle_with_repetitions()`：
-它会 flush 当前 MemGraph、持久化 semantic sidecar、执行 query signatures
-产生 L0 feedback、用 feedback 选择 L0 partition 合并到 L1，并返回
-`K4LifecycleReport`。SNB HTTP server 还没有自动把 mixed update workload
-接入这条 lifecycle，这是后续集成点。
+当前实现落点是：
 
-## 1. Scope
-
-This branch is the clean kernel line for LSMGraph. It keeps the database engine
-and the minimum product-facing CLI/server code needed to build, test, import,
-query, and serve the graph store.
-
-The branch now includes the minimum DB-native K4 lifecycle API. K4 means:
-
-```text
-write -> flush -> semantic metadata -> read pruning -> feedback
-      -> merge/compaction -> schema-safe recovery/reopen
+```rust
+Engine::run_k4_lifecycle(signatures)
+Engine::run_k4_lifecycle_with_repetitions(signatures, repetitions)
 ```
 
-The current clean branch preserves the kernel foundation, exposes the K4
-lifecycle through `Engine`, and keeps research artifacts out of the branch.
+它会使用真实 Engine 路径完成：
 
-## 2. Repository Boundary
+1. flush 当前 MemGraph 写入。
+2. 持久化 semantic sidecar。
+3. 执行 query signatures，触发 segment-level read pruning。
+4. 记录 L0 partition feedback。
+5. 根据 feedback 选择 hot L0 partition 并 merge 到 L1。
+6. 再次持久化 semantic sidecar。
+7. 通过 manifest、schema catalog、sidecar 支持 reopen 后恢复。
 
-Kept in this branch:
+注意：SNB HTTP server 的 mixed update workload 目前还没有自动触发这条
+K4 lifecycle。当前 K4 是 Engine 层能力，SNB 集成是后续工作。
 
-| Path | Role |
+## 2. 系统流程图
+
+```mermaid
+flowchart TD
+    A["应用 / LDBC SNB / 内核测试"] --> B["Engine API"]
+
+    B --> C["写入路径<br/>insert_edge / delete_edge / property insert"]
+    C --> D["MemGraph<br/>内存写缓冲"]
+    D --> E["flush_active()"]
+    E --> F["L0 CSR Segment<br/>拓扑 + 属性 + semantic metadata"]
+    F --> G["MANIFEST<br/>CreateFile / DeleteFile"]
+    F --> H["Semantic Sidecar<br/>degree directory"]
+
+    B --> I["读取路径<br/>get_neighbors_by_signature()"]
+    I --> J["GraphAccessSignature<br/>src label / edge type / degree / dst label / property"]
+    J --> K["Semantic L0 Index<br/>候选 L0 segment"]
+    K --> L{"signature_pruning_decision"}
+    L -->|pruned| M["跳过 segment<br/>记录 pruning reason"]
+    L -->|kept| N["CSR Reader<br/>bloom / offset / body read"]
+    N --> O["MVCC merge_visible<br/>insert/delete/tombstone"]
+    O --> P["查询结果"]
+
+    N --> Q["Metrics Feedback<br/>L0 partition query/probe counters"]
+    Q --> R["compact_best_l0_partition_by_score()"]
+    R --> S["L0 + overlapping L1 read all versions"]
+    S --> T["snapshot/tombstone-safe retention"]
+    T --> U["L1 CSR Segment"]
+    U --> G
+    U --> H
+
+    G --> V["Engine::open()"]
+    H --> V
+    V --> W["恢复 Version / Index / Semantic Index / Schema Catalog"]
+```
+
+## 3. 分支边界
+
+保留内容：
+
+| 路径 | 作用 |
 |---|---|
-| `src/` | DB kernel, SNB service path, storage engine, IO backends |
-| `tests/` | Kernel and engine regression tests |
-| `Cargo.toml`, `Cargo.lock` | Rust package definition |
-| `README.md`, `README-cn.md` | User-facing project entry points |
-| `LSMGRAPH-ARCHITECTURE.md` | Clean kernel architecture |
-| `LSMGRAPH-STARTUP-GUIDE.md` | Basic startup guide |
+| `src/` | DB 内核、SNB 服务路径、存储引擎、IO backend |
+| `tests/` | 内核回归测试 |
+| `Cargo.toml`, `Cargo.lock` | Rust 构建定义 |
+| `README.md`, `README-cn.md` | 项目入口说明 |
+| `LSMGRAPH-ARCHITECTURE.md` | 本架构文档 |
+| `LSMGRAPH-STARTUP-GUIDE.md` | 启动和验证说明 |
+| `CLEAN-KERNEL-INVENTORY.md` | 干净分支清单 |
 
-Removed from this branch:
+移除内容：
 
-| Path/type | Reason |
+| 路径 / 类型 | 移除原因 |
 |---|---|
-| `baseline/` | Research scripts, reports, raw summaries, and experiment plans |
-| `scripts/` | One-off experiment and analysis runners |
-| `figures/` | Paper figures, not kernel source |
-| `docs/` | Historical evidence archive, not clean kernel docs |
-| top-level paper/planning markdown | Submission and experiment process material |
-| external-system reports | Baseline study artifacts, not engine source |
-| W/P experiment binaries under `src/bin` | Not part of the clean DB product surface |
+| `baseline/` | 历史实验脚本、结果、报告、trace |
+| `scripts/` | 一次性实验和分析 runner |
+| `figures/` | 论文图片，不是内核源码 |
+| `docs/` | 历史证据归档，不是当前内核文档 |
+| 顶层论文/计划 markdown | 论文和项目管理材料 |
+| external-system reports | 外部 baseline 调研材料 |
+| W/P experiment binaries | 不属于干净 DB 产品入口 |
 
-## 3. Layered Architecture
+产品 binary 只保留：
 
 ```text
-Application / Benchmark / DGS HTTP Client
+target/release/lsmgraph
+```
+
+## 4. 模块分层
+
+```text
+Application / LDBC SNB / 内核测试
         |
         v
-SNB server and query layer
+SNB server / query layer
   - DGS-compatible HTTP endpoints
   - LDBC SNB query/update mapping
         |
@@ -93,244 +126,220 @@ Engine
   - MemGraph write buffer
   - VersionManager MVCC snapshots
   - L0/L1 CSR segment metadata
-  - semantic pruning and metrics
+  - semantic pruning / feedback / K4 lifecycle
         |
         v
 CSR storage + IO backend
-  - segment manifest
-  - offset arrays and edge bodies
-  - blocking/direct/io_uring backends
+  - manifest
+  - offset arrays / edge bodies / property sections
+  - blocking / direct / io_uring backends
 ```
 
-## 4. Core Modules
+## 5. 核心模块
 
-| Module | Responsibility |
+| 文件 | 责任 |
 |---|---|
-| `src/graph.rs` | Engine state, writes, flush, levels, snapshots, query entry points |
-| `src/version.rs` | Immutable versions and read snapshot pinning |
-| `src/memgraph/` | In-memory write buffer for recent edge updates |
-| `src/csr/` | Segment format, reader, writer, manifest, metadata cache |
-| `src/semantic.rs` | Query-facing graph access signatures and semantic predicates |
-| `src/schema.rs` | Logical schema catalog and schema epoch model |
-| `src/property_encoding.rs` | Property value encoding boundary |
-| `src/metrics.rs` | Engine, IO, CSR, HTTP, partition, and pruning metrics |
-| `src/base_graph/` | Immutable base graph build/read path |
-| `src/delta/` | Thin DeltaGraph wrapper over the LSM engine |
-| `src/dynamic_view/` | BaseGraph + DeltaGraph merged view |
-| `src/snb/` | LDBC SNB import, property layer, query layer, DGS server |
-| `src/io/` | Pluggable IO backends |
-| `src/bin/lsmgraph.rs` | Product CLI and server binary |
+| `src/graph.rs` | Engine 主体，写入、flush、读取、semantic index、feedback compaction、K4 lifecycle |
+| `src/memgraph/mod.rs` | 内存写缓冲 |
+| `src/csr/format.rs` | CSR segment metadata、semantic summary、pruning decision |
+| `src/csr/writer.rs` | CSR segment 写入 |
+| `src/csr/reader.rs` | CSR segment 读取、bloom/offset/body probe |
+| `src/csr/manifest.rs` | manifest replay 和文件生命周期 |
+| `src/schema.rs` | schema catalog、epoch、alias/drop/change |
+| `src/semantic.rs` | GraphAccessSignature、degree/direction/property predicate |
+| `src/metrics.rs` | storage/CSR/SNB/feedback/pruning metrics |
+| `src/snb/` | LDBC SNB 查询、HTTP adapter、属性辅助结构 |
+| `tests/engine_tests.rs` | Engine 级功能正确性回归 |
 
-## 5. Storage Model
+## 6. 写入与 Flush
 
-LSMGraph stores a dynamic graph as:
-
-```text
-BaseGraph: immutable CSR snapshot for stable graph data
-DeltaGraph: MemGraph + LSM CSR segments for recent updates
-```
-
-The read path merges the immutable base graph with delta updates. The write
-path appends updates into MemGraph, flushes immutable CSR-like segments to L0,
-and publishes a new immutable version.
-
-### 5.1 Versioning
-
-The engine uses MVCC-style immutable versions:
-
-```text
-Version {
-  id,
-  memgraphs,
-  levels,
-}
-```
-
-Readers pin the current version. Writers publish a new version after flush or
-level changes. This keeps read and write paths structurally separate.
-
-### 5.2 MemGraph
-
-MemGraph is the write buffer. It groups edge records by source and keeps recent
-updates in memory until a flush boundary is reached. Frozen memgraphs are
-flushed to CSR segments.
-
-### 5.3 CSR Segment
-
-A segment consists of:
-
-```text
-CsrHeader
-EdgeOffset[]  // source -> edge body range
-DiskEdgeBody[] // destination, timestamp, marker/property/type fields
-```
-
-`CsrSegmentMeta` records the segment-level proof surface used before reading a
-body. Important metadata includes source label, destination label when known,
-edge-type partition, direction, source range, schema epoch, property summary,
-degree-class summary, tombstone flag, and summary completeness.
-
-## 6. Query Semantics
-
-The storage-facing query abstraction is `GraphAccessSignature`.
-
-It can encode:
-
-| Field | Meaning |
-|---|---|
-| source vertex/source label | source-side graph constraint |
-| destination label | optional destination-side graph constraint |
-| edge type | typed edge constraint such as `LIKES` or `KNOWS` |
-| direction | outgoing/incoming/both boundary |
-| degree class | optional degree-range class |
-| property predicate | currently exact presence/absence/equality boundary |
-| timestamp range | snapshot/time pruning boundary |
-| schema epoch | interpretation boundary for segment metadata |
-
-The kernel rule is:
-
-```text
-Only prune a segment when metadata proves disjointness or exact absence.
-Otherwise keep the segment as a candidate.
-```
-
-This keeps the failure mode as extra reads, not false negatives.
-
-## 7. Semantic Pruning Boundary
-
-`CsrSegmentMeta::signature_pruning_decision()` evaluates a segment against a
-`GraphAccessSignature` and returns:
-
-```text
-SignaturePruningDecision {
-  pruned: bool,
-  reason: &'static str,
-}
-```
-
-Typical prune reasons:
-
-| Reason | Meaning |
-|---|---|
-| `time` | segment timestamp range cannot match |
-| `src_label` | source label is disjoint |
-| `edge_type` | exact edge-type partition is disjoint |
-| `direction` | direction is disjoint |
-| `degree` | exact degree class is disjoint |
-| `dst_label` | destination label is disjoint |
-| `property_absence` | segment exactly lacks a required property |
-
-Typical keep/fallback reasons:
-
-| Reason | Meaning |
-|---|---|
-| `kept_candidate` | no proof of disjointness |
-| `mixed_unknown_fallback` | metadata is mixed, unknown, or not safe for pruning |
-| `budgeted_not_materialized` | budgeted layout did not keep exact degree partition |
-| `schema_tombstone_fallback` | property absence cannot prune due to tombstone risk |
-
-These reasons are also exposed through `Metrics` as pruning-reason counters.
-
-## 8. Metrics
-
-The clean kernel keeps metrics that are useful for engine operation and K4
-lifecycle reports:
-
-| Metric group | Examples |
-|---|---|
-| storage | flush count, compaction count, read/write latency |
-| IO | read/write bytes and backend latency |
-| CSR | probe setup, offset lookup, body reads, bloom probes |
-| L0 partitions | query/probe history grouped by semantic partition |
-| pruning reasons | pruned/kept segment counts and estimated saved bytes |
-| HTTP | endpoint-level request and latency counters |
-
-These are kernel metrics, not paper-only counters.
-
-## 9. K4 Lifecycle Boundary
-
-The clean kernel supports a minimum K4 lifecycle through:
+写入入口：
 
 ```rust
-Engine::run_k4_lifecycle(signatures)
-Engine::run_k4_lifecycle_with_repetitions(signatures, repetitions)
+insert_edge()
+delete_edge()
+insert_edge_with_properties_prototype()
+insert_edge_with_property_values_prototype()
 ```
 
-The lifecycle does not create a separate experiment path. It uses the same
-production Engine operations:
+写入先进入 `MemGraph`。当 `MemGraph` 满，或者调用 `flush_active()` 时，
+Engine 会把当前 MemGraph freeze，创建新的 active MemGraph，并把旧 MemGraph
+异步写成 L0 CSR segment。
 
-| K4 phase | Engine operation |
+L0 flush 会写入：
+
+| 内容 | 说明 |
 |---|---|
-| write | `insert_edge*` / `delete_edge` into `MemGraph` |
-| flush | `flush_active()` writes L0 CSR segments |
-| semantic metadata | CSR segment metadata plus degree-directory sidecar |
-| read pruning | `get_neighbors_by_signature()` with exact-proof pruning |
-| feedback | `Metrics::record_l0_partition_query/probe` |
-| merge/compaction | `compact_best_l0_partition_by_score()` |
-| schema-safe recovery/reopen | manifest + schema catalog + sidecar replay through `Engine::open()` |
+| topology records | `src/dst/edge_type/ts/marker` |
+| property sections | property-aware CSR section |
+| semantic metadata | src label、dst label、edge type partition、degree class |
+| schema epoch | segment 对应的 schema epoch |
+| property encoding epoch | property value 的编码 epoch |
+| manifest record | `CreateFile { meta }` |
 
-Current status:
+flush 后会更新：
 
-| Capability | Status |
+1. `VersionManager` 当前可见版本。
+2. L1+ 多级索引。
+3. L0 semantic index。
+4. degree directory sidecar。
+
+## 7. 查询语义与剪枝
+
+查询入口：
+
+```rust
+get_neighbors()
+get_neighbors_typed()
+get_neighbors_by_signature()
+get_neighbors_matching_property_value()
+```
+
+语义签名由 `GraphAccessSignature` 表达：
+
+| 字段 | 作用 |
 |---|---|
-| write to MemGraph | present |
-| flush to L0 CSR segment | present |
-| segment-level semantic metadata | present |
-| exact-proof read pruning | present |
-| query feedback counters | present |
-| feedback-selected L0 merge | present |
-| snapshot/tombstone-safe merge retention | present |
-| schema catalog recovery | present |
-| K4 lifecycle report | present |
-| automatic SNB server integration | not implemented |
-| multi-level semantic proof propagation beyond L1 | not implemented |
+| `src` | 查询源点 |
+| `src_label` | 源点 label |
+| `edge_type` | 边类型 |
+| `direction` | 出边/入边/未知 |
+| `degree_class` | Low / Medium / High / Mixed / Unknown |
+| `dst_label` | 目标点 label |
+| `min_ts`, `max_ts` | 时间范围 |
+| `property_predicate` | required property / absent-or-default property |
 
-The K4 API is intentionally an Engine boundary. SNB validation can run before
-and after this lifecycle, but the Java driver path is not yet wired to trigger
-K4 automatically during mixed update workloads.
+每个 CSR segment 通过：
 
-## 10. Schema and Tombstone Safety
+```rust
+CsrSegmentMeta::signature_pruning_decision()
+```
 
-Segment metadata carries a schema epoch. Queries compiled under a newer schema
-may still read old segments. Exact disjointness can prune old segments only when
-the metadata is safe under the relevant schema interpretation.
+返回：
 
-Tombstone-sensitive segments are conservative candidates when a delete may
-suppress older visible inserts. This is why exact property absence does not
-automatically prune tombstone-bearing segments.
+```rust
+SignaturePruningDecision {
+    pruned: bool,
+    reason: &'static str,
+}
+```
 
-## 11. CLI Surface
+典型 prune reason：
 
-The clean branch exposes a single product binary:
+| reason | 含义 |
+|---|---|
+| `time` | segment 时间范围不可能匹配 |
+| `src_label` | 源点 label disjoint |
+| `edge_type` | edge type partition disjoint |
+| `direction` | 方向 disjoint |
+| `degree` | degree class disjoint |
+| `dst_label` | 目标点 label disjoint |
+| `property_absence` | segment 精确缺少 required property |
+
+典型 keep/fallback reason：
+
+| reason | 含义 |
+|---|---|
+| `kept_candidate` | 没有安全剪枝证明 |
+| `mixed_unknown_fallback` | metadata mixed/unknown，必须保守读取 |
+| `budgeted_not_materialized` | budgeted layout 没有物化该 exact degree partition |
+| `schema_tombstone_fallback` | tombstone/schema 风险阻止 property absence pruning |
+
+这些 reason 会进入 `Metrics`，用于解释 pruning 是否真的发生，以及为什么没有发生。
+
+## 8. Feedback 与 K4 Merge
+
+读取 L0 时，Engine 会记录：
+
+| 指标 | 说明 |
+|---|---|
+| `candidate_l0_segments` | 查询候选 L0 segment 数 |
+| `matched_l0_segments` | 实际命中结果的 L0 segment 数 |
+| `range_filtered_segments` | 被 src range 过滤的 segment |
+| `bloom_filtered_segments` | 被 source bloom 过滤的 segment |
+| `l0_partitions` | 按 src label、edge type、range bucket 统计的反馈 |
+
+K4 merge 使用：
+
+```rust
+compact_best_l0_partition_by_score()
+```
+
+它会从 metrics 中选择 hot L0 partition，读取对应 L0 和 overlap 的 L1，
+再通过 snapshot/tombstone-safe retention 生成新的 L1 CSR segment。
+
+这个路径不是 paper runner，而是 Engine 内核 API。新增测试：
 
 ```text
-target/release/lsmgraph
+k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe
 ```
 
-Experiment-specific binaries such as `p3-feedback-bench`, sustained feedback
-runners, and W-series workload-shift runners are intentionally removed from the
-clean branch.
+该测试验证：
 
-The CLI remains the entry point for import, validation, storage benchmarks,
-server startup, base graph building, and maintenance commands that are part of
-the DB product surface.
+1. schema 变更能持久化。
+2. 未 flush 的 tombstone 由 K4 lifecycle flush。
+3. query signatures 能产生 L0 feedback。
+4. feedback compaction 能选择 hot partition。
+5. L0 merge 到 L1 后结果仍正确。
+6. property value 查询仍正确。
+7. reopen 后 schema epoch、manifest、L1 segment、查询结果仍正确。
 
-## 12. Remaining K4 Gaps
+## 9. Schema 与 Tombstone 安全
 
-The branch contains a functional minimum K4 lifecycle, but it is not the final
-SIGMOD-grade lifecycle system.
+Schema catalog 持久化在 store 目录中。每个 segment 带 schema epoch。
+查询在新 schema 下访问旧 segment 时，必须遵守 conservative fallback：
+只有 metadata 足够精确且不会受到 alias/drop/encoding/tombstone 影响时才允许剪枝。
 
-Remaining additions:
+Tombstone 会隐藏旧版本 insert，因此 compaction 不能简单保留最新记录。
+当前 compaction 使用 snapshot/tombstone-safe retention，确保旧 snapshot 和当前
+snapshot 都不会读错。
 
-| K4 area | Required kernel addition |
+## 10. Recovery / Reopen
+
+`Engine::open()` 会恢复：
+
+| 状态 | 恢复来源 |
 |---|---|
-| semantic state machine | explicit exact/mixed/unknown/tombstone/schema-uncertain states |
-| merge metadata propagation | deterministic metadata downgrade rules across all levels |
-| LmergePolicy | production policy for scheduling K4 cycles continuously |
-| retention metrics | exact ratio, fallback ratio, pruning surface before/after merge |
-| write lifecycle metrics | flush latency, write amp, stall, backlog, open/recovery |
-| schema lifecycle | schema-change cost, epoch fallback, metadata repair |
-| SNB integration | Java driver mixed updates should drive DB-native K4, not only cache updates |
+| live files | `MANIFEST` replay |
+| next file id | manifest 最大 file id |
+| max timestamp | live segment max timestamp |
+| schema catalog | schema catalog 文件 |
+| L1+ index | segment offsets |
+| L0 semantic index | L0 metadata + degree directory |
+| degree directory | sidecar，缺失时可 rebuild |
 
-The current correctness proof is the engine-level test
-`k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe`.
+K4 的正确性必须包含 reopen，因为只在内存里正确不能证明 DB 生命周期正确。
+
+## 11. LDBC / SNB 验证边界
+
+当前 clean branch 不跟踪 `deps/ldbc_snb_interactive_impls`，这是为了保持分支干净。
+验证时可以使用外部已有 LDBC driver 目录，但 binary 使用 clean branch 产物：
+
+```text
+/data/WorkSpace/lsmgraph-rs-clean-kernel/target/release/lsmgraph
+```
+
+已经完成的验证：
+
+| 验证 | 结果 |
+|---|---|
+| `cargo test --lib` | 64 passed |
+| `cargo test --bin lsmgraph` | 4 passed |
+| `cargo test --test engine_tests` | 56 passed, 1 ignored |
+| K4 lifecycle 单测 | passed |
+| release build | passed |
+| Rust `snb-validate --max-lines 20` | checked=20, passed=20, failed=0 |
+| Java LDBC mixed validation smoke, `MAX_LINES=5` | Validation Result: PASS |
+
+## 12. 当前未完成项
+
+| 方向 | 状态 |
+|---|---|
+| SNB mixed update 自动触发 K4 lifecycle | 未实现 |
+| 连续后台 LmergePolicy 调度 | 未实现 |
+| 多层级 L1/L2/... semantic proof 传播 | 未实现 |
+| schema lifecycle cost model | 未实现 |
+| metadata downgrade/repair 的显式状态机 | 未实现 |
+| paper 级稳定延迟和写放大指标 | 需要后续实验 |
+
+因此，当前分支可以支撑“DB 内核已经具备最小 K4 lifecycle 且功能正确”的说法；
+但还不能声称“完整 SNB mixed workload 已经自动走 K4 生命周期”。

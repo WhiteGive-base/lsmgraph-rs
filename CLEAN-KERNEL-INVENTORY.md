@@ -1,112 +1,175 @@
-# Clean Kernel Inventory
+# 干净内核分支清单
 
-> Branch: `codex/k4-clean-kernel`
+> 分支：`codex/k4-clean-kernel`
 >
-> Worktree: `/data/WorkSpace/lsmgraph-rs-clean-kernel`
+> Worktree：`/data/WorkSpace/lsmgraph-rs-clean-kernel`
 >
-> Base commit: `48d44d1 W14 compare: result-digest correctness path + SF1 gate`
+> 清理基线：`48d44d1 W14 compare: result-digest correctness path + SF1 gate`
+>
+> 当前 K4 提交：`9841496 Implement-minimal-K4-engine-lifecycle`
 
-## 中文边界摘要
+## 1. 分支目的
 
-这个清单用于说明干净分支和原研究分支的差距。当前分支只保留 DB 内核、
-测试和最小产品入口，不保留论文材料、实验脚本、baseline trace、
-历史计划文档和一次性 benchmark binary。
+这个分支的目的有两个：
 
-已经带入的内核改动是 L0/semantic pruning 方向的稳定代码：
-pruning decision/reason、pruning reason metrics、以及目标点 label 查询签名。
-没有带入 W7/W14 等实验 runner。当前新增了最小 engine-level K4 lifecycle：
-flush -> semantic sidecar -> read feedback -> feedback merge -> schema-safe reopen。
+1. 建立一个只包含 DB 内核、测试和最小产品入口的干净分支。
+2. 在这个干净内核上实现最小 engine-level K4 lifecycle。
 
-## Purpose
+这个分支不保存论文草稿、历史实验脚本、baseline trace、外部系统报告、
+绘图产物和一次性 benchmark runner。
 
-This branch is a clean DB-kernel branch. It removes paper material, experiment
-logs, baseline runners, historical plans, and one-off research binaries from the
-tracked tree.
+当前已经实现的 K4 最小链路是：
 
-It now implements the minimum engine-level K4 lifecycle API while keeping the
-branch free of paper runners and experiment artifacts.
+```text
+write -> flush -> semantic sidecar -> read pruning -> feedback
+      -> feedback compaction -> schema-safe reopen
+```
 
-## Kept
+实现入口：
 
-| Path | Reason |
+```rust
+Engine::run_k4_lifecycle(signatures)
+Engine::run_k4_lifecycle_with_repetitions(signatures, repetitions)
+```
+
+## 2. 保留内容
+
+| 路径 | 保留原因 |
 |---|---|
-| `src/` | DB engine, storage, query, server, IO, schema, metrics |
-| `tests/` | Kernel regression coverage |
-| `Cargo.toml`, `Cargo.lock` | Build definition |
-| `.gitignore` | Repository hygiene |
-| `README.md`, `README-cn.md` | Project entry |
-| `LSMGRAPH-ARCHITECTURE.md` | Clean-kernel architecture |
-| `LSMGRAPH-STARTUP-GUIDE.md` | Startup instructions |
+| `src/` | DB engine、storage、query、server、IO、schema、metrics |
+| `tests/` | 内核功能正确性和回归测试 |
+| `Cargo.toml`, `Cargo.lock` | Rust 构建定义 |
+| `.gitignore` | 仓库卫生 |
+| `README.md`, `README-cn.md` | 项目入口 |
+| `LSMGRAPH-ARCHITECTURE.md` | 中文系统架构文档 |
+| `LSMGRAPH-STARTUP-GUIDE.md` | 启动和验证说明 |
+| `CLEAN-KERNEL-INVENTORY.md` | 本清单 |
 
-## Removed
+## 3. 移除内容
 
-| Removed path/type | Reason |
+| 移除路径 / 类型 | 原因 |
 |---|---|
-| `baseline/` | Experiment scripts, summaries, raw evidence, dated progress docs |
-| `scripts/` | Paper/evaluation/experiment runners |
-| `figures/` | Paper figures |
-| `docs/` | Historical evidence archive |
-| top-level planning markdown | Research/project management material |
-| external-system reports | External baseline notes, not kernel code |
-| `src/bin/p3_feedback_bench.rs` | Experiment runner |
-| `src/bin/p3_feedback_sustained.rs` | Experiment runner |
-| `src/bin/w3_workload_shift.rs` | Experiment runner |
-| `src/bin/w5_steady_state_real_store.rs` | Experiment runner |
+| `baseline/` | 实验脚本、结果、trace、历史进度文档 |
+| `scripts/` | paper/evaluation/experiment runner |
+| `figures/` | 论文图片，不是内核源码 |
+| `docs/` | 历史证据归档，不是当前内核文档 |
+| 顶层 planning markdown | 项目管理/论文计划材料 |
+| external-system reports | 外部 baseline 调研，不是内核代码 |
+| `src/bin/p3_feedback_bench.rs` | 实验 runner |
+| `src/bin/p3_feedback_sustained.rs` | 实验 runner |
+| `src/bin/w3_workload_shift.rs` | 实验 runner |
+| `src/bin/w5_steady_state_real_store.rs` | 实验 runner |
 
-## Product Binary Surface
+## 4. 产品 Binary 边界
 
-The branch keeps one binary:
+当前干净分支只保留一个产品 binary：
 
 ```text
 lsmgraph -> src/bin/lsmgraph.rs
 ```
 
-Cargo no longer declares paper/experiment binaries.
+Cargo 不再声明 paper/experiment binaries。
 
-## Selected Kernel Changes Carried In
+## 5. 从研究分支带入的内核改动
 
-The clean branch intentionally carries the non-experiment kernel changes from
-the active research worktree:
+以下改动被认为是稳定内核能力，已经带入 clean branch：
 
-| File | Change |
+| 文件 | 改动 |
 |---|---|
-| `src/csr/format.rs` | `signature_pruning_decision()` and pruning reason tests |
-| `src/metrics.rs` | pruning-reason metrics in metrics snapshot/reset |
+| `src/csr/format.rs` | `signature_pruning_decision()` 和 pruning reason 测试 |
+| `src/metrics.rs` | pruning-reason metrics，纳入 metrics snapshot/reset |
 | `src/semantic.rs` | `GraphAccessSignature::with_dst_label()` |
 
-Not carried in:
+这些改动已经和原研究 worktree 做过逐字节核对：
 
-| File/change | Reason |
+```text
+src/csr/format.rs
+src/metrics.rs
+src/semantic.rs
+```
+
+## 6. 没有带入的内容
+
+| 文件 / 改动 | 未带入原因 |
 |---|---|
-| `src/bin/w7_sf30_workload_shift.rs` | experiment runner |
-| `src/bin/lsmgraph.rs import-many` dirty change | W14 experiment path, not clean kernel |
-| `src/snb/full_loader.rs import_snb_full_multi` dirty change | W14 import optimization, not core DB API yet |
-| W6/W7/W8/W9/W13/W14 baseline scripts | experiment layer |
-| W10 paper/table renderer | paper layer |
+| `src/bin/w7_sf30_workload_shift.rs` | 实验 runner |
+| `src/bin/lsmgraph.rs import-many` 脏改动 | W14 实验路径，不是干净内核 API |
+| `src/snb/full_loader.rs import_snb_full_multi` 脏改动 | W14 import 优化，尚未沉淀为核心 DB API |
+| W6/W7/W8/W9/W13/W14 baseline scripts | 实验层 |
+| W10 paper/table renderer | 论文层 |
 
-## Current K4 Status
+## 7. 当前 K4 状态
 
-| Area | Clean branch state |
+| 区域 | clean branch 状态 |
 |---|---|
-| L0 exact-proof pruning | present |
-| pruning reason observability | present |
-| budgeted materialization machinery | present in kernel/config history |
-| stable latency proof | not a branch concern |
-| semantic-aware merge retention | present for the K4 L0->L1 path |
-| DB-native feedback-to-merge loop | present through `Engine::run_k4_lifecycle*` |
-| schema lifecycle cost model | not implemented |
-| automatic SNB mixed-update integration | not implemented |
+| L0 exact-proof pruning | 已实现 |
+| pruning reason observability | 已实现 |
+| budgeted materialization machinery | 已保留 |
+| DB-native feedback-to-merge loop | 已实现，入口为 `Engine::run_k4_lifecycle*` |
+| semantic-aware L0->L1 merge retention | 已实现 |
+| schema/tombstone-safe reopen 测试 | 已实现 |
+| SNB mixed update 自动接入 K4 | 未实现 |
+| schema lifecycle cost model | 未实现 |
+| paper 级稳定延迟证明 | 不属于本分支直接产物 |
 
-## Validation Target
+## 8. 新增 K4 文件变更
 
-Minimum checks for this branch:
+| 文件 | 内容 |
+|---|---|
+| `src/graph.rs` | 新增 `K4LifecycleReport`、`K4LifecycleReadReport`、`run_k4_lifecycle*` |
+| `src/lib.rs` | re-export K4 report 类型 |
+| `tests/engine_tests.rs` | 新增 K4 端到端功能正确性测试 |
+| `LSMGRAPH-ARCHITECTURE.md` | 中文架构文档和系统流程图 |
+| `CLEAN-KERNEL-INVENTORY.md` | 中文分支清单 |
+
+## 9. 验证结果
+
+已经执行并通过：
 
 ```text
 cargo test --lib
 cargo test --bin lsmgraph
+cargo test --test engine_tests
 cargo test --test engine_tests k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe
 cargo build --release --bin lsmgraph
 ```
 
-Full benchmark and paper evidence checks belong to the research branch, not this
-clean kernel branch.
+结果摘要：
+
+| 验证 | 结果 |
+|---|---|
+| `cargo test --lib` | 64 passed |
+| `cargo test --bin lsmgraph` | 4 passed |
+| `cargo test --test engine_tests` | 56 passed, 1 ignored |
+| K4 lifecycle 单测 | passed |
+| release build | passed |
+| Rust `snb-validate --max-lines 20` | checked=20, passed=20, failed=0 |
+| Java LDBC mixed validation smoke, `MAX_LINES=5` | Validation Result: PASS |
+
+保留的 warning：
+
+| warning | 状态 |
+|---|---|
+| `unused import: OpenOptions` in `src/base_graph/csr.rs` | 原有 warning |
+| `unused variable: capacity` in `src/base_graph/csr.rs` | 原有 warning |
+
+## 10. 当前结论
+
+这个分支现在可以作为 K4 后续工作的干净内核基线。
+
+可以主张：
+
+```text
+LSMGraph clean kernel 已经具备最小 DB-native K4 lifecycle，
+并通过 engine-level 功能正确性测试、Rust SNB validate smoke、
+以及 Java LDBC mixed validation smoke。
+```
+
+不能主张：
+
+```text
+完整 SNB mixed update workload 已经自动走 K4 lifecycle。
+```
+
+原因是 SNB HTTP server 目前还没有自动把 mixed update workload 接到
+`Engine::run_k4_lifecycle*`。这是下一阶段的集成工作。
