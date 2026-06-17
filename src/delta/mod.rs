@@ -28,13 +28,18 @@ impl DeltaGraph {
         Ok(Self { dir, engine })
     }
 
-    pub async fn create_with_k4_auto_maintenance(
+    pub async fn create_with_auto_maintenance(
         store_dir: impl AsRef<Path>,
         io_backend: IoBackendKind,
         memgraph_bytes: usize,
     ) -> Result<Self> {
         let dir = store_dir.as_ref().join("delta");
-        let engine = Engine::create(k4_delta_config(&dir, io_backend, memgraph_bytes)).await?;
+        let engine = Engine::create(auto_maintenance_delta_config(
+            &dir,
+            io_backend,
+            memgraph_bytes,
+        ))
+        .await?;
         Ok(Self { dir, engine })
     }
 
@@ -44,13 +49,18 @@ impl DeltaGraph {
         Ok(Self { dir, engine })
     }
 
-    pub async fn open_with_k4_auto_maintenance(
+    pub async fn open_with_auto_maintenance(
         store_dir: impl AsRef<Path>,
         io_backend: IoBackendKind,
         memgraph_bytes: usize,
     ) -> Result<Self> {
         let dir = store_dir.as_ref().join("delta");
-        let engine = Engine::open(k4_delta_config(&dir, io_backend, memgraph_bytes)).await?;
+        let engine = Engine::open(auto_maintenance_delta_config(
+            &dir,
+            io_backend,
+            memgraph_bytes,
+        ))
+        .await?;
         Ok(Self { dir, engine })
     }
 
@@ -105,7 +115,11 @@ impl DeltaGraph {
     }
 }
 
-fn k4_delta_config(dir: &Path, io_backend: IoBackendKind, memgraph_bytes: usize) -> LsmGraphConfig {
+fn auto_maintenance_delta_config(
+    dir: &Path,
+    io_backend: IoBackendKind,
+    memgraph_bytes: usize,
+) -> LsmGraphConfig {
     let mut config = LsmGraphConfig::new(dir)
         .with_io_backend(io_backend)
         .with_memgraph_capacity(memgraph_bytes)
@@ -113,7 +127,7 @@ fn k4_delta_config(dir: &Path, io_backend: IoBackendKind, memgraph_bytes: usize)
         .with_semantic_budget_min_edge_type_bytes(1)
         .with_semantic_budget_min_exact_bytes(1)
         .with_semantic_budget_min_benefit_score(0.0)
-        .with_k4_auto_maintenance(true);
+        .with_auto_maintenance(true);
     config.l0_ra_min_queries = 2;
     config.l0_ra_min_l0_segments = 2;
     config.l0_ra_min_score = 0.0;

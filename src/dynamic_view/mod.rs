@@ -65,7 +65,7 @@ impl DynamicGraphView {
         })
     }
 
-    pub async fn open_or_create_k4_delta(
+    pub async fn open_or_create_delta_with_auto_maintenance(
         store_dir: impl AsRef<Path>,
         base_io: IoConfig,
         delta_backend: IoBackendKind,
@@ -81,21 +81,13 @@ impl DynamicGraphView {
         let delta_dir = store_dir.join("delta");
         let delta = if delta_dir.exists() {
             Some(
-                DeltaGraph::open_with_k4_auto_maintenance(
-                    &store_dir,
-                    delta_backend,
-                    memgraph_bytes,
-                )
-                .await?,
+                DeltaGraph::open_with_auto_maintenance(&store_dir, delta_backend, memgraph_bytes)
+                    .await?,
             )
         } else {
             Some(
-                DeltaGraph::create_with_k4_auto_maintenance(
-                    &store_dir,
-                    delta_backend,
-                    memgraph_bytes,
-                )
-                .await?,
+                DeltaGraph::create_with_auto_maintenance(&store_dir, delta_backend, memgraph_bytes)
+                    .await?,
             )
         };
         Ok(Self {

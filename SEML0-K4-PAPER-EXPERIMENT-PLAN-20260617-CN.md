@@ -11,36 +11,38 @@
 
 ```text
 Query semantics can guide an LSM-based dynamic property graph through its lifecycle:
-write -> flush -> semantic metadata -> read pruning -> feedback -> K4 merge -> recovery
+write -> flush -> semantic metadata -> read pruning -> feedback -> semantic level compaction -> recovery
 ```
 
 因此实验要证明三件事：
 
 1. 读路径：semantic metadata 和 segment layout 真的减少 read amplification。
-2. 动态路径：mixed update/read 下，K4 能自动维护 L0/L1+，而不是手动离线整理。
+2. 动态路径：mixed update/read 下，DB 内核能自动维护 L0/L1+，而不是手动离线整理。
 3. 代价边界：读收益没有用不可接受的写放大、compaction 频率或恢复复杂度换来。
 
 ## 2. 当前已迁移的内核能力
 
 这次从 `lsmgraph-rs-clean-kernel` 迁移到主仓库的能力包括：
 
+说明：K4 在本文档中只作为论文实验变体名；代码和干净内核 API 使用普通 LSM compaction/maintenance 命名，不暴露 K4* 类型。
+
 | 能力 | 状态 |
 |---|---|
-| K4 lifecycle API | 已迁移 |
-| `K4MergePolicy` | 已迁移 |
+| LSM lifecycle API: run_lifecycle* | 已迁移 |
+| `LevelMergePolicy` | 已迁移 |
 | L0 feedback merge | 已迁移 |
 | L1+ fanout cascade | 已迁移 |
 | L1+ `(src_label, edge_type)` semantic segment layout | 已迁移 |
 | L1+ semantic metadata filter | 已迁移 |
 | 跨层 semantic metadata 重新推导 | 已迁移 |
-| 事件驱动 K4 maintenance scheduler | 已迁移 |
-| SNB dynamic delta 普通路径自然触发 K4 | 已迁移 |
+| 事件驱动 LSM maintenance scheduler | 已迁移 |
+| SNB dynamic delta 普通路径自然触发 LSM maintenance | 已迁移 |
 | paper 级 cost model / 写放大优化策略 | 后续补 |
 
 重要边界：
 
 ```text
-DB 内核应该包含：K4 scheduler、merge policy、semantic metadata、filter、metrics。
+DB 内核应该包含：LSM maintenance scheduler、LevelMergePolicy、semantic metadata、filter、metrics。
 实验 runner 应该包含：LDBC 数据准备、矩阵运行、日志汇总、画图、baseline 对比。
 ```
 
@@ -72,14 +74,14 @@ Rust snb-validate --max-lines 20
 Java LDBC mixed validation smoke, MAX_LINES=5
 ```
 
-新增 K4 correctness 必须单独保留：
+新增 DB lifecycle correctness 必须单独保留：
 
 ```text
-k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe
-k4_lmerge_cascades_l1_to_l2_with_semantic_filters
-k4_auto_maintenance_read_feedback_compacts_hot_l0_partition
-k4_auto_maintenance_flush_cascades_l1_to_l2
-k4_delta_graph_normal_api_triggers_auto_maintenance
+lifecycle_flushes_feedback_compacts_and_reopens_schema_safe
+lmerge_cascades_l1_to_l2_with_semantic_filters
+auto_maintenance_read_feedback_compacts_hot_l0_partition
+auto_maintenance_flush_cascades_l1_to_l2
+delta_graph_normal_api_triggers_auto_maintenance
 ```
 
 通过标准：
@@ -150,7 +152,7 @@ read latency p50/p90/p99/p99.9
 update latency p50/p90/p99
 throughput
 L0/L1/L2 segment count over time
-K4 maintenance count
+LSM maintenance count
 feedback compaction count
 L1+ cascade count
 pruning rate before/after maintenance
@@ -314,12 +316,12 @@ K4 不只是 microbenchmark 优化，而能支撑 SNB 端到端动态图 workloa
 当前 clean DB kernel 已经补齐 1、2；paper 实验还需要补：
 
 ```text
-K4 cost/benefit report
+semantic compaction cost/benefit report
 per-level rewrite bytes
 logical update bytes
 write amplification counter
 maintenance foreground blocking time
-K4 policy reason 字段
+LevelMergePolicy reason 字段
 实验 runner 输出统一 JSON/TSV
 图表汇总脚本
 ```
@@ -351,8 +353,8 @@ SF100 全矩阵已经完成。
 当前可以声称：
 
 ```text
-DB 内核已经具备 K4 自动生命周期链路；
-SNB dynamic delta 可以通过普通 Engine API 自然触发 K4；
+DB 内核已经具备自动 LSM lifecycle/maintenance 链路；
+SNB dynamic delta 可以通过普通 Engine API 自然触发 LSM maintenance；
 功能正确性已经由 unit/engine/SNB validate smoke 覆盖；
 paper 级性能和 cost 证据需要按本计划补齐。
 ```
