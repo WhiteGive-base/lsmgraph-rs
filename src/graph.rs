@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use crate::config::{L0LayoutPolicy, LsmGraphConfig};
@@ -32,8 +33,8 @@ use crate::schema::{
 };
 use crate::semantic::{DegreeClass, GraphAccessSignature, PropertyPredicate};
 use crate::types::{
-    source_label_from_vertex_id, EdgeMarker, EdgeRecord, EdgeType, FileId, SnapshotId, VertexId,
-    MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL,
+    source_label_from_vertex_id, EdgeMarker, EdgeRecord, EdgeType, FileId, LevelId, SnapshotId,
+    VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL,
 };
 use crate::version::{Version, VersionGuard, VersionManager};
 
@@ -523,6 +524,7 @@ pub struct Engine {
     metadata_cache: Arc<CsrMetadataCache>,
     degree_directory: RwLock<HashMap<(VertexId, EdgeType), DegreeClassMask>>,
     degree_directory_sidecar_persist_lock: Mutex<()>,
+    k4_maintenance_lock: AsyncMutex<()>,
     semantic_l0_index: RwLock<SemanticL0Index>,
     oracle_l0_index: RwLock<OracleL0Index>,
     schema_catalog: RwLock<SchemaCatalog>,
@@ -649,6 +651,90 @@ pub struct L0CompactionDecision {
     pub avg_candidate_segments: f64,
     pub offset_cache_miss_rate: f64,
     pub outputs: Vec<CsrSegmentMeta>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct K4LifecycleReadReport {
+    pub iteration: usize,
+    pub query_index: usize,
+    pub src: VertexId,
+    pub edge_type: Option<EdgeType>,
+    pub result_count: usize,
+    pub candidate_l0_segments_delta: u64,
+    pub matched_l0_segments_delta: u64,
+    pub range_filtered_segments_delta: u64,
+    pub bloom_filtered_segments_delta: u64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct K4MergePolicy {
+    pub fanout: usize,
+    pub min_input_segments: usize,
+    pub max_output_level: LevelId,
+    pub semantic_partition_outputs: bool,
+}
+
+impl K4MergePolicy {
+    pub fn from_config(config: &LsmGraphConfig) -> Self {
+        Self {
+            fanout: config.level_fanout.max(2),
+            min_input_segments: 2,
+            max_output_level: config.max_levels.saturating_sub(1).max(1) as LevelId,
+            semantic_partition_outputs: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct K4LevelCompactionDecision {
+    pub source_level: LevelId,
+    pub target_level: LevelId,
+    pub input_segments: usize,
+    pub output_segments: usize,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub semantic_partition_outputs: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum K4MaintenanceTrigger {
+    Manual,
+    Flush,
+    ReadFeedback,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct K4MaintenanceReport {
+    pub trigger: K4MaintenanceTrigger,
+    pub skipped_reason: Option<String>,
+    pub l0_segments_before: usize,
+    pub l1_segments_before: usize,
+    pub l0_segments_after: usize,
+    pub l1_segments_after: usize,
+    pub feedback_compaction: Option<L0CompactionDecision>,
+    pub threshold_l0_compaction: Option<CsrSegmentMeta>,
+    pub level_compactions: Vec<K4LevelCompactionDecision>,
+    pub compaction_count_delta: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct K4LifecycleReport {
+    pub initial_snapshot: SnapshotId,
+    pub final_snapshot: SnapshotId,
+    pub schema_epoch_before: SchemaEpoch,
+    pub schema_epoch_after: SchemaEpoch,
+    pub flush_count_delta: u64,
+    pub compaction_count_delta: u64,
+    pub degree_directory_sidecar_persists_delta: u64,
+    pub l0_segments_before: usize,
+    pub l1_segments_before: usize,
+    pub l0_segments_after_flush: usize,
+    pub l1_segments_after_flush: usize,
+    pub l0_segments_after_compaction: usize,
+    pub l1_segments_after_compaction: usize,
+    pub reads: Vec<K4LifecycleReadReport>,
+    pub feedback_compaction: Option<L0CompactionDecision>,
+    pub level_compactions: Vec<K4LevelCompactionDecision>,
 }
 
 #[derive(Debug, Clone)]
@@ -817,6 +903,7 @@ impl Engine {
             metadata_cache: Arc::new(CsrMetadataCache::new(metadata_cache_entries)),
             degree_directory: RwLock::new(HashMap::new()),
             degree_directory_sidecar_persist_lock: Mutex::new(()),
+            k4_maintenance_lock: AsyncMutex::new(()),
             semantic_l0_index: RwLock::new(SemanticL0Index::default()),
             oracle_l0_index: RwLock::new(OracleL0Index::default()),
             schema_catalog: RwLock::new(schema_catalog),
@@ -865,6 +952,241 @@ impl Engine {
 
     pub fn persist_semantic_sidecars(&self) -> Result<()> {
         self.persist_degree_directory_sidecar_for_current_version()
+    }
+
+    pub async fn run_k4_maintenance(&self) -> Result<K4MaintenanceReport> {
+        Ok(self
+            .run_k4_maintenance_inner(K4MaintenanceTrigger::Manual, true)
+            .await?
+            .expect("manual K4 maintenance always returns a report"))
+    }
+
+    async fn maybe_run_k4_maintenance(
+        &self,
+        trigger: K4MaintenanceTrigger,
+    ) -> Result<Option<K4MaintenanceReport>> {
+        if !self.config.auto_compaction {
+            return Ok(None);
+        }
+        self.run_k4_maintenance_inner(trigger, false).await
+    }
+
+    async fn run_k4_maintenance_inner(
+        &self,
+        trigger: K4MaintenanceTrigger,
+        force: bool,
+    ) -> Result<Option<K4MaintenanceReport>> {
+        let _maintenance = self.k4_maintenance_lock.lock().await;
+        if !force && !self.k4_maintenance_should_run(trigger) {
+            return Ok(None);
+        }
+
+        let before_levels = self.live_file_count_by_level();
+        let before_compactions = self.metrics.compaction_count.load(Ordering::Relaxed);
+        let feedback_compaction = self.compact_best_l0_partition_by_score().await?;
+        let threshold_l0_compaction =
+            if feedback_compaction.is_none() && self.l0_count_exceeds_auto_threshold() {
+                self.compact_l0_to_l1_inner(false).await?
+            } else {
+                None
+            };
+        let level_compactions = self.compact_k4_levels().await?;
+        if feedback_compaction.is_some()
+            || threshold_l0_compaction.is_some()
+            || !level_compactions.is_empty()
+        {
+            self.persist_semantic_sidecars()?;
+        }
+        let after_levels = self.live_file_count_by_level();
+        let after_compactions = self.metrics.compaction_count.load(Ordering::Relaxed);
+        let skipped_reason = if feedback_compaction.is_none()
+            && threshold_l0_compaction.is_none()
+            && level_compactions.is_empty()
+        {
+            Some("no eligible K4 maintenance work".to_string())
+        } else {
+            None
+        };
+        Ok(Some(K4MaintenanceReport {
+            trigger,
+            skipped_reason,
+            l0_segments_before: level_count(&before_levels, L0),
+            l1_segments_before: level_count(&before_levels, L1),
+            l0_segments_after: level_count(&after_levels, L0),
+            l1_segments_after: level_count(&after_levels, L1),
+            feedback_compaction,
+            threshold_l0_compaction,
+            level_compactions,
+            compaction_count_delta: after_compactions.saturating_sub(before_compactions),
+        }))
+    }
+
+    fn spawn_k4_maintenance_after_flush(self: &Arc<Self>) {
+        if !self.config.auto_compaction {
+            return;
+        }
+        let engine = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = engine
+                .maybe_run_k4_maintenance(K4MaintenanceTrigger::Flush)
+                .await
+            {
+                eprintln!("[engine] K4 maintenance after flush failed: {err:#}");
+            }
+        });
+    }
+
+    fn k4_maintenance_should_run(&self, trigger: K4MaintenanceTrigger) -> bool {
+        if self.l1plus_count_exceeds_k4_fanout() {
+            return true;
+        }
+        match trigger {
+            K4MaintenanceTrigger::Manual => true,
+            K4MaintenanceTrigger::Flush => self.l0_count_exceeds_auto_threshold(),
+            K4MaintenanceTrigger::ReadFeedback => self.pick_l0_partition_by_score().is_some(),
+        }
+    }
+
+    fn l0_count_exceeds_auto_threshold(&self) -> bool {
+        let threshold = self.config.l0_file_threshold.max(1);
+        self.version_manager
+            .pin_current()
+            .version()
+            .levels
+            .get(L0 as usize)
+            .map(|level| level.len() >= threshold)
+            .unwrap_or(false)
+    }
+
+    fn l1plus_count_exceeds_k4_fanout(&self) -> bool {
+        let policy = K4MergePolicy::from_config(&self.config);
+        let max_output_level = policy
+            .max_output_level
+            .min(self.config.max_levels.saturating_sub(1).max(1) as LevelId);
+        if max_output_level <= L1 {
+            return false;
+        }
+        let guard = self.version_manager.pin_current();
+        for source_level in L1..max_output_level {
+            let source_count = guard
+                .version()
+                .levels
+                .get(source_level as usize)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if source_count >= policy.min_input_segments && source_count > policy.fanout {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn run_k4_lifecycle(
+        self: &Arc<Self>,
+        signatures: &[GraphAccessSignature],
+    ) -> Result<K4LifecycleReport> {
+        self.run_k4_lifecycle_with_repetitions(signatures, 1).await
+    }
+
+    pub async fn run_k4_lifecycle_with_repetitions(
+        self: &Arc<Self>,
+        signatures: &[GraphAccessSignature],
+        repetitions: usize,
+    ) -> Result<K4LifecycleReport> {
+        let repetitions = repetitions.max(1);
+        let initial_snapshot = self.current_snapshot();
+        let schema_epoch_before = self.current_schema_epoch();
+        let before_levels = self.live_file_count_by_level();
+        let before_flush_count = self.metrics.flush_count.load(Ordering::Relaxed);
+        let before_compaction_count = self.metrics.compaction_count.load(Ordering::Relaxed);
+        let before_sidecar_persists = self
+            .metrics
+            .degree_directory_sidecar_persists
+            .load(Ordering::Relaxed);
+
+        self.flush_active().await?;
+        self.persist_semantic_sidecars()?;
+        let after_flush_levels = self.live_file_count_by_level();
+        let read_snapshot = self.current_snapshot();
+        let mut reads = Vec::new();
+
+        for iteration in 0..repetitions {
+            for (query_index, signature) in signatures.iter().copied().enumerate() {
+                let before_candidate_l0 =
+                    self.metrics.candidate_l0_segments.load(Ordering::Relaxed);
+                let before_matched_l0 = self.metrics.matched_l0_segments.load(Ordering::Relaxed);
+                let before_range_filtered =
+                    self.metrics.range_filtered_segments.load(Ordering::Relaxed);
+                let before_bloom_filtered =
+                    self.metrics.bloom_filtered_segments.load(Ordering::Relaxed);
+                let result = self
+                    .get_neighbors_by_signature(signature, read_snapshot)
+                    .await?;
+                reads.push(K4LifecycleReadReport {
+                    iteration,
+                    query_index,
+                    src: signature.src,
+                    edge_type: signature.edge_type,
+                    result_count: result.len(),
+                    candidate_l0_segments_delta: self
+                        .metrics
+                        .candidate_l0_segments
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(before_candidate_l0),
+                    matched_l0_segments_delta: self
+                        .metrics
+                        .matched_l0_segments
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(before_matched_l0),
+                    range_filtered_segments_delta: self
+                        .metrics
+                        .range_filtered_segments
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(before_range_filtered),
+                    bloom_filtered_segments_delta: self
+                        .metrics
+                        .bloom_filtered_segments
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(before_bloom_filtered),
+                });
+            }
+        }
+
+        let feedback_compaction = self.compact_best_l0_partition_by_score().await?;
+        let level_compactions = self.compact_k4_levels().await?;
+        self.persist_semantic_sidecars()?;
+        let after_compaction_levels = self.live_file_count_by_level();
+
+        Ok(K4LifecycleReport {
+            initial_snapshot,
+            final_snapshot: self.current_snapshot(),
+            schema_epoch_before,
+            schema_epoch_after: self.current_schema_epoch(),
+            flush_count_delta: self
+                .metrics
+                .flush_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(before_flush_count),
+            compaction_count_delta: self
+                .metrics
+                .compaction_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(before_compaction_count),
+            degree_directory_sidecar_persists_delta: self
+                .metrics
+                .degree_directory_sidecar_persists
+                .load(Ordering::Relaxed)
+                .saturating_sub(before_sidecar_persists),
+            l0_segments_before: level_count(&before_levels, L0),
+            l1_segments_before: level_count(&before_levels, L1),
+            l0_segments_after_flush: level_count(&after_flush_levels, L0),
+            l1_segments_after_flush: level_count(&after_flush_levels, L1),
+            l0_segments_after_compaction: level_count(&after_compaction_levels, L0),
+            l1_segments_after_compaction: level_count(&after_compaction_levels, L1),
+            reads,
+            feedback_compaction,
+            level_compactions,
+        })
     }
 
     pub fn schema_catalog_snapshot(&self) -> SchemaCatalog {
@@ -1386,14 +1708,21 @@ impl Engine {
         }
         self.wait_for_flushes().await?;
         if self.config.auto_compaction {
-            self.compact_l0_to_l1_inner(false).await?;
+            self.maybe_run_k4_maintenance(K4MaintenanceTrigger::Flush)
+                .await?;
         }
         Ok(())
     }
 
     async fn enqueue_flush(self: &Arc<Self>, memgraph: Arc<MemGraph>) -> Result<()> {
         let engine = self.clone();
-        let handle = tokio::spawn(async move { engine.flush_memgraph(memgraph).await });
+        let handle = tokio::spawn(async move {
+            let result = engine.clone().flush_memgraph(memgraph).await;
+            if result.is_ok() {
+                engine.spawn_k4_maintenance_after_flush();
+            }
+            result
+        });
         self.state.lock().flush_tasks.push(handle);
         Ok(())
     }
@@ -2563,6 +2892,10 @@ impl Engine {
         self.metrics
             .storage_get_neighbors_latency
             .record_since(started);
+        drop(guard);
+        drop(_lock);
+        self.maybe_run_k4_maintenance(K4MaintenanceTrigger::ReadFeedback)
+            .await?;
         Ok(out)
     }
 
@@ -2752,6 +3085,44 @@ impl Engine {
         }))
     }
 
+    pub async fn compact_k4_levels(&self) -> Result<Vec<K4LevelCompactionDecision>> {
+        self.compact_k4_levels_with_policy(K4MergePolicy::from_config(&self.config))
+            .await
+    }
+
+    pub async fn compact_k4_levels_with_policy(
+        &self,
+        policy: K4MergePolicy,
+    ) -> Result<Vec<K4LevelCompactionDecision>> {
+        let mut decisions = Vec::new();
+        let max_output_level = policy
+            .max_output_level
+            .min(self.config.max_levels.saturating_sub(1).max(1) as LevelId);
+        if max_output_level <= L1 {
+            return Ok(decisions);
+        }
+        for source_level in L1..max_output_level {
+            let source_count = self
+                .version_manager
+                .pin_current()
+                .version()
+                .levels
+                .get(source_level as usize)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if source_count < policy.min_input_segments || source_count <= policy.fanout {
+                continue;
+            }
+            if let Some(decision) = self
+                .compact_k4_level_to_next(source_level, source_level + 1, policy)
+                .await?
+            {
+                decisions.push(decision);
+            }
+        }
+        Ok(decisions)
+    }
+
     fn pick_l0_partition_by_score(&self) -> Option<PickedL0Partition> {
         let guard = self.version_manager.pin_current();
         let l0_files = guard.version().levels.get(L0 as usize)?;
@@ -2930,6 +3301,125 @@ impl Engine {
             .storage_compaction_latency
             .record_since(started);
         Ok(outputs)
+    }
+
+    async fn compact_k4_level_to_next(
+        &self,
+        source_level: LevelId,
+        target_level: LevelId,
+        policy: K4MergePolicy,
+    ) -> Result<Option<K4LevelCompactionDecision>> {
+        let started = Instant::now();
+        self.wait_for_flushes().await?;
+        let guard = self.version_manager.pin_current();
+        let selected_source = guard
+            .version()
+            .levels
+            .get(source_level as usize)
+            .cloned()
+            .unwrap_or_default();
+        if selected_source.is_empty() {
+            self.metrics
+                .storage_compaction_latency
+                .record_since(started);
+            return Ok(None);
+        }
+        let selected_target = guard
+            .version()
+            .levels
+            .get(target_level as usize)
+            .cloned()
+            .unwrap_or_default();
+        let input_segments = selected_source.len() + selected_target.len();
+        let reader = CsrReader::with_metrics_and_cache(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.metrics.clone(),
+            self.metadata_cache.clone(),
+        );
+        let mut updates = Vec::new();
+        let mut input_bytes = 0u64;
+        for meta in selected_source.iter().chain(selected_target.iter()) {
+            input_bytes += estimated_meta_bytes(meta);
+            updates.extend(
+                reader
+                    .read_all_edges_with_properties(meta)
+                    .await?
+                    .into_iter()
+                    .map(edge_record_with_properties_from_csr),
+            );
+        }
+
+        let snapshot = self.current_snapshot();
+        let compacted = retain_property_history_for_safe_snapshot(
+            updates,
+            snapshot,
+            self.snapshot_gc_safe_point(),
+        );
+        let writer = CsrWriter::new(
+            self.backend.clone(),
+            self.config.store_dir.clone(),
+            self.current_schema_epoch(),
+        );
+        let segments = if policy.semantic_partition_outputs {
+            split_k4_semantic_compaction_segments(compacted, self.config.segment_target_bytes)
+        } else {
+            split_property_compaction_segments(compacted, self.config.segment_target_bytes)
+        };
+        let mut outputs = Vec::new();
+        for segment_edges in segments {
+            let file_id = self.alloc_file_id();
+            let output = writer
+                .write_segment_with_properties(target_level, file_id, segment_edges)
+                .await?;
+            self.append_manifest(&ManifestRecord::CreateFile { meta: output })?;
+            outputs.push(output);
+        }
+        for meta in selected_source.iter().chain(selected_target.iter()) {
+            self.append_manifest(&ManifestRecord::DeleteFile {
+                file_id: meta.file_id,
+            })?;
+        }
+
+        let old = self.version_manager.pin_current();
+        let selected_source_ids: HashSet<_> = selected_source.iter().map(|m| m.file_id).collect();
+        let selected_target_ids: HashSet<_> = selected_target.iter().map(|m| m.file_id).collect();
+        let mut levels = old.version().levels.clone();
+        ensure_level(&mut levels, target_level);
+        levels[source_level as usize].retain(|meta| !selected_source_ids.contains(&meta.file_id));
+        levels[target_level as usize].retain(|meta| !selected_target_ids.contains(&meta.file_id));
+        levels[target_level as usize].extend(outputs.iter().copied());
+        sort_level(&mut levels[source_level as usize]);
+        sort_level(&mut levels[target_level as usize]);
+        self.version_manager.publish(Version {
+            id: old.version().id + 1,
+            memgraphs: old.version().memgraphs.clone(),
+            levels,
+        });
+        self.metrics
+            .compaction_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .compaction_input_bytes
+            .fetch_add(input_bytes, Ordering::Relaxed);
+        let output_bytes = outputs.iter().map(estimated_meta_bytes).sum::<u64>();
+        self.metrics
+            .compaction_output_bytes
+            .fetch_add(output_bytes, Ordering::Relaxed);
+        self.rebuild_index().await?;
+        self.rebuild_semantic_indexes().await?;
+        self.metrics
+            .storage_compaction_latency
+            .record_since(started);
+        Ok(Some(K4LevelCompactionDecision {
+            source_level,
+            target_level,
+            input_segments,
+            output_segments: outputs.len(),
+            input_bytes,
+            output_bytes,
+            semantic_partition_outputs: policy.semantic_partition_outputs,
+        }))
     }
 
     async fn compact_l0_to_l1_inner(&self, force: bool) -> Result<Option<CsrSegmentMeta>> {
@@ -3617,6 +4107,43 @@ fn split_property_compaction_segments(
     }
     if !current.is_empty() {
         segments.push(current);
+    }
+    segments
+}
+
+fn split_k4_semantic_compaction_segments(
+    mut records: Vec<EdgeRecordWithProperties>,
+    target_segment_bytes: usize,
+) -> Vec<Vec<EdgeRecordWithProperties>> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+    records.sort_by_key(|record| {
+        (
+            source_label_from_vertex_id(record.edge.src),
+            record.edge.edge_type,
+            record.edge.src,
+            record.edge.dst,
+            record.edge.ts,
+            record.edge.marker as u8,
+        )
+    });
+    let mut groups: BTreeMap<(i32, EdgeType), Vec<EdgeRecordWithProperties>> = BTreeMap::new();
+    for record in records {
+        groups
+            .entry((
+                source_label_from_vertex_id(record.edge.src),
+                record.edge.edge_type,
+            ))
+            .or_default()
+            .push(record);
+    }
+    let mut segments = Vec::new();
+    for (_, group) in groups {
+        segments.extend(split_property_compaction_segments(
+            group,
+            target_segment_bytes,
+        ));
     }
     segments
 }
@@ -4359,4 +4886,8 @@ fn ensure_level(levels: &mut Vec<Vec<CsrSegmentMeta>>, level: u8) {
     if levels.len() <= idx {
         levels.resize(idx + 1, Vec::new());
     }
+}
+
+fn level_count(levels: &[usize], level: u8) -> usize {
+    levels.get(level as usize).copied().unwrap_or(0)
 }

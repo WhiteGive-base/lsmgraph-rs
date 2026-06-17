@@ -696,7 +696,7 @@ impl DynamicSnbGraph {
             store_dir.display()
         );
         let view_started = Instant::now();
-        let view = DynamicGraphView::open_or_create_delta(
+        let view = DynamicGraphView::open_or_create_k4_delta(
             store_dir,
             base_io,
             io_backend,

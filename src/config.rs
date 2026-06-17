@@ -94,6 +94,9 @@ pub struct LsmGraphConfig {
     pub max_background_flushes: usize,
     pub max_outstanding_io: usize,
     pub io_backend: IoBackendKind,
+    /// Enables DB-native automatic K4 maintenance. When enabled, Engine
+    /// schedules flush-threshold L0 merge, feedback-driven L0 merge, and L1+
+    /// fanout cascade from normal write/read paths.
     pub auto_compaction: bool,
     pub schema_epoch: SchemaEpoch,
     pub l0_layout: L0LayoutPolicy,
@@ -175,6 +178,10 @@ impl LsmGraphConfig {
     pub fn with_auto_compaction(mut self, enabled: bool) -> Self {
         self.auto_compaction = enabled;
         self
+    }
+
+    pub fn with_k4_auto_maintenance(self, enabled: bool) -> Self {
+        self.with_auto_compaction(enabled)
     }
 
     pub fn with_schema_epoch(mut self, epoch: SchemaEpoch) -> Self {

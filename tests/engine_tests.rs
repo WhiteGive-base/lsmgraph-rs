@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lsmgraph::config::{L0LayoutPolicy, LsmGraphConfig};
+use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig};
 use lsmgraph::csr::{
     CsrPropertyValuePredicate, CsrWriter, EdgePropertyValue, EdgeRecordWithProperties, Manifest,
     ManifestRecord,
@@ -11,8 +11,8 @@ use lsmgraph::metrics::Metrics;
 use lsmgraph::property_encoding::PropertyValue;
 use lsmgraph::types::{EdgeLabel, EdgeRecord, VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
-    DegreeClass, GraphAccessSignature, NewPropertyEntry, PropertyOwner, SchemaCatalog,
-    SemanticSummaryCompleteness, VertexLabel,
+    DegreeClass, DeltaGraph, GraphAccessSignature, K4MergePolicy, NewPropertyEntry, PropertyOwner,
+    SchemaCatalog, SemanticSummaryCompleteness, VertexLabel,
 };
 use serde_json::Value;
 
@@ -4087,6 +4087,344 @@ async fn feedback_compaction_picks_hot_l0_partition_and_reduces_candidates() -> 
         after_candidates, 0,
         "after feedback compaction the hot source should no longer probe L0 files"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn k4_lifecycle_flushes_feedback_compacts_and_reopens_schema_safe() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-lifecycle-db-chain-")?;
+    let config = feedback_compaction_config(tmp.path());
+    let engine = Engine::create(config.clone()).await?;
+    let src = encoded(VertexLabel::Person, 70_000);
+    let edge_type = EdgeLabel::Knows.as_i32();
+    let property_id = 77;
+
+    engine.add_schema_edge_label(
+        edge_type,
+        "KNOWS",
+        VertexLabel::Person as i32,
+        VertexLabel::Person as i32,
+    )?;
+    let property_epoch = engine.add_schema_property(NewPropertyEntry {
+        id: property_id,
+        owner: PropertyOwner::EdgeLabel(edge_type),
+        name: "weight".to_string(),
+        logical_type: "int64".to_string(),
+        physical_encoding: "plain_i64".to_string(),
+        encoding_version: 1,
+        default_or_null_rule: "null".to_string(),
+    })?;
+
+    let dsts = [
+        encoded(VertexLabel::Person, 71_000),
+        encoded(VertexLabel::Person, 71_001),
+        encoded(VertexLabel::Person, 71_002),
+    ];
+    for (idx, dst) in dsts.iter().copied().enumerate() {
+        engine
+            .insert_edge_with_property_values_prototype(
+                src,
+                dst,
+                edge_type,
+                vec![(property_id, PropertyValue::I64(idx as i64))],
+            )
+            .await?;
+        engine.flush_active().await?;
+    }
+
+    let delete_snapshot = engine.delete_edge(src, dsts[0], edge_type).await?;
+    engine.metrics().reset();
+    let signature = GraphAccessSignature::neighbor_scan(src, Some(edge_type))
+        .with_degree_class(DegreeClass::Low);
+    let report = engine
+        .run_k4_lifecycle_with_repetitions(&[signature], 3)
+        .await?;
+
+    assert_eq!(report.initial_snapshot, delete_snapshot);
+    assert_eq!(report.schema_epoch_before, property_epoch);
+    assert_eq!(report.schema_epoch_after, property_epoch);
+    assert_eq!(report.flush_count_delta, 1);
+    assert!(
+        report.degree_directory_sidecar_persists_delta >= 2,
+        "K4 should persist semantic metadata after flush and after merge"
+    );
+    assert_eq!(report.reads.len(), 3);
+    assert!(
+        report
+            .reads
+            .iter()
+            .all(|read| read.result_count == 2 && read.candidate_l0_segments_delta >= 3),
+        "K4 reads should observe the tombstone-filtered result while collecting L0 feedback"
+    );
+    let decision = report
+        .feedback_compaction
+        .as_ref()
+        .expect("K4 feedback phase should select the hot L0 partition");
+    assert_eq!(decision.key.edge_type, edge_type);
+    assert!(decision.key.range_start <= src && src <= decision.key.range_end);
+    assert!(decision.selected_l0_segments >= 3);
+    assert!(report.compaction_count_delta >= 1);
+    assert_eq!(
+        report.l0_segments_after_compaction, 0,
+        "the only L0 partition in this store should be merged into L1"
+    );
+    assert!(report.l1_segments_after_compaction > 0);
+
+    let after_k4 = engine
+        .get_neighbors_typed(src, edge_type, engine.current_snapshot())
+        .await?;
+    let mut after_dsts: Vec<_> = after_k4.iter().map(|edge| edge.dst).collect();
+    after_dsts.sort_unstable();
+    assert_eq!(after_dsts, vec![dsts[1], dsts[2]]);
+    let property_match = engine
+        .get_neighbors_matching_property_value(
+            src,
+            edge_type,
+            engine.current_snapshot(),
+            property_id,
+            PropertyValue::I64(1),
+        )
+        .await?;
+    assert_eq!(property_match.len(), 1);
+    assert_eq!(property_match[0].dst, dsts[1]);
+
+    drop(engine);
+    let reopened = Engine::open(config).await?;
+    assert_eq!(reopened.current_schema_epoch(), property_epoch);
+    assert_eq!(reopened.live_file_count_by_level().get(0).copied(), Some(0));
+    assert!(
+        reopened
+            .live_file_count_by_level()
+            .get(1)
+            .copied()
+            .unwrap_or_default()
+            > 0
+    );
+    let reopened_neighbors = reopened
+        .get_neighbors_typed(src, edge_type, reopened.current_snapshot())
+        .await?;
+    let mut reopened_dsts: Vec<_> = reopened_neighbors.iter().map(|edge| edge.dst).collect();
+    reopened_dsts.sort_unstable();
+    assert_eq!(reopened_dsts, vec![dsts[1], dsts[2]]);
+    let reopened_property_match = reopened
+        .get_neighbors_matching_property_value(
+            src,
+            edge_type,
+            reopened.current_snapshot(),
+            property_id,
+            PropertyValue::I64(2),
+        )
+        .await?;
+    assert_eq!(reopened_property_match.len(), 1);
+    assert_eq!(reopened_property_match[0].dst, dsts[2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn k4_lmerge_cascades_l1_to_l2_with_semantic_filters() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-lmerge-l1-l2-semantic-filter-")?;
+    let mut config = feedback_compaction_config(tmp.path());
+    config.level_fanout = 2;
+    let engine = Engine::create(config.clone()).await?;
+    let src = encoded(VertexLabel::Person, 72_000);
+    let edge_types = [101, 102, 103];
+
+    for (idx, edge_type) in edge_types.iter().copied().enumerate() {
+        engine
+            .insert_edge(
+                src,
+                encoded(VertexLabel::Person, 73_000 + idx as u64),
+                edge_type,
+            )
+            .await?;
+        engine.flush_active().await?;
+        let outputs = engine
+            .compact_l0_partition_to_l1(VertexLabel::Person as i32, Some(edge_type))
+            .await?;
+        assert_eq!(outputs.len(), 1);
+    }
+
+    let before = engine.live_file_count_by_level();
+    assert_eq!(before.get(0).copied(), Some(0));
+    assert_eq!(before.get(1).copied(), Some(3));
+
+    let decisions = engine
+        .compact_k4_levels_with_policy(K4MergePolicy {
+            fanout: 2,
+            min_input_segments: 2,
+            max_output_level: 2,
+            semantic_partition_outputs: true,
+        })
+        .await?;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].source_level, 1);
+    assert_eq!(decisions[0].target_level, 2);
+    assert_eq!(decisions[0].input_segments, 3);
+    assert_eq!(decisions[0].output_segments, 3);
+
+    let after = engine.live_file_count_by_level();
+    assert_eq!(after.get(1).copied(), Some(0));
+    assert_eq!(after.get(2).copied(), Some(3));
+    let guard = engine.version_guard();
+    let l2 = guard
+        .version()
+        .levels
+        .get(2)
+        .expect("K4 cascade should create L2");
+    assert!(
+        l2.iter()
+            .all(|meta| meta.src_label == VertexLabel::Person as i32
+                && meta.summary_completeness.allows_semantic_pruning()
+                && meta.edge_type_partition != MIXED_EDGE_TYPE),
+        "K4 L1+ outputs should preserve exact semantic partitions"
+    );
+    for edge_type in edge_types {
+        assert!(
+            l2.iter().any(|meta| meta.edge_type_partition == edge_type),
+            "K4 L2 outputs should keep edge type {edge_type} as an exact partition"
+        );
+    }
+    drop(guard);
+
+    engine.metrics().reset();
+    let result = engine
+        .get_neighbors_typed(src, edge_types[0], engine.current_snapshot())
+        .await?;
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].edge_type, edge_types[0]);
+    let snapshot = engine.metrics().snapshot_json();
+    let edge_type_prunes = snapshot["csr"]["pruning_reasons"]["edge_type"]["pruned_segments"]
+        .as_u64()
+        .unwrap_or_default();
+    assert!(
+        edge_type_prunes >= 2,
+        "L1+ source index should feed exact semantic segment filters for disjoint edge types"
+    );
+
+    drop(engine);
+    let reopened = Engine::open(config).await?;
+    let reopened_result = reopened
+        .get_neighbors_typed(src, edge_types[1], reopened.current_snapshot())
+        .await?;
+    assert_eq!(reopened_result.len(), 1);
+    assert_eq!(reopened_result[0].edge_type, edge_types[1]);
+    assert_eq!(reopened.live_file_count_by_level().get(2).copied(), Some(3));
+    Ok(())
+}
+
+#[tokio::test]
+async fn k4_auto_maintenance_read_feedback_compacts_hot_l0_partition() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-auto-read-feedback-")?;
+    let mut config = feedback_compaction_config(tmp.path()).with_k4_auto_maintenance(true);
+    config.l0_file_threshold = 100;
+    let engine = Engine::create(config).await?;
+    let src = encoded(VertexLabel::Person, 82_000);
+    let edge_type = EdgeLabel::Knows.as_i32();
+
+    for i in 0..3u64 {
+        engine
+            .insert_edge(src, encoded(VertexLabel::Person, 83_000 + i), edge_type)
+            .await?;
+        engine.flush_active().await?;
+    }
+    assert_eq!(engine.live_file_count_by_level().get(0).copied(), Some(3));
+
+    for _ in 0..2 {
+        let neighbors = engine
+            .get_neighbors_typed(src, edge_type, engine.current_snapshot())
+            .await?;
+        assert_eq!(neighbors.len(), 3);
+    }
+
+    let levels = engine.live_file_count_by_level();
+    assert_eq!(
+        levels.get(0).copied(),
+        Some(0),
+        "read feedback should automatically trigger K4 L0 feedback merge"
+    );
+    assert!(
+        levels.get(1).copied().unwrap_or_default() >= 1,
+        "automatic feedback merge should materialize an L1 segment"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn k4_auto_maintenance_flush_cascades_l1_to_l2() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-auto-flush-l1-l2-")?;
+    let mut config = feedback_compaction_config(tmp.path()).with_k4_auto_maintenance(true);
+    config.level_fanout = 2;
+    config.max_levels = 3;
+    config.l0_file_threshold = 100;
+    let engine = Engine::create(config).await?;
+    let src = encoded(VertexLabel::Person, 84_000);
+    let edge_types = [201, 202, 203];
+
+    for (idx, edge_type) in edge_types.iter().copied().enumerate() {
+        engine
+            .insert_edge(
+                src,
+                encoded(VertexLabel::Person, 85_000 + idx as u64),
+                edge_type,
+            )
+            .await?;
+        engine.flush_active().await?;
+        let outputs = engine
+            .compact_l0_partition_to_l1(VertexLabel::Person as i32, Some(edge_type))
+            .await?;
+        assert_eq!(outputs.len(), 1);
+    }
+    assert_eq!(engine.live_file_count_by_level().get(1).copied(), Some(3));
+
+    engine
+        .insert_edge(src, encoded(VertexLabel::Person, 86_000), 204)
+        .await?;
+    engine.flush_active().await?;
+
+    let levels = engine.live_file_count_by_level();
+    assert_eq!(
+        levels.get(1).copied(),
+        Some(0),
+        "flush-triggered K4 maintenance should cascade over-fanout L1"
+    );
+    assert_eq!(levels.get(2).copied(), Some(3));
+    Ok(())
+}
+
+#[tokio::test]
+async fn k4_delta_graph_normal_api_triggers_auto_maintenance() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-delta-auto-maintenance-")?;
+    let delta =
+        DeltaGraph::create_with_k4_auto_maintenance(tmp.path(), IoBackendKind::Blocking, 1024)
+            .await?;
+    let src = encoded(VertexLabel::Person, 87_000);
+    let edge_type = EdgeLabel::Knows.as_i32();
+
+    for i in 0..3u64 {
+        delta
+            .insert_edge(src, encoded(VertexLabel::Person, 88_000 + i), edge_type)
+            .await?;
+        delta.flush().await?;
+    }
+    assert_eq!(
+        delta.engine().live_file_count_by_level().get(0).copied(),
+        Some(3)
+    );
+
+    for _ in 0..2 {
+        let neighbors = delta
+            .get_neighbors(src, Some(edge_type), delta.current_snapshot())
+            .await?;
+        assert_eq!(neighbors.len(), 3);
+    }
+
+    let levels = delta.engine().live_file_count_by_level();
+    assert_eq!(
+        levels.get(0).copied(),
+        Some(0),
+        "DeltaGraph should use ordinary Engine reads to trigger K4 feedback maintenance"
+    );
+    assert!(levels.get(1).copied().unwrap_or_default() >= 1);
     Ok(())
 }
 
