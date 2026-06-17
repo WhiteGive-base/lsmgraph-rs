@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use crate::config::{L0LayoutPolicy, LsmGraphConfig};
@@ -523,6 +524,7 @@ pub struct Engine {
     metadata_cache: Arc<CsrMetadataCache>,
     degree_directory: RwLock<HashMap<(VertexId, EdgeType), DegreeClassMask>>,
     degree_directory_sidecar_persist_lock: Mutex<()>,
+    k4_maintenance_lock: AsyncMutex<()>,
     semantic_l0_index: RwLock<SemanticL0Index>,
     oracle_l0_index: RwLock<OracleL0Index>,
     schema_catalog: RwLock<SchemaCatalog>,
@@ -692,6 +694,27 @@ pub struct K4LevelCompactionDecision {
     pub input_bytes: u64,
     pub output_bytes: u64,
     pub semantic_partition_outputs: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum K4MaintenanceTrigger {
+    Manual,
+    Flush,
+    ReadFeedback,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct K4MaintenanceReport {
+    pub trigger: K4MaintenanceTrigger,
+    pub skipped_reason: Option<String>,
+    pub l0_segments_before: usize,
+    pub l1_segments_before: usize,
+    pub l0_segments_after: usize,
+    pub l1_segments_after: usize,
+    pub feedback_compaction: Option<L0CompactionDecision>,
+    pub threshold_l0_compaction: Option<CsrSegmentMeta>,
+    pub level_compactions: Vec<K4LevelCompactionDecision>,
+    pub compaction_count_delta: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -880,6 +903,7 @@ impl Engine {
             metadata_cache: Arc::new(CsrMetadataCache::new(metadata_cache_entries)),
             degree_directory: RwLock::new(HashMap::new()),
             degree_directory_sidecar_persist_lock: Mutex::new(()),
+            k4_maintenance_lock: AsyncMutex::new(()),
             semantic_l0_index: RwLock::new(SemanticL0Index::default()),
             oracle_l0_index: RwLock::new(OracleL0Index::default()),
             schema_catalog: RwLock::new(schema_catalog),
@@ -928,6 +952,133 @@ impl Engine {
 
     pub fn persist_semantic_sidecars(&self) -> Result<()> {
         self.persist_degree_directory_sidecar_for_current_version()
+    }
+
+    pub async fn run_k4_maintenance(&self) -> Result<K4MaintenanceReport> {
+        Ok(self
+            .run_k4_maintenance_inner(K4MaintenanceTrigger::Manual, true)
+            .await?
+            .expect("manual K4 maintenance always returns a report"))
+    }
+
+    async fn maybe_run_k4_maintenance(
+        &self,
+        trigger: K4MaintenanceTrigger,
+    ) -> Result<Option<K4MaintenanceReport>> {
+        if !self.config.auto_compaction {
+            return Ok(None);
+        }
+        self.run_k4_maintenance_inner(trigger, false).await
+    }
+
+    async fn run_k4_maintenance_inner(
+        &self,
+        trigger: K4MaintenanceTrigger,
+        force: bool,
+    ) -> Result<Option<K4MaintenanceReport>> {
+        let _maintenance = self.k4_maintenance_lock.lock().await;
+        if !force && !self.k4_maintenance_should_run(trigger) {
+            return Ok(None);
+        }
+
+        let before_levels = self.live_file_count_by_level();
+        let before_compactions = self.metrics.compaction_count.load(Ordering::Relaxed);
+        let feedback_compaction = self.compact_best_l0_partition_by_score().await?;
+        let threshold_l0_compaction =
+            if feedback_compaction.is_none() && self.l0_count_exceeds_auto_threshold() {
+                self.compact_l0_to_l1_inner(false).await?
+            } else {
+                None
+            };
+        let level_compactions = self.compact_k4_levels().await?;
+        if feedback_compaction.is_some()
+            || threshold_l0_compaction.is_some()
+            || !level_compactions.is_empty()
+        {
+            self.persist_semantic_sidecars()?;
+        }
+        let after_levels = self.live_file_count_by_level();
+        let after_compactions = self.metrics.compaction_count.load(Ordering::Relaxed);
+        let skipped_reason = if feedback_compaction.is_none()
+            && threshold_l0_compaction.is_none()
+            && level_compactions.is_empty()
+        {
+            Some("no eligible K4 maintenance work".to_string())
+        } else {
+            None
+        };
+        Ok(Some(K4MaintenanceReport {
+            trigger,
+            skipped_reason,
+            l0_segments_before: level_count(&before_levels, L0),
+            l1_segments_before: level_count(&before_levels, L1),
+            l0_segments_after: level_count(&after_levels, L0),
+            l1_segments_after: level_count(&after_levels, L1),
+            feedback_compaction,
+            threshold_l0_compaction,
+            level_compactions,
+            compaction_count_delta: after_compactions.saturating_sub(before_compactions),
+        }))
+    }
+
+    fn spawn_k4_maintenance_after_flush(self: &Arc<Self>) {
+        if !self.config.auto_compaction {
+            return;
+        }
+        let engine = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = engine
+                .maybe_run_k4_maintenance(K4MaintenanceTrigger::Flush)
+                .await
+            {
+                eprintln!("[engine] K4 maintenance after flush failed: {err:#}");
+            }
+        });
+    }
+
+    fn k4_maintenance_should_run(&self, trigger: K4MaintenanceTrigger) -> bool {
+        if self.l1plus_count_exceeds_k4_fanout() {
+            return true;
+        }
+        match trigger {
+            K4MaintenanceTrigger::Manual => true,
+            K4MaintenanceTrigger::Flush => self.l0_count_exceeds_auto_threshold(),
+            K4MaintenanceTrigger::ReadFeedback => self.pick_l0_partition_by_score().is_some(),
+        }
+    }
+
+    fn l0_count_exceeds_auto_threshold(&self) -> bool {
+        let threshold = self.config.l0_file_threshold.max(1);
+        self.version_manager
+            .pin_current()
+            .version()
+            .levels
+            .get(L0 as usize)
+            .map(|level| level.len() >= threshold)
+            .unwrap_or(false)
+    }
+
+    fn l1plus_count_exceeds_k4_fanout(&self) -> bool {
+        let policy = K4MergePolicy::from_config(&self.config);
+        let max_output_level = policy
+            .max_output_level
+            .min(self.config.max_levels.saturating_sub(1).max(1) as LevelId);
+        if max_output_level <= L1 {
+            return false;
+        }
+        let guard = self.version_manager.pin_current();
+        for source_level in L1..max_output_level {
+            let source_count = guard
+                .version()
+                .levels
+                .get(source_level as usize)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if source_count >= policy.min_input_segments && source_count > policy.fanout {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn run_k4_lifecycle(
@@ -1557,14 +1708,21 @@ impl Engine {
         }
         self.wait_for_flushes().await?;
         if self.config.auto_compaction {
-            self.compact_l0_to_l1_inner(false).await?;
+            self.maybe_run_k4_maintenance(K4MaintenanceTrigger::Flush)
+                .await?;
         }
         Ok(())
     }
 
     async fn enqueue_flush(self: &Arc<Self>, memgraph: Arc<MemGraph>) -> Result<()> {
         let engine = self.clone();
-        let handle = tokio::spawn(async move { engine.flush_memgraph(memgraph).await });
+        let handle = tokio::spawn(async move {
+            let result = engine.clone().flush_memgraph(memgraph).await;
+            if result.is_ok() {
+                engine.spawn_k4_maintenance_after_flush();
+            }
+            result
+        });
         self.state.lock().flush_tasks.push(handle);
         Ok(())
     }
@@ -2734,6 +2892,10 @@ impl Engine {
         self.metrics
             .storage_get_neighbors_latency
             .record_since(started);
+        drop(guard);
+        drop(_lock);
+        self.maybe_run_k4_maintenance(K4MaintenanceTrigger::ReadFeedback)
+            .await?;
         Ok(out)
     }
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lsmgraph::config::{L0LayoutPolicy, LsmGraphConfig};
+use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig};
 use lsmgraph::csr::{
     CsrPropertyValuePredicate, CsrWriter, EdgePropertyValue, EdgeRecordWithProperties, Manifest,
     ManifestRecord,
@@ -11,7 +11,7 @@ use lsmgraph::metrics::Metrics;
 use lsmgraph::property_encoding::PropertyValue;
 use lsmgraph::types::{EdgeLabel, EdgeRecord, VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
-    DegreeClass, GraphAccessSignature, K4MergePolicy, NewPropertyEntry, PropertyOwner,
+    DegreeClass, DeltaGraph, GraphAccessSignature, K4MergePolicy, NewPropertyEntry, PropertyOwner,
     SchemaCatalog, SemanticSummaryCompleteness, VertexLabel,
 };
 use serde_json::Value;
@@ -4309,6 +4309,122 @@ async fn k4_lmerge_cascades_l1_to_l2_with_semantic_filters() -> anyhow::Result<(
     assert_eq!(reopened_result.len(), 1);
     assert_eq!(reopened_result[0].edge_type, edge_types[1]);
     assert_eq!(reopened.live_file_count_by_level().get(2).copied(), Some(3));
+    Ok(())
+}
+
+#[tokio::test]
+async fn k4_auto_maintenance_read_feedback_compacts_hot_l0_partition() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-auto-read-feedback-")?;
+    let mut config = feedback_compaction_config(tmp.path()).with_k4_auto_maintenance(true);
+    config.l0_file_threshold = 100;
+    let engine = Engine::create(config).await?;
+    let src = encoded(VertexLabel::Person, 82_000);
+    let edge_type = EdgeLabel::Knows.as_i32();
+
+    for i in 0..3u64 {
+        engine
+            .insert_edge(src, encoded(VertexLabel::Person, 83_000 + i), edge_type)
+            .await?;
+        engine.flush_active().await?;
+    }
+    assert_eq!(engine.live_file_count_by_level().get(0).copied(), Some(3));
+
+    for _ in 0..2 {
+        let neighbors = engine
+            .get_neighbors_typed(src, edge_type, engine.current_snapshot())
+            .await?;
+        assert_eq!(neighbors.len(), 3);
+    }
+
+    let levels = engine.live_file_count_by_level();
+    assert_eq!(
+        levels.get(0).copied(),
+        Some(0),
+        "read feedback should automatically trigger K4 L0 feedback merge"
+    );
+    assert!(
+        levels.get(1).copied().unwrap_or_default() >= 1,
+        "automatic feedback merge should materialize an L1 segment"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn k4_auto_maintenance_flush_cascades_l1_to_l2() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-auto-flush-l1-l2-")?;
+    let mut config = feedback_compaction_config(tmp.path()).with_k4_auto_maintenance(true);
+    config.level_fanout = 2;
+    config.max_levels = 3;
+    config.l0_file_threshold = 100;
+    let engine = Engine::create(config).await?;
+    let src = encoded(VertexLabel::Person, 84_000);
+    let edge_types = [201, 202, 203];
+
+    for (idx, edge_type) in edge_types.iter().copied().enumerate() {
+        engine
+            .insert_edge(
+                src,
+                encoded(VertexLabel::Person, 85_000 + idx as u64),
+                edge_type,
+            )
+            .await?;
+        engine.flush_active().await?;
+        let outputs = engine
+            .compact_l0_partition_to_l1(VertexLabel::Person as i32, Some(edge_type))
+            .await?;
+        assert_eq!(outputs.len(), 1);
+    }
+    assert_eq!(engine.live_file_count_by_level().get(1).copied(), Some(3));
+
+    engine
+        .insert_edge(src, encoded(VertexLabel::Person, 86_000), 204)
+        .await?;
+    engine.flush_active().await?;
+
+    let levels = engine.live_file_count_by_level();
+    assert_eq!(
+        levels.get(1).copied(),
+        Some(0),
+        "flush-triggered K4 maintenance should cascade over-fanout L1"
+    );
+    assert_eq!(levels.get(2).copied(), Some(3));
+    Ok(())
+}
+
+#[tokio::test]
+async fn k4_delta_graph_normal_api_triggers_auto_maintenance() -> anyhow::Result<()> {
+    let tmp = target_tempdir("k4-delta-auto-maintenance-")?;
+    let delta =
+        DeltaGraph::create_with_k4_auto_maintenance(tmp.path(), IoBackendKind::Blocking, 1024)
+            .await?;
+    let src = encoded(VertexLabel::Person, 87_000);
+    let edge_type = EdgeLabel::Knows.as_i32();
+
+    for i in 0..3u64 {
+        delta
+            .insert_edge(src, encoded(VertexLabel::Person, 88_000 + i), edge_type)
+            .await?;
+        delta.flush().await?;
+    }
+    assert_eq!(
+        delta.engine().live_file_count_by_level().get(0).copied(),
+        Some(3)
+    );
+
+    for _ in 0..2 {
+        let neighbors = delta
+            .get_neighbors(src, Some(edge_type), delta.current_snapshot())
+            .await?;
+        assert_eq!(neighbors.len(), 3);
+    }
+
+    let levels = delta.engine().live_file_count_by_level();
+    assert_eq!(
+        levels.get(0).copied(),
+        Some(0),
+        "DeltaGraph should use ordinary Engine reads to trigger K4 feedback maintenance"
+    );
+    assert!(levels.get(1).copied().unwrap_or_default() >= 1);
     Ok(())
 }
 
