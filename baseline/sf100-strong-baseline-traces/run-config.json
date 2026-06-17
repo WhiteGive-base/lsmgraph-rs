@@ -1,3 +1,0 @@
-{"run_id":"qslsm-sf100-strong-baseline-20260610","scale":"sf100","input":"/data/WorkSpace/ldbc-sf100/social_network","samples":5000,
-"edge_types":"1,2,3,7,8,9,10,11,12","memgraph_bytes":67108864,"budget_sweep":"64 256 1024",
-"run_compare":0,"started_at":"2026-06-11T01:02:49+08:00"}

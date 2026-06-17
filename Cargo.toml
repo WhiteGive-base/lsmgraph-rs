@@ -11,14 +11,6 @@ path = "src/lib.rs"
 name = "lsmgraph"
 path = "src/bin/lsmgraph.rs"
 
-[[bin]]
-name = "p3-feedback-bench"
-path = "src/bin/p3_feedback_bench.rs"
-
-[[bin]]
-name = "w3-workload-shift"
-path = "src/bin/w3_workload_shift.rs"
-
 [dependencies]
 anyhow = "1.0"
 bytes = "1.7"

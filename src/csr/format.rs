@@ -184,7 +184,10 @@ impl CsrSegmentMeta {
         self.source_bloom_offset > 0 && self.source_bloom_len > 0 && self.source_bloom_bit_count > 0
     }
 
-    pub fn may_contain_signature(&self, signature: &GraphAccessSignature) -> bool {
+    pub fn signature_pruning_decision(
+        &self,
+        signature: &GraphAccessSignature,
+    ) -> SignaturePruningDecision {
         let time_matches = !signature
             .min_ts
             .map(|min_ts| self.max_ts < min_ts)
@@ -194,42 +197,57 @@ impl CsrSegmentMeta {
                 .map(|max_ts| self.min_ts > max_ts)
                 .unwrap_or(false);
         if !time_matches {
-            return false;
+            return SignaturePruningDecision::pruned("time");
         }
         if !self.summary_completeness.allows_semantic_pruning() {
-            return true;
+            return SignaturePruningDecision::kept("mixed_unknown_fallback");
         }
 
-        let label_matches = signature.label_matches(self.src_label);
-        let edge_matches = match signature.edge_type {
-            Some(edge_type) => {
-                self.edge_type_partition == MIXED_EDGE_TYPE || self.edge_type_partition == edge_type
+        if !signature.label_matches(self.src_label) {
+            return SignaturePruningDecision::pruned("src_label");
+        }
+        if let Some(edge_type) = signature.edge_type {
+            if self.edge_type_partition != MIXED_EDGE_TYPE && self.edge_type_partition != edge_type
+            {
+                return SignaturePruningDecision::pruned("edge_type");
             }
-            None => true,
-        };
-        let direction_matches = signature.direction_matches(self.direction);
-        let degree_matches = match signature.degree_class {
-            Some(degree_class) if self.degree_class_exact => {
-                self.degree_class.may_contain_global_query(degree_class)
+        }
+        if !signature.direction_matches(self.direction) {
+            return SignaturePruningDecision::pruned("direction");
+        }
+        if let Some(degree_class) = signature.degree_class {
+            if self.degree_class_exact {
+                if !self.degree_class.may_contain_global_query(degree_class) {
+                    return SignaturePruningDecision::pruned("degree");
+                }
+            } else {
+                return SignaturePruningDecision::kept("budgeted_not_materialized");
             }
-            _ => true,
-        };
-        let dst_matches = match signature.dst_label {
-            Some(dst_label) => {
-                self.dst_label == UNKNOWN_SOURCE_LABEL || self.dst_label == dst_label
+        }
+        if let Some(dst_label) = signature.dst_label {
+            if self.dst_label != UNKNOWN_SOURCE_LABEL && self.dst_label != dst_label {
+                return SignaturePruningDecision::pruned("dst_label");
             }
-            None => true,
-        };
-        let property_matches = match signature.property_predicate {
-            Some(predicate) => self.may_satisfy_property_predicate(predicate),
-            None => true,
-        };
-        label_matches
-            && edge_matches
-            && direction_matches
-            && degree_matches
-            && dst_matches
-            && property_matches
+        }
+        if let Some(PropertyPredicate::RequiredPresent { property_id }) =
+            signature.property_predicate
+        {
+            if self.definitely_lacks_property(property_id) {
+                if self.may_contain_tombstones {
+                    return SignaturePruningDecision::kept("schema_tombstone_fallback");
+                }
+                return SignaturePruningDecision::pruned("property_absence");
+            }
+            if !self.property_summary_completeness.allows_semantic_pruning() {
+                return SignaturePruningDecision::kept("mixed_unknown_fallback");
+            }
+        }
+
+        SignaturePruningDecision::kept("kept_candidate")
+    }
+
+    pub fn may_contain_signature(&self, signature: &GraphAccessSignature) -> bool {
+        !self.signature_pruning_decision(signature).pruned
     }
 
     pub fn may_contain_property(&self, property_id: PropertyId) -> bool {
@@ -250,6 +268,28 @@ impl CsrSegmentMeta {
                 self.may_contain_tombstones || self.may_contain_property(property_id)
             }
             PropertyPredicate::AbsentOrDefault { property_id: _ } => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignaturePruningDecision {
+    pub pruned: bool,
+    pub reason: &'static str,
+}
+
+impl SignaturePruningDecision {
+    fn pruned(reason: &'static str) -> Self {
+        Self {
+            pruned: true,
+            reason,
+        }
+    }
+
+    fn kept(reason: &'static str) -> Self {
+        Self {
+            pruned: false,
+            reason,
         }
     }
 }
@@ -479,6 +519,39 @@ mod tests {
         legacy_meta.src_label = UNKNOWN_SOURCE_LABEL;
         assert!(legacy_meta
             .may_contain_signature(&GraphAccessSignature::neighbor_scan(person_vid(7), Some(1))));
+    }
+
+    #[test]
+    fn signature_pruning_decision_reports_semantic_reason() {
+        let meta = semantic_meta(1);
+        let edge_decision = meta.signature_pruning_decision(&GraphAccessSignature::neighbor_scan(
+            person_vid(7),
+            Some(2),
+        ));
+        assert!(edge_decision.pruned);
+        assert_eq!(edge_decision.reason, "edge_type");
+
+        let mut src_meta = meta;
+        src_meta.src_label = 2;
+        let label_decision = src_meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(person_vid(7), Some(1)),
+        );
+        assert!(label_decision.pruned);
+        assert_eq!(label_decision.reason, "src_label");
+
+        let property_decision = meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(person_vid(7), Some(1)).with_required_property(2),
+        );
+        assert!(property_decision.pruned);
+        assert_eq!(property_decision.reason, "property_absence");
+
+        let mut tombstone_meta = meta;
+        tombstone_meta.may_contain_tombstones = true;
+        let tombstone_decision = tombstone_meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(person_vid(7), Some(1)).with_required_property(2),
+        );
+        assert!(!tombstone_decision.pruned);
+        assert_eq!(tombstone_decision.reason, "schema_tombstone_fallback");
     }
 
     #[test]

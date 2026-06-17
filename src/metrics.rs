@@ -140,6 +140,7 @@ pub struct Metrics {
 
     endpoint_metrics: Mutex<HashMap<String, Arc<EndpointMetric>>>,
     l0_partition_metrics: Mutex<HashMap<L0PartitionKey, L0PartitionMetric>>,
+    pruning_reason_metrics: Mutex<HashMap<&'static str, PruningReasonMetric>>,
 }
 
 impl Default for Metrics {
@@ -231,6 +232,7 @@ impl Default for Metrics {
             io_remove_blocking_latency: LatencyMetric::default(),
             endpoint_metrics: Mutex::new(HashMap::new()),
             l0_partition_metrics: Mutex::new(HashMap::new()),
+            pruning_reason_metrics: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -286,6 +288,23 @@ impl Metrics {
         metric.bloom_false_positive_probes += probe.bloom_false_positive_probes;
     }
 
+    pub fn record_signature_pruning_decision(
+        &self,
+        reason: &'static str,
+        pruned: bool,
+        segment_bytes: u64,
+    ) {
+        let mut reasons = self.pruning_reason_metrics.lock();
+        let metric = reasons.entry(reason).or_default();
+        if pruned {
+            metric.pruned_segments += 1;
+            metric.estimated_saved_segment_bytes += segment_bytes;
+            metric.estimated_saved_body_reads += 1;
+        } else {
+            metric.kept_segments += 1;
+        }
+    }
+
     pub fn l0_partition_snapshots(&self) -> Vec<L0PartitionSnapshot> {
         let mut snapshots: Vec<_> = self
             .l0_partition_metrics
@@ -310,6 +329,7 @@ impl Metrics {
             metric.reset();
         }
         self.l0_partition_metrics.lock().clear();
+        self.pruning_reason_metrics.lock().clear();
     }
 
     pub fn snapshot_json(&self) -> Value {
@@ -318,6 +338,12 @@ impl Metrics {
             .lock()
             .iter()
             .map(|(name, metric)| (name.clone(), metric.snapshot_json()))
+            .collect();
+        let pruning_reasons: serde_json::Map<String, Value> = self
+            .pruning_reason_metrics
+            .lock()
+            .iter()
+            .map(|(reason, metric)| ((*reason).to_string(), metric.snapshot_json()))
             .collect();
 
         json!({
@@ -378,6 +404,7 @@ impl Metrics {
                 "probe_offset_miss": self.load(&self.csr_probe_offset_miss),
                 "probe_body_hit": self.load(&self.csr_probe_body_hit),
                 "bloom_false_positive_probes": self.load(&self.l0_bloom_false_positive_probes),
+                "pruning_reasons": pruning_reasons,
                 "l0_partitions": self.l0_partition_snapshots(),
             },
             "http": {
@@ -623,6 +650,25 @@ impl L0PartitionMetric {
     }
 }
 
+#[derive(Debug, Default)]
+struct PruningReasonMetric {
+    pruned_segments: u64,
+    kept_segments: u64,
+    estimated_saved_segment_bytes: u64,
+    estimated_saved_body_reads: u64,
+}
+
+impl PruningReasonMetric {
+    fn snapshot_json(&self) -> Value {
+        json!({
+            "pruned_segments": self.pruned_segments,
+            "kept_segments": self.kept_segments,
+            "estimated_saved_segment_bytes": self.estimated_saved_segment_bytes,
+            "estimated_saved_body_reads": self.estimated_saved_body_reads,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct LatencyMetric {
     count: AtomicU64,
@@ -832,12 +878,17 @@ mod tests {
         metrics
             .csr_probe_bloom_negative
             .fetch_add(1, Ordering::Relaxed);
+        metrics.record_signature_pruning_decision("src_label", true, 1024);
 
         let before = metrics.snapshot_json();
         assert_eq!(before["io"]["read_bytes"], 128);
         assert_eq!(before["http"]["requests"], 1);
         assert_eq!(before["csr"]["probe_setup_latency"]["count"], 1);
         assert_eq!(before["csr"]["probe_bloom_negative"], 1);
+        assert_eq!(
+            before["csr"]["pruning_reasons"]["src_label"]["pruned_segments"],
+            1
+        );
         assert_eq!(
             before["http"]["endpoints"]["/query/interactive_complex_1"]["count"],
             1
@@ -848,6 +899,10 @@ mod tests {
         assert_eq!(after["io"]["read_bytes"], 0);
         assert_eq!(after["http"]["requests"], 0);
         assert_eq!(after["storage"]["get_neighbors_latency"]["count"], 0);
+        assert!(after["csr"]["pruning_reasons"]
+            .as_object()
+            .unwrap()
+            .is_empty());
         assert_eq!(after["csr"]["probe_setup_latency"]["count"], 0);
         assert_eq!(after["csr"]["probe_bloom_negative"], 0);
         assert_eq!(
