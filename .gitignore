@@ -7,3 +7,20 @@
 /remote-logs/
 /migrated-from-ablation-20260610/
 /baseline/external-drivers/livegraph_driver
+# Generated caches
+__pycache__/
+*.py[cod]
+
+# Local document exports
+/*.pdf
+
+# Benchmark raw data and DB artifacts
+/baseline/external-drivers/livegraph_driver_stream
+/baseline/external-drivers/livegraph_digest_driver
+/baseline/external-baselines-20260624/**/edges-raw.tsv
+/baseline/external-baselines-20260624/**/edges-dense.txt
+/baseline/external-baselines-20260624/**/livegraph-block
+/baseline/external-baselines-20260624/**/livegraph-wal
+/baseline/external-baselines-20260626/3plus3-baselines/systems/
+/baseline/external-baselines-20260626/3plus3-baselines/scripts/dense_truth_driver
+/baseline/external-baselines-20260626/3plus3-baselines/scripts/tugraph_dense_driver

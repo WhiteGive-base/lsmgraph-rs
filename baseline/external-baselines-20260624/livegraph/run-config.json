@@ -1,0 +1,91 @@
+{
+  "generated_at": "2026-06-26T21:55:00+08:00",
+  "status": "SF1 smoke and SF10 typed-neighbor scan completed; query-count digest PASS; external-driver clean rebuild recorded",
+  "remote_root": "/data/WorkSpace/lsmgraph-rs",
+  "remote_result_dir": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph",
+  "local_result_dir": "E:\\文档\\DGS项目复现\\baseline\\external-baselines-20260624\\livegraph",
+  "pipeline_script": "baseline/run_livegraph_sf10_pipeline_20260612.sh",
+  "driver_binary": "baseline/external-drivers/livegraph_driver",
+  "driver_source": "baseline/external-drivers/livegraph_driver.cpp",
+  "driver_binary_md5": "40d8bd8d23dd2638eea8ef8bda5cce39",
+  "driver_source_md5": "d601e9fc9f4d6ff73054c674dde30766",
+  "pipeline_script_md5": "21aec1f719661a87678cf9c5b380cb9b",
+  "livegraph_lib_md5": "5cb007decf4c761c4988e964a3c633d8",
+  "semL0_repo_head": "c2aa16c6e9d4fd26fd29c16711f0f1499ce1d664",
+  "semL0_worktree_dirty": true,
+  "livegraph_repo_head": "eea5a40ce6ee443f901e44323c1119f59113eaf3",
+  "livegraph_build": {
+    "lib": "deps/LiveGraph/build/liblivegraph.so",
+    "driver": "baseline/external-drivers/livegraph_driver",
+    "build_command_from_makefile": "g++ -O2 -std=c++17 -Wall -I../../deps/LiveGraph/bind livegraph_driver.cpp -L../../deps/LiveGraph/build -llivegraph -lpthread -o livegraph_driver",
+    "clean_rebuild_in_this_run": true,
+    "clean_rebuild_note": "Ran make clean && make all in baseline/external-drivers on 2026-06-26. This is a clean rebuild of external drivers in the current remote worktree, not a separate clean checkout.",
+    "rebuilt_binaries": {
+      "livegraph_driver": "40d8bd8d23dd2638eea8ef8bda5cce39",
+      "livegraph_driver_stream": "7e4e770b5bf568c55b8bde0506b3c8c5",
+      "livegraph_digest_driver": "f27799e3635701a7e18e52bccc7733f2"
+    }
+  },
+  "machine": {
+    "host": "finbench",
+    "kernel": "Linux 5.4.0-171-generic x86_64",
+    "cpu": "Intel Xeon Platinum 8163 @ 2.50GHz, 64 vCPU, 1 socket, 32 cores/socket, 2 threads/core",
+    "memory_total": "503GiB",
+    "swap": "0B",
+    "data_filesystem": "/dev/vdb1 mounted on /data, 2.0T total"
+  },
+  "runs": {
+    "sf1-smoke": {
+      "scale": "SF1",
+      "run_id": "external-baseline-livegraph-sf1-smoke-20260624",
+      "input": "/data/WorkSpace/ldbc-sf1/social_network",
+      "samples": 500,
+      "min_available_gib": 8,
+      "min_free_gib": 20
+    },
+    "sf10-typed-neighbor": {
+      "scale": "SF10",
+      "run_id": "external-baseline-livegraph-sf10-typed-scan-20260624",
+      "input": "/data/WorkSpace/ldbc-sf10/social_network",
+      "samples": 1000,
+      "min_available_gib": 64,
+      "min_free_gib": 80
+    }
+  },
+  "driver_stream_binary_md5": "7e4e770b5bf568c55b8bde0506b3c8c5",
+  "driver_digest_binary": "baseline/external-drivers/livegraph_digest_driver",
+  "driver_digest_source": "baseline/external-drivers/livegraph_digest_driver.cpp",
+  "driver_digest_binary_md5": "f27799e3635701a7e18e52bccc7733f2",
+  "driver_digest_source_md5": "20f98d31c0cdbe6f59d5fd745bfc0e2e",
+  "driver_stream_source_md5": "ae890df46409e697e177b7ba063a34b4",
+  "external_driver_makefile_md5": "a27f662d674cf2fece61f15eb798a76e",
+  "digest_correctness": {
+    "driver": "baseline/external-drivers/livegraph_digest_driver",
+    "seed": 42,
+    "method": "fixed-seed sampled (edge_type, src); dense edge-list ground-truth count/hash vs LiveGraph get_edges(src,label) count/hash",
+    "runs": {
+      "sf1-smoke": {
+        "status": "PASS",
+        "checked": 16140,
+        "unique_queries": 13898,
+        "mismatches": 0,
+        "samples_per_edge_type": 500,
+        "load_s": 27.4332,
+        "truth_s": 10.8958,
+        "verify_s": 0.828844,
+        "peak_rss_kb": 3735460
+      },
+      "sf10-typed-neighbor": {
+        "status": "PASS",
+        "checked": 32140,
+        "unique_queries": 27579,
+        "mismatches": 0,
+        "samples_per_edge_type": 1000,
+        "load_s": 1555.96,
+        "truth_s": 92.5096,
+        "verify_s": 16.3594,
+        "peak_rss_kb": 36797488
+      }
+    }
+  }
+}

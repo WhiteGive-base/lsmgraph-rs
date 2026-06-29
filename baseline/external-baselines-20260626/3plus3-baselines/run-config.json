@@ -1,0 +1,51 @@
+{
+  "generated_at": "2026-06-27T02:40:37+08:00",
+  "repo_root": "/data/WorkSpace/lsmgraph-rs",
+  "result_dir": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines",
+  "groups": {
+    "problem_adjacent": [
+      "LiveGraph",
+      "LSMGraph-style",
+      "Aster"
+    ],
+    "open_source_graph_db": [
+      "Neo4j Community",
+      "TuGraph",
+      "NebulaGraph"
+    ]
+  },
+  "gate": [
+    "clean build/version record",
+    "same LDBC edge set",
+    "same sampled typed-neighbor workload",
+    "per-query count/hash digest",
+    "load/RSS/footprint/latency logs",
+    "raw config and DONE marker"
+  ],
+  "nebulagraph_image_setup": {
+    "updated_at": "2026-06-29T00:00:00+08:00",
+    "remote_status": "server images pulled; SF1 smoke pending",
+    "mirror": "docker.1ms.run",
+    "official_tags": [
+      "vesoft/nebula-graphd:v3.8.0",
+      "vesoft/nebula-metad:v3.8.0",
+      "vesoft/nebula-storaged:v3.8.0"
+    ],
+    "mirror_tags": [
+      "docker.1ms.run/vesoft/nebula-graphd:v3.8.0",
+      "docker.1ms.run/vesoft/nebula-metad:v3.8.0",
+      "docker.1ms.run/vesoft/nebula-storaged:v3.8.0"
+    ],
+    "digests": {
+      "nebula-graphd": "sha256:1040573cc684ea6cc5e673b667422e9abab607c9d553c2c17c7bac6ad8a74e05",
+      "nebula-metad": "sha256:ab687bd32d3e441d436842b41427ba0961a5e169c46997ef03fa4dcfd5388b35",
+      "nebula-storaged": "sha256:7142642ee69001a5b5c50520196538d58bb2ec3930707c067cb4c4e2be3890f9"
+    },
+    "network_notes": [
+      "Remote HTTP_PROXY/HTTPS_PROXY pointed at 127.0.0.1:7897, but that proxy port was not listening.",
+      "Direct registry-1.docker.io access failed with connection refused.",
+      "dockerproxy.com timed out; docker.m.daocloud.io returned read-only denial for this probe.",
+      "docker.1ms.run manifest probes succeeded for graphd/metad/storaged:v3.8.0."
+    ]
+  }
+}

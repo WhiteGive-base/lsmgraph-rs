@@ -1,0 +1,10 @@
+[2026-06-24 21:28:00] run_id=external-baseline-livegraph-sf10-typed-scan-20260624
+[2026-06-24 21:28:00] store=/data/WorkSpace/lsmgraph-rs/store/external-baseline-livegraph-sf10-typed-scan-20260624/schema
+[2026-06-24 21:28:00] input=/data/WorkSpace/ldbc-sf10/social_network
+[2026-06-24 21:28:00] resource check (start): mem_available=451GiB disk_free=456GiB
+[2026-06-24 21:34:27] resource check (before scan dump): mem_available=451GiB disk_free=442GiB
+[2026-06-24 21:40:04] delete /data/WorkSpace/lsmgraph-rs/store/external-baseline-livegraph-sf10-typed-scan-20260624/schema
+[2026-06-24 21:40:04] resource check (before convert): mem_available=451GiB disk_free=442GiB
+[2026-06-24 21:59:53] resource check (before livegraph): mem_available=451GiB disk_free=436GiB
+validated scan_edges=355185382 dense_edges=355185382 vertices=29987835 livegraph_peak_rss_kb=47908544
+[2026-06-24 22:26:24] DONE external-baseline-livegraph-sf10-typed-scan-20260624

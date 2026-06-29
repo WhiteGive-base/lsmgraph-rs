@@ -1,0 +1,78 @@
+warning: unused import: `OpenOptions`
+ --> src/base_graph/csr.rs:2:21
+  |
+2 | use std::fs::{File, OpenOptions};
+  |                     ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `capacity`
+   --> src/base_graph/csr.rs:713:12
+    |
+713 |     fn new(capacity: usize) -> Self {
+    |            ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_capacity`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lsmgraph-rs` (lib) generated 2 warnings (run `cargo fix --lib -p lsmgraph-rs` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running `target/debug/c2-merge-retention --sources 40000 --edge-types 101,102,103,104,105,106 --store-dir target/c2-scale --output baseline/path-b-c2/stage5-scale-sf10class-20260618.json`
+{
+  "edge_types": [
+    101,
+    102,
+    103,
+    104,
+    105,
+    106
+  ],
+  "rows": [
+    {
+      "correctness_mismatches": 0,
+      "decisions": 1,
+      "exact_surface_ratio_after": 0.0,
+      "exact_surface_ratio_before": 1.0,
+      "filter_passed_after": 0,
+      "filter_passed_before": 0,
+      "input_bytes": 14227200,
+      "input_segments": 6,
+      "logical_update_bytes": 7680000,
+      "mixed_ratio_after": 1.0,
+      "mixed_ratio_before": 0.0,
+      "output_bytes": 8771200,
+      "output_segments": 1,
+      "policy": "naive",
+      "pruning_retention": 0.0,
+      "read_bytes_after": 46080000,
+      "read_bytes_before": 7680000,
+      "rewrite_bytes": 8771200,
+      "semantic_partition_outputs": false,
+      "write_amp": 1.1420833333333333
+    },
+    {
+      "correctness_mismatches": 0,
+      "decisions": 1,
+      "exact_surface_ratio_after": 1.0,
+      "exact_surface_ratio_before": 1.0,
+      "filter_passed_after": 0,
+      "filter_passed_before": 0,
+      "input_bytes": 14227200,
+      "input_segments": 6,
+      "logical_update_bytes": 7680000,
+      "mixed_ratio_after": 0.0,
+      "mixed_ratio_before": 0.0,
+      "output_bytes": 14227200,
+      "output_segments": 6,
+      "policy": "semantic",
+      "pruning_retention": 1.0,
+      "read_bytes_after": 7680000,
+      "read_bytes_before": 7680000,
+      "rewrite_bytes": 14227200,
+      "semantic_partition_outputs": true,
+      "write_amp": 1.8525
+    }
+  ],
+  "runner": "c2-merge-retention",
+  "sources": 40000
+}
+C2 smoke: naive exact_after=0.000 mixed_after=1.000 retention=0.000 | semantic exact_after=1.000 retention=1.000 | mismatches naive=0 semantic=0

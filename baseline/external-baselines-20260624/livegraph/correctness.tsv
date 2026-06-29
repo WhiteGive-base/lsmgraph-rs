@@ -1,0 +1,9 @@
+run	scale	check	expected	observed	status	notes
+external-baseline-livegraph-sf1-smoke-20260624	SF1	scan_edges_equals_dense_edges	34692699	34692699	PASS	SemL0 scan dump vs dense converter edge count
+external-baseline-livegraph-sf1-smoke-20260624	SF1	dense_edges_equals_livegraph_edges	34692699	34692699	PASS	converter output vs LiveGraph loaded edge count
+external-baseline-livegraph-sf1-smoke-20260624	SF1	positive_edge_type_scans	>=3	17	PASS	positive typed-neighbor scan coverage
+external-baseline-livegraph-sf1-smoke-20260624	SF1	query_count_digest	mismatches=0	checked=16140; unique=13898; mismatches=0	PASS	fixed-seed dense-list vs LiveGraph count/hash digest; seed=42; samples_per_edge_type=500
+external-baseline-livegraph-sf10-typed-scan-20260624	SF10	scan_edges_equals_dense_edges	355185382	355185382	PASS	SemL0 scan dump vs dense converter edge count
+external-baseline-livegraph-sf10-typed-scan-20260624	SF10	dense_edges_equals_livegraph_edges	355185382	355185382	PASS	converter output vs LiveGraph loaded edge count
+external-baseline-livegraph-sf10-typed-scan-20260624	SF10	positive_edge_type_scans	>=3	17	PASS	positive typed-neighbor scan coverage
+external-baseline-livegraph-sf10-typed-scan-20260624	SF10	query_count_digest	mismatches=0	checked=32140; unique=27579; mismatches=0	PASS	fixed-seed dense-list vs LiveGraph count/hash digest; seed=42; samples_per_edge_type=1000

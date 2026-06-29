@@ -1,0 +1,56 @@
+{
+  "edge_types": [
+    101,
+    102,
+    103,
+    104
+  ],
+  "rows": [
+    {
+      "correctness_mismatches": 0,
+      "decisions": 1,
+      "exact_surface_ratio_after": 0.0,
+      "exact_surface_ratio_before": 1.0,
+      "filter_passed_after": 0,
+      "filter_passed_before": 0,
+      "input_bytes": 71808,
+      "input_segments": 4,
+      "logical_update_bytes": 38400,
+      "mixed_ratio_after": 1.0,
+      "mixed_ratio_before": 0.0,
+      "output_bytes": 46752,
+      "output_segments": 1,
+      "policy": "naive",
+      "pruning_retention": 0.0,
+      "read_bytes_after": 153600,
+      "read_bytes_before": 38400,
+      "rewrite_bytes": 46752,
+      "semantic_partition_outputs": false,
+      "write_amp": 1.2175
+    },
+    {
+      "correctness_mismatches": 0,
+      "decisions": 1,
+      "exact_surface_ratio_after": 1.0,
+      "exact_surface_ratio_before": 1.0,
+      "filter_passed_after": 0,
+      "filter_passed_before": 0,
+      "input_bytes": 71808,
+      "input_segments": 4,
+      "logical_update_bytes": 38400,
+      "mixed_ratio_after": 0.0,
+      "mixed_ratio_before": 0.0,
+      "output_bytes": 71808,
+      "output_segments": 4,
+      "policy": "semantic",
+      "pruning_retention": 1.0,
+      "read_bytes_after": 38400,
+      "read_bytes_before": 38400,
+      "rewrite_bytes": 71808,
+      "semantic_partition_outputs": true,
+      "write_amp": 1.87
+    }
+  ],
+  "runner": "c2-merge-retention",
+  "sources": 300
+}

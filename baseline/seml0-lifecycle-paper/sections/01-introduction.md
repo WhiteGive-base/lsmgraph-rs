@@ -1,0 +1,11 @@
+## 1. Introduction
+
+Dynamic property graphs — social networks, knowledge graphs, financial transaction graphs — must absorb a continuous stream of edge and property updates while still answering selective reads quickly. Log-structured merge (LSM) storage suits the write side: updates are buffered, flushed as immutable segments, and reorganized by background compaction. The read side pays for this: recent L0 segments overlap in key space, so a query touching a single source vertex may probe many segments, most of which cannot contain a relevant edge.
+
+The usual framing treats this as a *physical adjacency locality* problem; we argue it is also a *semantics* problem. A property-graph query almost always exposes structure before the engine reads any segment body: source and destination labels, edge type, traversal direction, a degree class, a required property, and the schema epoch it resolves against. An engine blind to these cannot skip a segment it could provably never match.
+
+SemL0's thesis is that a property-graph query signature should act as a **lifecycle control signal** for an LSM-based graph store. At flush time the engine records a per-segment *semantic pruning surface*; at read time it prunes a segment only when its metadata proves the segment disjoint from the query, and otherwise degrades to a conservative read. This surface must also be *maintained*: naive, semantics-blind compaction collapses distinct partitions into mixed segments, silently destroying the surface and reintroducing read amplification. SemL0 therefore makes compaction semantics-aware — retaining or rebuilding the surface across levels — and keeps the whole loop conservative-correct under updates and schema evolution.
+
+We contribute C1 (the pruning surface), C2 (its lifecycle retention — the keystone), and C3 (snapshot/schema correctness), summarized above and evaluated in §7. We are deliberate about claim strength: read-amplification and candidate reductions are robust and safe; end-to-end latency is workload-dependent and reported as supporting evidence, not a uniform speedup.
+
+We do **not** position SemL0 as a complete graph DBMS, a full schema-migration engine, a production write-stall study, or an end-to-end/production performance report.

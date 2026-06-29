@@ -1,0 +1,25 @@
+loaded edge list: vcount=29987835 edges=355185382
+loaded into LiveGraph in 1457.4s
+	Command being timed: "baseline/external-drivers/livegraph_driver --edges /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/edges-dense.txt --samples 1000 --block-path /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/livegraph-block --wal-path /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/livegraph-wal --output /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/livegraph-sf10.json"
+	User time (seconds): 1568.94
+	System time (seconds): 106.99
+	Percent of CPU this job got: 105%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 26:30.61
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 47908544
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 8689978
+	Minor (reclaiming a frame) page faults: 7493468
+	Voluntary context switches: 9103112
+	Involuntary context switches: 2640
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 70369560
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

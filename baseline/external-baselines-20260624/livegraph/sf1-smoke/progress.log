@@ -1,0 +1,10 @@
+[2026-06-24 21:22:23] run_id=external-baseline-livegraph-sf1-smoke-20260624
+[2026-06-24 21:22:23] store=/data/WorkSpace/lsmgraph-rs/store/external-baseline-livegraph-sf1-smoke-20260624/schema
+[2026-06-24 21:22:23] input=/data/WorkSpace/ldbc-sf1/social_network
+[2026-06-24 21:22:23] resource check (start): mem_available=451GiB disk_free=461GiB
+[2026-06-24 21:23:05] resource check (before scan dump): mem_available=451GiB disk_free=460GiB
+[2026-06-24 21:23:35] delete /data/WorkSpace/lsmgraph-rs/store/external-baseline-livegraph-sf1-smoke-20260624/schema
+[2026-06-24 21:23:35] resource check (before convert): mem_available=451GiB disk_free=460GiB
+[2026-06-24 21:25:30] resource check (before livegraph): mem_available=451GiB disk_free=459GiB
+validated scan_edges=34692699 dense_edges=34692699 vertices=3181724 livegraph_peak_rss_kb=4850512
+[2026-06-24 21:26:06] DONE external-baseline-livegraph-sf1-smoke-20260624

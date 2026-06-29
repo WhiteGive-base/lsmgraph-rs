@@ -1,0 +1,34 @@
+LiveGraph external baseline build record (updated 2026-06-26)
+
+Status: EXTERNAL DRIVERS CLEAN-REBUILT; DIGEST CORRECTNESS PASSED.
+
+Remote root: /data/WorkSpace/lsmgraph-rs
+SemL0 repo HEAD: c2aa16c6e9d4fd26fd29c16711f0f1499ce1d664
+SemL0 worktree: dirty (experiment/paper files present; this is not a separate clean checkout)
+LiveGraph repo HEAD: eea5a40ce6ee443f901e44323c1119f59113eaf3
+LiveGraph shared library: deps/LiveGraph/build/liblivegraph.so, md5 5cb007decf4c761c4988e964a3c633d8
+
+Clean rebuild command run on 2026-06-26:
+  cd /data/WorkSpace/lsmgraph-rs/baseline/external-drivers
+  make clean && make all
+
+Rebuilt binaries and source hashes:
+  livegraph_driver: md5 40d8bd8d23dd2638eea8ef8bda5cce39
+  livegraph_driver.cpp: md5 d601e9fc9f4d6ff73054c674dde30766
+  livegraph_driver_stream: md5 7e4e770b5bf568c55b8bde0506b3c8c5
+  livegraph_driver_stream.cpp: md5 ae890df46409e697e177b7ba063a34b4
+  livegraph_digest_driver: md5 f27799e3635701a7e18e52bccc7733f2
+  livegraph_digest_driver.cpp: md5 20f98d31c0cdbe6f59d5fd745bfc0e2e
+  Makefile: md5 a27f662d674cf2fece61f15eb798a76e
+
+Makefile build commands:
+  g++ -O2 -std=c++17 -Wall -I../../deps/LiveGraph/bind livegraph_driver.cpp -L../../deps/LiveGraph/build -llivegraph -lpthread -o livegraph_driver
+  g++ -O2 -std=c++17 -Wall -I../../deps/LiveGraph/bind livegraph_driver_stream.cpp -L../../deps/LiveGraph/build -llivegraph -lpthread -o livegraph_driver_stream
+  g++ -O2 -std=c++17 -Wall -I../../deps/LiveGraph/bind livegraph_digest_driver.cpp -L../../deps/LiveGraph/build -llivegraph -lpthread -o livegraph_digest_driver
+
+Digest correctness results:
+  SF1: checked=16140, unique=13898, mismatches=0, seed=42, samples_per_edge_type=500.
+  SF10: checked=32140, unique=27579, mismatches=0, seed=42, samples_per_edge_type=1000.
+
+Boundary:
+  The external drivers were clean-rebuilt in the current remote worktree. This is stronger than the previous prebuilt-binary record, but it is not a separate clean-checkout reproduction. The LiveGraph shared library remains the recorded artifact at the hash above.
