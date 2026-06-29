@@ -5,7 +5,10 @@ pub mod reader;
 pub mod writer;
 
 pub use cache::{CachedCsrMetadata, CsrMetadataCache};
-pub use format::{CsrHeader, CsrSegmentMeta, DiskEdgeBody, EdgeOffset};
+pub use format::{
+    CsrHeader, CsrSegmentMeta, DegreeSummaryState, DiskEdgeBody, EdgeOffset, PruningSurfaceSummary,
+    SchemaState, SegmentSemanticState, TombstoneState, TopologySummaryState,
+};
 pub use manifest::{Manifest, ManifestRecord};
 pub use reader::{
     AbsentPropertyPolicy, CsrDecodedPropertyValue, CsrEdgeRecordWithDecodedProperties,

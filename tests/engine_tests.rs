@@ -4312,6 +4312,75 @@ async fn lmerge_cascades_l1_to_l2_with_semantic_filters() -> anyhow::Result<()> 
     Ok(())
 }
 
+// C2: a real L1->L2 compaction must populate the pruning-surface measurement,
+// and semantic partitioning must retain the surface where naive merge degrades it.
+// Returns (surface_before_exact_ratio, surface_after_exact_ratio,
+//          surface_after_mixed_ratio, logical_update_bytes).
+async fn run_c2_surface_merge(
+    semantic: bool,
+    prefix: &str,
+) -> anyhow::Result<(f64, f64, f64, u64)> {
+    let src = encoded(VertexLabel::Person, 72_000);
+    let edge_types = [101, 102, 103];
+    let tmp = target_tempdir(prefix)?;
+    let mut config = feedback_compaction_config(tmp.path());
+    config.level_fanout = 2;
+    let engine = Engine::create(config).await?;
+    for (idx, edge_type) in edge_types.iter().copied().enumerate() {
+        engine
+            .insert_edge(
+                src,
+                encoded(VertexLabel::Person, 73_000 + idx as u64),
+                edge_type,
+            )
+            .await?;
+        engine.flush_active().await?;
+        engine
+            .compact_l0_partition_to_l1(VertexLabel::Person as i32, Some(edge_type))
+            .await?;
+    }
+    let decisions = engine
+        .compact_levels_with_policy(LevelMergePolicy {
+            fanout: 2,
+            min_input_segments: 2,
+            max_output_level: 2,
+            semantic_partition_outputs: semantic,
+        })
+        .await?;
+    assert_eq!(decisions.len(), 1);
+    let d = &decisions[0];
+    Ok((
+        d.surface_before.exact_surface_ratio(),
+        d.surface_after.exact_surface_ratio(),
+        d.surface_after.mixed_ratio(),
+        d.logical_update_bytes,
+    ))
+}
+
+#[tokio::test]
+async fn semantic_merge_retains_pruning_surface_while_naive_merge_degrades_it() -> anyhow::Result<()>
+{
+    let (sem_before, sem_after, _sem_mixed, sem_logical) =
+        run_c2_surface_merge(true, "c2-surface-semantic-").await?;
+    let (naive_before, naive_after, naive_mixed, _naive_logical) =
+        run_c2_surface_merge(false, "c2-surface-naive-").await?;
+
+    // Identical, already-exact inputs for both runs.
+    assert!((sem_before - 1.0).abs() < 1e-9);
+    assert!((naive_before - 1.0).abs() < 1e-9);
+    assert!(sem_logical > 0);
+
+    // Semantic merge retains the exact (src_label, edge_type) surface; naive merge
+    // collapses the keys into a MIXED_EDGE_TYPE segment and degrades it.
+    assert!((sem_after - 1.0).abs() < 1e-9);
+    assert!(
+        naive_after < sem_after,
+        "naive merge should degrade the pruning surface (naive_after={naive_after}, sem_after={sem_after})"
+    );
+    assert!(naive_mixed > 0.0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn auto_maintenance_read_feedback_compacts_hot_l0_partition() -> anyhow::Result<()> {
     let tmp = target_tempdir("k4-auto-read-feedback-")?;

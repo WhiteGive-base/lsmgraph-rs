@@ -10,6 +10,9 @@ DATA_ROOT="${DATA_ROOT:-}"
 STORE_ROOT="${STORE_ROOT:-/data/WorkSpace/lsmgraph-rs/store}"
 SMOKE_STORE="${SMOKE_STORE:-${STORE_ROOT}/sf1-base-graph}"
 SF30_STORE_ROOT="${SF30_STORE_ROOT:-${STORE_ROOT}}"
+SCHEMA_STORE="${SCHEMA_STORE:-${SF30_STORE_ROOT}/sf30-schema}"
+BUDG_B64_STORE="${BUDG_B64_STORE:-${SF30_STORE_ROOT}/sf30-budg-b64}"
+SEMANTIC_STORE="${SEMANTIC_STORE:-${SF30_STORE_ROOT}/sf30-semantic}"
 QUERY_RATE="${QUERY_RATE:-200}"
 WRITE_RATE="${WRITE_RATE:-200}"
 CHECKPOINT_SECS="${CHECKPOINT_SECS:-30}"
@@ -26,6 +29,22 @@ echo "log_root=${LOG_ROOT}"
 echo "ETA smoke: 3-5 min; formal SF30: 30-60 min per variant plus build/open overhead"
 echo "Abort conditions: checkpoint queries < ${ABORT_MIN_QUERIES}; writer op > ${ABORT_MAX_WRITE_OP_MS}ms is counted as stall; runner aborts on writer errors."
 echo "Progress signals: JSONL checkpoints include elapsed_secs, candidate_l0_segments, latency p50/p99, L0 files, compaction rewrite bytes, flush-stall proxy, io.write_bytes."
+
+if command -v df >/dev/null 2>&1 && df -BG /data >/dev/null 2>&1; then
+  DATA_AVAIL_GIB="$(df -BG /data | awk 'NR==2 {gsub("G","",$4); print $4}')"
+  if [ "${DATA_AVAIL_GIB:-0}" -lt 200 ]; then
+    echo "ABORT: /data available ${DATA_AVAIL_GIB}GiB < 200GiB" | tee "${LOG_ROOT}/ABORT"
+    exit 2
+  fi
+fi
+
+if [ -r /proc/meminfo ]; then
+  MEM_AVAILABLE_KIB="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
+  if [ "${MEM_AVAILABLE_KIB:-0}" -lt 83886080 ]; then
+    echo "ABORT: MemAvailable ${MEM_AVAILABLE_KIB}KiB < 80GiB" | tee "${LOG_ROOT}/ABORT"
+    exit 2
+  fi
+fi
 
 nice -n 10 cargo build --release --bin w5_steady_state_real_store
 
@@ -65,9 +84,16 @@ case "${MODE}" in
     fi
     DATA_ROOT="${DATA_ROOT:-/data/WorkSpace/ldbc-sf30/social_network}"
     DURATION="${DURATION:-3600}"
-    for variant in schema budg-b64 semantic; do
-      run_variant "${variant}" "${SF30_STORE_ROOT}/sf30-${variant}" "${DURATION}"
+    echo "formal stores: schema=${SCHEMA_STORE} budg-b64=${BUDG_B64_STORE} semantic=${SEMANTIC_STORE}"
+    for store in "${SCHEMA_STORE}" "${BUDG_B64_STORE}" "${SEMANTIC_STORE}"; do
+      if [[ ! -d "${store}" ]]; then
+        echo "ABORT: formal store missing: ${store}" | tee "${LOG_ROOT}/ABORT"
+        exit 2
+      fi
     done
+    run_variant "schema" "${SCHEMA_STORE}" "${DURATION}"
+    run_variant "budg-b64" "${BUDG_B64_STORE}" "${DURATION}"
+    run_variant "semantic" "${SEMANTIC_STORE}" "${DURATION}"
     ;;
   *)
     echo "unknown MODE=${MODE}; use smoke or formal" >&2

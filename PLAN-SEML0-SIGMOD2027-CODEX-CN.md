@@ -72,6 +72,24 @@ C12 第二阶段（feedback-only 模式 + workload-shift 验证）；property-aw
 - 审稿人最可能追加的两问：外部 SOTA 基线（→W12 LSMGraph）、超出 1-hop 的查询收益（→W4 2-hop + property + SF10 server smoke）。
 - 最大不可控：Gate 1（budg-b64 延迟优势是否经得起复测）与 C10 成效——两者都有 fallback 叙事（§3），不会毁稿。
 
+### 0.5 schema-evolution：机制已实现，结论（2026-06-13 核查，决定不破冻结）
+
+审稿人必问「新增 edge label / property 后旧存储是否失效、会不会漏边」。**核查结论：机制已建好且已测，无需新引擎代码。**
+- `src/schema.rs`：完整 `SchemaCatalog`（add/drop/alias/resolve vertex-label/edge-label/property、`encoding_epoch`、
+  `valid_from/to_epoch`、`is_visible_at`）——即 GPT 说要建的 Versioned Schema Catalog，已存在。
+- `src/csr/format.rs:117/125`：段 footer 持久化 `schema_epoch` + `property_encoding_epoch`（编解码已测）。
+- `src/graph.rs`：catalog 随 store 加载/保存；`add_edge_label/add_property/alias_*/drop_*` engine API 推进 epoch 并落盘；
+  `segment_count_by_schema_epoch` 统计；flush 给段打当前 epoch。
+- `tests/engine_tests.rs:1942 schema_epoch_change_keeps_old_segments_readable` + `:2020 schema_catalog_persists...`
+  + `:395 schema_epoch_snapshot_mixed_delta_survives_compaction_and_reopen`：已证旧段在 schema 演进 + 重开后仍可读、查询正确。
+- **关键设计点**：`GraphAccessSignature`（semantic.rs:73）不含 schema_epoch——剪枝靠 **stable edge_type id**。
+  新增 label = 新 type id，旧 exact 段按 type 不相交**自动被现有 exact-disjoint 路径跳过**；schema_epoch 仅用于
+  property-encoding 解释和 snapshot 可见性。这正是「旧存储不失效」想要的性质，且零额外剪枝代码。
+
+→ 因此把 GPT 的提议落成 **W13（实验 + invariant/theorem 写作）**，放 Batch C，**不破 `engine-freeze-sigmod2027` 冻结**
+（runner 属允许项；真要给 catalog 补能力是 future work，不在投稿路径上）。贡献升级为「schema/snapshot-safe semantic pruning」，
+是区别于「普通语义索引（schema 变了要重建）」的差异点，几乎零成本拿下。
+
 ---
 
 ## §1 硬性规约（每个工单会话开头自检，违反即停）
@@ -206,6 +224,21 @@ budget sweep、oracle 达成比例（candidate 相对 oracle 的 %）、**各变
     沿用 LiveGraph SF10 的 dense edge list 流程（`baseline/convert_livegraph_edges.py` 产物格式可复用）；
   3. 不可行 → 与 BACH 同款处理：related work 定性对比 + 设计差异表（多级 CSR 布局 / 布局变换 vs 语义 L0 剪枝，
     强调正交性：SemL0 可叠加在任意 LSM-CSR 布局之上）+ 内部消融方法学辩护（贡献是 L0 布局策略而非整引擎）。
+- **W13：schema-evolution 安全裁剪实验 + invariant/theorem（新增，无需破冻结）**——见 §0.5 的核查结论：
+  机制（`src/schema.rs` SchemaCatalog、段 footer `schema_epoch`/`property_encoding_epoch`、engine add/drop/alias API、
+  `tests/engine_tests.rs:1942 schema_epoch_change_keeps_old_segments_readable`）**已实现且已测**，剪枝靠 stable edge_type id
+  自动跳过旧 exact 段，**不需要新引擎代码**。本工单只做实验 + 写作：
+  1. runner（SF30 级）：epoch 0 import 一批 edge label → 用 engine API `add_edge_label` + `add_property` 推进到 epoch 1 →
+     epoch 1 写入新 label / 新 property 的 delta → bench 三类查询：(a) 新 label typed-neighbor、(b) 旧 label topology、
+     (c) 新 property equality/absent；记录每类的 candidate_l0_segments 漏斗 + mismatches；
+  2. 断言三件事：correctness（vs naive，mismatches=0，**无 false negative**）；pruning（新 label 查询对 epoch 0 exact 段
+     candidate≈0，即旧段被正确跳过）；conservative（mixed/legacy 段被保守读，candidate>0 但仍 0 mismatch）；
+  3. 可选 +1：lazy compaction 后旧 schema-uncertain 段升级，pruning power 恢复（与 feedback compaction 故事合并）；
+  4. 写作：3 个 invariant（Segment Schema / Epoch-Aware Resolution / Conservative Pruning）+ theorem
+     「schema evolution 只降剪枝精度、不引入漏读」+ schema-变更分类表（additive 支持、rename=alias/relabel 二分、
+     drop=lazy、type/encoding=保守）；与 BACH file-snapshot MVCC 的对照写进 related work。
+     **边界（必须显式）**：只声称 additive schema + 定宽 property equality + presence/absence + epoch/encoding-epoch + alias/tombstone/snapshot；
+     不声称任意 schema migration、range/string/compound predicate、在线全库 rewrite。
 
 ---
 
@@ -218,6 +251,8 @@ budget sweep、oracle 达成比例（candidate 相对 oracle 的 %）、**各变
 | **Gate 2** schema/budgeted 的 import maxRSS 与 naive 同量级（C4 后） | W1 初判、W6 终判 | 维护代价表入主文作加分项                              | RSS 列移注脚 + 写成当前实现限制，主文只保 store/manifest/L0/import wall                         |
 | **Gate 3** property/2-hop 工作负载出正向结果                          | W8 后        | 标题保留「property graphs」全称，签名维度覆盖声明成立        | 标题/正文收窄为「L0 design …」，property 写成机制 + microbench                               |
 | **Gate 4** feedback-only 在 workload-shift 下 N 个 flush 内重定向预算 | W7 后        | 贡献写「self-tuning semantic materialization」 | feedback 降级为「controlled workload-shift mechanism」，勿称生产级自适应                     |
+| **Gate 5** 稳态混合读写出 time-series（schema/budg-b64/semantic）       | W9 后        | LSM 动机坐实，read-amp 随 L0 churn 的曲线入主文       | 降级为附录/observation，主文不强调 dynamic steady-state                                  |
+| **Gate 7** schema-evolution 实验：新 label 查询跳过旧 exact 段、0 mismatch、mixed 保守读 | W13 后  | 贡献加「schema/snapshot-safe semantic pruning」+ theorem，标题可含 dynamic property graph 全义 | 退为 correctness 小节 + invariant（机制已测，故几乎必过；真出问题就只写 readability 不写 pruning 收益）  |
 
 
 ---
@@ -245,4 +280,42 @@ budget sweep、oracle 达成比例（candidate 相对 oracle 的 %）、**各变
 - 禁止：重做 §0 已完成项；未做 ETA 评估就起 >30min 任务；并发多个 SF100 级任务；覆盖旧 trace；
 在 W2 冻结后、W6 结束前改引擎行为（bug fix 除外）。
 - 遇到与本文档冲突的仓内新状态（别的会话推进了），以仓内状态文档为准并更新本文档对应小节。
+
+---
+
+## §6 发表完成线（Definition of Done，分三层；这是「做到哪就能投」的明确答案）
+
+> 顶会无「保证录用」。下面给的是**可投线**（所有 desk-reject 风险关闭、贡献诚实成立）与**有竞争力线**。
+> 关键事实：W7/W8/W9 的**代码已在 W3/W4/W5 合并完成**，所以 Tier 2 只剩「跑」不剩「写代码」——
+> 从 Tier 1 到 Tier 2 的边际成本只是几次 SF30 跑批（小时级，非开发），**因此真实目标定在 Tier 1+2**。
+
+### Tier 1 — 最低可投线（必须全做；做完即可投，claim 按 Gate 收窄）
+| 项 | 关掉的风险 | 完成判据 |
+|---|---|---|
+| **W6** SF100 全矩阵复测 | G1 单次测量 / G3 kv 假标注 / G4 RSS / G8 naive 锚 / read_bytes caveat | 9 变体 JSON 齐全、真实 kv-lsm 入表、各变体 3 轮 mean±stddev、vs-naive 0 mismatch、oracle 上界列；判 Gate 1/2 |
+| **W13** schema-evolution 实验 + invariant/theorem | 「schema 变了旧存储是否失效/漏边」必问项 | SF30 实验：新 label 跳旧 exact 段、0 mismatch、mixed 保守读；3 invariant + theorem 写入正确性小节（判 Gate 7） |
+| **W10** 数据卫生 + claim 安全化 | 数据完整性 / 过度声明 | 全表从 raw JSON 再生；claim 按 Gate 1/3/4/5/7 结果落档；limitations 显式（external/RSS/kv/tail/property 不藏） |
+
+**到 Tier 1 即可投**：所有一票否决项已关，论文诚实、贡献成立（哪怕标题收窄为「Query-Semantic L0 Design for
+LSM-Based Dynamic Property Graphs」、property 写成机制+microbench）。现实预期：borderline，靠 R4 自带 revision 轮有补救空间。
+
+### Tier 2 — 有竞争力线（代码已就绪，只需跑批；**推荐的真实目标**）
+| 项 | 升级了什么 | 完成判据 |
+|---|---|---|
+| **W7** feedback-only workload-shift（代码 W3 已完成） | 杀掉「benchmark 过拟合」(G5)；贡献升为 **self-tuning materialization** | SF30 三组（feedback-only/static/no-feedback）相位切换，预算 N 个 flush 内重定向（判 Gate 4） |
+| **W8** property + 2-hop（代码 W4 已完成） | 标题保住 **property graph** 全义 + 多跳相关性 (Gate 3) | SF30 四类 property 谓词 + 2-hop typed expansion 出正向 candidate/latency |
+| **W9** 稳态混合读写（代码 W5 已完成） | 坐实 **LSM 动机本身** (Gate 5) | SF30 30–60min time-series：candidate/p99/rewrite/flush-stall 随 L0 churn |
+
+**到 Tier 1+2 = 强投稿**：标题保留全义；三个差异化贡献立住（exact-proof budgeted pruning + feedback self-tuning +
+schema/snapshot-safe）；Gate 1/2/3/4/5/7 全绿或诚实有界。
+
+### Tier 3 — 加分项（绝不阻塞投稿；缺了用 limitations/related-work 兜底）
+- **W12** LSMGraph 外部对比（可构建则 SF10 实测；否则定性 + 设计差异表）。
+- **W11** legacy 死代码清理（artifact 卫生）。
+- oracle 上界打磨、更多规模点。
+
+### 一句话
+**做到 Tier 1 就能投；做到 Tier 1+2 才值得投**（因为 Tier 2 代码是已付的沉没成本，只差跑）。Tier 3 随缘。
+顺序：W6 过夜 → 判 Gate 1/2 → W7/W8/W9/W13 跑批（均 SF30 级，单-SF100 规约只约束 W6，故这批可错峰并行）→
+W10 写作冻结 → 投。按此节奏比 10/17 截稿留 ≥1 月缓冲。
 

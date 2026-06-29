@@ -107,6 +107,11 @@ impl GraphAccessSignature {
         self
     }
 
+    pub fn with_dst_label(mut self, dst_label: i32) -> Self {
+        self.dst_label = Some(dst_label);
+        self
+    }
+
     pub fn with_required_property(mut self, property_id: PropertyId) -> Self {
         self.property_predicate = Some(PropertyPredicate::RequiredPresent { property_id });
         self

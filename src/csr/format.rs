@@ -184,7 +184,10 @@ impl CsrSegmentMeta {
         self.source_bloom_offset > 0 && self.source_bloom_len > 0 && self.source_bloom_bit_count > 0
     }
 
-    pub fn may_contain_signature(&self, signature: &GraphAccessSignature) -> bool {
+    pub fn signature_pruning_decision(
+        &self,
+        signature: &GraphAccessSignature,
+    ) -> SignaturePruningDecision {
         let time_matches = !signature
             .min_ts
             .map(|min_ts| self.max_ts < min_ts)
@@ -194,42 +197,57 @@ impl CsrSegmentMeta {
                 .map(|max_ts| self.min_ts > max_ts)
                 .unwrap_or(false);
         if !time_matches {
-            return false;
+            return SignaturePruningDecision::pruned("time");
         }
         if !self.summary_completeness.allows_semantic_pruning() {
-            return true;
+            return SignaturePruningDecision::kept("mixed_unknown_fallback");
         }
 
-        let label_matches = signature.label_matches(self.src_label);
-        let edge_matches = match signature.edge_type {
-            Some(edge_type) => {
-                self.edge_type_partition == MIXED_EDGE_TYPE || self.edge_type_partition == edge_type
+        if !signature.label_matches(self.src_label) {
+            return SignaturePruningDecision::pruned("src_label");
+        }
+        if let Some(edge_type) = signature.edge_type {
+            if self.edge_type_partition != MIXED_EDGE_TYPE && self.edge_type_partition != edge_type
+            {
+                return SignaturePruningDecision::pruned("edge_type");
             }
-            None => true,
-        };
-        let direction_matches = signature.direction_matches(self.direction);
-        let degree_matches = match signature.degree_class {
-            Some(degree_class) if self.degree_class_exact => {
-                self.degree_class.may_contain_global_query(degree_class)
+        }
+        if !signature.direction_matches(self.direction) {
+            return SignaturePruningDecision::pruned("direction");
+        }
+        if let Some(degree_class) = signature.degree_class {
+            if self.degree_class_exact {
+                if !self.degree_class.may_contain_global_query(degree_class) {
+                    return SignaturePruningDecision::pruned("degree");
+                }
+            } else {
+                return SignaturePruningDecision::kept("budgeted_not_materialized");
             }
-            _ => true,
-        };
-        let dst_matches = match signature.dst_label {
-            Some(dst_label) => {
-                self.dst_label == UNKNOWN_SOURCE_LABEL || self.dst_label == dst_label
+        }
+        if let Some(dst_label) = signature.dst_label {
+            if self.dst_label != UNKNOWN_SOURCE_LABEL && self.dst_label != dst_label {
+                return SignaturePruningDecision::pruned("dst_label");
             }
-            None => true,
-        };
-        let property_matches = match signature.property_predicate {
-            Some(predicate) => self.may_satisfy_property_predicate(predicate),
-            None => true,
-        };
-        label_matches
-            && edge_matches
-            && direction_matches
-            && degree_matches
-            && dst_matches
-            && property_matches
+        }
+        if let Some(PropertyPredicate::RequiredPresent { property_id }) =
+            signature.property_predicate
+        {
+            if self.definitely_lacks_property(property_id) {
+                if self.may_contain_tombstones {
+                    return SignaturePruningDecision::kept("schema_tombstone_fallback");
+                }
+                return SignaturePruningDecision::pruned("property_absence");
+            }
+            if !self.property_summary_completeness.allows_semantic_pruning() {
+                return SignaturePruningDecision::kept("mixed_unknown_fallback");
+            }
+        }
+
+        SignaturePruningDecision::kept("kept_candidate")
+    }
+
+    pub fn may_contain_signature(&self, signature: &GraphAccessSignature) -> bool {
+        !self.signature_pruning_decision(signature).pruned
     }
 
     pub fn may_contain_property(&self, property_id: PropertyId) -> bool {
@@ -250,6 +268,210 @@ impl CsrSegmentMeta {
                 self.may_contain_tombstones || self.may_contain_property(property_id)
             }
             PropertyPredicate::AbsentOrDefault { property_id: _ } => true,
+        }
+    }
+
+    /// Derive the orthogonal, multi-dimensional semantic state of this segment.
+    ///
+    /// This is the C2 measurement primitive. Topology is **key-based**: a segment
+    /// whose `src_label`/`edge_type_partition` collapsed to the
+    /// `UNKNOWN_SOURCE_LABEL`/`MIXED_EDGE_TYPE` sentinels (e.g. the output of a
+    /// naive, non-semantic merge over multiple labels/edge types) is `Mixed`,
+    /// because the CSR writer always records `summary_completeness == Exact` for
+    /// freshly written segments — so the key sentinels, not the completeness flag,
+    /// are what signals a degraded pruning surface.
+    pub fn semantic_state(&self, current_epoch: SchemaEpoch) -> SegmentSemanticState {
+        let topology = if !self.summary_completeness.allows_semantic_pruning() {
+            TopologySummaryState::Unknown
+        } else if self.src_label == UNKNOWN_SOURCE_LABEL
+            || self.edge_type_partition == MIXED_EDGE_TYPE
+        {
+            TopologySummaryState::Mixed
+        } else {
+            TopologySummaryState::Exact
+        };
+        let degree = if !self.summary_completeness.allows_semantic_pruning()
+            || matches!(self.degree_class, DegreeClass::Unknown)
+        {
+            DegreeSummaryState::Unknown
+        } else if self.degree_class_exact
+            && matches!(
+                self.degree_class,
+                DegreeClass::Low | DegreeClass::Medium | DegreeClass::High
+            )
+        {
+            DegreeSummaryState::Exact
+        } else {
+            DegreeSummaryState::Mixed
+        };
+        let tombstone = if self.may_contain_tombstones {
+            TombstoneState::Sensitive
+        } else {
+            TombstoneState::Clean
+        };
+        let schema = if self.schema_epoch == current_epoch {
+            SchemaState::Current
+        } else if self.schema_epoch < current_epoch {
+            SchemaState::OlderEpoch
+        } else {
+            SchemaState::Uncertain
+        };
+        SegmentSemanticState {
+            topology,
+            degree,
+            property: self.property_summary_completeness,
+            tombstone,
+            schema,
+        }
+    }
+}
+
+/// Orthogonal, multi-dimensional semantic state of a CSR segment (C2).
+///
+/// Kept as a struct of independent dimensions rather than one flat enum: a
+/// segment can be e.g. topology-`Exact` yet tombstone-`Sensitive` and
+/// schema-`OlderEpoch` simultaneously, which a flat enum could not express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentSemanticState {
+    pub topology: TopologySummaryState,
+    pub degree: DegreeSummaryState,
+    /// Reuses the catalog completeness enum (Exact / Conservative / Unknown).
+    pub property: SemanticSummaryCompleteness,
+    pub tombstone: TombstoneState,
+    pub schema: SchemaState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologySummaryState {
+    /// Summary allows pruning and both (src_label, edge_type) keys are concrete.
+    Exact,
+    /// Summary allows pruning but a partition key collapsed to a sentinel
+    /// (UNKNOWN_SOURCE_LABEL or MIXED_EDGE_TYPE): pruning surface degraded.
+    Mixed,
+    /// Summary does not allow semantic pruning at all.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegreeSummaryState {
+    Exact,
+    Mixed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TombstoneState {
+    Clean,
+    Sensitive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaState {
+    Current,
+    OlderEpoch,
+    Uncertain,
+}
+
+/// Edge-weighted + segment-count summary of the pruning surface over a set of
+/// segments (e.g. the inputs vs the outputs of one compaction). This is the
+/// core C2 retention measurement; `exact_surface_ratio` is the headline metric.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct PruningSurfaceSummary {
+    pub segment_count: usize,
+    pub edge_count: u64,
+    pub topology_exact_edges: u64,
+    pub topology_mixed_edges: u64,
+    pub topology_unknown_edges: u64,
+    pub topology_exact_segments: usize,
+    pub topology_mixed_segments: usize,
+    pub topology_unknown_segments: usize,
+    pub degree_exact_segments: usize,
+    pub property_exact_segments: usize,
+    pub tombstone_sensitive_segments: usize,
+    pub older_epoch_segments: usize,
+}
+
+impl PruningSurfaceSummary {
+    /// Aggregate the semantic state of every segment, edge-weighted by
+    /// `edge_count`. Pass the schema epoch the read path would resolve against.
+    pub fn from_segments(metas: &[CsrSegmentMeta], current_epoch: SchemaEpoch) -> Self {
+        let mut summary = PruningSurfaceSummary::default();
+        for meta in metas {
+            let state = meta.semantic_state(current_epoch);
+            let edges = meta.edge_count;
+            summary.segment_count += 1;
+            summary.edge_count += edges;
+            match state.topology {
+                TopologySummaryState::Exact => {
+                    summary.topology_exact_edges += edges;
+                    summary.topology_exact_segments += 1;
+                }
+                TopologySummaryState::Mixed => {
+                    summary.topology_mixed_edges += edges;
+                    summary.topology_mixed_segments += 1;
+                }
+                TopologySummaryState::Unknown => {
+                    summary.topology_unknown_edges += edges;
+                    summary.topology_unknown_segments += 1;
+                }
+            }
+            if matches!(state.degree, DegreeSummaryState::Exact) {
+                summary.degree_exact_segments += 1;
+            }
+            if matches!(state.property, SemanticSummaryCompleteness::Exact) {
+                summary.property_exact_segments += 1;
+            }
+            if matches!(state.tombstone, TombstoneState::Sensitive) {
+                summary.tombstone_sensitive_segments += 1;
+            }
+            if matches!(state.schema, SchemaState::OlderEpoch | SchemaState::Uncertain) {
+                summary.older_epoch_segments += 1;
+            }
+        }
+        summary
+    }
+
+    /// Fraction of edges living in a topology-`Exact` segment (headline metric).
+    pub fn exact_surface_ratio(&self) -> f64 {
+        if self.edge_count == 0 {
+            0.0
+        } else {
+            self.topology_exact_edges as f64 / self.edge_count as f64
+        }
+    }
+
+    /// Fraction of edges living in a topology-`Mixed` segment.
+    pub fn mixed_ratio(&self) -> f64 {
+        if self.edge_count == 0 {
+            0.0
+        } else {
+            self.topology_mixed_edges as f64 / self.edge_count as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignaturePruningDecision {
+    pub pruned: bool,
+    pub reason: &'static str,
+}
+
+impl SignaturePruningDecision {
+    fn pruned(reason: &'static str) -> Self {
+        Self {
+            pruned: true,
+            reason,
+        }
+    }
+
+    fn kept(reason: &'static str) -> Self {
+        Self {
+            pruned: false,
+            reason,
         }
     }
 }
@@ -482,6 +704,39 @@ mod tests {
     }
 
     #[test]
+    fn signature_pruning_decision_reports_semantic_reason() {
+        let meta = semantic_meta(1);
+        let edge_decision = meta.signature_pruning_decision(&GraphAccessSignature::neighbor_scan(
+            person_vid(7),
+            Some(2),
+        ));
+        assert!(edge_decision.pruned);
+        assert_eq!(edge_decision.reason, "edge_type");
+
+        let mut src_meta = meta;
+        src_meta.src_label = 2;
+        let label_decision = src_meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(person_vid(7), Some(1)),
+        );
+        assert!(label_decision.pruned);
+        assert_eq!(label_decision.reason, "src_label");
+
+        let property_decision = meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(person_vid(7), Some(1)).with_required_property(2),
+        );
+        assert!(property_decision.pruned);
+        assert_eq!(property_decision.reason, "property_absence");
+
+        let mut tombstone_meta = meta;
+        tombstone_meta.may_contain_tombstones = true;
+        let tombstone_decision = tombstone_meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(person_vid(7), Some(1)).with_required_property(2),
+        );
+        assert!(!tombstone_decision.pruned);
+        assert_eq!(tombstone_decision.reason, "schema_tombstone_fallback");
+    }
+
+    #[test]
     fn semantic_degree_signature_treats_segment_degree_as_local_bound() {
         let low_meta = semantic_meta(1);
         assert!(low_meta.may_contain_signature(
@@ -642,5 +897,227 @@ mod tests {
 
         assert_eq!(bytes.len(), DISK_PROPERTY_VALUE_INDEX_ENTRY_LEN);
         assert_eq!(DiskPropertyValueIndexEntry::decode(&bytes), entry);
+    }
+
+    // ---- C2: SegmentSemanticState / PruningSurfaceSummary ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn surface_meta(
+        src_label: i32,
+        edge_type_partition: EdgeType,
+        edge_count: u64,
+        summary: SemanticSummaryCompleteness,
+        degree_class: DegreeClass,
+        degree_class_exact: bool,
+        may_contain_tombstones: bool,
+        schema_epoch: SchemaEpoch,
+    ) -> CsrSegmentMeta {
+        CsrSegmentMeta {
+            file_id: 1,
+            level: 0,
+            src_label,
+            dst_label: UNKNOWN_SOURCE_LABEL,
+            schema_epoch,
+            summary_completeness: summary,
+            property_summary_completeness: SemanticSummaryCompleteness::Exact,
+            property_presence_bitmap: 0,
+            property_encoding_epoch: 0,
+            property_index_offset: 0,
+            property_index_len: 0,
+            property_values_offset: 0,
+            property_values_len: 0,
+            source_bloom_offset: 0,
+            source_bloom_len: 0,
+            source_bloom_bit_count: 0,
+            may_contain_tombstones,
+            edge_type_partition,
+            direction: EdgeDirection::default(),
+            degree_class,
+            degree_class_exact,
+            sort_key: SegmentSortKey::default(),
+            min_src: 0,
+            max_src: 0,
+            min_ts: 0,
+            edge_count,
+            unique_src_count: 0,
+            avg_degree_x100: 0,
+            max_degree: 0,
+            segment_bytes: 0,
+            max_ts: 0,
+        }
+    }
+
+    #[test]
+    fn semantic_state_topology_exact_for_concrete_keys() {
+        let m = surface_meta(
+            5,
+            7,
+            100,
+            SemanticSummaryCompleteness::Exact,
+            DegreeClass::Low,
+            true,
+            false,
+            1,
+        );
+        assert_eq!(m.semantic_state(1).topology, TopologySummaryState::Exact);
+    }
+
+    #[test]
+    fn semantic_state_topology_mixed_when_keys_collapse() {
+        // After a naive (non-semantic) merge over multiple labels/edge types the
+        // writer records UNKNOWN_SOURCE_LABEL / MIXED_EDGE_TYPE while keeping
+        // summary_completeness == Exact.
+        let mixed_label = surface_meta(
+            UNKNOWN_SOURCE_LABEL,
+            7,
+            100,
+            SemanticSummaryCompleteness::Exact,
+            DegreeClass::Mixed,
+            false,
+            false,
+            1,
+        );
+        let mixed_type = surface_meta(
+            5,
+            MIXED_EDGE_TYPE,
+            100,
+            SemanticSummaryCompleteness::Exact,
+            DegreeClass::Mixed,
+            false,
+            false,
+            1,
+        );
+        assert_eq!(
+            mixed_label.semantic_state(1).topology,
+            TopologySummaryState::Mixed
+        );
+        assert_eq!(
+            mixed_type.semantic_state(1).topology,
+            TopologySummaryState::Mixed
+        );
+    }
+
+    #[test]
+    fn semantic_state_dimensions() {
+        let m = surface_meta(
+            5,
+            7,
+            100,
+            SemanticSummaryCompleteness::Unknown,
+            DegreeClass::High,
+            true,
+            true,
+            0,
+        );
+        let s = m.semantic_state(2);
+        assert_eq!(s.topology, TopologySummaryState::Unknown);
+        assert_eq!(s.degree, DegreeSummaryState::Unknown); // gated by Unknown summary
+        assert_eq!(s.tombstone, TombstoneState::Sensitive);
+        assert_eq!(s.schema, SchemaState::OlderEpoch);
+
+        let exact_degree = surface_meta(
+            5,
+            7,
+            100,
+            SemanticSummaryCompleteness::Exact,
+            DegreeClass::High,
+            true,
+            false,
+            3,
+        );
+        assert_eq!(exact_degree.semantic_state(3).degree, DegreeSummaryState::Exact);
+        assert_eq!(exact_degree.semantic_state(3).schema, SchemaState::Current);
+    }
+
+    #[test]
+    fn pruning_surface_summary_is_edge_weighted() {
+        let exact = surface_meta(
+            5,
+            7,
+            100,
+            SemanticSummaryCompleteness::Exact,
+            DegreeClass::Low,
+            true,
+            false,
+            1,
+        );
+        let mixed = surface_meta(
+            UNKNOWN_SOURCE_LABEL,
+            MIXED_EDGE_TYPE,
+            900,
+            SemanticSummaryCompleteness::Exact,
+            DegreeClass::Mixed,
+            false,
+            false,
+            1,
+        );
+        let s = PruningSurfaceSummary::from_segments(&[exact, mixed], 1);
+        assert_eq!(s.segment_count, 2);
+        assert_eq!(s.edge_count, 1000);
+        assert!((s.exact_surface_ratio() - 0.1).abs() < 1e-9);
+        assert!((s.mixed_ratio() - 0.9).abs() < 1e-9);
+        assert_eq!(s.topology_exact_segments, 1);
+        assert_eq!(s.topology_mixed_segments, 1);
+    }
+
+    #[test]
+    fn naive_merge_degrades_surface_semantic_merge_rebuilds_it() {
+        // before: one big mixed input segment (e.g. produced by a prior naive merge)
+        let before = PruningSurfaceSummary::from_segments(
+            &[surface_meta(
+                UNKNOWN_SOURCE_LABEL,
+                MIXED_EDGE_TYPE,
+                1000,
+                SemanticSummaryCompleteness::Exact,
+                DegreeClass::Mixed,
+                false,
+                false,
+                1,
+            )],
+            1,
+        );
+        // naive merge output: still a mixed segment
+        let naive_after = PruningSurfaceSummary::from_segments(
+            &[surface_meta(
+                UNKNOWN_SOURCE_LABEL,
+                MIXED_EDGE_TYPE,
+                1000,
+                SemanticSummaryCompleteness::Exact,
+                DegreeClass::Mixed,
+                false,
+                false,
+                1,
+            )],
+            1,
+        );
+        // semantic merge output: split into concrete (label, edge_type) segments
+        let semantic_after = PruningSurfaceSummary::from_segments(
+            &[
+                surface_meta(
+                    5,
+                    7,
+                    400,
+                    SemanticSummaryCompleteness::Exact,
+                    DegreeClass::Low,
+                    true,
+                    false,
+                    1,
+                ),
+                surface_meta(
+                    5,
+                    8,
+                    600,
+                    SemanticSummaryCompleteness::Exact,
+                    DegreeClass::Low,
+                    true,
+                    false,
+                    1,
+                ),
+            ],
+            1,
+        );
+        assert!(before.exact_surface_ratio() < 0.01);
+        assert!(naive_after.exact_surface_ratio() < 0.01);
+        assert!((semantic_after.exact_surface_ratio() - 1.0).abs() < 1e-9);
     }
 }

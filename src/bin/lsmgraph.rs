@@ -12,8 +12,9 @@ use lsmgraph::csr::CsrPropertyValuePredicate;
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
 use lsmgraph::snb::{
-    import_snb_full, import_snb_updates, rebuild_snb_edge_props, start_dgs_compatible_server,
-    validate_ic1_ic14_dynamic, validate_ic_batch_dynamic, validate_mixed_tugraph_dynamic, SnbGraph,
+    import_snb_full, import_snb_full_multi, import_snb_updates, rebuild_snb_edge_props,
+    start_dgs_compatible_server, validate_ic1_ic14_dynamic, validate_ic_batch_dynamic,
+    validate_mixed_tugraph_dynamic, SnbGraph,
 };
 use lsmgraph::types::{source_label_from_vertex_id, EdgeMarker, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
@@ -64,6 +65,50 @@ enum Command {
         graph_aware_l0: bool,
         #[arg(long, default_value = "naive")]
         l0_layout: L0LayoutPolicy,
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        semantic_budget_min_edge_type_bytes: usize,
+        #[arg(long, default_value_t = 1.0e308)]
+        semantic_budget_min_edge_type_score: f64,
+        #[arg(long, default_value_t = 4.0)]
+        semantic_budget_core_edge_weight: f64,
+        #[arg(long, default_value_t = 2.0)]
+        semantic_budget_reverse_core_edge_weight: f64,
+        #[arg(long, default_value_t = 0.5)]
+        semantic_budget_other_edge_weight: f64,
+        #[arg(long)]
+        semantic_budget_max_extra_l0_files: Option<usize>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        semantic_budget_edge_type_allowlist: Vec<i32>,
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        semantic_budget_min_exact_bytes: usize,
+        #[arg(long, default_value_t = 1.0)]
+        semantic_budget_min_benefit_score: f64,
+        #[arg(long, default_value_t = 1.0)]
+        semantic_budget_degree_weight: f64,
+        #[arg(long, default_value_t = false)]
+        semantic_budget_feedback_only: bool,
+        #[arg(long, default_value_t = false)]
+        semantic_budget_disable_feedback: bool,
+    },
+    ImportMany {
+        #[arg(long, default_value = DEFAULT_DATA)]
+        input: PathBuf,
+        #[arg(long, default_value = "snb-full")]
+        relation: String,
+        /// Repeated as `--layout-store layout:/absolute/store/path`.
+        ///
+        /// This is an experimental W14 import path: it parses the SNB CSV stream once and fans
+        /// each edge out to multiple Engine instances. It currently requires
+        /// `SNB_SKIP_ADJ_CACHE=1`, because vertex JSONL, edge-prop JSONL, and adjacency cache are
+        /// single-store artifacts in the legacy import pipeline.
+        #[arg(long = "layout-store", required = true)]
+        layout_stores: Vec<String>,
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        memgraph_bytes: usize,
+        #[arg(long, default_value_t = 0)]
+        schema_epoch: u64,
+        #[arg(long, default_value_t = false)]
+        auto_compact: bool,
         #[arg(long, default_value_t = 4 * 1024 * 1024)]
         semantic_budget_min_edge_type_bytes: usize,
         #[arg(long, default_value_t = 1.0e308)]
@@ -449,6 +494,28 @@ enum StorageBenchPropertyPredicateMode {
     AbsentDefault,
 }
 
+#[derive(Debug, Clone)]
+struct ImportManyLayoutStore {
+    layout: L0LayoutPolicy,
+    data_dir: PathBuf,
+}
+
+fn parse_import_many_layout_store(raw: &str) -> Result<ImportManyLayoutStore> {
+    let Some((layout_raw, data_dir_raw)) = raw.split_once(':') else {
+        anyhow::bail!(
+            "invalid --layout-store {raw:?}; expected layout:/absolute/store/path"
+        );
+    };
+    if data_dir_raw.is_empty() {
+        anyhow::bail!("invalid --layout-store {raw:?}; empty store path");
+    }
+    let layout = layout_raw.parse::<L0LayoutPolicy>()?;
+    Ok(ImportManyLayoutStore {
+        layout,
+        data_dir: PathBuf::from(data_dir_raw),
+    })
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -550,6 +617,103 @@ async fn main() -> Result<()> {
                 stats.input_rows,
                 stats.directed_edges,
                 engine.current_snapshot()
+            );
+        }
+        Command::ImportMany {
+            input,
+            relation,
+            layout_stores,
+            memgraph_bytes,
+            schema_epoch,
+            auto_compact,
+            semantic_budget_min_edge_type_bytes,
+            semantic_budget_min_edge_type_score,
+            semantic_budget_core_edge_weight,
+            semantic_budget_reverse_core_edge_weight,
+            semantic_budget_other_edge_weight,
+            semantic_budget_max_extra_l0_files,
+            semantic_budget_edge_type_allowlist,
+            semantic_budget_min_exact_bytes,
+            semantic_budget_min_benefit_score,
+            semantic_budget_degree_weight,
+            semantic_budget_feedback_only,
+            semantic_budget_disable_feedback,
+        } => {
+            if !matches!(relation.as_str(), "snb-full" | "full") {
+                anyhow::bail!("import-many currently supports only --relation snb-full");
+            }
+            let layout_stores = layout_stores
+                .iter()
+                .map(|raw| parse_import_many_layout_store(raw))
+                .collect::<Result<Vec<_>>>()?;
+            if layout_stores.is_empty() {
+                anyhow::bail!("import-many requires at least one --layout-store");
+            }
+            let mut engines = Vec::with_capacity(layout_stores.len());
+            for spec in &layout_stores {
+                let config = LsmGraphConfig::new(&spec.data_dir)
+                    .with_memgraph_capacity(memgraph_bytes)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries)
+                    .with_auto_compaction(auto_compact)
+                    .with_schema_epoch(schema_epoch)
+                    .with_l0_layout(spec.layout)
+                    .with_semantic_budget_min_edge_type_bytes(semantic_budget_min_edge_type_bytes)
+                    .with_semantic_budget_min_edge_type_score(semantic_budget_min_edge_type_score)
+                    .with_semantic_budget_core_edge_weight(semantic_budget_core_edge_weight)
+                    .with_semantic_budget_reverse_core_edge_weight(
+                        semantic_budget_reverse_core_edge_weight,
+                    )
+                    .with_semantic_budget_other_edge_weight(semantic_budget_other_edge_weight)
+                    .with_semantic_budget_max_extra_l0_files(semantic_budget_max_extra_l0_files)
+                    .with_semantic_budget_edge_type_allowlist(
+                        semantic_budget_edge_type_allowlist.clone(),
+                    )
+                    .with_semantic_budget_min_exact_bytes(semantic_budget_min_exact_bytes)
+                    .with_semantic_budget_min_benefit_score(semantic_budget_min_benefit_score)
+                    .with_semantic_budget_degree_weight(semantic_budget_degree_weight)
+                    .with_semantic_budget_feedback_only(semantic_budget_feedback_only)
+                    .with_semantic_budget_disable_feedback(semantic_budget_disable_feedback);
+                engines.push(Engine::create(config).await?);
+            }
+            let store_dirs = layout_stores
+                .iter()
+                .map(|spec| spec.data_dir.clone())
+                .collect::<Vec<_>>();
+            let stats = import_snb_full_multi(&engines, &input, &store_dirs).await?;
+            let sidecar_start = Instant::now();
+            eprintln!(
+                "[import-many] persist semantic sidecars start stores={} elapsed_s={:.1}",
+                engines.len(),
+                sidecar_start.elapsed().as_secs_f64()
+            );
+            for (idx, engine) in engines.iter().enumerate() {
+                eprintln!("[import-many] persist semantic sidecars engine_index={} start", idx);
+                engine.persist_semantic_sidecars()?;
+                eprintln!("[import-many] persist semantic sidecars engine_index={} complete", idx);
+            }
+            eprintln!(
+                "[import-many] persist semantic sidecars complete elapsed_s={:.1}",
+                sidecar_start.elapsed().as_secs_f64()
+            );
+            let stores = layout_stores
+                .iter()
+                .zip(engines.iter())
+                .map(|(spec, engine)| {
+                    json!({
+                        "layout": format!("{:?}", spec.layout),
+                        "data_dir": spec.data_dir.display().to_string(),
+                        "snapshot": engine.current_snapshot(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "input_rows": stats.input_rows,
+                    "directed_edges": stats.directed_edges,
+                    "stores": stores,
+                }))?
             );
         }
         Command::BaseBuild { input, data_dir } => {

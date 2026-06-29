@@ -19,6 +19,14 @@ path = "src/bin/p3_feedback_bench.rs"
 name = "w3-workload-shift"
 path = "src/bin/w3_workload_shift.rs"
 
+[[bin]]
+name = "w7-sf30-workload-shift"
+path = "src/bin/w7_sf30_workload_shift.rs"
+
+[[bin]]
+name = "c2-merge-retention"
+path = "src/bin/c2_merge_retention.rs"
+
 [dependencies]
 anyhow = "1.0"
 bytes = "1.7"

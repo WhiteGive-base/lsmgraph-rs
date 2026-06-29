@@ -16,7 +16,7 @@ use crate::csr::format::property_presence_bit;
 use crate::csr::{
     CsrEdgeRecordWithProperties, CsrMetadataCache, CsrPropertyValuePredicate, CsrReader,
     CsrSegmentMeta, CsrSegmentSemanticOverrides, CsrWriter, EdgePropertyValue,
-    EdgeRecordWithProperties, Manifest, ManifestRecord,
+    EdgeRecordWithProperties, Manifest, ManifestRecord, PruningSurfaceSummary,
 };
 use crate::error::Result;
 use crate::index::{MultiLevelIndex, VertexLockTable};
@@ -693,6 +693,13 @@ pub struct LevelCompactionDecision {
     pub output_segments: usize,
     pub input_bytes: u64,
     pub output_bytes: u64,
+    /// Logical (snapshot-safe, deduplicated) edge payload covered by this merge,
+    /// used as the write-amplification denominator (= live_records * sizeof(EdgeRecord)).
+    pub logical_update_bytes: u64,
+    /// Pruning surface over the merge inputs (selected_source ∪ selected_target).
+    pub surface_before: PruningSurfaceSummary,
+    /// Pruning surface over the merge outputs produced by this policy.
+    pub surface_after: PruningSurfaceSummary,
     pub semantic_partition_outputs: bool,
 }
 
@@ -3351,15 +3358,21 @@ impl Engine {
         }
 
         let snapshot = self.current_snapshot();
+        let current_epoch = self.current_schema_epoch();
+        let mut surface_inputs = selected_source.clone();
+        surface_inputs.extend(selected_target.iter().copied());
+        let surface_before = PruningSurfaceSummary::from_segments(&surface_inputs, current_epoch);
         let compacted = retain_property_history_for_safe_snapshot(
             updates,
             snapshot,
             self.snapshot_gc_safe_point(),
         );
+        let logical_update_bytes =
+            compacted.len() as u64 * std::mem::size_of::<EdgeRecord>() as u64;
         let writer = CsrWriter::new(
             self.backend.clone(),
             self.config.store_dir.clone(),
-            self.current_schema_epoch(),
+            current_epoch,
         );
         let segments = if policy.semantic_partition_outputs {
             split_semantic_compaction_segments(compacted, self.config.segment_target_bytes)
@@ -3375,6 +3388,7 @@ impl Engine {
             self.append_manifest(&ManifestRecord::CreateFile { meta: output })?;
             outputs.push(output);
         }
+        let surface_after = PruningSurfaceSummary::from_segments(&outputs, current_epoch);
         for meta in selected_source.iter().chain(selected_target.iter()) {
             self.append_manifest(&ManifestRecord::DeleteFile {
                 file_id: meta.file_id,
@@ -3418,6 +3432,9 @@ impl Engine {
             output_segments: outputs.len(),
             input_bytes,
             output_bytes,
+            logical_update_bytes,
+            surface_before,
+            surface_after,
             semantic_partition_outputs: policy.semantic_partition_outputs,
         }))
     }

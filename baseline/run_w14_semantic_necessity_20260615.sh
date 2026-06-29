@@ -42,6 +42,7 @@ SCENARIOS="${SCENARIOS//,/ }"
 W14_EMIT_DIGESTS="${W14_EMIT_DIGESTS:-1}"
 W14_NEIGHBOR_COMPARE="${W14_NEIGHBOR_COMPARE:-0}"
 W14_LOG_OPEN_PHASES="${W14_LOG_OPEN_PHASES:-1}"
+W14_PLAN_CACHE_ROOT="${W14_PLAN_CACHE_ROOT:-}"
 DIGEST_COMPARE="${DIGEST_COMPARE:-$ROOT/baseline/sf100_digest_compare.py}"
 
 if [[ "$SCALE" == "sf100" ]]; then
@@ -342,28 +343,38 @@ run_digest_compare() {
 run_scenario() {
   local label="$1" edge_type="$2" src_label="$3" dst_label="$4" property_mode="$5" degree_hint="$6" force_signature="$7"
   local scenario_dir="$LOG_ROOT/$label" plan="$LOG_ROOT/$label/sample-plan.json"
+  local cached_plan=""
   local plan_env=()
   mkdir -p "$scenario_dir"
   scenario_args "$edge_type" "$src_label" "$dst_label" "$property_mode" "$degree_hint" "$force_signature"
-  if is_true "$W14_SKIP_SEM_INDEX_FOR_PLAN"; then
-    plan_env+=(SNB_SKIP_SEM_INDEX=1)
+  if [[ -n "$W14_PLAN_CACHE_ROOT" ]]; then
+    cached_plan="$W14_PLAN_CACHE_ROOT/$label/sample-plan.json"
   fi
-  log "sample-plan env label=${label} W14_SKIP_SEM_INDEX_FOR_PLAN=${W14_SKIP_SEM_INDEX_FOR_PLAN} plan_env=${plan_env[*]:-none}"
-  resource_gate "before-plan-${label}"
-  run_timed "$BENCH_TIMEOUT_SECONDS" "sample-plan-${label}" \
-    env "${plan_env[@]}" "$BIN" \
-      --io-backend "$IO_BACKEND" \
-      --csr-metadata-cache-entries "$CSR_METADATA_CACHE_ENTRIES" \
-      storage-bench \
-      --data-dir "$(variant_store schema)" \
-      --samples "$SAMPLES" \
-      --warmup-runs 0 \
-      --repeats 1 \
-      --sample-plan-out "$plan" \
-      "${SCENARIO_ARGS[@]}" \
-      > "$scenario_dir/schema-plan-source.json"
-  json_valid "$plan" || fail "invalid sample plan for ${label}"
-  json_valid "$scenario_dir/schema-plan-source.json" || fail "invalid schema plan-source JSON for ${label}"
+  if [[ -n "$cached_plan" && -s "$cached_plan" ]]; then
+    log "reuse sample-plan label=${label} cached_plan=${cached_plan}"
+    cp "$cached_plan" "$plan"
+    json_valid "$plan" || fail "invalid cached sample plan for ${label}: ${cached_plan}"
+  else
+    if is_true "$W14_SKIP_SEM_INDEX_FOR_PLAN"; then
+      plan_env+=(SNB_SKIP_SEM_INDEX=1)
+    fi
+    log "sample-plan env label=${label} W14_SKIP_SEM_INDEX_FOR_PLAN=${W14_SKIP_SEM_INDEX_FOR_PLAN} plan_env=${plan_env[*]:-none}"
+    resource_gate "before-plan-${label}"
+    run_timed "$BENCH_TIMEOUT_SECONDS" "sample-plan-${label}" \
+      env "${plan_env[@]}" "$BIN" \
+        --io-backend "$IO_BACKEND" \
+        --csr-metadata-cache-entries "$CSR_METADATA_CACHE_ENTRIES" \
+        storage-bench \
+        --data-dir "$(variant_store schema)" \
+        --samples "$SAMPLES" \
+        --warmup-runs 0 \
+        --repeats 1 \
+        --sample-plan-out "$plan" \
+        "${SCENARIO_ARGS[@]}" \
+        > "$scenario_dir/schema-plan-source.json"
+    json_valid "$plan" || fail "invalid sample plan for ${label}"
+    json_valid "$scenario_dir/schema-plan-source.json" || fail "invalid schema plan-source JSON for ${label}"
+  fi
   for variant in $VARIANTS; do
     run_bench "$scenario_dir" "$label" "$variant" "$plan"
   done
@@ -404,6 +415,7 @@ log "W14_SKIP_SEM_INDEX_FOR_PLAN=${W14_SKIP_SEM_INDEX_FOR_PLAN} (sets SNB_SKIP_S
 log "W14_EMIT_DIGESTS=${W14_EMIT_DIGESTS} (Step B compares schema vs variant from bench result digests; no second engine open)"
 log "W14_NEIGHBOR_COMPARE=${W14_NEIGHBOR_COMPARE} (standalone neighbor-compare; default off, auto-runs as debug preview on digest mismatch)"
 log "W14_LOG_OPEN_PHASES=${W14_LOG_OPEN_PHASES} (sets LSMGRAPH_LOG_OPEN_PHASES=1 so each bench logs Engine::open phase timings)"
+log "W14_PLAN_CACHE_ROOT=${W14_PLAN_CACHE_ROOT:-none} (when set, reuses <cache>/<scenario>/sample-plan.json if present)"
 log "ETA: setup/build 10-30 min; SF30 edge-type-only import 20-60 min if needed; SF100 formal 15-25h."
 log "abort: MemAvailable <80GiB, /data free <200GiB, single import >${IMPORT_TIMEOUT_SECONDS}s, compare mismatch, or missing telemetry."
 

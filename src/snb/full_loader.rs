@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -23,15 +23,50 @@ pub async fn import_snb_full(
     csv_root: &Path,
     store_dir: &Path,
 ) -> Result<ImportStats> {
+    let engines = [engine];
+    let store_dirs = [store_dir.to_path_buf()];
+    import_snb_full_multi(&engines, csv_root, &store_dirs).await
+}
+
+pub async fn import_snb_full_multi(
+    engines: &[Arc<Engine>],
+    csv_root: &Path,
+    store_dirs: &[PathBuf],
+) -> Result<ImportStats> {
+    if engines.is_empty() {
+        anyhow::bail!("import_snb_full_multi requires at least one engine");
+    }
+    if engines.len() != store_dirs.len() {
+        anyhow::bail!(
+            "import_snb_full_multi requires matching engines/store_dirs; engines={} store_dirs={}",
+            engines.len(),
+            store_dirs.len()
+        );
+    }
+    let skip_adj = std::env::var("SNB_SKIP_ADJ_CACHE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if engines.len() > 1 && !skip_adj {
+        anyhow::bail!(
+            "multi-layout SNB full import currently requires SNB_SKIP_ADJ_CACHE=1; \
+             vertex JSONL, edge-prop JSONL, and adjacency cache are single-store artifacts"
+        );
+    }
+    import_snb_full_inner(engines, csv_root, &store_dirs[0], skip_adj).await
+}
+
+async fn import_snb_full_inner(
+    engines: &[Arc<Engine>],
+    csv_root: &Path,
+    store_dir: &Path,
+    skip_adj: bool,
+) -> Result<ImportStats> {
     let import_started = Instant::now();
     fs::create_dir_all(store_dir)?;
     // For the L0-layout ablation (SNB_SKIP_ADJ_CACHE=1) the vertex JSONL, edge-prop JSONL and
     // adjacency cache are never consumed by storage-bench / neighbor-compare. Edge labels come
     // from the file type (not a vertex lookup), so we can skip the 26GB vertex write, send the
     // 30GB edge-prop stream to /dev/null, and stop the adjacency builder from retaining edges.
-    let skip_adj = std::env::var("SNB_SKIP_ADJ_CACHE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
     let vertex_path = store_dir.join("snb_vertices.jsonl");
     let edge_prop_path = if skip_adj {
         std::path::PathBuf::from("/dev/null")
@@ -68,7 +103,7 @@ pub async fn import_snb_full(
 
     stats.add(
         import_edge_file(
-            engine.clone(),
+            engines,
             &mut edge_props,
             &dynamic.join("person_knows_person_0_0.csv"),
             VertexLabel::Person,
@@ -84,7 +119,7 @@ pub async fn import_snb_full(
     );
     stats.add(
         import_edge_file(
-            engine.clone(),
+            engines,
             &mut edge_props,
             &dynamic.join("person_likes_comment_0_0.csv"),
             VertexLabel::Person,
@@ -100,7 +135,7 @@ pub async fn import_snb_full(
     );
     stats.add(
         import_edge_file(
-            engine.clone(),
+            engines,
             &mut edge_props,
             &dynamic.join("person_likes_post_0_0.csv"),
             VertexLabel::Person,
@@ -116,7 +151,7 @@ pub async fn import_snb_full(
     );
     stats.add(
         import_edge_file(
-            engine.clone(),
+            engines,
             &mut edge_props,
             &dynamic.join("person_hasInterest_tag_0_0.csv"),
             VertexLabel::Person,
@@ -132,7 +167,7 @@ pub async fn import_snb_full(
     );
     stats.add(
         import_edge_file(
-            engine.clone(),
+            engines,
             &mut edge_props,
             &dynamic.join("person_studyAt_organisation_0_0.csv"),
             VertexLabel::Person,
@@ -148,7 +183,7 @@ pub async fn import_snb_full(
     );
     stats.add(
         import_edge_file(
-            engine.clone(),
+            engines,
             &mut edge_props,
             &dynamic.join("person_workAt_organisation_0_0.csv"),
             VertexLabel::Person,
@@ -164,7 +199,7 @@ pub async fn import_snb_full(
     );
     stats.add(
         import_edge_file(
-            engine.clone(),
+            engines,
             &mut edge_props,
             &dynamic.join("forum_hasMember_person_0_0.csv"),
             VertexLabel::Forum,
@@ -198,7 +233,7 @@ pub async fn import_snb_full(
     ] {
         stats.add(
             import_edge_file(
-                engine.clone(),
+                engines,
                 &mut edge_props,
                 &path,
                 src,
@@ -320,7 +355,7 @@ pub async fn import_snb_full(
             "isSubclassOf",
         ),
     ] {
-        stats.add(import_named_edge(engine.clone(), &mut edge_props, spec, &mut adjacency).await?);
+        stats.add(import_named_edge(engines, &mut edge_props, spec, &mut adjacency).await?);
     }
 
     edge_props.flush()?;
@@ -332,8 +367,15 @@ pub async fn import_snb_full(
         import_started.elapsed().as_secs_f64()
     );
     let flush_started = Instant::now();
-    eprintln!("[snb-full] flushing active MemGraph to CSR");
-    engine.flush_active().await?;
+    eprintln!(
+        "[snb-full] flushing active MemGraph to CSR engines={}",
+        engines.len()
+    );
+    for (idx, engine) in engines.iter().enumerate() {
+        eprintln!("[snb-full] flush engine_index={} start", idx);
+        engine.flush_active().await?;
+        eprintln!("[snb-full] flush engine_index={} complete", idx);
+    }
     eprintln!(
         "[snb-full] flush complete elapsed_s={:.1}",
         flush_started.elapsed().as_secs_f64()
@@ -882,7 +924,7 @@ async fn import_update_stream_file(
 }
 
 async fn import_edge_file(
-    engine: Arc<Engine>,
+    engines: &[Arc<Engine>],
     edge_props: &mut BufWriter<File>,
     path: &Path,
     src_label: VertexLabel,
@@ -921,8 +963,8 @@ async fn import_edge_file(
         let src = encode_vid(src_label, src_ext);
         let dst = encode_vid(dst_label, dst_ext);
         let prop_value = prop.read(&headers, &rec)?;
-        insert_forward_reverse(
-            engine.clone(),
+        insert_forward_reverse_many(
+            engines,
             edge_props,
             src,
             dst,
@@ -934,8 +976,8 @@ async fn import_edge_file(
         .await?;
         directed_edges += 2;
         if bidirectional_positive {
-            insert_forward_reverse(
-                engine.clone(),
+            insert_forward_reverse_many(
+                engines,
                 edge_props,
                 dst,
                 src,
@@ -971,13 +1013,13 @@ async fn import_edge_file(
 }
 
 async fn import_named_edge(
-    engine: Arc<Engine>,
+    engines: &[Arc<Engine>],
     edge_props: &mut BufWriter<File>,
     spec: NamedEdgeSpec,
     adjacency: &mut AdjacencyBuilder,
 ) -> Result<ImportStats> {
     import_edge_file(
-        engine,
+        engines,
         edge_props,
         &spec.path,
         spec.src_label,
@@ -1384,13 +1426,45 @@ async fn insert_forward_reverse(
     include_reverse: bool,
     adjacency: &mut AdjacencyBuilder,
 ) -> Result<()> {
+    let engines = [engine];
+    insert_forward_reverse_many(
+        &engines,
+        edge_props,
+        src,
+        dst,
+        edge_label,
+        prop,
+        include_reverse,
+        adjacency,
+    )
+    .await
+}
+
+async fn insert_forward_reverse_many(
+    engines: &[Arc<Engine>],
+    edge_props: &mut BufWriter<File>,
+    src: u64,
+    dst: u64,
+    edge_label: EdgeLabel,
+    prop: EdgeProp,
+    include_reverse: bool,
+    adjacency: &mut AdjacencyBuilder,
+) -> Result<()> {
     let label = edge_label.as_i32();
-    let ts = engine.insert_edge(src, dst, label).await?;
-    adjacency.record_edge(src, label, dst, ts);
+    let mut first_ts = None;
+    for engine in engines {
+        let ts = engine.insert_edge(src, dst, label).await?;
+        first_ts.get_or_insert(ts);
+    }
+    adjacency.record_edge(src, label, dst, first_ts.unwrap_or(0));
     write_edge_prop(edge_props, src, dst, label, prop)?;
     if include_reverse {
-        let ts = engine.insert_edge(dst, src, -label).await?;
-        adjacency.record_edge(dst, -label, src, ts);
+        let mut first_ts = None;
+        for engine in engines {
+            let ts = engine.insert_edge(dst, src, -label).await?;
+            first_ts.get_or_insert(ts);
+        }
+        adjacency.record_edge(dst, -label, src, first_ts.unwrap_or(0));
         write_edge_prop(edge_props, dst, src, -label, prop)?;
     }
     Ok(())

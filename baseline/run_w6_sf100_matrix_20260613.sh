@@ -15,7 +15,7 @@ EDGE_TYPES="${EDGE_TYPES:-1,2,3,7,8,9,10,11,12}"
 SAMPLES="${SAMPLES:-$([[ "$DRY_RUN" == "1" ]] && echo 20 || echo 5000)}"
 REPEATS="${REPEATS:-3}"
 IMPORT_TIMEOUT="${IMPORT_TIMEOUT:-$([[ "$SCALE" == "sf100" ]] && echo 120m || echo 30m)}"
-RUN_COMPARE="${RUN_COMPARE:-$([[ "$DRY_RUN" == "1" ]] && echo 1 || echo 0)}"
+RUN_COMPARE="${RUN_COMPARE:-1}"
 KEEP_STORES="${KEEP_STORES:-0}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-200}"
 MIN_MEM_GIB="${MIN_MEM_GIB:-80}"
@@ -144,17 +144,18 @@ bench_variant() {
 
 compare_variant() {
   local variant="$1" store="$2" bench_layout="$3"
-  [[ "$RUN_COMPARE" == "1" && "$variant" != "schema" ]] || return 0
-  local out="${OUT_DIR}/compare-schema-vs-${variant}.json"
-  local err="${OUT_DIR}/compare-schema-vs-${variant}.err"
+  [[ "$RUN_COMPARE" == "1" && "$variant" != "naive" ]] || return 0
+  [[ -d "${STORE_ROOT}/naive" ]] || die "naive anchor missing before compare ${variant}"
+  local out="${OUT_DIR}/compare-naive-vs-${variant}.json"
+  local err="${OUT_DIR}/compare-naive-vs-${variant}.err"
   local extra=()
   case "$bench_layout" in
     semantic|semantic-budgeted|oracle) extra=(--right-semantic-degree-hint) ;;
   esac
   ensure_resources "before-compare-${variant}"
-  log "compare start schema vs ${variant}"
+  log "compare start naive vs ${variant}"
   "$BIN" --io-backend "$IO_BACKEND" neighbor-compare \
-    --left-data-dir "${STORE_ROOT}/schema" \
+    --left-data-dir "${STORE_ROOT}/naive" \
     --right-data-dir "$store" \
     --sample-plan "$PLAN" \
     "${extra[@]}" \
@@ -170,7 +171,7 @@ if data.get("mismatches") != 0:
 if data.get("checked", 0) <= 0:
     raise SystemExit("checked=0")
 PY
-  log "compare done schema vs ${variant}"
+  log "compare done naive vs ${variant}"
   record_manifest "$variant" "$bench_layout" compare "$store" "$out"
 }
 
@@ -222,7 +223,7 @@ run_variant() {
   import_variant "$variant" "$store" "$import_layout" "$import_flags"
   bench_variant "$variant" "$store" "$bench_layout"
   compare_variant "$variant" "$store" "$bench_layout"
-  if [[ "$variant" != "schema" ]]; then
+  if [[ "$variant" != "schema" && "$variant" != "naive" ]]; then
     safe_delete_store "$store"
     log "store deleted variant=${variant} store=${store}"
   fi
@@ -243,6 +244,7 @@ main() {
   run_sentinel A1
 
   run_variant naive
+  compare_variant schema "${STORE_ROOT}/schema" schema
   run_variant kv-lsm
   run_variant edge-type-only
   run_sentinel B
