@@ -1,6 +1,6 @@
 # 外部 Baseline 调研与执行结论
 
-更新日期：2026-06-27
+更新日期：2026-06-30
 
 本文件给 CIDR draft 使用。原则是：只有通过同一 workload 的可复现 correctness gate，才进入数值表；其他系统只写 design comparison、artifact attempt 或 related work。
 
@@ -57,6 +57,34 @@
 
 写法边界：这是 embedded C++ API typed-neighbor baseline，不是完整 TuGraph LDBC Interactive benchmark。
 
+### Aster RocksGraph
+
+定位：LSM-adjacent graph storage baseline。
+
+实现口径：使用 `NTU-Siqiang-Group/Aster` 的轻量 RocksGraph 实现，远端 checkout commit 为 `6abb258e577c479325092a8ac0e7691fdfd154c2`。typed-neighbor bridge 将 `(edge_type, src)` 映射为 compact logical vertex id，避免稀疏大 id 触发 Aster MorrisCounter 内存放大。
+
+结果：
+
+- SF1：checked 1,700 / mismatches 0；all-types avg 150.985 us，p50 10.680 us，p90 381.904 us，p99 3,411.36 us；load 74.399 s；peak RSS 1,851,684 KB；disk 1,054,936,788 bytes。
+- SF10：checked 1,700 / mismatches 0；all-types avg 1,408.270 us，p50 580.529 us，p90 1,061.240 us，p99 15,809.60 us；load 794.262 s；peak RSS 15,621,088 KB；disk 10,401,409,041 bytes。
+- SF10 negative/high-fanout avg 2,252.040 us，returned negative neighbors 84,017,646。
+
+写法边界：可以写成 Aster/RocksGraph typed-neighbor bridge baseline；不要写成完整 AsterDB Gremlin benchmark 或官方论文 artifact 复现。
+
+### NebulaGraph
+
+定位：开源分布式图数据库 baseline。
+
+实现口径：使用 NebulaGraph v3.8.0 官方 server images；远端 Docker Hub 直连受限，镜像通过 `docker.1ms.run` 拉取并 retag 为官方名。space 使用 `vid_type=INT64`，每个 dense edge type 建一个 nGQL edge type（`E_Px` / `E_Nx`）。
+
+结果：
+
+- SF1：checked 1,700 / mismatches 0；all-types avg 61,553.966 us，p50 581.010 us，p90 10,736.324 us，p99 1,189,334.146 us；load 194.644 s；peak RSS 1,673,516 KB；disk 4,552,617,537 bytes。
+- SF10：checked 1,700 / mismatches 0；all-types avg 744,146.618 us，p50 741.524 us，p90 20,218.339 us，p99 14,228,169.276 us；load 2,493.471 s；peak RSS 3,665,396 KB；disk 46,185,803,519 bytes。
+- SF10 negative/high-fanout avg 1,486,539.881 us，returned negative neighbors 84,017,646。
+
+写法边界：可以写成同一 typed-neighbor workload 下的 open-source graph DB baseline；不要写成生产部署、集群调优或完整 LDBC Interactive benchmark。
+
 ## 内部/布局 Baseline
 
 ### LSMGraph-style
@@ -70,14 +98,6 @@
 
 ## Qualitative / Artifact Attempt
 
-### Aster
-
-远端当前无本地 source checkout 或 Docker image。2026-06-29 继续公开检索后，能确认 Aster 论文存在，但没有定位到可直接复现的官方 GitHub/source/artifact 入口。当前判断更接近 artifact 未公开、未归档或入口不明显，而不是远端下载权限问题。可作为 LSM-structured graph database 的 qualitative comparison；拿到 artifact 并通过 gate 前不能给数值。
-
-### NebulaGraph
-
-NebulaGraph 是官方开源图数据库，远端 GitHub 能访问 `vesoft-inc/nebula` 和 `vesoft-inc/nebula-docker-compose`。2026-06-29 换源后，`docker.1ms.run` 可获取 `vesoft/nebula-{graphd,metad,storaged}:v3.8.0`，三项服务镜像已拉取并 retag 为官方名。当前 blocker 已从 image availability 降级为 service/schema/loader/query/digest。可作为 popular distributed graph database 的 design comparison；完成 SF1/SF10 typed-neighbor digest 前不能给数值。
-
 ### Teseo、GraphOne、LLAMA、Aspen
 
 这些系统适合 related work 或 design-space comparison，但公开 artifact/API/workload 与 SemL0 的 LDBC property-graph typed-neighbor workload 不直接匹配。不要硬塞进主 latency table。
@@ -90,10 +110,11 @@ NebulaGraph 是官方开源图数据库，远端 GitHub 能访问 `vesoft-inc/ne
 
 可以写：
 
-> We evaluate SemL0 against measured external baselines that pass the same-workload digest gate: LiveGraph as a scope-limited dynamic graph storage baseline, Neo4j Community as a general property-graph database baseline, and TuGraph as an embedded graph database baseline. We also report artifact attempts for Aster and NebulaGraph, and keep them out of the numeric table until they satisfy the same loader, workload, and count/hash digest gate.
+> We evaluate SemL0 against measured external baselines that pass the same-workload digest gate: LiveGraph as a scope-limited dynamic graph storage baseline, Aster RocksGraph as an LSM-adjacent typed-neighbor bridge baseline, Neo4j Community as a general property-graph database baseline, TuGraph as an embedded graph database baseline, and NebulaGraph as a distributed open-source graph DB baseline. Each row loads the same LDBC dense edge set, runs the same fixed-seed sampled typed-neighbor workload, and passes a per-query count/hash digest check.
 
 不要写：
 
 - We beat all graph databases.
-- Aster/NebulaGraph are measured baselines.
+- Aster RocksGraph is a full AsterDB/Gremlin benchmark.
+- NebulaGraph is a production deployment or full LDBC Interactive benchmark.
 - LSMGraph-style is an official external LSMGraph artifact.

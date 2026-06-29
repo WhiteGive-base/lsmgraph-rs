@@ -11,14 +11,14 @@
 | LLAMA | Multi-versioned graph analytics | large multiversioned CSR arrays | snapshot/delta merge | 否 | merge/versioning 相关，但非 query-semantic | multi-version arrays | weak analytics sanity |
 | Aspen | Low-latency graph streaming | compressed purely-functional trees | streaming updates | 否 | 非 LSM compaction target | versioned functional structure | design-space comparison |
 | LSMGraph | Dynamic graph storage with multi-level CSR | LSM + multi-level CSR | dynamic graph updates | 未知/非主目标 | 关注 LSM graph layout，但非 SemL0 semantic surface | storage-level | 最接近 LSM 图存储背景 |
-| Aster | Scalable graph database over LSM structures | enhanced LSM structures | graph DB updates | 未知/非主目标 | 可能关注 LSM storage organization，但非 query signature control plane | graph DB related | 近邻 qualitative comparison |
+| Aster RocksGraph | Scalable graph database over LSM structures | enhanced LSM structures | graph DB updates | 未知/非主目标 | 可能关注 LSM storage organization，但非 query signature control plane | graph DB related | measured typed-neighbor bridge + 近邻设计对照 |
 | BACH | HGTAP layout transformation | adjacency list <-> CSR using LSM-trees | HTAP-oriented | 否/非主目标 | 关注 layout transformation，不是 semantic pruning retention | 不明确 | 近邻 qualitative comparison |
 | LSM-Community | 利用社区结构的图存储 | community-aware graph storage | social graph updates | 使用 graph structure，不是 query signature | 非 SemL0 surface retention | 不明确 | 结构感知存储对比 |
 | ByteGraph | 分布式工业图数据库 | distributed graph DB | production graph workload | 查询语言/系统层优化 | 非 LSM semantic control plane | production DB | 写法参考，不直接数值对比 |
 | BG3 | ByteDance cost-effective I/O-efficient graph DB | graph DB storage | industry workload | 系统级优化 | 非 SemL0 control plane | production DB | 写法参考 |
 | Galaxybase | native distributed graph database for HTAP | distributed native graph DB | HTAP | 系统级 query support | 非 SemL0 control plane | production DB | 写法参考 |
 | GES | Huawei graph processing engine/service | graph engine/service | service workload | 系统级 query/analytics | 非 SemL0 control plane | service system | 写法参考 |
-| Nebula Graph | open-source distributed graph database | distributed graph DB | graph DB workload | 查询语言层 | 非 SemL0 control plane | graph DB | 背景系统 |
+| Nebula Graph | open-source distributed graph database | distributed graph DB | graph DB workload | 查询语言层 | 非 SemL0 control plane | graph DB | measured nGQL edge-type baseline + 背景系统 |
 
 ## CIDR 版比较结论
 
@@ -32,4 +32,5 @@
 
 - SemL0 全面优于这些系统。
 - 这些系统都已经跑过。
-- Teseo/GraphOne/LLAMA/Aster/NebulaGraph 是完成的数值 baseline。
+- Teseo/GraphOne/LLAMA/Aspen 是完成的数值 baseline。
+- Aster RocksGraph 是完整 AsterDB/Gremlin benchmark，或 NebulaGraph 是生产部署/完整 LDBC Interactive benchmark。

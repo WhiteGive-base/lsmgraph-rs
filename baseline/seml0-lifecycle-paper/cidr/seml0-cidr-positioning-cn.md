@@ -65,7 +65,9 @@ Full semantic materialization 会触发 fanout/RSS cliff。SemL0 的经验是：
 - 不写 production deployment。
 - 不写 full external SOTA comparison。
 - 不写 uniform latency speedup。
-- 不写 LiveGraph/Teseo/GraphOne/LLAMA 数值 baseline 已完成。
+- 不写 Aster RocksGraph 是完整 AsterDB/Gremlin benchmark。
+- 不写 NebulaGraph 是生产部署或完整 LDBC Interactive benchmark。
+- 不写 Teseo/GraphOne/LLAMA/Aspen 数值 baseline 已完成。
 
 ## CIDR 摘要草稿
 

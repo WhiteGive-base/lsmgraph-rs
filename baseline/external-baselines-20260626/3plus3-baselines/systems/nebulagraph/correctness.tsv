@@ -1,0 +1,3 @@
+system	scale	check	expected	observed	status	raw_artifact	notes
+NebulaGraph	SF1	query_count_digest	checked=1700; mismatches=0	checked=1700; mismatches=0	PASS	baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph/sf1-smoke-r1/result.json	fixed Neo4j truth-s50-seed42.tsv vs NebulaGraph typed edge traversal
+NebulaGraph	SF10	query_count_digest	checked=1700; mismatches=0	checked=1700; mismatches=0	PASS	baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph/sf10-main-r1/result.json	fixed Neo4j truth-s50-seed42.tsv vs NebulaGraph typed edge traversal

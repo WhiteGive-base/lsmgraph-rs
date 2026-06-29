@@ -38,9 +38,9 @@ SYSTEMS = [
         "id": "aster",
         "name": "Aster",
         "group": "problem-adjacent",
-        "claim": "artifact attempt / qualitative until workload bridge passes",
+        "claim": "candidate numeric baseline after typed-neighbor digest PASS",
         "deps_path": "deps/baselines/problem-adjacent/aster",
-        "source_path": "",
+        "source_path": "deps/Aster",
     },
     {
         "id": "neo4j",
@@ -64,7 +64,7 @@ SYSTEMS = [
         "group": "open-source-graph-db",
         "claim": "candidate numeric baseline after typed-neighbor digest PASS",
         "deps_path": "deps/baselines/open-source-graph-db/nebulagraph",
-        "source_path": "",
+        "source_path": "docker images vesoft/nebula-{graphd,metad,storaged}:v3.8.0",
     },
 ]
 
@@ -650,12 +650,12 @@ def build_statuses(root: Path, out: Path) -> tuple[list[dict[str, Any]], list[di
 
     defaults = {
         "aster": {
-            "status": "PENDING ARTIFACT PROBE",
+            "status": "PENDING ASTER SOURCE/BRIDGE PROBE",
             "sf1": "N/A",
             "sf10": "N/A",
             "correctness": "N/A",
             "raw": "baseline/external-baselines-20260626/3plus3-baselines/systems/aster",
-            "notes": "Need source/artifact and LDBC typed-neighbor bridge before numeric table.",
+            "notes": "Use Aster/RocksGraph source build plus compact typed-neighbor bridge; numeric rows require digest PASS.",
             "version": "",
         },
         "neo4j": {
@@ -677,12 +677,12 @@ def build_statuses(root: Path, out: Path) -> tuple[list[dict[str, Any]], list[di
             "version": "tugraph runtime image available",
         },
         "nebulagraph": {
-            "status": "PENDING IMAGE/SERVICE PROBE",
-            "sf1": "WAIT-IMAGE",
+            "status": "PENDING SERVICE/LOADER PROBE",
+            "sf1": "WAIT-SF1",
             "sf10": "WAIT-SF1",
             "correctness": "TODO",
             "raw": "baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph",
-            "notes": "No local image observed yet; first step is service/artifact availability.",
+            "notes": "Server images are available; first step is service/schema/loader/query digest.",
             "version": "",
         },
     }
@@ -823,7 +823,7 @@ def render_attempt_summary(progress: list[dict[str, Any]], generated_at: str) ->
     lines.extend(
         [
             "",
-            "Paper wording rule: LiveGraph can be cited as a measured scope-limited SF10 typed-neighbor external baseline. LSMGraph-style is an internal layout baseline. Neo4j, TuGraph, NebulaGraph, and Aster must stay as attempts/qualitative rows until their per-query digest passes.",
+            "Paper wording rule: only systems whose rows pass the same-workload count/hash digest gate can be cited as measured numeric baselines. LSMGraph-style remains an internal layout baseline. Failed, skipped, or pending rows stay in artifact-attempt/qualitative text.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -946,6 +946,50 @@ def main() -> None:
                     "load/RSS/footprint/latency logs",
                     "raw config and DONE marker",
                 ],
+                "workload": {
+                    "query": "fixed-seed sampled typed-neighbor count/hash digest",
+                    "seed": 42,
+                    "samples_per_edge_type": 50,
+                    "truth": "dense edge-list count/sum_hash/xor_hash",
+                    "sf1_dense_path": "baseline/external-baselines-20260624/livegraph/sf1-smoke/edges-dense.txt",
+                    "sf10_dense_path": "baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/edges-dense.txt",
+                    "edge_format": "first line vertex count, then: src edge_type dst",
+                },
+                "aster_setup": {
+                    "source_repo": "https://github.com/NTU-Siqiang-Group/Aster.git",
+                    "checkout": "6abb258e577c479325092a8ac0e7691fdfd154c2",
+                    "source_path": "deps/Aster",
+                    "numeric_scope": "Aster/RocksGraph typed-neighbor bridge, not full AsterDB/Gremlin benchmark",
+                    "bridge": "compact logical vertex id per (edge_type,src); avoids sparse-id MorrisCounter blow-up",
+                    "build_log": "baseline/external-baselines-20260626/3plus3-baselines/systems/aster/build/build.log",
+                },
+                "nebulagraph_setup": {
+                    "updated_at": "2026-06-30T00:00:00+08:00",
+                    "remote_status": "SF1/SF10 typed-neighbor digest PASS",
+                    "numeric_scope": "nGQL edge-type model, not production deployment or full LDBC Interactive benchmark",
+                    "mirror": "docker.1ms.run",
+                    "official_tags": [
+                        "vesoft/nebula-graphd:v3.8.0",
+                        "vesoft/nebula-metad:v3.8.0",
+                        "vesoft/nebula-storaged:v3.8.0",
+                    ],
+                    "mirror_tags": [
+                        "docker.1ms.run/vesoft/nebula-graphd:v3.8.0",
+                        "docker.1ms.run/vesoft/nebula-metad:v3.8.0",
+                        "docker.1ms.run/vesoft/nebula-storaged:v3.8.0",
+                    ],
+                    "digests": {
+                        "nebula-graphd": "sha256:1040573cc684ea6cc5e673b667422e9abab607c9d553c2c17c7bac6ad8a74e05",
+                        "nebula-metad": "sha256:ab687bd32d3e441d436842b41427ba0961a5e169c46997ef03fa4dcfd5388b35",
+                        "nebula-storaged": "sha256:7142642ee69001a5b5c50520196538d58bb2ec3930707c067cb4c4e2be3890f9",
+                    },
+                    "network_notes": [
+                        "Remote HTTP_PROXY/HTTPS_PROXY pointed at 127.0.0.1:7897, but that proxy port was not listening.",
+                        "Direct registry-1.docker.io access failed with connection refused.",
+                        "dockerproxy.com timed out; docker.m.daocloud.io returned read-only denial for this probe.",
+                        "docker.1ms.run manifest probes succeeded for graphd/metad/storaged:v3.8.0.",
+                    ],
+                },
             },
             ensure_ascii=False,
             indent=2,

@@ -1,0 +1,48 @@
+$ docker rm -f seml0-nebula-graph-sf10
+Error response from daemon: No such container: seml0-nebula-graph-sf10
+
+[exit=0 elapsed_s=0.012]
+$ docker rm -f seml0-nebula-storage-sf10
+Error response from daemon: No such container: seml0-nebula-storage-sf10
+
+[exit=0 elapsed_s=0.011]
+$ docker rm -f seml0-nebula-meta-sf10
+Error response from daemon: No such container: seml0-nebula-meta-sf10
+
+[exit=0 elapsed_s=0.011]
+$ docker network rm seml0-nebula-sf10
+Error response from daemon: network seml0-nebula-sf10 not found
+
+[exit=1 elapsed_s=0.011]
+$ docker network create seml0-nebula-sf10
+fc6a9b1eaef55195c98b76fee5fa3ecc59128e8c63a8f558a3117cf065252f3b
+
+[exit=0 elapsed_s=0.047]
+$ docker run -d --name seml0-nebula-meta-sf10 --network seml0-nebula-sf10 -v /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph/sf10-main-r1/data/meta:/data/meta -v /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph/sf10-main-r1/data/logs:/logs vesoft/nebula-metad:v3.8.0 --meta_server_addrs=seml0-nebula-meta-sf10:9559 --local_ip=seml0-nebula-meta-sf10 --ws_ip=0.0.0.0 --port=9559 --ws_http_port=19559 --data_path=/data/meta --log_dir=/logs
+53ee87b3a23e69ea5e4739e93fa74f3525fbe3417f939fb2da851f9d2bceb058
+
+[exit=0 elapsed_s=0.229]
+$ docker run -d --name seml0-nebula-storage-sf10 --network seml0-nebula-sf10 -v /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph/sf10-main-r1/data/storage:/data/storage -v /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph/sf10-main-r1/data/logs:/logs vesoft/nebula-storaged:v3.8.0 --meta_server_addrs=seml0-nebula-meta-sf10:9559 --local_ip=seml0-nebula-storage-sf10 --ws_ip=0.0.0.0 --port=9779 --ws_http_port=19779 --data_path=/data/storage --log_dir=/logs
+0d771a381fd176cdefc15fea5e4a35add038b197e08a600c73df4e2b56fc09e8
+
+[exit=0 elapsed_s=0.230]
+$ docker run -d --name seml0-nebula-graph-sf10 --network seml0-nebula-sf10 -p 127.0.0.1:29669:9669 -v /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph/sf10-main-r1/data/graph:/data/graph -v /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph/sf10-main-r1/data/logs:/logs vesoft/nebula-graphd:v3.8.0 --meta_server_addrs=seml0-nebula-meta-sf10:9559 --local_ip=seml0-nebula-graph-sf10 --ws_ip=0.0.0.0 --port=9669 --ws_http_port=19669 --log_dir=/logs
+194113460b8492bff673eeae5dc6d500472249ac59868dd867a732dd8e7a342d
+
+[exit=0 elapsed_s=0.220]
+$ docker rm -f seml0-nebula-graph-sf10
+seml0-nebula-graph-sf10
+
+[exit=0 elapsed_s=0.332]
+$ docker rm -f seml0-nebula-storage-sf10
+seml0-nebula-storage-sf10
+
+[exit=0 elapsed_s=0.274]
+$ docker rm -f seml0-nebula-meta-sf10
+seml0-nebula-meta-sf10
+
+[exit=0 elapsed_s=0.277]
+$ docker network rm seml0-nebula-sf10
+seml0-nebula-sf10
+
+[exit=0 elapsed_s=0.114]

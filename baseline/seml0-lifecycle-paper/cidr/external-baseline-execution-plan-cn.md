@@ -1,6 +1,6 @@
 # 外部 Baseline 执行计划
 
-> 2026-06-27 执行状态：本计划中的 P0/P1/P2 口径已经部分完成并升级。LiveGraph、Neo4j Community、TuGraph 均已完成 SF1/SF10 measured baseline 并通过 count/hash digest gate；Aster/NebulaGraph 仍为 artifact/image-source pending。最新可引用结论见 `external-baseline-status-20260627-cn.md`、`../../external-baselines-20260626/3plus3-baselines/progress-table.md` 和 `../../external-baselines-20260626/3plus3-baselines/effect-table.md`。
+> 2026-06-30 执行状态：LiveGraph、Aster RocksGraph、Neo4j Community、TuGraph、NebulaGraph 均已完成 SF1/SF10 measured baseline 并通过 count/hash digest gate。LSMGraph-style 保持为 internal layout row；Teseo/GraphOne/LLAMA/Aspen 继续作为 qualitative/design comparison，不硬塞进数值表。最新可引用结论见 `external-baseline-status-20260627-cn.md`、`../../external-baselines-20260626/3plus3-baselines/progress-table.md` 和 `../../external-baselines-20260626/3plus3-baselines/effect-table.md`。
 
 ## 目标
 

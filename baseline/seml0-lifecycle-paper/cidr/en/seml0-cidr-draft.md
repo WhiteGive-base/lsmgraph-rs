@@ -118,7 +118,7 @@ W13 exercises the conservative fallback path. The test set covers old segment re
 
 ### External baselines: measured systems with a digest gate
 
-We also ran external baselines under the same typed-neighbor gate. A system enters the numeric table only if it loads the same LDBC dense edge set, runs a fixed-seed sampled typed-neighbor workload, and passes a per-query count/hash digest check against the dense edge-list truth. The current measured rows are LiveGraph, Neo4j Community, and TuGraph. Aster and NebulaGraph remain artifact attempts because we do not yet have a runnable source/image and workload bridge on the remote machine.
+We also ran external baselines under the same typed-neighbor gate. A system enters the numeric table only if it loads the same LDBC dense edge set, runs a fixed-seed sampled typed-neighbor workload, and passes a per-query count/hash digest check against the dense edge-list truth. The current measured rows are LiveGraph, Aster RocksGraph, Neo4j Community, TuGraph, and NebulaGraph. LSMGraph-style remains an internal layout row rather than an official external artifact.
 
 LiveGraph is the scope-limited dynamic graph storage baseline. SF1 completed with 34,692,699 edges, 3,181,724 vertices, 21.155 s load time, 4,850,512 KB peak RSS, and an edge-count gate showing `scan_edges = dense_edges = LiveGraph edge_count`. SF10 completed with 355,185,382 edges, 29,987,835 vertices, 1,457.36 s load time, 47,908,544 KB peak RSS, and 38,654,705,664 bytes footprint. The digest verifier checks 16,140 SF1 sampled queries and 32,140 SF10 sampled queries with zero mismatches. LiveGraph is useful as a typed-neighbor scan baseline, not as a complete graph-database head-to-head.
 
@@ -126,17 +126,21 @@ Neo4j Community is the general property-graph database baseline. We import each 
 
 TuGraph is the embedded graph database baseline. We use the TuGraph runtime image with an embedded C++ typed-neighbor driver over the same dense edge set. SF1 loads 3,181,724 vertices and 34,692,699 edges, checks 1,700 queries with zero mismatches, and reports avg/p50/p90/p99 of 420.925/6.358/151.398/17,602.600 us. SF10 loads 29,987,835 vertices and 355,185,382 edges, checks 1,700 queries with zero mismatches, and reports avg/p50/p90/p99 of 3,775.450/12.630/633.490/158,870 us. This is an embedded API typed-neighbor baseline, not a full TuGraph LDBC Interactive benchmark.
 
+Aster RocksGraph is the LSM-adjacent bridge baseline. We use the lightweight `NTU-Siqiang-Group/Aster` implementation at commit `6abb258e577c479325092a8ac0e7691fdfd154c2`. The driver maps each `(edge_type, src)` pair to a compact logical vertex id, which avoids sparse-id expansion in Aster's MorrisCounter path. SF1 checks 1,700 queries with zero mismatches and reports avg/p50/p90/p99 of 150.985/10.680/381.904/3,411.36 us. SF10 checks 1,700 queries with zero mismatches and reports avg/p50/p90/p99 of 1,408.270/580.529/1,061.240/15,809.60 us. This row should be described as an Aster/RocksGraph typed-neighbor bridge, not as a full AsterDB Gremlin benchmark.
+
+NebulaGraph is the distributed open-source graph database baseline. We use NebulaGraph v3.8.0 server images and model each dense edge type as a separate nGQL edge type, such as `E_Px` and `E_Nx`. SF1 checks 1,700 queries with zero mismatches and reports avg/p50/p90/p99 of 61,553.966/581.010/10,736.324/1,189,334.146 us. SF10 checks 1,700 queries with zero mismatches and reports avg/p50/p90/p99 of 744,146.618/741.524/20,218.339/14,228,169.276 us. This is a same-workload typed-neighbor baseline, not a production deployment or a full LDBC Interactive benchmark.
+
 ## 7. Comparison with Existing Systems
 
 SemL0 is closest in spirit to systems that rethink dynamic graph storage layout, including LSM-style graph stores, multi-version CSR designs, transactional graph stores, and dynamic graph analytics containers. These systems are valuable design baselines, but they optimize different interfaces.
 
-LiveGraph is a transactional graph store with efficient adjacency scans. It is the closest measured external system for typed-neighbor scans, but it is an in-memory transactional graph store rather than an LSM-based property-graph storage prototype with a semantic compaction control plane. Neo4j and TuGraph broaden the comparison to mainstream property-graph database implementations, while still remaining scoped to the typed-neighbor workload and digest gate.
+LiveGraph is a transactional graph store with efficient adjacency scans. It is the closest measured external system for typed-neighbor scans, but it is an in-memory transactional graph store rather than an LSM-based property-graph storage prototype with a semantic compaction control plane. Aster RocksGraph gives an LSM-adjacent measured row through a typed-neighbor bridge. Neo4j, TuGraph, and NebulaGraph broaden the comparison to mainstream property-graph database implementations, while still remaining scoped to the typed-neighbor workload and digest gate.
 
-LSMGraph, Aster, and BACH are closer to SemL0's LSM and layout setting. They are useful qualitative comparisons for multi-level CSR, LSM graph layout, and adjacency/CSR transformation. SemL0's distinct claim is not another layout alone, but the use of query signatures as a storage control plane that shapes pruning and physical rewrites.
+LSMGraph and BACH remain useful qualitative comparisons for multi-level CSR, LSM graph layout, and adjacency/CSR transformation. SemL0's distinct claim is not another layout alone, but the use of query signatures as a storage control plane that shapes pruning and physical rewrites.
 
 Teseo, GraphOne, LLAMA, and Aspen are important dynamic graph systems, but their public artifacts and workloads are not direct matches for LDBC property-graph typed-neighbor reads with schema/snapshot semantics. LLAMA is primarily analytics-oriented; Teseo and GraphOne focus on dynamic graph containers and structural analytics; Aspen focuses on low-latency graph streaming. They should appear in the design matrix and related work, not as forced apples-to-apples latency baselines.
 
-Industrial graph systems such as ByteGraph, BG3, Galaxybase, GES, and Nebula Graph are useful writing models for motivation, deployment framing, and lessons learned. NebulaGraph is also a planned artifact attempt once a runnable image/source and loader are available. SemL0 should not imply production deployment or direct production-scale comparability with these systems.
+Industrial graph systems such as ByteGraph, BG3, Galaxybase, GES, and Nebula Graph are useful writing models for motivation, deployment framing, and lessons learned. The NebulaGraph row in our table is a reproducible same-workload baseline, not evidence of production deployment or direct production-scale comparability with these systems.
 
 ## 8. Experience and Lessons Learned
 
@@ -158,7 +162,7 @@ Latency improvements are workload-dependent. The paper's strongest claims are re
 
 The C2 real SF30 evidence is a three-layer story: controlled full-read workload and correctness, real SF30 retention/write cost, and real SF30 metadata replay. It is not a full SF30 body-read execution trace.
 
-LiveGraph, Neo4j Community, and TuGraph now have SF1/SF10 measured evidence with digest correctness. The verifier samples `(edge_type, src)` pairs with a fixed seed, computes neighbor counts and hashes against dense edge-list truth, and reports zero mismatches for the rows in the numeric table. Aster and NebulaGraph should remain artifact attempts until they satisfy the same loader, workload, and digest gate. A separate clean-checkout reproduction remains optional if we want an even stricter artifact story.
+LiveGraph, Aster RocksGraph, Neo4j Community, TuGraph, and NebulaGraph now have SF1/SF10 measured evidence with digest correctness. The verifier samples `(edge_type, src)` pairs with a fixed seed, computes neighbor counts and hashes against dense edge-list truth, and reports zero mismatches for the rows in the numeric table. A separate clean-checkout reproduction remains optional if we want an even stricter artifact story for Aster and NebulaGraph.
 
 ## 10. Conclusion
 
@@ -171,4 +175,4 @@ SemL0 argues that query signatures should become a storage control plane for dyn
 - Add a figure for the storage control plane lifecycle: query signature -> flush metadata -> read pruning -> semantic compaction -> schema/snapshot fallback.
 - Add a figure for C2: exact-surface retention and write amplification under naive vs semantic merge.
 - Keep external comparisons scope-limited: typed-neighbor workload, digest PASS, not a complete graph-database head-to-head.
-- Place LiveGraph, Neo4j, and TuGraph measured rows in the evaluation table or in an external-baseline sidebar; keep Aster/NebulaGraph as artifact attempts.
+- Place LiveGraph, Aster RocksGraph, Neo4j, TuGraph, and NebulaGraph measured rows in the evaluation table or in an external-baseline sidebar, with scope notes for Aster and NebulaGraph.

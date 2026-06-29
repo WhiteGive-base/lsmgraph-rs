@@ -1,0 +1,9 @@
+{
+  "status": "SF10 DONE",
+  "sf1": "PASS",
+  "sf10": "PASS",
+  "correctness": "PASS",
+  "raw": "baseline/external-baselines-20260626/3plus3-baselines/systems/aster",
+  "notes": "Aster/RocksGraph source available; typed-neighbor bridge uses compact logical vertex per (edge_type,src) to avoid sparse-id Morris counter blow-up.",
+  "version": "6abb258e577c479325092a8ac0e7691fdfd154c2"
+}

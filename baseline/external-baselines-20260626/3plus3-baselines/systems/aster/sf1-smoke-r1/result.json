@@ -1,0 +1,44 @@
+{
+  "all_types": {
+    "avg_us": 150.985,
+    "ops": 1700,
+    "p50_us": 10.68,
+    "p90_us": 381.904,
+    "p99_us": 3411.36
+  },
+  "bridge": "compact logical vertex id per (edge_type,src); avoids sparse-id Morris counter blow-up",
+  "checked": 1700,
+  "db_dir": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/aster/sf1-smoke-r1/db",
+  "dense_group_s": 9.784526,
+  "dense_path": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf1-smoke/edges-dense.txt",
+  "disk_total_bytes": 1054936788,
+  "input_vertices": 3181724,
+  "load_s": 74.399302,
+  "loaded_edges": 34692699,
+  "loaded_logical_vertices": 11330230,
+  "mismatches": 0,
+  "negative_edge_types": {
+    "avg_us": 293.322,
+    "ops": 850,
+    "p50_us": 15.533,
+    "p90_us": 602.615,
+    "p99_us": 3618.67
+  },
+  "negative_neighbors": 7515388,
+  "peak_rss_kb": 1851684,
+  "positive_edge_types": {
+    "avg_us": 8.64785,
+    "ops": 850,
+    "p50_us": 8.89,
+    "p90_us": 12.321,
+    "p99_us": 22.621
+  },
+  "positive_neighbors": 42257,
+  "query_s": 0.257297,
+  "sample_mismatches": [],
+  "scale": "sf1",
+  "status": "PASS",
+  "system": "Aster RocksGraph",
+  "total_neighbors": 7557645,
+  "truth_path": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/neo4j/sf1-smoke/workload/truth-s50-seed42.tsv"
+}

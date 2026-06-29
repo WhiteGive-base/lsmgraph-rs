@@ -1,5 +1,7 @@
 # 外部 Baseline 执行状态更新（2026-06-27）
 
+更新：2026-06-30，Aster RocksGraph 与 NebulaGraph 已完成 SF1/SF10 typed-neighbor digest gate。
+
 本文是 `external-baseline-survey-cn.md` 的执行状态补充页，用于写 CIDR draft 时引用。原始结果包在远端：
 
 - `/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/`
@@ -53,17 +55,29 @@ SF10 main：
 
 可写口径：Neo4j 是一个通用图数据库 baseline，用于说明 property graph DB 在该 typed-neighbor/high-fanout workload 上的代价，不是同类存储引擎的一对一系统竞赛。
 
-## 内部/布局 baseline
+### Aster RocksGraph
 
-### LSMGraph-style
+状态：SF1/SF10 typed-neighbor bridge baseline 已完成，count/hash digest PASS。
 
-状态：已从 SemL0 ablation trace 提取 SF30/SF100 layout-style rows。
+实现口径：使用 `NTU-Siqiang-Group/Aster` 轻量 RocksGraph 实现；远端 checkout 记录 commit `6abb258e577c479325092a8ac0e7691fdfd154c2`。typed-neighbor bridge 将每个 `(edge_type, src)` 映射到 compact logical vertex id，避免 Aster MorrisCounter 对稀疏大 vertex id 的内存放大。这个结果可作为 Aster/RocksGraph storage bridge baseline，不能写成完整 AsterDB/Gremlin benchmark。
 
-可写口径：
+SF1 smoke：
 
-- internal layout baseline，不是官方外部 LSMGraph artifact。
-- 可以帮助说明 LSM/level-style layout 在 typed-neighbor pruning workload 下的代价。
-- 不要写成 external LSMGraph system result。
+- checked=1700，mismatches=0。
+- all-types avg 150.985 us，p50 10.680 us，p90 381.904 us，p99 3,411.36 us。
+- positive-only avg 8.648 us。
+- negative/high-fanout avg 293.322 us。
+- load 74.399 s，peak RSS 1,851,684 KB，disk 1,054,936,788 bytes。
+
+SF10 main：
+
+- checked=1700，mismatches=0。
+- all-types avg 1,408.270 us，p50 580.529 us，p90 1,061.240 us，p99 15,809.60 us。
+- positive-only avg 564.505 us。
+- negative/high-fanout avg 2,252.040 us。
+- load 794.262 s，peak RSS 15,621,088 KB，disk 10,401,409,041 bytes。
+
+可写口径：Aster 可以进入数值表，但必须写成 Aster/RocksGraph typed-neighbor bridge baseline；不要写成完整 AsterDB 图数据库系统评测。
 
 ### TuGraph
 
@@ -89,38 +103,63 @@ SF10 关键结果：
 
 可写口径：TuGraph 可以作为 SF1/SF10 measured graph DB baseline 写入数值表。需要说明这是 embedded C++ API typed-neighbor driver，不是完整 TuGraph LDBC Interactive benchmark。
 
-## 不能进入数值主表的系统
-
-### Aster
-
-状态：远端当前没有本地 source checkout 或 Docker image；2026-06-29 继续公开检索后，能确认 Aster 论文存在，但没有定位到可直接复现的官方 GitHub/source/artifact 入口。
-
-这更像 artifact 未公开、未归档或入口不明显，不是远端下载权限问题。当前只能写 qualitative/artifact-needed row。拿到 source/artifact 并接入同一 typed-neighbor workload 前，不能给数值。
-
 ### NebulaGraph
 
-状态：NebulaGraph 是官方开源系统；远端能访问 `vesoft-inc/nebula` 和 `vesoft-inc/nebula-docker-compose` 的 GitHub 仓库。2026-06-29 已经通过 `docker.1ms.run` mirror 拉取并 retag 三个服务镜像：`vesoft/nebula-graphd:v3.8.0`、`vesoft/nebula-metad:v3.8.0`、`vesoft/nebula-storaged:v3.8.0`。
+状态：SF1/SF10 typed-neighbor baseline 已完成，count/hash digest PASS。
 
-远端排查结论：原 blocker 是网络/代理问题，不是系统不存在。远端 shell 的 `HTTP_PROXY/HTTPS_PROXY` 指向 `127.0.0.1:7897`，该代理端口未启动；取消代理后直连 Docker Hub 仍被拒绝；`dockerproxy.com` 超时，`docker.m.daocloud.io` 对该探测返回 read-only denial；`docker.1ms.run` 可用。
+实现口径：使用官方 NebulaGraph v3.8.0 server images（`vesoft/nebula-graphd`、`vesoft/nebula-metad`、`vesoft/nebula-storaged`）。由于远端 Docker Hub 直连受限，镜像通过 `docker.1ms.run` 拉取后 retag 为官方名。space 使用 `vid_type=INT64`，每个 dense edge type 建一个 nGQL edge type（`E_Px` / `E_Nx`），用 Python client 批量写入和查询。
 
-当前状态从 image/source setup pending 升级为 server images ready / SF1 smoke pending。服务启动、schema、loader、query driver、digest gate 都完成前，仍不能给数值。
+SF1 smoke：
+
+- checked=1700，mismatches=0。
+- all-types avg 61,553.966 us，p50 581.010 us，p90 10,736.324 us，p99 1,189,334.146 us。
+- positive-only avg 1,012.955 us。
+- negative/high-fanout avg 122,094.978 us。
+- load 194.644 s，peak RSS 1,673,516 KB，disk 4,552,617,537 bytes。
+
+SF10 main：
+
+- checked=1700，mismatches=0。
+- all-types avg 744,146.618 us，p50 741.524 us，p90 20,218.339 us，p99 14,228,169.276 us。
+- positive-only avg 1,753.354 us。
+- negative/high-fanout avg 1,486,539.881 us。
+- load 2,493.471 s，peak RSS 3,665,396 KB，disk 46,185,803,519 bytes。
+
+可写口径：NebulaGraph 可以作为 open-source distributed graph DB baseline 写入数值表，但必须说明这是同一 typed-neighbor workload 下的 nGQL edge-type model，不是生产部署、集群调优或完整 LDBC Interactive benchmark。
+
+## 内部/布局 baseline
+
+### LSMGraph-style
+
+状态：已从 SemL0 ablation trace 提取 SF30/SF100 layout-style rows。
+
+可写口径：
+
+- internal layout baseline，不是官方外部 LSMGraph artifact。
+- 可以帮助说明 LSM/level-style layout 在 typed-neighbor pruning workload 下的代价。
+- 不要写成 external LSMGraph system result。
+
+## 不能进入数值主表的系统
+
+Teseo、GraphOne、LLAMA、Aspen 仍不进入数值主表：它们的公开 artifact/API/workload 与 SemL0 的 LDBC property-graph typed-neighbor workload 不直接匹配，适合 related work 或 design-space comparison。
 
 ## CIDR draft 写法建议
 
 可以写：
 
-> We evaluate SemL0 against measured external baselines that pass the same-workload digest gate: LiveGraph as a scope-limited dynamic graph storage baseline, Neo4j Community as a general property-graph database baseline, and TuGraph as an embedded graph database baseline. We report artifact attempts for Aster and NebulaGraph, and keep them out of the numeric table until they satisfy the same loader, workload, and count/hash digest gate.
+> We evaluate SemL0 against measured external baselines that pass the same-workload digest gate: LiveGraph as a scope-limited dynamic graph storage baseline, Aster RocksGraph as an LSM-adjacent typed-neighbor bridge baseline, Neo4j Community as a general property-graph database baseline, TuGraph as an embedded graph database baseline, and NebulaGraph as a distributed open-source graph DB baseline. Each numeric row uses the same LDBC dense edge set, the same fixed-seed sampled typed-neighbor workload, and a per-query count/hash digest check.
 
 不要写：
 
 - “SemL0 beats all graph databases.”
-- “Aster/NebulaGraph results are measured baselines.”
+- “Aster RocksGraph results are full AsterDB/Gremlin benchmark results.”
+- “NebulaGraph results are production deployment or full LDBC Interactive benchmark results.”
 - “LSMGraph-style is an official external LSMGraph artifact.”
 
 ## 下一步
 
 优先级：
 
-1. NebulaGraph：镜像获取 blocker 已通过 `docker.1ms.run` 解决；下一步完成 service/schema/loader smoke。
-2. Aster：继续找官方 source/artifact；如果没有公开入口，写成 artifact-unavailable qualitative comparison。
-3. CIDR draft：主表放 LiveGraph + Neo4j + TuGraph + 内部 LSMGraph-style；Aster/NebulaGraph 放 artifact attempt 和 design comparison。
+1. CIDR draft：主表或 external-baseline sidebar 放 LiveGraph + Aster RocksGraph + Neo4j + TuGraph + NebulaGraph，并保留各自 scope 注释。
+2. 若投稿前要进一步加强 artifact story，可对 Aster/NebulaGraph 做 clean checkout / clean image reproduction，把 binary hash、image digest、run config 再固化一次。
+3. Teseo/GraphOne/LLAMA/Aspen 继续放 design comparison，不硬塞进 latency 表。

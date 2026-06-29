@@ -1,0 +1,9 @@
+{
+  "status": "SF10 DONE",
+  "sf1": "PASS",
+  "sf10": "PASS",
+  "correctness": "PASS",
+  "raw": "baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph",
+  "notes": "NebulaGraph server images available; nGQL edge-type model uses one edge type per dense edge type.",
+  "version": "vesoft/nebula-graphd/metad/storaged:v3.8.0"
+}

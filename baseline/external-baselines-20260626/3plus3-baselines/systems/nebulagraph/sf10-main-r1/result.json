@@ -1,0 +1,44 @@
+{
+  "all_types": {
+    "avg_us": 744146.6177941178,
+    "ops": 1700,
+    "p50_us": 741.524,
+    "p90_us": 20218.339,
+    "p99_us": 14228169.276
+  },
+  "batch_size": 500,
+  "checked": 1700,
+  "dense_path": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/edges-dense.txt",
+  "disk_total_bytes": 46185803519,
+  "image_version": "v3.8.0",
+  "load_edges_per_s": 142446.14645241096,
+  "load_s": 2493.4713282585144,
+  "loaded_edges": 355185382,
+  "loaded_vertices_header": 29987835,
+  "mismatches": 0,
+  "negative_edge_types": {
+    "avg_us": 1486539.8812611774,
+    "ops": 850,
+    "p50_us": 2035.727,
+    "p90_us": 98061.027,
+    "p99_us": 63139284.448
+  },
+  "negative_neighbors": 84017646,
+  "peak_rss_kb": 3665396,
+  "positive_edge_types": {
+    "avg_us": 1753.3543270588223,
+    "ops": 850,
+    "p50_us": 480.324,
+    "p90_us": 3450.354,
+    "p99_us": 20629.986
+  },
+  "positive_neighbors": 87168,
+  "query_s": 1265.0518424510956,
+  "run_dir": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/nebulagraph/sf10-main-r1",
+  "sample_mismatches": [],
+  "scale": "sf10",
+  "status": "PASS",
+  "system": "NebulaGraph",
+  "total_neighbors": 84104814,
+  "truth_path": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/neo4j/sf10-main/workload/truth-s50-seed42.tsv"
+}

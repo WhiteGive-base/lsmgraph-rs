@@ -108,15 +108,16 @@ SemL0 当前只能写成 remote prototype deployment：
 | System | Scale | Correctness | 可写强度 |
 |---|---|---|---|
 | LiveGraph | SF1/SF10 | PASS | scope-limited dynamic graph storage baseline |
+| Aster RocksGraph | SF1/SF10 | PASS | LSM-adjacent typed-neighbor bridge baseline |
 | Neo4j Community | SF1/SF10 | PASS | general property-graph database baseline |
 | TuGraph | SF1/SF10 | PASS | embedded graph database baseline |
+| NebulaGraph | SF1/SF10 | PASS | distributed open-source graph DB baseline；nGQL edge-type model |
 
 不能进数值表：
 
 | System | 当前状态 | 口径 |
 |---|---|---|
-| Aster | 无本地 source/image | qualitative/artifact-needed |
-| NebulaGraph | 无本地 image/source | image/source pending |
+| Teseo/GraphOne/LLAMA/Aspen | workload/API 不匹配 | related work/design comparison |
 | LSMGraph-style | internal layout row | 不写成 official external artifact |
 
 ## CIDR Evidence Table
@@ -128,5 +129,5 @@ SemL0 当前只能写成 remote prototype deployment：
 | Compaction 是否会破坏 semantic surface | C2 synthetic + real SF30 | 强 |
 | Schema/snapshot 下能否不漏读 | W13 | 中强 |
 | 动态 workload 中 latency 是否改善 | W9 SF30 | 中，supporting |
-| 是否有外部 baseline | LiveGraph/Neo4j/TuGraph SF1/SF10 measured baselines，digest PASS | 中强，需保留 scope 边界 |
+| 是否有外部 baseline | LiveGraph/Aster RocksGraph/Neo4j/TuGraph/NebulaGraph SF1/SF10 measured baselines，digest PASS | 中强，需保留 scope 边界 |
 | 是否有生产部署 | 无 | 不能写 |

@@ -1,0 +1,30 @@
+$ git checkout 6abb258e577c479325092a8ac0e7691fdfd154c2
+HEAD is now at 6abb258e5 Add APIs 'AddEdgeBatch' and 'DeleteEdgeBatch'
+
+[exit=0 elapsed_s=0.005]
+$ make -j32 EXTRA_CXXFLAGS=-I/data/WorkSpace/lsmgraph-rs/deps/_external_work/boost-root/usr/include -I/data/WorkSpace/lsmgraph-rs/deps/_external_work/gflags-root/usr/include -Wno-error=shadow -Wno-shadow static_lib
+$DEBUG_LEVEL is 0, $LIB_MODE is static
+make: Nothing to be done for 'static_lib'.
+
+[exit=0 elapsed_s=9.857]
+$ make EXTRA_CXXFLAGS=-I/data/WorkSpace/lsmgraph-rs/deps/_external_work/boost-root/usr/include -I/data/WorkSpace/lsmgraph-rs/deps/_external_work/gflags-root/usr/include -Wno-error=shadow -Wno-shadow EXEC_LDFLAGS=-L/data/WorkSpace/lsmgraph-rs/deps/_external_work/gflags-root/usr/lib/x86_64-linux-gnu -Wl,-rpath,/data/WorkSpace/lsmgraph-rs/deps/_external_work/gflags-root/usr/lib/x86_64-linux-gnu -lgflags all
+cd .. && make static_lib
+make[1]: Entering directory '/data/WorkSpace/lsmgraph-rs/deps/Aster'
+$DEBUG_LEVEL is 0, $LIB_MODE is static
+make[1]: Nothing to be done for 'static_lib'.
+make[1]: Leaving directory '/data/WorkSpace/lsmgraph-rs/deps/Aster'
+g++ -fno-rtti graph_example.cc -ograph_example ../librocksdb.a -I../include -O2 -std=c++17 -lpthread -lrt -ldl -lgflags -lz -lnuma -ltbb -std=c++17 -I/data/WorkSpace/lsmgraph-rs/deps/_external_work/boost-root/usr/include -I/data/WorkSpace/lsmgraph-rs/deps/_external_work/gflags-root/usr/include -Wno-error=shadow -Wno-shadow -faligned-new -DHAVE_ALIGNED_NEW -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX  -DOS_LINUX -fno-builtin-memcmp -DROCKSDB_FALLOCATE_PRESENT -DGFLAGS=1 -DZLIB -DNUMA -DTBB -DROCKSDB_MALLOC_USABLE_SIZE -DROCKSDB_PTHREAD_ADAPTIVE_MUTEX -DROCKSDB_BACKTRACE -DROCKSDB_RANGESYNC_PRESENT -DROCKSDB_SCHED_GETCPU_PRESENT -DROCKSDB_AUXV_GETAUXVAL_PRESENT -march=native  -DHAVE_UINT128_EXTENSION  -L/data/WorkSpace/lsmgraph-rs/deps/_external_work/gflags-root/usr/lib/x86_64-linux-gnu -Wl,-rpath,/data/WorkSpace/lsmgraph-rs/deps/_external_work/gflags-root/usr/lib/x86_64-linux-gnu -lgflags
+
+[exit=0 elapsed_s=17.300]
+$ ./graph_example --load_mode=tiny
+Edges from vertex 1:
+ -> 2
+ -> 3
+Edge from vertex 1 to vertex 2 deleted
+Edges from vertex 1:
+ -> 3
+
+[exit=0 elapsed_s=0.034]
+$ g++ -std=c++17 -O2 -DNDEBUG -I/data/WorkSpace/lsmgraph-rs/deps/Aster/include -I/data/WorkSpace/lsmgraph-rs/deps/_external_work/boost-root/usr/include /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/scripts/aster_typed_driver.cpp -o /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/scripts/aster_typed_driver /data/WorkSpace/lsmgraph-rs/deps/Aster/librocksdb.a -lpthread -lrt -ldl -lz -lnuma -ltbb
+
+[exit=0 elapsed_s=6.979]

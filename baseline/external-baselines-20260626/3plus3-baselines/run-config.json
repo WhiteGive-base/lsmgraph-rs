@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-27T02:40:37+08:00",
+  "generated_at": "2026-06-30T02:49:33+08:00",
   "repo_root": "/data/WorkSpace/lsmgraph-rs",
   "result_dir": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines",
   "groups": {
@@ -22,9 +22,27 @@
     "load/RSS/footprint/latency logs",
     "raw config and DONE marker"
   ],
-  "nebulagraph_image_setup": {
-    "updated_at": "2026-06-29T00:00:00+08:00",
-    "remote_status": "server images pulled; SF1 smoke pending",
+  "workload": {
+    "query": "fixed-seed sampled typed-neighbor count/hash digest",
+    "seed": 42,
+    "samples_per_edge_type": 50,
+    "truth": "dense edge-list count/sum_hash/xor_hash",
+    "sf1_dense_path": "baseline/external-baselines-20260624/livegraph/sf1-smoke/edges-dense.txt",
+    "sf10_dense_path": "baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/edges-dense.txt",
+    "edge_format": "first line vertex count, then: src edge_type dst"
+  },
+  "aster_setup": {
+    "source_repo": "https://github.com/NTU-Siqiang-Group/Aster.git",
+    "checkout": "6abb258e577c479325092a8ac0e7691fdfd154c2",
+    "source_path": "deps/Aster",
+    "numeric_scope": "Aster/RocksGraph typed-neighbor bridge, not full AsterDB/Gremlin benchmark",
+    "bridge": "compact logical vertex id per (edge_type,src); avoids sparse-id MorrisCounter blow-up",
+    "build_log": "baseline/external-baselines-20260626/3plus3-baselines/systems/aster/build/build.log"
+  },
+  "nebulagraph_setup": {
+    "updated_at": "2026-06-30T00:00:00+08:00",
+    "remote_status": "SF1/SF10 typed-neighbor digest PASS",
+    "numeric_scope": "nGQL edge-type model, not production deployment or full LDBC Interactive benchmark",
     "mirror": "docker.1ms.run",
     "official_tags": [
       "vesoft/nebula-graphd:v3.8.0",

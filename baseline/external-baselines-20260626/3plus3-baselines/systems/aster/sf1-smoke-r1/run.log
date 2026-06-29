@@ -1,0 +1,3 @@
+$ /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/scripts/aster_typed_driver --dense=/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf1-smoke/edges-dense.txt --truth=/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/neo4j/sf1-smoke/workload/truth-s50-seed42.tsv --db=/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/aster/sf1-smoke-r1/db --out=/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/aster/sf1-smoke-r1/result.json --scale=sf1
+
+[exit=0 elapsed_s=77.227]
