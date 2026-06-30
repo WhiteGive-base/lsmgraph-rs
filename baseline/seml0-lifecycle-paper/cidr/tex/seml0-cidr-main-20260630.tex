@@ -1,0 +1,611 @@
+\documentclass[sigconf,screen]{cidr-2027}
+
+\usepackage{graphicx}
+\usepackage{xspace}
+
+\graphicspath{{../images/}}
+
+\settopmatter{printccs=false, printacmref=false}
+
+\newcommand{\sys}{SemL0\xspace}
+\newcommand{\exact}{\textsc{Exact}\xspace}
+\newcommand{\cons}{\textsc{Conservative}\xspace}
+\newcommand{\unknown}{\textsc{Unknown}\xspace}
+
+\title{\sys: Query Signatures as a Storage Control Plane for Dynamic Property Graphs}
+
+\author{Author Name(s)}
+\affiliation{%
+  \institution{Institution}
+  \country{Country}
+}
+\email{email@example.com}
+
+\begin{abstract}
+Dynamic property-graph stores expose rich query signatures: vertex labels,
+edge types, directions, degree classes, property predicates, snapshots, and
+schema epochs. Yet in many LSM-style graph stores, these semantics stop at the
+query layer. The storage layer continues to organize reads and physical
+rewrites around keys, levels, adjacency blocks, and size-based compaction. This
+separation makes selective graph reads unnecessarily expensive: a query can
+identify the typed neighborhood it needs, while the storage layer still probes
+segments whose contents are semantically irrelevant.
+
+We introduce \sys, a prototype LSM-based property-graph store that treats query
+signatures as a storage control plane. \sys compiles signatures into
+segment-level semantic state, uses exact evidence for safe pruning, preserves
+or rebuilds semantic pruning surfaces during compaction, and falls back
+conservatively under schema, snapshot, and tombstone uncertainty. The design
+studies a storage architecture principle: mutable graph storage should be
+controlled not only by key order and level structure, but also by the semantics
+of the graph queries it is expected to serve.
+
+In prototype experiments on LDBC SNB workloads up to SF100, \sys reduces
+candidate segments and read bytes; the same runs expose a 118.03 GiB memory
+cliff for unbudgeted semantic materialization. On real SF30 compaction inputs,
+semantic-aware compaction retains the pruning surface with bounded write
+amplification, and schema/snapshot tests exercise the no-false-negative
+fallback path. We include five measured external systems and one internal
+LSMGraph-style layout baseline under a typed-neighbor digest gate. The
+comparison is deliberately scoped: it positions the storage mechanism rather
+than claiming a full graph-database head-to-head.
+\end{abstract}
+
+\keywords{dynamic graphs, LSM-tree, property graph, storage layout, compaction}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+Property graphs are queried through semantics. A typical graph query does not
+merely ask for the next key range or the next adjacency block; it asks for
+typed neighborhoods such as outgoing \texttt{KNOWS} edges from
+\texttt{Person} vertices, membership edges involving \texttt{Forum} vertices,
+message-related edges satisfying a property predicate, or snapshot-consistent
+paths across a changing graph. These queries carry rich signatures: source
+labels, edge types, directions, degree classes, property access patterns,
+temporal visibility, and schema epochs.
+
+This interface is no longer only a feature of a single graph database product.
+Graph query-language work has converged on property graphs as a common model:
+Cypher exposed a practical industrial language, G-CORE distilled a
+composable research core, SQL/PGQ brought property-graph pattern matching into
+SQL, and GQL standardized a standalone property-graph query language
+\cite{graphquerysurvey,cypher,gcore,sqlpgq,gql}. The convergence matters for
+storage. Labels, edge types, properties, paths, and snapshots are not accidental
+syntax; they are the recurring vocabulary through which applications ask graph
+systems to navigate data. Benchmarks such as LDBC SNB encode the same
+observation by making typed neighborhoods, properties, and evolving social
+objects central to the workload \cite{ldbc}.
+
+Storage systems often lag behind this semantic interface. In LSM-style graph
+stores, updates are absorbed into mutable or append-friendly components and
+later reorganized through flush and compaction. This design is attractive for
+dynamic graphs, but the storage layer is usually organized around key order,
+level structure, adjacency representation, and size-based rewrite policies. As
+a result, query semantics are interpreted above storage, while storage itself
+remains largely query-blind.
+
+This mismatch creates a specific form of read amplification. A selective
+property-graph query may know that only a small subset of typed neighborhoods
+can contribute to the result, but the storage layer may still inspect many
+candidate segments because their metadata cannot prove semantic irrelevance.
+This is especially visible in LSM-based layouts: as updates accumulate in L0
+and are later compacted into lower levels, semantically precise segments can
+become mixed physical outputs. Once a segment loses its precise semantic
+identity, future queries must conservatively read it even when most of its
+contents are irrelevant.
+
+We propose a different architecture: query signatures should become a
+storage-level control plane. In this architecture, property-graph query
+semantics are compiled into storage-visible metadata and rewrite decisions.
+Segment metadata records what kinds of graph neighborhoods a segment can
+contain. The read path uses this metadata to prune only when absence or
+disjointness is exact. The compaction path preserves or reconstructs
+high-value semantic partitions instead of treating physical rewrite as
+semantically neutral. The correctness path falls back conservatively under
+schema changes, tombstones, and snapshot uncertainty.
+
+We explore this architecture in \sys. \sys stores graph data in LSM-style CSR
+segments enriched with semantic state. A query signature describes the graph
+access pattern, including labels, edge types, direction, degree class,
+properties, and visibility constraints. At flush time, \sys materializes
+segment-level semantic summaries. At query time, it uses an exactness-aware
+pruning contract: a segment can be skipped only when its semantic state proves
+that it cannot contribute to the query. At compaction time, \sys treats
+physical rewrite as an opportunity to preserve the semantic pruning surface.
+Under uncertainty, \sys prefers correctness over pruning.
+
+The main consequence is that compaction cannot be treated as semantically
+neutral.
+Conventional LSM compaction is usually discussed in terms of level size, key
+overlap, space amplification, and write amplification. In a property-graph
+store, compaction also changes the semantic shape of the read path. A naive
+merge can combine previously exact semantic partitions into mixed outputs,
+destroying the evidence needed for safe pruning. Conversely, a semantic-aware
+merge can preserve or rebuild exact partitions, trading a bounded amount of
+rewrite work for lower future read amplification.
+
+\sys is not intended to be a complete graph database or a universal replacement
+for existing dynamic graph systems. It is a prototype used to evaluate a
+systems principle: query semantics can act as a storage-level control signal
+in mutable graph stores. This framing also affects evaluation. Rather than
+claiming a complete state-of-the-art comparison against systems with different
+abstractions, we focus on whether the control plane reduces read
+amplification, whether full semantic materialization is too expensive, whether
+compaction can destroy semantic surfaces, and whether conservative fallback
+prevents false negatives under schema and snapshot changes.
+
+This work contributes a storage-level query-semantic control plane for dynamic
+property graphs, an exactness-aware pruning contract over \exact, \cons, and
+\unknown semantic states, a formulation of semantic surface retention as a
+physical rewrite problem, and a scoped prototype evaluation on LDBC SNB
+workloads and digest-gated baselines.
+
+\section{Motivation}
+
+LSM-style storage is a natural fit for dynamic graph updates. Writes can be
+absorbed into memory or append-friendly components, flushed into immutable
+segments, and reorganized in the background. This design has been successful
+in key-value stores and has inspired graph storage designs that combine recent
+deltas with CSR-like read paths \cite{lsm,rocksdb,lsmgraph,bach,tugraphpaper}. However, the
+source of read amplification in property graphs is not only key overlap or
+file count. It is also semantic invisibility.
+
+Consider a typed-neighbor query over an LDBC-style social graph \cite{ldbc}.
+The query may ask for outgoing \texttt{KNOWS} edges from \texttt{Person}
+vertices. Another query may ask for \texttt{HAS\_MEMBER} edges involving
+\texttt{Forum} vertices. At the query layer, these accesses are clearly
+different. At a storage layer that sees only physical segments and key ranges,
+they can look similar: both may require probing many L0 files because the
+system cannot prove that a file contains no relevant edge. The result is an
+avoidable admission problem. Before reading segment bodies, the storage layer
+lacks the proof needed to reject semantically irrelevant segments.
+
+Existing dynamic graph systems provide valuable points in the design space.
+LiveGraph focuses on transactional graph storage and efficient adjacency scans
+\cite{livegraph}. Teseo and GraphOne target structural dynamic graphs and
+real-time analytics \cite{teseo,graphone}. LLAMA, Aspen, and recent DGS
+studies explore multi-version, streaming, and in-memory dynamic graph
+representations \cite{llama,aspen,revisitingdgs}. Aster
+uses LSM-oriented storage ideas for graph databases \cite{aster}, while
+NebulaGraph studies a distributed native graph database architecture
+\cite{nebula}. These systems are not query-blind in a broad sense; they are
+designed around specific graph interfaces and update models. The gap addressed
+by \sys is narrower: how should an LSM-style property-graph storage layer use
+the semantics already present in typed-neighbor and property-aware queries to
+control pruning and physical rewrite?
+
+Safety is the first constraint. Semantic pruning is tempting because labels,
+edge types, properties, snapshots, and schema epochs appear to expose strong
+filters. But a storage engine cannot skip a segment because it is probably
+irrelevant. A segment may have been written under an old schema epoch, may
+contain tombstones that affect snapshot visibility, or may mix multiple
+semantic categories after compaction. If the metadata is not exact, pruning can
+silently lose answers. Therefore, query semantics can become a storage control
+signal only if the system treats every skip as a proof obligation.
+
+Lifecycle is the second constraint. It is not enough to attach semantic
+metadata to freshly flushed segments. In an LSM tree, segments are repeatedly
+rewritten. A flush policy may create exact semantic partitions, but a later
+compaction may merge them into a mixed output. The graph contents remain
+correct, yet the evidence needed for future pruning is gone. Thus, the
+question is not only whether query signatures can filter L0. The deeper
+question is whether a mutable graph store can preserve useful query-semantic
+evidence across flush, read, compaction, schema evolution, tombstones, and
+snapshots.
+
+We frame the design around the following question:
+
+\begin{quote}
+Can property-graph query signatures serve as a safe, budgeted storage control
+plane for mutable LSM graph stores?
+\end{quote}
+
+\section{System Design}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.98\textwidth]{fig1_system_control_plane.pdf}
+  \caption{\sys turns property-graph query signatures into storage-visible
+  evidence. Exact evidence enables safe read pruning, while conservative or
+  unknown evidence forces admission. The same semantic catalog guides
+  compaction, so physical rewrites preserve or rebuild the pruning surface
+  instead of silently destroying it.}
+  \label{fig:architecture}
+\end{figure*}
+
+Figure~\ref{fig:architecture} shows the \sys architecture. \sys is not a new
+query language layer and is not intended to replace the underlying graph store.
+Instead, it inserts a query-semantic control plane between a property-graph
+query interface and an LSM-style graph store. The control plane keeps graph
+query semantics visible across the storage lifecycle: query compilation, read
+admission, physical rewrite, and conservative correctness fallback. The storage
+side remains in the broad family of designs that combine write-friendly deltas
+with CSR-like read paths \cite{lsmgraph,bach}; the difference is that \sys
+persists query-semantic evidence as a control signal for both reads and
+compaction.
+
+\subsection{Query signatures and segment state}
+
+\sys represents the storage-visible part of a graph access as a query
+signature. A signature is not a full logical query plan; it is the subset of
+query semantics that can affect storage decisions. The current prototype
+focuses on typed-neighbor and property-aware reads over LDBC SNB-style data. A
+signature can include source label, edge type, direction, degree class,
+property predicate class, snapshot, and schema epoch. A signature may be
+partial. When a component is unknown, unsupported, or unsafe under the current
+schema or snapshot, \sys carries it conservatively instead of converting
+uncertainty into pruning evidence.
+
+Each segment stores compact semantic state that summarizes what it may contain
+and how trustworthy the summary is. A segment may be exact for a specific
+\texttt{(source label, edge type)} pair, exact only for edge type,
+conservative because it mixes several labels or epochs, or unknown because
+schema or visibility information is insufficient. The exactness state is more
+important than the particular metadata format. Exact evidence can prove absence
+or disjointness with respect to a query signature; conservative and unknown
+evidence cannot. Therefore, \sys treats exact segment metadata as a proof
+object for read admission, not as a best-effort cache hint.
+
+\subsection{Exactness-aware pruning}
+
+The read path evaluates a query signature against segment metadata. A segment
+is skipped only when its metadata proves non-overlap with the requested
+signature or exact absence of a required property. If the segment is
+conservative or unknown, the read path scans it. This rule is intentionally
+strict. \sys can lose pruning opportunities when metadata is coarse, but it
+does not lose answers because of optimistic metadata.
+
+This contract also determines how \sys handles schema evolution, snapshots,
+and tombstones. Old segments may have been written under a different
+interpretation of labels or properties. If the old interpretation can be mapped
+exactly, \sys can keep pruning. If aliasing, dropping, or encoding changes make
+the mapping uncertain, the segment is read conservatively. This follows the
+broader lesson from online schema-evolution systems that schema changes must be
+handled transactionally or lazily without exposing partially migrated state to queries
+\cite{bullfrog,tesseract}. A segment can also
+be exact for topology but conservative for snapshot visibility. In that case,
+the read path uses only the exact parts that remain sound and reads the segment
+when visibility uncertainty could hide an answer.
+
+\subsection{Semantic compaction}
+
+The main design difference between \sys and a query-time filter is compaction.
+If semantic metadata is produced only at flush time and ignored afterward, the
+optimization decays as the LSM tree evolves. \sys therefore treats physical
+rewrite as semantic rewrite. When a partition is valuable for the workload and
+can be kept exact at acceptable cost, \sys emits semantic-aware outputs, such
+as outputs grouped by \texttt{(source label, edge type)}. When exact
+preservation is too expensive or unsafe, \sys marks the output conservatively
+and lets the read path fall back to scanning.
+
+The lifecycle path in Figure~\ref{fig:architecture} is the control loop:
+read-time evidence identifies valuable partitions, while compaction decides
+whether to preserve exact partitions or explicitly mark mixed outputs
+conservative. This makes compaction part of the semantic contract rather than
+only a background space-management task.
+
+This design separates correctness from optimization. Correctness does not
+depend on successful semantic partitioning. If metadata is exact, the read
+path can prune. If metadata is conservative or unknown, the read path reads.
+The worst case is reduced pruning, not a false negative. This separation is
+what makes query signatures suitable as a storage control plane rather than a
+risky shortcut.
+
+\subsection{Budgeted control}
+
+The remaining design constraint is budget. The control plane should not materialize every
+possible semantic distinction. Property graphs expose many dimensions: labels,
+edge types, directions, degree classes, property predicates, snapshots, and
+schema epochs. Fully materializing their cross product can create a memory or
+file-count cliff. \sys therefore treats query signatures as budgeted control
+signals. This is consistent with recent work arguing that storage layouts and
+search-acceleration metadata should be separated and tuned independently, and
+with graph DBMS work showing that graph access patterns require storage formats
+different from conventional columnar scans \cite{functionalstorage,columnargraph}.
+The prototype supports coarse signatures, edge-type-only signatures,
+and budgeted variants that preserve useful semantic distinctions without
+requiring full semantic partitioning everywhere.
+
+\section{Preliminary Experiments}
+
+We evaluate \sys as a prototype implementation along four axes: read
+amplification, metadata budget, compaction lifecycle, and conservative fallback
+under schema and snapshot uncertainty.
+
+\subsection{SF100 read amplification}
+
+Figure~\ref{fig:sf100} summarizes the W6 SF100 read-only matrix on LDBC SNB
+data \cite{ldbc}. The
+semantics-blind \texttt{naive} and \texttt{kv-lsm} variants inspect 49,257,601
+L0 candidates and read 3,461.6 MiB. Semantic variants reduce L0 candidates to
+about 5.9M--7.9M and reduce read bytes to about 642.7--820.0 MiB, depending on
+budget and metadata granularity. All comparable rows checked 45,000 operations
+and reported zero mismatches.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.98\textwidth]{fig2_sf100_read_budget.pdf}
+  \caption{SF100 read amplification and budget tradeoff. Query-semantic
+  metadata reduces L0 candidates and read bytes, while full unbudgeted semantic
+  materialization creates a memory cliff. The latency panel is scoped to this
+  workload rather than presented as a universal speedup.}
+  \label{fig:sf100}
+\end{figure*}
+
+The same experiment shows why the control plane must be budgeted. Full
+unbudgeted semantic materialization reaches 118.03 GiB peak import RSS, while
+budgeted/schema variants remain near the naive memory envelope, around
+2.2--2.5 GiB in the measured import runs. The failure mode is important:
+query semantics can guide storage, but a practical system cannot materialize
+every semantic distinction without a budget.
+
+\subsection{Lifecycle retention under compaction}
+
+Figure~\ref{fig:c2} reports semantic surface retention under compaction. The
+experiment isolates a lifecycle effect that a query-time filter would miss:
+compaction can preserve graph contents while destroying the semantic evidence
+needed for future pruning. The controlled rows isolate the merge policy and
+measure the read-amplification consequence on a full read workload. Naive merge
+destroys exact surfaces and causes a 4x--6x typed-neighbor read blow-up, while
+semantic-aware merge keeps read cost flat with zero mismatches.
+
+The real SF30 rows measure retention and write cost on a real LDBC input with
+1.09B directed edges, 40 \texttt{(source label, edge type)} partitions, and 528
+exact L1 segments. Naive compaction has semantic retention 0.0; semantic-aware
+compaction has retention 1.0. The cost is bounded: write amplification is 1.24
+for semantic-aware merge versus 1.07 for naive merge. A metadata replay over
+the real SF30 post-merge segment metadata shows a 6.52x weighted candidate-byte
+proxy for naive merge versus 1.00x for semantic-aware merge.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.98\textwidth]{fig3_c2_lifecycle_retention.pdf}
+  \caption{C2 lifecycle retention under compaction. Naive merge preserves graph
+  contents but destroys exact semantic surfaces; semantic-aware merge retains
+  the pruning surface at bounded write cost. The real SF30 read-amplification
+  row uses metadata replay rather than full body-read execution.}
+  \label{fig:c2}
+\end{figure*}
+
+Together, the controlled rows and the real-input replay separate the graph
+correctness question from the storage-evidence question. The metadata is not
+just a query-time filter; it is a pruning surface that must survive the
+physical lifecycle.
+
+\subsection{Correctness and dynamic behavior}
+
+The W13 schema-evolution runner exercises the conservative fallback path. The
+test set covers old segment readability, mixed deltas across compaction and
+reopen, alias/drop behavior, encoding epoch handling, and new-label
+exact-vs-mixed pruning. Two completed runs report all ten selected
+schema-evolution tests passed. These tests cover the correctness side of the
+design: \sys can use exact metadata where it remains valid and can fall back
+when schema or snapshot uncertainty would make pruning unsafe.
+
+On a 30-minute SF30 mixed read/write run with six checkpoints, the system
+sustains about 163 queries/s with zero writer errors. Tail latency is
+workload-dependent and should not be reported as a universal speedup, but the
+dynamic run in Figure~\ref{fig:w9} shows the same pattern over time. At 1800 seconds,
+schema p99 reaches 8,740.2 us, while semantic p99 is 1,274.0 us. Preserving
+query-semantic state over time can therefore protect the read path under a
+changing LSM layout.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.98\columnwidth]{fig4_dynamic_sf30_p99.pdf}
+  \caption{SF30 dynamic mixed read/write run. The p99 trend is a
+  workload-specific lifecycle measurement: retaining query-semantic state
+  protects the read path over time, but the result is not reported as a
+  universal latency speedup.}
+  \label{fig:w9}
+\end{figure}
+
+\subsection{Baselines under a typed-neighbor gate}
+
+We also ran baselines under the same typed-neighbor gate. A measured external
+system enters the quantitative comparison only if it loads the same LDBC dense
+edge set, runs a fixed-seed sampled typed-neighbor workload, and passes a
+per-query count/hash digest check against the dense edge-list truth.
+Figure~\ref{fig:baselines} includes five measured external systems and one
+internal LSMGraph-style layout row. The internal row is included to complete
+the 3+3 comparison structure, but it is not an official external LSMGraph
+artifact.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.98\textwidth]{fig5_baseline_positioning.pdf}
+  \caption{Scope-limited baseline positioning. Five rows are measured external
+  systems under the digest-gated typed-neighbor workload
+  \cite{livegraph,aster,tugraphpaper,nebula,cypher}; the LSMGraph-style row is
+  an internal SF100 layout row, not an official external LSMGraph artifact.}
+  \label{fig:baselines}
+\end{figure*}
+
+These rows are useful for positioning, but they do not replace the main
+experimental question. \sys studies a storage-control interface: query
+signatures shaping segment metadata and physical rewrite. LiveGraph is the
+closest measured storage baseline for typed-neighbor scans; Aster RocksGraph
+is an LSM-adjacent bridge; Neo4j, TuGraph, and NebulaGraph broaden the
+comparison to property-graph databases and query engines
+\cite{livegraph,aster,cypher,tugraphpaper,nebula}.
+None of these rows should be described as evidence that \sys is a complete
+graph database or a production deployment.
+
+\section{Lessons and Future Work}
+
+Several constraints fall out of the prototype.
+
+\textbf{Exactness comes before pruning.}
+The main risk in semantic pruning is not missing an optimization; it is
+skipping data incorrectly. \sys's \exact/\cons/\unknown state model makes every
+skip a proof obligation.
+
+\textbf{Semantic state needs a budget.}
+In SF100, semantics reduce candidates and read bytes substantially, while full
+semantic materialization creates an import-memory cliff. A
+practical system should treat query signatures as a budgeted control plane
+rather than a request to materialize every possible semantic partition.
+
+\textbf{Compaction must carry semantic evidence forward.}
+C2 is the case where flush-time metadata alone fails. If compaction ignores
+semantics, the benefits of query-semantic flush decay as the LSM tree evolves.
+The system must carry semantic control through the lifecycle.
+
+\textbf{Fallback belongs in the main design.}
+Schema evolution, tombstones, and snapshots are not rare corner cases in
+mutable graph storage. \sys's fallback rule limits the effect of uncertain
+metadata: the system reads more, but it does not lose answers.
+
+\textbf{Baselines must match the interface being tested.}
+Many existing systems are strong baselines for transactions, analytics, CSR
+snapshots, or distributed graph services. Fewer expose the exact property-graph
+typed-neighbor interface and semantic rewrite control that \sys studies. CIDR
+is a natural venue because the contribution is a storage architecture principle
+and a set of systems-building lessons, not only benchmark numbers.
+
+\textbf{Future work.}
+\sys is a prototype, not a production graph database. The experimental evidence
+should not be described as a production deployment, a full graph query engine,
+or a complete replacement for existing dynamic graph stores. The next
+engineering steps are a cleaner production-style scheduler for semantic-aware
+compaction, broader property-predicate summaries, more complete handling of
+schema and property encoding changes, and a stricter clean-checkout artifact
+story for external baselines. These extensions refine the same control-plane
+principle: in mutable graph storage, physical lifecycle policy determines not
+only where bytes are placed, but also whether future queries retain the
+evidence needed to avoid reading them.
+
+\begin{thebibliography}{99}
+
+\bibitem{lsm}
+P. O'Neil, E. Cheng, D. Gawlick, and E. O'Neil.
+\newblock The log-structured merge-tree.
+\newblock \emph{Acta Informatica}, 33(4):351--385, 1996.
+
+\bibitem{rocksdb}
+S. Dong, A. Kryczka, Y. Jin, and M. Stumm.
+\newblock Evolution of development priorities in key-value stores serving
+large-scale applications: The RocksDB experience.
+\newblock In \emph{FAST}, 2021.
+
+\bibitem{ldbc}
+O. Erling et al.
+\newblock The LDBC social network benchmark: Interactive workload.
+\newblock In \emph{SIGMOD}, 2015.
+
+\bibitem{graphquerysurvey}
+R. Angles, M. Arenas, P. Barceló, A. Hogan, J. Reutter, and D. Vrgoč.
+\newblock Foundations of modern query languages for graph databases.
+\newblock \emph{ACM Computing Surveys}, 50(5), Article 68, 2017.
+
+\bibitem{gcore}
+R. Angles, M. Arenas, P. Barceló, P. Boncz, G. H. L. Fletcher, C. Gutierrez,
+T. Lindaaker, M. Paradies, S. Plantikow, J. Sequeda, O. van Rest, and
+H. Voigt.
+\newblock G-CORE: A core for future graph query languages.
+\newblock In \emph{SIGMOD}, 2018.
+
+\bibitem{sqlpgq}
+ISO/IEC.
+\newblock ISO/IEC 9075-16:2023, Information technology -- Database languages
+-- SQL -- Part 16: Property Graph Queries (SQL/PGQ).
+\newblock International Organization for Standardization, 2023.
+
+\bibitem{gql}
+ISO/IEC.
+\newblock ISO/IEC 39075:2024, Information technology -- Database languages --
+GQL.
+\newblock International Organization for Standardization, 2024.
+
+\bibitem{livegraph}
+X. Zhu et al.
+\newblock LiveGraph: A transactional graph storage system with purely
+sequential adjacency list scans.
+\newblock \emph{PVLDB}, 13(7):1020--1034, 2020.
+
+\bibitem{teseo}
+D. De Leo and P. Boncz.
+\newblock Teseo and the analysis of structural dynamic graphs.
+\newblock \emph{PVLDB}, 14(6):1053--1066, 2021.
+
+\bibitem{graphone}
+P. Kumar and H. H. Huang.
+\newblock GraphOne: A data store for real-time analytics on evolving graphs.
+\newblock In \emph{FAST}, 2019.
+
+\bibitem{llama}
+P. Macko et al.
+\newblock LLAMA: Efficient graph analytics using large multiversioned arrays.
+\newblock In \emph{ICDE}, 2015.
+
+\bibitem{aspen}
+L. Dhulipala, J. Shun, and G. E. Blelloch.
+\newblock Low-latency graph streaming using compressed purely-functional trees.
+\newblock In \emph{PLDI}, 2019.
+
+\bibitem{lsmgraph}
+S. Yu et al.
+\newblock LSMGraph: A high-performance dynamic graph storage system with
+multi-level CSR.
+\newblock \emph{Proceedings of the ACM on Management of Data}, 2(6), Article
+243, 2024.
+
+\bibitem{bach}
+J. Huang, Y. Cao, S. Ren, B. Wu, and D. Miao.
+\newblock BACH: Bridging adjacency list and CSR format using LSM-trees for
+HGTAP workloads.
+\newblock \emph{PVLDB}, 18(5):1509--1521, 2025.
+
+\bibitem{tugraphpaper}
+H. Lin, Z. Wang, S. Qi, X. Zhu, C. Hong, W. Chen, and Y. Luo.
+\newblock Building a high-performance graph storage on top of tree-structured
+key-value stores.
+\newblock \emph{Big Data Mining and Analytics}, 7(1), 2024.
+
+\bibitem{aster}
+D. Mo, J. Liu, F. Wang, and S. Luo.
+\newblock Aster: Enhancing LSM-structures for scalable graph database.
+\newblock \emph{CoRR abs/2501.06570}, 2025.
+
+\bibitem{nebula}
+M. Wu, X. Yi, H. Yu, Y. Liu, and Y. Wang.
+\newblock Nebula Graph: An open source distributed graph database.
+\newblock \emph{CoRR abs/2206.07278}, 2022.
+
+\bibitem{cypher}
+N. Francis et al.
+\newblock Cypher: An evolving query language for property graphs.
+\newblock In \emph{SIGMOD}, 2018.
+
+\bibitem{revisitingdgs}
+J. Su et al.
+\newblock Revisiting the design of in-memory dynamic graph storage.
+\newblock Manuscript, 2024.
+
+\bibitem{bullfrog}
+S. Bhattacherjee, G. Liao, M. Hicks, and D. J. Abadi.
+\newblock BullFrog: Online schema evolution via lazy evaluation.
+\newblock In \emph{SIGMOD}, 2021.
+
+\bibitem{tesseract}
+T. Hu, T. Wang, and Q. Zhou.
+\newblock Online schema evolution is (almost) free for snapshot databases.
+\newblock \emph{PVLDB}, 16(2):140--153, 2022.
+
+\bibitem{functionalstorage}
+M. Prammer, X. Zeng, R. Meng, W. McKinney, H. Zhang, A. Pavlo, and J. M. Patel.
+\newblock Towards functional decomposition of storage formats.
+\newblock In \emph{CIDR}, 2025.
+
+\bibitem{columnargraph}
+P. Gupta, A. Mhedhbi, and S. Salihoglu.
+\newblock Columnar storage and list-based processing for graph database
+management systems.
+\newblock \emph{PVLDB}, 14(11):2491--2504, 2021.
+
+\end{thebibliography}
+
+\end{document}
