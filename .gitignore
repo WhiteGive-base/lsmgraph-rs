@@ -1,0 +1,51 @@
+
+# Rust build outputs
+target/
+**/target/
+
+# Local datasets and generated stores
+data/
+store/
+**/store/
+
+# Optional external/vendored dependencies supplied by users
+deps/
+**/deps/
+
+# Logs, traces, and experiment output
+logs/
+remote-logs/
+**/logs/
+**/remote-logs/
+*.log
+*.out
+*.err
+
+# Private or local runtime configuration
+.env
+.env.*
+REMOTE_ACCESS.md
+tmp-ssh-config
+*.pem
+*.key
+*.p12
+*.crt
+*.cer
+
+# Archives and exported documents
+*.tgz
+*.tar.gz
+*.zip
+*.pdf
+
+# Scratch and research-only material
+baseline/
+paper/
+tmp/
+tmp-*/
+remote-*/
+migrated-from-ablation-*/
+
+# Python caches
+__pycache__/
+*.py[cod]
