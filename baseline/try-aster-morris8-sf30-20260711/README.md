@@ -25,3 +25,6 @@ contains the scripts and compact summaries needed to reproduce and audit them.
 For this insertion-only SNB import it is also the missed-result-edge proxy. It
 must not be generalized to update/tombstone workloads without visible-version
 reconciliation.
+
+The concise Chinese result and run-length explanation are in
+[`conclusion-cn.md`](conclusion-cn.md).
