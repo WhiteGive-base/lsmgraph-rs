@@ -24,5 +24,7 @@ Each figure is emitted as PDF, SVG, and PNG from the same Python source:
 - `fig4_dynamic_sf30_p99`: SF30 dynamic mixed read/write tail-latency signal.
 - `fig5_baseline_positioning`: scope-limited artifact context, not a speed ranking.
 
-The English main paper uses PDF. The Chinese reading edition uses PNG and also
-explains the artifact-only figures. SVG is retained for editable/vector checks.
+The English main paper uses PDF. Its one-to-one Chinese translation embeds PNG
+versions of the same three paper figures: control plane, budget/resource, and
+C2 retention. The remaining figures are artifact-only. SVG is retained for
+editable/vector checks.

@@ -84,6 +84,25 @@ one experiment that validates the complete lifecycle. The current property
 support is also deliberately narrow: storage admission summarizes property
 presence, not arbitrary equality, range, or \texttt{WHERE} predicates.
 
+This framing produces three concrete systems questions. First, what semantic
+state can an immutable segment expose without making correctness depend on an
+optional index? Second, where should a finite file budget be spent when the
+schema layout already provides useful label/type pruning? Third, how can a
+rewrite retain that state without turning every compaction into full semantic
+repartitioning? We answer these questions with the following contributions:
+
+\begin{itemize}
+\item We define a storage-admission interface that separates a query's
+semantic signature from MVCC visibility and schema resolution. Its
+\exact/\cons/\unknown contract makes each skipped segment a proof obligation.
+\item We implement a file-budgeted L0 layout. It ranks source-label/edge-type
+groups by configured or observed demand, charges the estimated number of
+degree-exact files, and leaves unselected groups at the schema baseline.
+\item We make semantic-surface retention an explicit compaction objective and
+measure its read/write consequence on controlled inputs and real SF30
+metadata, while reporting the limits of each experiment.
+\end{itemize}
+
 \section{Design}
 
 \begin{figure*}[t]
@@ -120,11 +139,51 @@ edge-type sentinel or mixed degree classes. It admits every relevant query on
 that dimension. These rules separate correctness from optimization: coarse
 evidence causes extra reads, not false negatives.
 
+The physical unit remains a CSR segment rather than one logical edge group.
+Its header records level, source range, sort key, direction, label/type
+partition, degree state, timestamp bounds, schema epoch, property-presence
+bitmap, tombstone flag, and summary completeness. The body contains an offset
+array followed by edge records and optional property sections. Many source
+vertices can therefore share one exact \texttt{(Person, KNOWS, Low)} segment,
+and the same tuple can span several files after repeated flushes or a 64~MiB
+range split. Exactness describes the values represented by each physical
+file; it does not imply one file per tuple or one source per file.
+
+For query signature $q$ and segment summary $m$, let $O_d(q,m)$ mean that the
+query and summary may overlap on semantic dimension $d$. Read admission is:
+
+\begin{equation}
+\mathrm{admit}(q,m)=
+\begin{cases}
+\textsc{skip}, & \exists d:\neg O_d(q,m)\text{ is safely proven},\\
+\textsc{read}, & \text{otherwise}.
+\end{cases}
+\label{eq:admit}
+\end{equation}
+
+The proof can come from an exact set or from a conservative superset that is
+still disjoint. Unknown evidence makes $O_d$ true by default. Mixed values do
+the same on their own dimension, but do not erase evidence on another
+dimension: a segment with exact \texttt{Person/KNOWS} and mixed degree can
+still reject a \texttt{Forum/HAS\_MEMBER} query. Source ranges and record-time
+bounds are applied under the same rule. Direction \textsc{Both}/\textsc{Unknown}
+and a missing query constraint are possible overlap, never a skip certificate.
+
 The property bitmap has two classes: the property must be present, or its
 absence/default is accepted. Proven absence can prune only a segment without
 tombstones. Tombstone sensitivity forces a read. Property-value equality has a
 separate prototype path and does not extend the signature; general value
 predicates remain future work.
+
+Snapshot visibility is deliberately evaluated after admission. A segment that
+may contain the requested topology is read, and record versions are then
+merged at the API's snapshot. Likewise, the catalog resolves an edge/property
+identifier under the segment's stored epoch before its evidence is trusted.
+If an old encoding or alias can be mapped exactly, the remaining summary may
+still prune; if resolution is uncertain, that dimension falls back to read.
+This ordering prevents a record timestamp bound from being mistaken for an
+MVCC snapshot and prevents a current schema name from being applied blindly to
+an older segment.
 
 \subsection{Budgeted L0 layout}
 
@@ -149,11 +208,19 @@ range's query count and $a_r$ is its average candidate-segment pressure. The
 configured weights are 4.0 for the nine core LDBC edge types,
 2.0 for their reverse types, and 0.5 otherwise. Invalid or absent feedback is
 zero; feedback is capped before taking the maximum. Candidates are sorted by
-$s_g$. With file budget $B$, a candidate is selected only if
+$s_g$; ties prefer more edges and then stable label/type order. With file budget $B$, a candidate is selected only if
 $\mathrm{used}+c_g\le B$; selection increments $\mathrm{used}$ by $c_g$.
 The W6 budget-64 row sets the byte gate to zero and $B=64$. Therefore, 64 is
 the maximum number of \emph{charged additional degree-exact L0 files}, not the
 total L0 file count and not 64 files per flush.
+
+The accounting is persistent in meaning even though selection runs at flush.
+On reopen, \texttt{used} is reconstructed by counting only L0 files with a
+real edge type and an exact non-mixed degree class. Schema-style files with a
+real edge type but mixed degree cost zero. This mirrors the admission policy:
+the budget pays only for precision beyond schema, so restarting cannot charge
+thousands of pre-existing schema files against $B=64$ and permanently exhaust
+the controller.
 
 For a selected candidate, each source is classified by its local neighbor
 count: Low is 1--16, Medium is 17--1024, and High is above 1024. Degree classes
@@ -164,6 +231,24 @@ schema layout's label/edge-type pruning and gives up only the extra degree
 split. This detail is why budgeted control is a bounded interpolation rather
 than an all-or-nothing semantic layout.
 
+The second gate prevents a selected group from creating a nearly empty file
+for every observed class. For class $k$, with bytes $b_k$, source count $n_k$,
+total sources $n$, minimum exact bytes $M$, configured degree weight $w_d$,
+and class weight $\alpha_k\in\{1,1.25,2\}$ for Low/Medium/High, the implemented
+benefit score is
+
+\begin{equation}
+h_k=\frac{b_k}{\max(M,1)}\rho_k\alpha_k w_d,\qquad
+\rho_k=\begin{cases}(n-n_k)/n,&n>n_k,\\1,&n=n_k.\end{cases}
+\label{eq:degree-gate}
+\end{equation}
+
+The implementation treats the competing-query fraction as one when all
+sources occupy the class, and keeps class $k$ exact only when $h_k$ reaches the
+configured threshold. Otherwise its sources join the group's Mixed partition.
+Thus the group score decides where the file budget may be spent, while the
+degree score decides whether each finer split has enough local benefit.
+
 \subsection{Semantic retention}
 
 Flush publishes segment metadata into the manifest and updates the degree
@@ -173,7 +258,34 @@ a naive merge may collapse keys to mixed sentinels. Unsafe reconstruction
 demotes the output rather than trusting it. The design does not require every
 stage to remain exact; it requires every skip to remain justified.
 
+The resulting lifecycle has four explicit transitions. (1) Flush constructs
+the initial label/type groups, applies the budget and degree gates, and writes
+metadata beside immutable CSR bodies. (2) Open/reopen rebuilds the in-memory
+admission index from the manifest and schema catalog instead of inferring
+precision from file names. (3) Reads consume evidence and update pressure
+counters keyed by label, edge type, and source range. (4) Compaction either
+preserves exact grouping, reconstructs it from decoded records, or publishes a
+Mixed/Unknown output. A crash before manifest publication leaves the previous
+version authoritative; a successfully published coarse output remains
+correct, but admits more future reads.
+
+Two feedback decisions should not be conflated. Equation~\ref{eq:budget}
+chooses which flush groups receive degree precision under the global file
+budget. A separate optional L0 compaction controller ranks an observed source
+range by query count, candidate pressure, offset-cache miss rate, and estimated
+rewrite MiB. It chooses a physical rewrite target, not a new signature field.
+W7 tests whether this second priority follows a hot range after a workload
+shift; C2 tests whether the chosen rewrite retains the semantic surface.
+
 \section{Evaluation}
+
+The evaluation asks four scoped questions. \emph{RQ1:} Does semantic evidence
+reduce segment admission, and which metric is trustworthy? \emph{RQ2:} Does a
+file budget avoid the resource cliff of full materialization while preserving
+the schema baseline? \emph{RQ3:} What read/write tradeoff results when
+compaction retains exact partitions? \emph{RQ4:} Do feedback movement and
+schema/snapshot fallback behave as designed? No single run answers all four;
+we map each claim to the stage that actually executes it.
 
 \subsection{Setup and variants}
 
@@ -187,6 +299,14 @@ no explicit warmup, and no OS page-cache drop. Percentiles are means of
 per-edge-type percentiles across repeats, not global operation percentiles.
 All compared W6 rows passed count/hash checks against the same snapshot with
 zero mismatches.
+
+The nine IDs correspond to the LDBC relationships Knows, HasCreator, HasTag,
+LikesComment, LikesPost, ReplyOfComment, ReplyOfPost, ContainerOf, and
+HasMember. Candidate L0 counts every L0 file admitted before body
+filtering, including repeated admissions across operations. Import RSS is the
+peak resident set of the loader process; store size is allocated on-disk bytes
+after import; L0 files come from the manifest. Latency includes admission and
+body processing inside the typed-neighbor driver but excludes data import.
 
 \begin{table*}[t]
 \centering
@@ -236,6 +356,17 @@ arrays after metadata-cache misses, and SF100 standard deviations are large.
 Panel (b) likewise does not establish a stable budget-64 latency win over
 schema; their one-standard-deviation gate is \textsc{fallback}.
 
+Panel (a)'s ``normalized cost (naive=1, log)'' is
+$x_v/x_{naive}$ for each metric $x$ and variant $v$, displayed on a logarithmic
+axis so the candidate, byte, and file ratios remain visible together. It is
+not a weighted composite score. Schema cuts candidate admission to 12.0\% of
+naive; budget-64 is 12.2\%. Full semantic admits 7.78M candidates because
+finer files improve some dimensions while increasing the number of files that
+can overlap a source range. Oracle's exact in-memory L0 index admits only
+0.53M candidates, but it is an upper-bound reference built after import, not a
+durable layout with comparable construction cost. These rows show why file
+count and metadata precision must be interpreted jointly.
+
 The main budget result is the resource bound. Table~\ref{tab:variants} shows
 that at SF10 budget-64 stays at 13.3~GiB and 2.26~GiB RSS, while full semantic
 grows to 14.6~GiB and 8.38~GiB RSS. At SF100, full semantic reaches
@@ -245,6 +376,16 @@ real-SF30-derived W7 workload shift, feedback-only control selected a hot
 partition in both phases and moved the selected range after the hot range
 changed. This is derived workload evidence, not a production trace, but it
 tests the mechanism that static schema lacks.
+
+Budget-64 should therefore not be presented as a universal replacement for
+schema. On this read matrix its candidate count is slightly higher and its
+latency confidence gate does not separate the two. Its additional value is a
+hard accounting boundary around degree precision and an input for workload
+adaptation. Full semantic demonstrates the opposite endpoint: more metadata
+can reduce selected read bytes on this workload, yet its file and import-memory
+cost becomes unacceptable at SF100. The meaningful comparison is the
+resource/performance envelope, not a claim that one b64 point dominates every
+static layout.
 
 \subsection{Compaction retention}
 
@@ -267,6 +408,30 @@ output and retention 0, producing 4x/6x full-read amplification. Semantic merge
 keeps retention 1 and read cost 1x, with write amplification 1.87/1.85 versus
 1.22/1.14 for naive.
 
+More formally, for the logical edge multiset $D$ covered by a merge, let
+$E(M)$ be edges residing in topology-exact segments under metadata state $M$.
+The three reported quantities are
+
+\begin{equation}
+\mathrm{ret}=\frac{|E(M_{after})|/|D|}{|E(M_{before})|/|D|},\quad
+\mathrm{WA}=\frac{\mathrm{output\ bytes}}{\mathrm{logical\ update\ bytes}},
+\label{eq:c2}
+\end{equation}
+
+and the read-consequence proxy is aggregate bytes admitted by post-merge
+metadata divided by bytes in each queried exact partition before merge. The
+denominator is the body that an ideal retained partition would expose, not the
+whole database. ``Post-merge metadata'' means that each source-label/edge-type
+signature is tested against output headers with the same admission contract as
+Equation~\ref{eq:admit}. It does not mean the output bodies were decoded.
+
+Synthetic data is appropriate for the first two rows because it controls the
+number and size of exact partitions while keeping logical contents fixed. A
+naive output must then admit all four or six equal partitions, making the
+4x/6x consequence directly attributable to merge policy rather than LDBC
+skew. The real SF30 row supplies external validity using the partitions that
+the loader and manifest actually produced.
+
 The real SF30 run processes all 1.09 billion directed edges. Draining L0
 produces the 40 observed source-label/edge-type groups and 528 exact L1
 segments; 40 is therefore data-derived, not an arbitrary query count. Naive
@@ -279,15 +444,39 @@ performs no body decode and supports no SF30 latency claim.
 \subsection{Lifecycle coverage and correctness}
 
 The evidence is decomposed by stage. W6 measures flush layout, admission, and
-resources. C2 isolates compaction retention and rewrite cost. W9 runs 30
-minutes of mixed reads/writes over SF30 starting stores and records six
-checkpoints, but rewrite bytes are zero for all variants. It is evidence for
-continued flush and L0 accumulation, not concurrent compaction. W13 is a
-bounded ten-test suite covering stored schema epochs, fixed-width encoding
-changes, alias/drop handling, snapshot and tombstone visibility, reopen, and
-exact-versus-mixed fallback. All ten tests pass. These stages support a
-lifecycle-oriented design without pretending that one run exercised the full
-lifecycle end to end.
+resources; C2 isolates compaction retention and rewrite cost. W7 uses a store
+derived from real SF30 CSV, with two phases of eight flushes, 64 hot sources,
+and eight queries per source. Feedback-only and static-budgeted policies both
+compact the hot range after the first flush of each phase; feedback-only moves
+to the new range in phase B, whereas no-feedback performs no hot compaction.
+For the last flush, candidate segments per query fall from 2 to 0 and body
+reads from 3 to 1 after the selected compaction. This is a controlled
+workload-shift mechanism test, not a full SF30 production trace and not evidence
+that the flush budget alone predicts future demand.
+
+W9 runs 30 minutes of mixed reads/writes over SF30 starting stores and records
+six checkpoints. At the last checkpoint, the measured p99 is 8,740.2~$\mu$s
+for schema and 1,274.0~$\mu$s for semantic, with about 163 queries/s and zero
+writer errors. However, rewrite bytes are zero for every variant. The trend is
+therefore evidence for continued flush, L0 accumulation, and preservation of
+the starting layout; it does not execute concurrent semantic compaction and
+cannot validate the complete lifecycle.
+
+W13 is a bounded ten-test suite. It checks mixed schema epochs across
+compaction/reopen, property deltas at snapshots, old-segment readability,
+catalog persistence, reporting boundaries, fixed-width property encoding
+changes, edge-label aliases, row encoding epochs, dropped-property behavior,
+and exact-versus-mixed pruning after a new edge label. All ten tests pass.
+These are implementation correctness tests, not a general online schema
+migration benchmark. Together, the stages support a lifecycle-oriented design
+without pretending that one run exercised the lifecycle end to end.
+
+The measured/proxy boundary is consequently explicit. W6, W7, W9, and W13
+execute their respective prototype paths; controlled C2 executes merge and
+read consequences; real-SF30 C2 executes merge but replays only metadata for
+the read consequence. SF100 read bytes are measured yet secondary because of
+known reader over-read. Every principal number in the paper comes from a
+completed artifact, but completion does not make scopes interchangeable.
 
 \section{Related Work}
 
@@ -296,6 +485,12 @@ structures \cite{livegraph,teseo}. GraphOne and a recent DGS study examine
 mutable graph representations and their tradeoffs \cite{graphone,revisitingdgs}.
 LSMGraph combines dynamic updates with multi-level CSR \cite{lsmgraph}; \sys
 focuses on semantic evidence used by both read admission and physical rewrite.
+These systems establish that update path, versioning, and adjacency layout
+matter for evolving graphs. They do not make the same claim that a
+property-graph access signature should be persisted as a proof object and
+retained across LSM rewrites. Our external artifact runs several systems only
+through a common typed-neighbor correctness gate; differing loaders, APIs, and
+operation counts prevent an end-to-end speed ranking.
 
 BACH already uses workload and degree distribution to tune LSM-based graph
 format and merge choices \cite{bach}. ArceKV adapts generic LSM compaction to
@@ -307,6 +502,16 @@ decomposition motivates separating access needs from a fixed format
 \cite{functionalstorage}. Graph-oriented columnar layouts make a related case
 for graph-specific physical organization \cite{columnargraph}.
 
+Traditional LSM filters and range metadata also reject irrelevant files, but
+their evidence is normally expressed over keys or membership. SemL0's
+dimensions include graph labels, typed relationships, direction, local degree
+bounds, and property presence, and their interpretation can depend on a schema
+catalog. The novelty is not that summaries can prune; it is that summary
+completeness is part of the storage contract, budget selection starts from a
+schema-aware baseline, and compaction is measured by whether it retains the
+future proof surface. This positioning is narrower than a new graph query
+engine and broader than an L0-only filter.
+
 \section{Limitations and Conclusion}
 
 \sys is a prototype, not a complete property-query engine or production graph
@@ -315,6 +520,23 @@ bytes carry a reader-over-read caveat, SF100 latency does not pass the
 budget-64/schema separation gate, W7 is real-data-derived rather than a trace,
 and SF30 C2 read consequence is a metadata proxy. Schema/snapshot evidence is a
 bounded correctness suite, not general online migration.
+
+The current budget also optimizes an estimated file unit, not CPU time,
+long-term write amplification, or a multi-tenant objective. Its weights are
+configured constants plus local feedback, and Low/Medium/High thresholds are
+fixed rather than learned. A production controller would need decay, admission
+hysteresis, background-I/O limits, and coordination between flush precision
+and level compaction. Rich property predicates would additionally require
+value summaries whose exactness survives encoding changes. These extensions
+fit the same proof rule but are not evaluated here.
+
+The design applies most directly to selective typed-neighbor workloads over
+immutable graph segments. A scan that requests every edge type gains little
+from semantic partitioning; a workload dominated by high-degree hubs may pay
+more file and merge cost; and a store whose schema already creates one physical
+relation per edge type may need only the retention contract. Budgeted control
+is useful precisely when workload selectivity and materialization cost are
+both non-uniform.
 
 Within those boundaries, the result is consistent: graph query semantics can
 be persistent storage evidence; every skip must follow an exactness contract;

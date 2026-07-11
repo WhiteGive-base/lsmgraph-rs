@@ -33,5 +33,6 @@ the standalone generators in a fixed order. LaTeX consumes PDF, while the
 Chinese reading edition embeds PNG.
 
 The detailed evidence-lifecycle, dynamic SF30, and baseline-positioning figures
-are artifact/reading-edition material. The six-page English paper keeps the
-merged control-plane, budget/resource, and C2 figures.
+are artifact-only material. The six-page English paper and its one-to-one
+Chinese translation both keep the merged control-plane, budget/resource, and
+C2 figures.

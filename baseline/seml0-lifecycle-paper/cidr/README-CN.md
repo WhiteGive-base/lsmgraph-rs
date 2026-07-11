@@ -1,17 +1,17 @@
 # SemL0 CIDR 材料包
 
 生成日期：2026-06-27
-更新日期：2026-06-30
+更新日期：2026-07-11
 
 本目录用于把 SemL0 从 SIGMOD/research-track 写法调整为 CIDR 写法：强调系统设计原则、原型实现经验、资源化实验和边界，而不是强行写成完整图数据库 SOTA 竞赛。
 
 ## 先读哪些文件
 
-1. `en/seml0-cidr-draft.md`
-   英文主稿草案。主题是 **Query Signatures as a Storage Control Plane for Dynamic Property Graphs**。
+1. `tex/seml0-cidr-main-20260630.tex` 和同名 PDF
+   CIDR canonical 英文主稿。PDF 使用官方 class 编译为六页。
 
 2. `cn/seml0-cidr-reading-cn.md`
-   中文阅读版，给自己和导师快速看故事、贡献、证据和边界。
+   英文 canonical 主稿的中文翻译版。章节、公式、图表、实验数字、结论边界和参考文献一一对应，不包含英文主稿之外的扩展教程内容。
 
 3. `external-baseline-status-20260627-cn.md`
    最新外部 baseline 状态页。当前可进数值表的是 LiveGraph、Aster RocksGraph、Neo4j Community、TuGraph、NebulaGraph；LSMGraph-style 是内部 layout row。
