@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use lsmgraph::base_graph::{build_from_snb, BuildConfig, IoConfig};
-use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig};
+use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig, SemanticDegreeEstimator};
 use lsmgraph::csr::CsrPropertyValuePredicate;
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
@@ -85,6 +85,10 @@ enum Command {
         semantic_budget_min_benefit_score: f64,
         #[arg(long, default_value_t = 1.0)]
         semantic_budget_degree_weight: f64,
+        #[arg(long, default_value = "exact")]
+        semantic_degree_estimator: SemanticDegreeEstimator,
+        #[arg(long, default_value_t = 0xa57e_2026_0711_0001)]
+        semantic_degree_estimator_seed: u64,
         #[arg(long, default_value_t = false)]
         semantic_budget_feedback_only: bool,
         #[arg(long, default_value_t = false)]
@@ -372,6 +376,10 @@ enum Command {
         dst_label: Option<i32>,
         #[arg(long, default_value_t = false)]
         semantic_degree_hint: bool,
+        #[arg(long, default_value = "exact")]
+        semantic_degree_estimator: SemanticDegreeEstimator,
+        #[arg(long, default_value_t = 0xa57e_2026_0711_0001)]
+        semantic_degree_estimator_seed: u64,
         #[arg(long, default_value_t = false)]
         force_signature: bool,
         /// Emit a deterministic per-sample result digest (stable hash over the sorted visible
@@ -502,9 +510,7 @@ struct ImportManyLayoutStore {
 
 fn parse_import_many_layout_store(raw: &str) -> Result<ImportManyLayoutStore> {
     let Some((layout_raw, data_dir_raw)) = raw.split_once(':') else {
-        anyhow::bail!(
-            "invalid --layout-store {raw:?}; expected layout:/absolute/store/path"
-        );
+        anyhow::bail!("invalid --layout-store {raw:?}; expected layout:/absolute/store/path");
     };
     if data_dir_raw.is_empty() {
         anyhow::bail!("invalid --layout-store {raw:?}; empty store path");
@@ -543,6 +549,8 @@ async fn main() -> Result<()> {
             semantic_budget_min_exact_bytes,
             semantic_budget_min_benefit_score,
             semantic_budget_degree_weight,
+            semantic_degree_estimator,
+            semantic_degree_estimator_seed,
             semantic_budget_feedback_only,
             semantic_budget_disable_feedback,
         } => {
@@ -577,6 +585,8 @@ async fn main() -> Result<()> {
                 .with_semantic_budget_min_exact_bytes(semantic_budget_min_exact_bytes)
                 .with_semantic_budget_min_benefit_score(semantic_budget_min_benefit_score)
                 .with_semantic_budget_degree_weight(semantic_budget_degree_weight)
+                .with_semantic_degree_estimator(semantic_degree_estimator)
+                .with_semantic_degree_estimator_seed(semantic_degree_estimator_seed)
                 .with_semantic_budget_feedback_only(semantic_budget_feedback_only)
                 .with_semantic_budget_disable_feedback(semantic_budget_disable_feedback);
             let engine = Engine::create(config).await?;
@@ -613,10 +623,13 @@ async fn main() -> Result<()> {
                 sidecar_start.elapsed().as_secs_f64()
             );
             println!(
-                "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{}}}",
-                stats.input_rows,
-                stats.directed_edges,
-                engine.current_snapshot()
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "input_rows": stats.input_rows,
+                    "directed_edges": stats.directed_edges,
+                    "snapshot": engine.current_snapshot(),
+                    "semantic_degree_estimator_stats": engine.semantic_degree_estimator_stats_json(),
+                }))?
             );
         }
         Command::ImportMany {
@@ -688,9 +701,15 @@ async fn main() -> Result<()> {
                 sidecar_start.elapsed().as_secs_f64()
             );
             for (idx, engine) in engines.iter().enumerate() {
-                eprintln!("[import-many] persist semantic sidecars engine_index={} start", idx);
+                eprintln!(
+                    "[import-many] persist semantic sidecars engine_index={} start",
+                    idx
+                );
                 engine.persist_semantic_sidecars()?;
-                eprintln!("[import-many] persist semantic sidecars engine_index={} complete", idx);
+                eprintln!(
+                    "[import-many] persist semantic sidecars engine_index={} complete",
+                    idx
+                );
             }
             eprintln!(
                 "[import-many] persist semantic sidecars complete elapsed_s={:.1}",
@@ -803,6 +822,7 @@ async fn main() -> Result<()> {
                     "snapshot": engine.current_snapshot(),
                     "levels": levels,
                     "metrics": metrics.snapshot_json(),
+                    "semantic_degree_estimator_stats": engine.semantic_degree_estimator_stats_json(),
                 }))?
             );
         }
@@ -1237,6 +1257,8 @@ async fn main() -> Result<()> {
             src_label,
             dst_label,
             semantic_degree_hint,
+            semantic_degree_estimator,
+            semantic_degree_estimator_seed,
             force_signature,
             emit_result_digests,
             sample_plan_degree_hint,
@@ -1258,7 +1280,9 @@ async fn main() -> Result<()> {
             let repeats = repeats.max(1);
             let mut config = LsmGraphConfig::new(&data_dir)
                 .with_io_backend(io_backend)
-                .with_metadata_cache_entries(csr_metadata_cache_entries);
+                .with_metadata_cache_entries(csr_metadata_cache_entries)
+                .with_semantic_degree_estimator(semantic_degree_estimator)
+                .with_semantic_degree_estimator_seed(semantic_degree_estimator_seed);
             if let Some(l0_layout) = l0_layout {
                 config.l0_layout = l0_layout;
             }
@@ -1477,6 +1501,9 @@ async fn main() -> Result<()> {
                     "src_label": src_label,
                     "dst_label": dst_label,
                     "semantic_degree_hint": semantic_degree_hint,
+                    "semantic_degree_estimator": format!("{:?}", semantic_degree_estimator),
+                    "semantic_degree_estimator_seed": semantic_degree_estimator_seed,
+                    "semantic_degree_estimator_stats": engine.semantic_degree_estimator_stats_json(),
                     "force_signature": effective_force_signature,
                     "emit_result_digests": emit_result_digests,
                     "sample_plan_degree_hint": sample_plan_degree_hint,
@@ -2356,11 +2383,20 @@ mod tests {
 
     #[test]
     fn result_digest_detects_edge_set_changes() {
-        let mut base = vec![EdgeRecord::insert(1, 10, 1, 2), EdgeRecord::insert(1, 20, 1, 3)];
+        let mut base = vec![
+            EdgeRecord::insert(1, 10, 1, 2),
+            EdgeRecord::insert(1, 20, 1, 3),
+        ];
         let mut extra = base.clone();
         extra.push(EdgeRecord::insert(1, 30, 1, 4));
-        let mut dst_changed = vec![EdgeRecord::insert(1, 11, 1, 2), EdgeRecord::insert(1, 20, 1, 3)];
-        let mut marker_changed = vec![EdgeRecord::delete(1, 10, 1, 2), EdgeRecord::insert(1, 20, 1, 3)];
+        let mut dst_changed = vec![
+            EdgeRecord::insert(1, 11, 1, 2),
+            EdgeRecord::insert(1, 20, 1, 3),
+        ];
+        let mut marker_changed = vec![
+            EdgeRecord::delete(1, 10, 1, 2),
+            EdgeRecord::insert(1, 20, 1, 3),
+        ];
         let baseline = storage_bench_result_digest(&mut base);
         assert_ne!(baseline, storage_bench_result_digest(&mut extra));
         assert_ne!(baseline, storage_bench_result_digest(&mut dst_changed));
@@ -2372,7 +2408,10 @@ mod tests {
 
     #[test]
     fn entry_digest_folds_per_sample_digests() {
-        let samples = vec![(1u64, 0xaaaa_aaaa_aaaa_aaaau64), (2u64, 0xbbbb_bbbb_bbbb_bbbbu64)];
+        let samples = vec![
+            (1u64, 0xaaaa_aaaa_aaaa_aaaau64),
+            (2u64, 0xbbbb_bbbb_bbbb_bbbbu64),
+        ];
         let folded = storage_bench_entry_digest(&samples);
         // Stable and sensitive to per-sample order (each src is keyed in).
         assert_eq!(folded, storage_bench_entry_digest(&samples));

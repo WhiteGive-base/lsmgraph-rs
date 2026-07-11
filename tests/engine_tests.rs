@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig};
+use lsmgraph::config::{
+    IoBackendKind, L0LayoutPolicy, LsmGraphConfig, SemanticDegreeEstimator,
+};
 use lsmgraph::csr::{
     CsrPropertyValuePredicate, CsrWriter, EdgePropertyValue, EdgeRecordWithProperties, Manifest,
     ManifestRecord,
@@ -1256,6 +1258,59 @@ async fn budgeted_semantic_l0_keeps_edge_type_for_unselected_small_partitions() 
         .get_neighbors_typed(src, 4, engine.current_snapshot())
         .await?;
     assert_eq!(merged_neighbors.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn morris8_budget_admission_persists_exact_degree_metadata() -> anyhow::Result<()> {
+    let tmp = target_tempdir("morris8-budget-admission-exact-metadata-")?;
+    let config = LsmGraphConfig::new(tmp.path())
+        .with_memgraph_capacity(64 * 1024 * 1024)
+        .with_l0_layout(L0LayoutPolicy::SemanticBudgeted)
+        .with_semantic_budget_min_edge_type_bytes(0)
+        .with_semantic_budget_min_edge_type_score(0.0)
+        .with_semantic_budget_min_exact_bytes(0)
+        .with_semantic_budget_min_benefit_score(0.0)
+        .with_semantic_degree_estimator(SemanticDegreeEstimator::Morris8);
+    let engine = Engine::create(config).await?;
+    let src = encoded(VertexLabel::Person, 650);
+    for local in 0..17 {
+        engine
+            .insert_edge(
+                src,
+                encoded(VertexLabel::Person, 10_000 + local),
+                EdgeLabel::Knows.as_i32(),
+            )
+            .await?;
+    }
+    engine.flush_active().await?;
+
+    let guard = engine.version_guard();
+    let meta = guard.version().levels[0]
+        .iter()
+        .find(|meta| {
+            meta.edge_type_partition == EdgeLabel::Knows.as_i32()
+                && meta.min_src == src
+                && meta.max_src == src
+        })
+        .expect("Morris-admitted partition should exist");
+    assert_eq!(meta.degree_class, DegreeClass::Medium);
+    assert!(meta.degree_class_exact);
+    drop(guard);
+
+    let signature = GraphAccessSignature::neighbor_scan(src, Some(EdgeLabel::Knows.as_i32()))
+        .with_degree_class(DegreeClass::Medium);
+    let neighbors = engine
+        .get_neighbors_by_signature(signature, engine.current_snapshot())
+        .await?;
+    assert_eq!(neighbors.len(), 17);
+    let stats = engine.semantic_degree_estimator_stats_json();
+    assert_eq!(stats["mode"], "morris8");
+    assert!(stats["estimation"]["tested_sources"]
+        .as_u64()
+        .unwrap_or_default()
+        > 0);
+    assert_eq!(stats["query_shadow"]["safe_false_skip_rate"], 0.0);
     Ok(())
 }
 

@@ -26,6 +26,24 @@ impl FromStr for IoBackendKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticDegreeEstimator {
+    Exact,
+    Morris8,
+}
+
+impl FromStr for SemanticDegreeEstimator {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "exact" | "run-length" | "run_length" => Ok(Self::Exact),
+            "morris8" | "morris-8" | "aster-morris8" | "aster_morris8" => Ok(Self::Morris8),
+            _ => anyhow::bail!("unknown semantic degree estimator: {s}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L0LayoutPolicy {
     Naive,
     Schema,
@@ -110,6 +128,8 @@ pub struct LsmGraphConfig {
     pub semantic_budget_min_exact_bytes: usize,
     pub semantic_budget_min_benefit_score: f64,
     pub semantic_budget_degree_weight: f64,
+    pub semantic_degree_estimator: SemanticDegreeEstimator,
+    pub semantic_degree_estimator_seed: u64,
     pub semantic_budget_feedback_only: bool,
     pub semantic_budget_disable_feedback: bool,
     pub l0_ra_range_bucket_size: u64,
@@ -150,6 +170,8 @@ impl LsmGraphConfig {
             semantic_budget_min_exact_bytes: 4 * 1024 * 1024,
             semantic_budget_min_benefit_score: 1.0,
             semantic_budget_degree_weight: 1.0,
+            semantic_degree_estimator: SemanticDegreeEstimator::Exact,
+            semantic_degree_estimator_seed: 0xa57e_2026_0711_0001,
             semantic_budget_feedback_only: false,
             semantic_budget_disable_feedback: false,
             l0_ra_range_bucket_size: 1 << 20,
@@ -250,6 +272,16 @@ impl LsmGraphConfig {
 
     pub fn with_semantic_budget_degree_weight(mut self, weight: f64) -> Self {
         self.semantic_budget_degree_weight = weight;
+        self
+    }
+
+    pub fn with_semantic_degree_estimator(mut self, estimator: SemanticDegreeEstimator) -> Self {
+        self.semantic_degree_estimator = estimator;
+        self
+    }
+
+    pub fn with_semantic_degree_estimator_seed(mut self, seed: u64) -> Self {
+        self.semantic_degree_estimator_seed = seed;
         self
     }
 

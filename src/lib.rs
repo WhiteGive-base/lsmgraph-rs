@@ -11,6 +11,7 @@ pub mod levels;
 pub mod loader;
 pub mod memgraph;
 pub mod metrics;
+mod morris8;
 pub mod property_encoding;
 pub mod schema;
 pub mod semantic;
@@ -18,7 +19,7 @@ pub mod snb;
 pub mod types;
 pub mod version;
 
-pub use config::{L0LayoutPolicy, LsmGraphConfig};
+pub use config::{L0LayoutPolicy, LsmGraphConfig, SemanticDegreeEstimator};
 pub use delta::DeltaGraph;
 pub use dynamic_view::DynamicGraphView;
 pub use graph::{

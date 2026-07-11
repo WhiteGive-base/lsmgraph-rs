@@ -11,7 +11,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
-use crate::config::{L0LayoutPolicy, LsmGraphConfig};
+use crate::config::{L0LayoutPolicy, LsmGraphConfig, SemanticDegreeEstimator};
 use crate::csr::format::property_presence_bit;
 use crate::csr::{
     CsrEdgeRecordWithProperties, CsrMetadataCache, CsrPropertyValuePredicate, CsrReader,
@@ -24,6 +24,7 @@ use crate::io::AnyIoBackend;
 use crate::levels::{split_levels, L0, L1};
 use crate::memgraph::MemGraph;
 use crate::metrics::{L0PartitionKey, L0PartitionProbe, L0PartitionSnapshot, Metrics};
+use crate::morris8::{Morris8, Morris8RunStats};
 use crate::property_encoding::{
     encode_with_encoding, parse_default_or_null_rule, PropertyEncodingRegistry,
     PropertyPhysicalEncoding, PropertyValue,
@@ -37,12 +38,295 @@ use crate::types::{
     VertexId, MIXED_EDGE_TYPE, UNKNOWN_SOURCE_LABEL,
 };
 use crate::version::{Version, VersionGuard, VersionManager};
+use serde_json::{json, Value};
 
 struct EngineState {
     active: Arc<MemGraph>,
     next_file_id: FileId,
     flush_tasks: Vec<JoinHandle<Result<()>>>,
     semantic_budget_used_extra_l0_files: usize,
+}
+
+const MORRIS8_ERROR_BUCKET_UPPER_BP: [u64; 9] =
+    [0, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, u64::MAX];
+const MORRIS8_BOUNDARY_WINDOW_LABELS: [&str; 2] = ["low_medium_14_18", "medium_high_922_1126"];
+const MORRIS8_BOUNDARY_POINT_LABELS: [&str; 6] = [
+    "degree_15",
+    "degree_16",
+    "degree_17",
+    "degree_1023",
+    "degree_1024",
+    "degree_1025",
+];
+
+#[derive(Debug, Clone, Default)]
+struct BoundaryCounters {
+    tested: u64,
+    misclassified: u64,
+    overestimated: u64,
+    underestimated: u64,
+}
+
+impl BoundaryCounters {
+    fn record(&mut self, exact_rank: usize, estimated_rank: usize) {
+        self.tested += 1;
+        if exact_rank != estimated_rank {
+            self.misclassified += 1;
+        }
+        if estimated_rank > exact_rank {
+            self.overestimated += 1;
+        } else if estimated_rank < exact_rank {
+            self.underestimated += 1;
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.tested += other.tested;
+        self.misclassified += other.misclassified;
+        self.overestimated += other.overestimated;
+        self.underestimated += other.underestimated;
+    }
+
+    fn snapshot(&self, label: &str) -> Value {
+        json!({
+            "label": label,
+            "tested_sources": self.tested,
+            "misclassified_sources": self.misclassified,
+            "overestimated_sources": self.overestimated,
+            "underestimated_sources": self.underestimated,
+            "misclass_rate": ratio(self.misclassified, self.tested),
+            "overestimate_rate": ratio(self.overestimated, self.tested),
+            "underestimate_rate": ratio(self.underestimated, self.tested),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DegreeEstimatorStats {
+    update: Morris8RunStats,
+    tested_sources: u64,
+    tested_edges: u64,
+    misclassified_sources: u64,
+    overestimated_sources: u64,
+    underestimated_sources: u64,
+    confusion: [u64; 9],
+    relative_error_histogram: [u64; 9],
+    max_relative_error_bp: u64,
+    peak_live_estimates: u64,
+    boundary_windows: [BoundaryCounters; 2],
+    boundary_points: [BoundaryCounters; 6],
+    exact_keep_sources: u64,
+    exact_keep_bytes: u64,
+    morris_keep_sources: u64,
+    morris_keep_bytes: u64,
+    exact_keep_morris_skip_sources: u64,
+    exact_keep_morris_skip_bytes: u64,
+    exact_skip_morris_keep_sources: u64,
+    exact_skip_morris_keep_bytes: u64,
+    active_mixed_sources: u64,
+    active_mixed_bytes: u64,
+    audited_queries: u64,
+    queries_with_raw_false_skip: u64,
+    raw_required_segments: u64,
+    raw_false_skipped_segments: u64,
+    raw_required_edge_records: u64,
+    raw_false_skipped_edge_records: u64,
+}
+
+impl DegreeEstimatorStats {
+    fn record_source(
+        &mut self,
+        exact_degree: u64,
+        estimated_degree: u64,
+        exact_class: DegreeClass,
+        estimated_class: DegreeClass,
+    ) {
+        let Some(exact_rank) = degree_class_rank(exact_class) else {
+            return;
+        };
+        let Some(estimated_rank) = degree_class_rank(estimated_class) else {
+            return;
+        };
+        self.tested_sources += 1;
+        self.tested_edges += exact_degree;
+        self.confusion[exact_rank * 3 + estimated_rank] += 1;
+        if exact_rank != estimated_rank {
+            self.misclassified_sources += 1;
+        }
+        if estimated_rank > exact_rank {
+            self.overestimated_sources += 1;
+        } else if estimated_rank < exact_rank {
+            self.underestimated_sources += 1;
+        }
+
+        let error_bp = exact_degree
+            .abs_diff(estimated_degree)
+            .saturating_mul(10_000)
+            / exact_degree.max(1);
+        let error_bucket = MORRIS8_ERROR_BUCKET_UPPER_BP
+            .iter()
+            .position(|upper| error_bp <= *upper)
+            .unwrap_or(MORRIS8_ERROR_BUCKET_UPPER_BP.len() - 1);
+        self.relative_error_histogram[error_bucket] += 1;
+        self.max_relative_error_bp = self.max_relative_error_bp.max(error_bp);
+
+        if (14..=18).contains(&exact_degree) {
+            self.boundary_windows[0].record(exact_rank, estimated_rank);
+        }
+        if (922..=1126).contains(&exact_degree) {
+            self.boundary_windows[1].record(exact_rank, estimated_rank);
+        }
+        let point_index = match exact_degree {
+            15 => Some(0),
+            16 => Some(1),
+            17 => Some(2),
+            1023 => Some(3),
+            1024 => Some(4),
+            1025 => Some(5),
+            _ => None,
+        };
+        if let Some(point_index) = point_index {
+            self.boundary_points[point_index].record(exact_rank, estimated_rank);
+        }
+    }
+
+    fn record_materialization(
+        &mut self,
+        exact_keep: bool,
+        morris_keep: bool,
+        active_keep: bool,
+        bytes: u64,
+    ) {
+        if exact_keep {
+            self.exact_keep_sources += 1;
+            self.exact_keep_bytes += bytes;
+        }
+        if morris_keep {
+            self.morris_keep_sources += 1;
+            self.morris_keep_bytes += bytes;
+        }
+        if exact_keep && !morris_keep {
+            self.exact_keep_morris_skip_sources += 1;
+            self.exact_keep_morris_skip_bytes += bytes;
+        }
+        if !exact_keep && morris_keep {
+            self.exact_skip_morris_keep_sources += 1;
+            self.exact_skip_morris_keep_bytes += bytes;
+        }
+        if !active_keep {
+            self.active_mixed_sources += 1;
+            self.active_mixed_bytes += bytes;
+        }
+    }
+
+    fn record_query_shadow(&mut self, shadow: MorrisQueryShadow) {
+        if !shadow.audited {
+            return;
+        }
+        self.audited_queries += 1;
+        self.raw_required_segments += shadow.required_segments;
+        self.raw_false_skipped_segments += shadow.false_skipped_segments;
+        self.raw_required_edge_records += shadow.required_edge_records;
+        self.raw_false_skipped_edge_records += shadow.false_skipped_edge_records;
+        if shadow.false_skipped_segments > 0 {
+            self.queries_with_raw_false_skip += 1;
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.update.merge(&other.update);
+        self.tested_sources += other.tested_sources;
+        self.tested_edges += other.tested_edges;
+        self.misclassified_sources += other.misclassified_sources;
+        self.overestimated_sources += other.overestimated_sources;
+        self.underestimated_sources += other.underestimated_sources;
+        for index in 0..self.confusion.len() {
+            self.confusion[index] += other.confusion[index];
+        }
+        for index in 0..self.relative_error_histogram.len() {
+            self.relative_error_histogram[index] += other.relative_error_histogram[index];
+        }
+        self.max_relative_error_bp = self.max_relative_error_bp.max(other.max_relative_error_bp);
+        self.peak_live_estimates = self.peak_live_estimates.max(other.peak_live_estimates);
+        for index in 0..self.boundary_windows.len() {
+            self.boundary_windows[index].merge(&other.boundary_windows[index]);
+        }
+        for index in 0..self.boundary_points.len() {
+            self.boundary_points[index].merge(&other.boundary_points[index]);
+        }
+        self.exact_keep_sources += other.exact_keep_sources;
+        self.exact_keep_bytes += other.exact_keep_bytes;
+        self.morris_keep_sources += other.morris_keep_sources;
+        self.morris_keep_bytes += other.morris_keep_bytes;
+        self.exact_keep_morris_skip_sources += other.exact_keep_morris_skip_sources;
+        self.exact_keep_morris_skip_bytes += other.exact_keep_morris_skip_bytes;
+        self.exact_skip_morris_keep_sources += other.exact_skip_morris_keep_sources;
+        self.exact_skip_morris_keep_bytes += other.exact_skip_morris_keep_bytes;
+        self.active_mixed_sources += other.active_mixed_sources;
+        self.active_mixed_bytes += other.active_mixed_bytes;
+        self.audited_queries += other.audited_queries;
+        self.queries_with_raw_false_skip += other.queries_with_raw_false_skip;
+        self.raw_required_segments += other.raw_required_segments;
+        self.raw_false_skipped_segments += other.raw_false_skipped_segments;
+        self.raw_required_edge_records += other.raw_required_edge_records;
+        self.raw_false_skipped_edge_records += other.raw_false_skipped_edge_records;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MorrisQueryShadow {
+    audited: bool,
+    required_segments: u64,
+    false_skipped_segments: u64,
+    required_edge_records: u64,
+    false_skipped_edge_records: u64,
+}
+
+fn degree_class_rank(class: DegreeClass) -> Option<usize> {
+    match class {
+        DegreeClass::Low => Some(0),
+        DegreeClass::Medium => Some(1),
+        DegreeClass::High => Some(2),
+        DegreeClass::Unknown | DegreeClass::Mixed => None,
+    }
+}
+
+fn degree_class_name(index: usize) -> &'static str {
+    match index {
+        0 => "low",
+        1 => "medium",
+        2 => "high",
+        _ => "unknown",
+    }
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn histogram_quantile_bp(histogram: &[u64; 9], quantile: f64) -> Option<u64> {
+    let total: u64 = histogram.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let target = ((total as f64 * quantile).ceil() as u64).max(1);
+    let mut cumulative = 0u64;
+    for (index, count) in histogram.iter().enumerate() {
+        cumulative += count;
+        if cumulative >= target {
+            let upper = MORRIS8_ERROR_BUCKET_UPPER_BP[index];
+            return (upper != u64::MAX).then_some(upper);
+        }
+    }
+    None
+}
+
+fn morris8_source_seed(base_seed: u64, src: VertexId, edge_type: EdgeType) -> u64 {
+    base_seed ^ src.rotate_left(17) ^ (edge_type as u32 as u64).wrapping_mul(0xd6e8_feb8_6659_fd93)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -523,6 +807,7 @@ pub struct Engine {
     vertex_locks: Arc<VertexLockTable>,
     metadata_cache: Arc<CsrMetadataCache>,
     degree_directory: RwLock<HashMap<(VertexId, EdgeType), DegreeClassMask>>,
+    degree_estimator_stats: Mutex<DegreeEstimatorStats>,
     degree_directory_sidecar_persist_lock: Mutex<()>,
     maintenance_lock: AsyncMutex<()>,
     semantic_l0_index: RwLock<SemanticL0Index>,
@@ -909,6 +1194,7 @@ impl Engine {
             vertex_locks: Arc::new(VertexLockTable::new(1 << 16)),
             metadata_cache: Arc::new(CsrMetadataCache::new(metadata_cache_entries)),
             degree_directory: RwLock::new(HashMap::new()),
+            degree_estimator_stats: Mutex::new(DegreeEstimatorStats::default()),
             degree_directory_sidecar_persist_lock: Mutex::new(()),
             maintenance_lock: AsyncMutex::new(()),
             semantic_l0_index: RwLock::new(SemanticL0Index::default()),
@@ -955,6 +1241,197 @@ impl Engine {
 
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
+    }
+
+    pub fn semantic_degree_estimator_stats_json(&self) -> Value {
+        let stats = self.degree_estimator_stats.lock().clone();
+        let update_by_exponent = (0..16)
+            .map(|exponent| {
+                let attempted = stats.update.attempted_by_exponent[exponent];
+                let applied = stats.update.applied_by_exponent[exponent];
+                let skipped = attempted.saturating_sub(applied);
+                let probability = 1.0 / (1u64 << exponent) as f64;
+                let expected_applied = attempted as f64 * probability;
+                let sigma = (attempted as f64 * probability * (1.0 - probability)).sqrt();
+                let tolerance = (4.0 * sigma).max(5.0);
+                json!({
+                    "exponent": exponent,
+                    "attempted_updates": attempted,
+                    "applied_updates": applied,
+                    "skipped_updates": skipped,
+                    "observed_skip_rate": ratio(skipped, attempted),
+                    "expected_skip_rate": 1.0 - probability,
+                    "expected_applied_updates": expected_applied,
+                    "four_sigma_tolerance": tolerance,
+                    "probability_check_applicable": expected_applied >= 25.0,
+                    "within_four_sigma": if expected_applied >= 25.0 {
+                        Some((applied as f64 - expected_applied).abs() <= tolerance)
+                    } else {
+                        None
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let stats_ref = &stats;
+        let confusion = (0..3)
+            .flat_map(|exact| {
+                (0..3).map(move |estimated| {
+                    json!({
+                        "exact_class": degree_class_name(exact),
+                        "estimated_class": degree_class_name(estimated),
+                        "sources": stats_ref.confusion[exact * 3 + estimated],
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let error_histogram = MORRIS8_ERROR_BUCKET_UPPER_BP
+            .iter()
+            .enumerate()
+            .map(|(index, upper)| {
+                json!({
+                    "upper_bound_basis_points": if *upper == u64::MAX { None } else { Some(*upper) },
+                    "sources": stats.relative_error_histogram[index],
+                })
+            })
+            .collect::<Vec<_>>();
+        let boundary_windows = MORRIS8_BOUNDARY_WINDOW_LABELS
+            .iter()
+            .enumerate()
+            .map(|(index, label)| stats.boundary_windows[index].snapshot(label))
+            .collect::<Vec<_>>();
+        let boundary_points = MORRIS8_BOUNDARY_POINT_LABELS
+            .iter()
+            .enumerate()
+            .map(|(index, label)| stats.boundary_points[index].snapshot(label))
+            .collect::<Vec<_>>();
+        let directory = self.degree_directory.read();
+        let directory_entries = directory.len() as u64;
+        let directory_capacity = directory.capacity() as u64;
+        let directory_sidecar_bytes =
+            fs::metadata(degree_directory_sidecar_path(&self.config.store_dir))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+        let version = self.version_manager.pin_current();
+        let l0 = version
+            .version()
+            .levels
+            .get(L0 as usize)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let exact_degree_segments = l0
+            .iter()
+            .filter(|meta| {
+                meta.degree_class_exact
+                    && !matches!(meta.degree_class, DegreeClass::Mixed | DegreeClass::Unknown)
+            })
+            .count();
+        let mixed_degree_segments = l0.len().saturating_sub(exact_degree_segments);
+        let exact_degree_segment_bytes: u64 = l0
+            .iter()
+            .filter(|meta| {
+                meta.degree_class_exact
+                    && !matches!(meta.degree_class, DegreeClass::Mixed | DegreeClass::Unknown)
+            })
+            .map(|meta| meta.segment_bytes)
+            .sum();
+        let mixed_degree_segment_bytes: u64 = l0
+            .iter()
+            .filter(|meta| {
+                !meta.degree_class_exact
+                    || matches!(meta.degree_class, DegreeClass::Mixed | DegreeClass::Unknown)
+            })
+            .map(|meta| meta.segment_bytes)
+            .sum();
+        let attempted_updates: u64 = stats.update.attempted_by_exponent.iter().sum();
+        let applied_updates: u64 = stats.update.applied_by_exponent.iter().sum();
+
+        json!({
+            "mode": match self.config.semantic_degree_estimator {
+                SemanticDegreeEstimator::Exact => "exact",
+                SemanticDegreeEstimator::Morris8 => "morris8",
+            },
+            "seed": self.config.semantic_degree_estimator_seed,
+            "morris8_max_estimate": Morris8::MAX_ESTIMATE,
+            "counter_updates": {
+                "attempted_updates": attempted_updates,
+                "applied_updates": applied_updates,
+                "skipped_updates": attempted_updates.saturating_sub(applied_updates),
+                "write_avoidance_rate": ratio(attempted_updates.saturating_sub(applied_updates), attempted_updates),
+                "saturation_count": stats.update.saturation_events,
+                "by_exponent": update_by_exponent,
+            },
+            "estimation": {
+                "tested_sources": stats.tested_sources,
+                "tested_edges": stats.tested_edges,
+                "misclassified_sources": stats.misclassified_sources,
+                "overestimated_sources": stats.overestimated_sources,
+                "underestimated_sources": stats.underestimated_sources,
+                "boundary_misclass_rate": ratio(stats.misclassified_sources, stats.tested_sources),
+                "boundary_overestimate_rate": ratio(stats.overestimated_sources, stats.tested_sources),
+                "boundary_underestimate_rate": ratio(stats.underestimated_sources, stats.tested_sources),
+                "class_confusion": confusion,
+                "relative_error_histogram": error_histogram,
+                "relative_error_p50_upper_bp": histogram_quantile_bp(&stats.relative_error_histogram, 0.50),
+                "relative_error_p95_upper_bp": histogram_quantile_bp(&stats.relative_error_histogram, 0.95),
+                "relative_error_p99_upper_bp": histogram_quantile_bp(&stats.relative_error_histogram, 0.99),
+                "max_relative_error_bp": stats.max_relative_error_bp,
+                "boundary_windows": boundary_windows,
+                "boundary_points": boundary_points,
+            },
+            "materialization": {
+                "exact_keep_sources": stats.exact_keep_sources,
+                "exact_keep_bytes": stats.exact_keep_bytes,
+                "morris_keep_sources": stats.morris_keep_sources,
+                "morris_keep_bytes": stats.morris_keep_bytes,
+                "exact_keep_morris_skip_sources": stats.exact_keep_morris_skip_sources,
+                "exact_keep_morris_skip_bytes": stats.exact_keep_morris_skip_bytes,
+                "materialization_false_skip_rate_sources": ratio(stats.exact_keep_morris_skip_sources, stats.exact_keep_sources),
+                "materialization_false_skip_rate_bytes": ratio(stats.exact_keep_morris_skip_bytes, stats.exact_keep_bytes),
+                "exact_skip_morris_keep_sources": stats.exact_skip_morris_keep_sources,
+                "exact_skip_morris_keep_bytes": stats.exact_skip_morris_keep_bytes,
+                "false_include_rate_sources": ratio(stats.exact_skip_morris_keep_sources, stats.tested_sources),
+                "active_mixed_sources": stats.active_mixed_sources,
+                "active_mixed_bytes": stats.active_mixed_bytes,
+                "active_mixed_source_rate": ratio(stats.active_mixed_sources, stats.tested_sources),
+                "active_mixed_byte_rate": ratio(stats.active_mixed_bytes, stats.tested_edges.saturating_mul(std::mem::size_of::<EdgeRecord>() as u64)),
+            },
+            "query_shadow": {
+                "audited_queries": stats.audited_queries,
+                "queries_with_raw_false_skip": stats.queries_with_raw_false_skip,
+                "raw_false_skip_query_rate": ratio(stats.queries_with_raw_false_skip, stats.audited_queries),
+                "raw_required_segments": stats.raw_required_segments,
+                "raw_false_skipped_segments": stats.raw_false_skipped_segments,
+                "raw_false_skip_segment_rate": ratio(stats.raw_false_skipped_segments, stats.raw_required_segments),
+                "raw_required_edge_records": stats.raw_required_edge_records,
+                "raw_false_skipped_edge_records": stats.raw_false_skipped_edge_records,
+                "raw_false_skip_edge_rate": ratio(stats.raw_false_skipped_edge_records, stats.raw_required_edge_records),
+                "safe_false_skip_queries": 0,
+                "safe_false_skip_segments": 0,
+                "safe_false_skip_edge_records": 0,
+                "safe_false_skip_rate": 0.0,
+            },
+            "degree_directory_memory": {
+                "entries": directory_entries,
+                "capacity": directory_capacity,
+                "key_bytes": std::mem::size_of::<(VertexId, EdgeType)>(),
+                "value_bytes": std::mem::size_of::<DegreeClassMask>(),
+                "bucket_payload_lower_bound_bytes": directory_capacity.saturating_mul(std::mem::size_of::<((VertexId, EdgeType), DegreeClassMask)>() as u64),
+                "current_u8_value_payload_bytes": directory_entries,
+                "hypothetical_exact_u64_payload_bytes": directory_entries.saturating_mul(8),
+                "morris8_value_payload_bytes": directory_entries,
+                "sidecar_bytes": directory_sidecar_bytes,
+                "current_flush_exact_degree_table_bytes": 0,
+                "morris8_peak_live_estimates": stats.peak_live_estimates,
+                "morris8_peak_live_estimate_bytes": stats.peak_live_estimates.saturating_mul(std::mem::size_of::<DegreeClass>() as u64),
+            },
+            "l0_layout": {
+                "total_segments": l0.len(),
+                "exact_degree_segments": exact_degree_segments,
+                "mixed_degree_segments": mixed_degree_segments,
+                "exact_degree_segment_bytes": exact_degree_segment_bytes,
+                "mixed_degree_segment_bytes": mixed_degree_segment_bytes,
+            },
+        })
     }
 
     pub fn persist_semantic_sidecars(&self) -> Result<()> {
@@ -2128,6 +2605,11 @@ impl Engine {
         let mut partitions: BTreeMap<(i32, EdgeType, DegreeClass), Vec<EdgeRecord>> =
             BTreeMap::new();
         let mut needs_sort: BTreeSet<(i32, EdgeType, DegreeClass)> = BTreeSet::new();
+        let mut morris_stats = matches!(
+            self.config.semantic_degree_estimator,
+            SemanticDegreeEstimator::Morris8
+        )
+        .then(DegreeEstimatorStats::default);
         let mut candidates = Vec::new();
         let feedback_edge_type_weights = if self.config.semantic_budget_disable_feedback {
             HashMap::new()
@@ -2232,52 +2714,12 @@ impl Engine {
                 continue;
             }
 
-            let mut degree_bytes: BTreeMap<DegreeClass, usize> = BTreeMap::new();
-            let mut degree_sources: BTreeMap<DegreeClass, usize> = BTreeMap::new();
-            let mut total_sources = 0usize;
-            let mut src_start = candidate.start;
-            while src_start < candidate.end {
-                let src = edges[src_start].src;
-                let mut src_end = src_start + 1;
-                while src_end < candidate.end && edges[src_end].src == src {
-                    src_end += 1;
-                }
-                let degree_class = DegreeClass::from_max_degree((src_end - src_start) as u64);
-                *degree_bytes.entry(degree_class).or_default() +=
-                    estimate_segment_bytes(&edges[src_start..src_end]);
-                *degree_sources.entry(degree_class).or_default() += 1;
-                total_sources += 1;
-                src_start = src_end;
-            }
-
-            let mut src_start = candidate.start;
-            while src_start < candidate.end {
-                let src = edges[src_start].src;
-                let mut src_end = src_start + 1;
-                while src_end < candidate.end && edges[src_end].src == src {
-                    src_end += 1;
-                }
-                let degree_class = DegreeClass::from_max_degree((src_end - src_start) as u64);
-                let keep_degree_exact = should_preserve_budgeted_semantic_degree(
-                    degree_class,
-                    *degree_bytes.get(&degree_class).unwrap_or(&0),
-                    *degree_sources.get(&degree_class).unwrap_or(&0),
-                    total_sources,
-                    self.config.semantic_budget_min_exact_bytes,
-                    self.config.semantic_budget_min_benefit_score,
-                    self.config.semantic_budget_degree_weight,
-                );
-                let key = if keep_degree_exact {
-                    (src_label, edge_type, degree_class)
-                } else {
-                    (src_label, edge_type, DegreeClass::Mixed)
-                };
-                partitions
-                    .entry(key)
-                    .or_default()
-                    .extend_from_slice(&edges[src_start..src_end]);
-                src_start = src_end;
-            }
+            self.partition_budgeted_degree_candidate(
+                &edges,
+                candidate,
+                &mut partitions,
+                morris_stats.as_mut(),
+            );
         }
 
         let mut segments = Vec::new();
@@ -2307,7 +2749,164 @@ impl Engine {
             );
         }
 
+        if let Some(morris_stats) = morris_stats {
+            self.degree_estimator_stats.lock().merge(&morris_stats);
+        }
         Ok(segments)
+    }
+
+    fn partition_budgeted_degree_candidate(
+        &self,
+        edges: &[EdgeRecord],
+        candidate: &BudgetedEdgeCandidate,
+        partitions: &mut BTreeMap<(i32, EdgeType, DegreeClass), Vec<EdgeRecord>>,
+        morris_stats: Option<&mut DegreeEstimatorStats>,
+    ) {
+        let src_label = candidate.src_label;
+        let edge_type = candidate.edge_type;
+        let mut exact_bytes: BTreeMap<DegreeClass, usize> = BTreeMap::new();
+        let mut exact_sources: BTreeMap<DegreeClass, usize> = BTreeMap::new();
+        let mut total_sources = 0usize;
+
+        match morris_stats {
+            None => {
+                let mut src_start = candidate.start;
+                while src_start < candidate.end {
+                    let src = edges[src_start].src;
+                    let mut src_end = src_start + 1;
+                    while src_end < candidate.end && edges[src_end].src == src {
+                        src_end += 1;
+                    }
+                    let exact_class = DegreeClass::from_max_degree((src_end - src_start) as u64);
+                    *exact_bytes.entry(exact_class).or_default() +=
+                        estimate_segment_bytes(&edges[src_start..src_end]);
+                    *exact_sources.entry(exact_class).or_default() += 1;
+                    total_sources += 1;
+                    src_start = src_end;
+                }
+
+                let mut src_start = candidate.start;
+                while src_start < candidate.end {
+                    let src = edges[src_start].src;
+                    let mut src_end = src_start + 1;
+                    while src_end < candidate.end && edges[src_end].src == src {
+                        src_end += 1;
+                    }
+                    let exact_class = DegreeClass::from_max_degree((src_end - src_start) as u64);
+                    let keep = should_preserve_budgeted_semantic_degree(
+                        exact_class,
+                        *exact_bytes.get(&exact_class).unwrap_or(&0),
+                        *exact_sources.get(&exact_class).unwrap_or(&0),
+                        total_sources,
+                        self.config.semantic_budget_min_exact_bytes,
+                        self.config.semantic_budget_min_benefit_score,
+                        self.config.semantic_budget_degree_weight,
+                    );
+                    let key = if keep {
+                        (src_label, edge_type, exact_class)
+                    } else {
+                        (src_label, edge_type, DegreeClass::Mixed)
+                    };
+                    partitions
+                        .entry(key)
+                        .or_default()
+                        .extend_from_slice(&edges[src_start..src_end]);
+                    src_start = src_end;
+                }
+            }
+            Some(stats) => {
+                let mut morris_bytes: BTreeMap<DegreeClass, usize> = BTreeMap::new();
+                let mut morris_sources: BTreeMap<DegreeClass, usize> = BTreeMap::new();
+                let mut estimated_classes = Vec::with_capacity(candidate.group_sources);
+                let mut src_start = candidate.start;
+                while src_start < candidate.end {
+                    let src = edges[src_start].src;
+                    let mut src_end = src_start + 1;
+                    while src_end < candidate.end && edges[src_end].src == src {
+                        src_end += 1;
+                    }
+                    let exact_degree = (src_end - src_start) as u64;
+                    let exact_class = DegreeClass::from_max_degree(exact_degree);
+                    let source_bytes = estimate_segment_bytes(&edges[src_start..src_end]);
+                    let counter = Morris8::observe(
+                        exact_degree,
+                        morris8_source_seed(
+                            self.config.semantic_degree_estimator_seed,
+                            src,
+                            edge_type,
+                        ),
+                        &mut stats.update,
+                    );
+                    let estimated_degree = counter.estimate();
+                    let estimated_class = DegreeClass::from_max_degree(estimated_degree);
+                    stats.record_source(
+                        exact_degree,
+                        estimated_degree,
+                        exact_class,
+                        estimated_class,
+                    );
+                    *exact_bytes.entry(exact_class).or_default() += source_bytes;
+                    *exact_sources.entry(exact_class).or_default() += 1;
+                    *morris_bytes.entry(estimated_class).or_default() += source_bytes;
+                    *morris_sources.entry(estimated_class).or_default() += 1;
+                    estimated_classes.push(estimated_class);
+                    total_sources += 1;
+                    src_start = src_end;
+                }
+                stats.peak_live_estimates = stats
+                    .peak_live_estimates
+                    .max(estimated_classes.len() as u64);
+
+                let mut estimated_index = 0usize;
+                let mut src_start = candidate.start;
+                while src_start < candidate.end {
+                    let src = edges[src_start].src;
+                    let mut src_end = src_start + 1;
+                    while src_end < candidate.end && edges[src_end].src == src {
+                        src_end += 1;
+                    }
+                    let exact_class = DegreeClass::from_max_degree((src_end - src_start) as u64);
+                    let estimated_class = estimated_classes[estimated_index];
+                    estimated_index += 1;
+                    let source_bytes = estimate_segment_bytes(&edges[src_start..src_end]);
+                    let exact_keep = should_preserve_budgeted_semantic_degree(
+                        exact_class,
+                        *exact_bytes.get(&exact_class).unwrap_or(&0),
+                        *exact_sources.get(&exact_class).unwrap_or(&0),
+                        total_sources,
+                        self.config.semantic_budget_min_exact_bytes,
+                        self.config.semantic_budget_min_benefit_score,
+                        self.config.semantic_budget_degree_weight,
+                    );
+                    let morris_keep = should_preserve_budgeted_semantic_degree(
+                        estimated_class,
+                        *morris_bytes.get(&estimated_class).unwrap_or(&0),
+                        *morris_sources.get(&estimated_class).unwrap_or(&0),
+                        total_sources,
+                        self.config.semantic_budget_min_exact_bytes,
+                        self.config.semantic_budget_min_benefit_score,
+                        self.config.semantic_budget_degree_weight,
+                    );
+                    stats.record_materialization(
+                        exact_keep,
+                        morris_keep,
+                        morris_keep,
+                        source_bytes as u64,
+                    );
+                    let key = if morris_keep {
+                        // Morris decides admission only. Persisted metadata remains exact.
+                        (src_label, edge_type, exact_class)
+                    } else {
+                        (src_label, edge_type, DegreeClass::Mixed)
+                    };
+                    partitions
+                        .entry(key)
+                        .or_default()
+                        .extend_from_slice(&edges[src_start..src_end]);
+                    src_start = src_end;
+                }
+            }
+        }
     }
 
     fn append_budgeted_edge_candidate_diagnostics(
@@ -2763,6 +3362,14 @@ impl Engine {
         let _lock = self.vertex_locks.read_lock(src);
         let guard = self.version_manager.pin_current();
         let mut updates = Vec::new();
+        let mut morris_query_shadow = MorrisQueryShadow {
+            audited: matches!(
+                self.config.semantic_degree_estimator,
+                SemanticDegreeEstimator::Morris8
+            ) && signature.degree_class.is_some()
+                && edge_type.is_some(),
+            ..MorrisQueryShadow::default()
+        };
         for memgraph in &guard.version().memgraphs {
             updates.extend(memgraph.get_edges_for_src(src));
         }
@@ -2860,6 +3467,32 @@ impl Engine {
                     &signature,
                     reader.get_neighbors(meta, src).await?,
                 );
+                if morris_query_shadow.audited
+                    && !edges.is_empty()
+                    && meta.degree_class_exact
+                    && !matches!(meta.degree_class, DegreeClass::Mixed | DegreeClass::Unknown)
+                {
+                    morris_query_shadow.required_segments += 1;
+                    morris_query_shadow.required_edge_records += edges.len() as u64;
+                    let estimated_class = DegreeClass::from_max_degree(
+                        Morris8::observe_untracked(
+                            edges.len() as u64,
+                            morris8_source_seed(
+                                self.config.semantic_degree_estimator_seed,
+                                src,
+                                meta.edge_type_partition,
+                            ),
+                        )
+                        .estimate(),
+                    );
+                    let query_class = signature
+                        .degree_class
+                        .expect("Morris query shadow requires a degree hint");
+                    if !estimated_class.may_contain_global_query(query_class) {
+                        morris_query_shadow.false_skipped_segments += 1;
+                        morris_query_shadow.false_skipped_edge_records += edges.len() as u64;
+                    }
+                }
                 if !edges.is_empty() {
                     self.metrics
                         .matched_l0_segments
@@ -2896,6 +3529,11 @@ impl Engine {
         }
         updates = retain_edges_for_dst_label(&signature, updates);
         let out = merge_visible(updates, snapshot);
+        if morris_query_shadow.audited {
+            self.degree_estimator_stats
+                .lock()
+                .record_query_shadow(morris_query_shadow);
+        }
         self.metrics
             .storage_get_neighbors_latency
             .record_since(started);
@@ -4593,6 +5231,35 @@ mod tests {
                 DegreeClass::Unknown,
             ],
         );
+    }
+
+    #[test]
+    fn morris_boundary_overestimate_is_counted_as_raw_false_skip_risk() {
+        let mut stats = DegreeEstimatorStats::default();
+        stats.record_source(16, 17, DegreeClass::Low, DegreeClass::Medium);
+
+        assert_eq!(stats.tested_sources, 1);
+        assert_eq!(stats.misclassified_sources, 1);
+        assert_eq!(stats.overestimated_sources, 1);
+        assert_eq!(stats.boundary_windows[0].overestimated, 1);
+        assert_eq!(stats.boundary_points[1].overestimated, 1);
+        assert!(
+            !DegreeClass::Medium.may_contain_global_query(DegreeClass::Low),
+            "directly persisting the overestimated class would skip a required low-degree segment"
+        );
+        assert!(
+            DegreeClass::Mixed.may_contain_global_query(DegreeClass::Low),
+            "the safe fallback must retain the segment as a candidate"
+        );
+    }
+
+    #[test]
+    fn morris_boundary_underestimate_is_safe_but_less_selective() {
+        let mut stats = DegreeEstimatorStats::default();
+        stats.record_source(1025, 1024, DegreeClass::High, DegreeClass::Medium);
+
+        assert_eq!(stats.underestimated_sources, 1);
+        assert!(DegreeClass::Medium.may_contain_global_query(DegreeClass::High));
     }
 
     #[test]
