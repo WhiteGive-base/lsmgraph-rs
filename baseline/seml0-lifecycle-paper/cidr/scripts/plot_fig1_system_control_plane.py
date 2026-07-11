@@ -48,8 +48,9 @@ def configure_matplotlib() -> None:
 
 def save_figure(fig: mpl.figure.Figure, out_dir: Path, stem: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for ext in ("pdf", "svg"):
-        fig.savefig(out_dir / f"{stem}.{ext}")
+    for ext in ("pdf", "svg", "png"):
+        kwargs = {"dpi": 220} if ext == "png" else {}
+        fig.savefig(out_dir / f"{stem}.{ext}", **kwargs)
     plt.close(fig)
 
 
@@ -137,13 +138,15 @@ def plot_system_control_plane(out_dir: Path) -> None:
         ax.add_patch(Rectangle((x, 0.165), w, 0.710, facecolor=fc, edgecolor=ec, linewidth=1.05))
         txt(x + w / 2, 0.910, title, fs=9.6, bold=True)
 
-    # Query column.
-    box(0.080, 0.690, 0.225, 0.100, "Property-graph read\ntyped-neighbor / property-aware", fc=PALETTE["white"], ec=PALETTE["blue"], fs=7.2, bold=True)
-    box(0.080, 0.545, 0.225, 0.075, "Signature compiler", fc=PALETTE["white"], ec=PALETTE["blue"], fs=7.6, bold=True)
-    txt(0.192, 0.470, "GraphAccessSignature", fs=7.4, bold=True)
-    row(0.070, 0.420, 0.245, 0.042, ["LBL", "ETYPE", "DIR", "PROP", "SNAP", "EPOCH"], ec=PALETTE["blue"], fs=5.4)
-    arrow((0.192, 0.690), (0.192, 0.620), color=PALETTE["blue"])
-    arrow((0.192, 0.545), (0.192, 0.463), color=PALETTE["blue"])
+    # Query column. Snapshot and schema resolution remain outside the signature.
+    box(0.080, 0.700, 0.225, 0.090, "Property-graph read\ntyped-neighbor / property-presence", fc=PALETTE["white"], ec=PALETTE["blue"], fs=6.9, bold=True)
+    box(0.080, 0.570, 0.225, 0.070, "Query adapter / Signature builder", fc=PALETTE["white"], ec=PALETTE["blue"], fs=7.1, bold=True)
+    txt(0.192, 0.515, "GraphAccessSignature", fs=7.4, bold=True)
+    row(0.058, 0.455, 0.270, 0.047, ["SRC/LBL", "ETYPE", "DIR", "DEG", "TIME", "PROP-PRES"], ec=PALETTE["blue"], fs=4.6)
+    box(0.070, 0.320, 0.245, 0.060, "Read snapshot\nindependent visibility context", fc=PALETTE["orange_light"], ec=PALETTE["orange"], fs=6.2, bold=True)
+    box(0.070, 0.215, 0.245, 0.065, "Schema catalog + segment epoch\nindependent resolution context", fc=PALETTE["purple_light"], ec=PALETTE["purple"], fs=6.0, bold=True)
+    arrow((0.192, 0.700), (0.192, 0.640), color=PALETTE["blue"])
+    arrow((0.192, 0.570), (0.192, 0.502), color=PALETTE["blue"])
 
     # Control plane core.
     box(
@@ -151,22 +154,22 @@ def plot_system_control_plane(out_dir: Path) -> None:
         0.650,
         0.230,
         0.135,
-        "Semantic evidence index\nExactness contract\nBudgeted rewrite policy",
+        "Admission evidence index\nExact / Conservative over-approx\nBudgeted rewrite policy",
         fc=PALETTE["white"],
         ec=PALETTE["green"],
-        fs=7.3,
+        fs=6.9,
         bold=True,
     )
-    diamond(0.495, 0.485, 0.140, 0.105, "Read admission\ngate", fc=PALETTE["white"], ec=PALETTE["blue"], fs=6.8)
+    diamond(0.495, 0.485, 0.140, 0.105, "Storage admission\ngate", fc=PALETTE["white"], ec=PALETTE["blue"], fs=6.8)
     box(
-        0.360,
-        0.462,
-        0.052,
-        0.048,
-        "SKIP",
+        0.350,
+        0.455,
+        0.075,
+        0.060,
+        "SKIP\nproven disjoint",
         fc=PALETTE["green_light"],
         ec=PALETTE["green"],
-        fs=7.0,
+        fs=5.2,
         bold=True,
     )
     box(
@@ -182,29 +185,30 @@ def plot_system_control_plane(out_dir: Path) -> None:
     )
     box(
         0.395,
-        0.205,
+        0.195,
         0.230,
-        0.080,
-        "Persistent Evidence Catalog\nsegment evidence | schema/epoch | live files",
+        0.095,
+        "Persistent metadata\nmanifest + schema catalog\n+ degree sidecar",
         fc=PALETTE["white"],
         ec=PALETTE["green"],
-        fs=6.8,
+        fs=6.2,
         bold=True,
     )
 
     # Store column.
-    box(0.730, 0.675, 0.190, 0.090, "Segment metadata", fc=PALETTE["green_light"], ec=PALETTE["green"], fs=7.2, bold=True)
+    box(0.730, 0.675, 0.190, 0.090, "Manifest segment metadata", fc=PALETTE["green_light"], ec=PALETTE["green"], fs=7.0, bold=True)
     box(0.730, 0.500, 0.190, 0.110, "CSR segments\nsegment bodies", fc=PALETTE["white"], ec=ink, fs=7.2, bold=True)
     box(0.730, 0.330, 0.190, 0.105, "Compaction executor\napply rewrite plan\nunsafe -> Conservative", fc=PALETTE["purple_light"], ec=PALETTE["purple"], fs=6.8, bold=True)
 
     # Main arrows: query to evidence, metadata to gate, read output.
-    arrow((0.315, 0.441), (0.395, 0.680), color=PALETTE["red"], rad=0.08)
+    arrow((0.328, 0.478), (0.395, 0.680), color=PALETTE["red"], rad=0.08)
     arrow((0.730, 0.720), (0.625, 0.720), color=PALETTE["green"], rad=0.00)
     txt(0.675, 0.742, "segment evidence", fs=6.4, color=PALETTE["green"], ha="center", bg=True)
     arrow((0.495, 0.650), (0.495, 0.538), color=PALETTE["green"], rad=0.00)
     arrow((0.565, 0.485), (0.730, 0.575), color=PALETTE["orange"], rad=0.04)
-    txt(0.672, 0.602, "READ body", fs=6.4, color=PALETTE["orange"], ha="center", bg=True)
-    arrow((0.425, 0.485), (0.412, 0.485), color=PALETTE["green"])
+    txt(0.672, 0.602, "possible overlap -> READ", fs=5.9, color=PALETTE["orange"], ha="center", bg=True)
+    arrow((0.425, 0.485), (0.423, 0.485), color=PALETTE["green"])
+    arrow((0.315, 0.247), (0.395, 0.247), color=PALETTE["purple"], dashed=True)
 
     # Rewrite path.
     arrow((0.585, 0.650), (0.590, 0.425), color=PALETTE["purple"], rad=0.00)

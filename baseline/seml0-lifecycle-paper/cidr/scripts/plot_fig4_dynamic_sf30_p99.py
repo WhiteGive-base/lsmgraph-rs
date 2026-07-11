@@ -63,8 +63,9 @@ def configure_matplotlib() -> None:
 
 def save_figure(fig: mpl.figure.Figure, out_dir: Path, stem: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for ext in ("pdf", "svg"):
-        fig.savefig(out_dir / f"{stem}.{ext}")
+    for ext in ("pdf", "svg", "png"):
+        kwargs = {"dpi": 220} if ext == "png" else {}
+        fig.savefig(out_dir / f"{stem}.{ext}", **kwargs)
     plt.close(fig)
 
 

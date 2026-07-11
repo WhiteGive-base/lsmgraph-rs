@@ -2385,6 +2385,12 @@ impl Engine {
             .await
     }
 
+    /// Reads neighbors after using `signature` only for storage admission.
+    ///
+    /// MVCC visibility is evaluated against the independent `snapshot`
+    /// argument. Schema names and physical encodings are resolved through the
+    /// catalog and each segment's schema epoch; neither context is encoded in
+    /// [`GraphAccessSignature`].
     pub async fn get_neighbors_by_signature(
         &self,
         signature: GraphAccessSignature,

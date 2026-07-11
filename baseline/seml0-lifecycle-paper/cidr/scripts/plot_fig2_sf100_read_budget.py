@@ -76,8 +76,9 @@ def configure_matplotlib() -> None:
 
 def save_figure(fig: mpl.figure.Figure, out_dir: Path, stem: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for ext in ("pdf", "svg"):
-        fig.savefig(out_dir / f"{stem}.{ext}")
+    for ext in ("pdf", "svg", "png"):
+        kwargs = {"dpi": 220} if ext == "png" else {}
+        fig.savefig(out_dir / f"{stem}.{ext}", **kwargs)
     plt.close(fig)
 
 
@@ -133,7 +134,7 @@ def plot_sf100_read_budget(out_dir: Path) -> None:
     ax.set_yscale("log")
     ax.set_ylim(0.009, 1.5)
     ax.axhline(1.0, color="#94A3B8", linewidth=0.9, linestyle="--")
-    ax.set_ylabel("Normalized cost (naive=1, log)")
+    ax.set_ylabel("Ratio to naive (naive=1; log scale)")
     ax.set_xticks(x, variants, rotation=35, ha="right")
     ax.set_title("Read amplification")
     ax.legend(frameon=True, facecolor="white", edgecolor="none", framealpha=0.9, loc="upper right")

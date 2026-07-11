@@ -21,10 +21,16 @@ impl Default for EdgeDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DegreeClass {
+    /// The writer has no trustworthy degree summary for this segment.
     Unknown,
+    /// The maximum observed segment-local source degree is in 1..=16.
     Low,
+    /// The maximum observed segment-local source degree is in 17..=1024.
     Medium,
+    /// The maximum observed segment-local source degree is greater than 1024.
     High,
+    /// Multiple degree classes share the segment, or the budget did not pay for
+    /// a degree-exact partition.
     Mixed,
 }
 
@@ -69,16 +75,34 @@ impl Default for SegmentSortKey {
     }
 }
 
+/// Storage-admission facts extracted from one graph access.
+///
+/// The signature is matched against [`crate::csr::format::CsrSegmentMeta`] to
+/// decide which immutable segments can be skipped safely. It is deliberately
+/// not a complete query plan: MVCC visibility is supplied separately as the
+/// `snapshot` argument to the graph read API, while schema names and encodings
+/// are resolved by [`crate::schema::SchemaCatalog`] and the segment's
+/// `schema_epoch`.
+///
+/// `min_ts` and `max_ts` constrain record timestamps for segment admission.
+/// They are not an MVCC snapshot and do not replace the independent snapshot
+/// visibility check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GraphAccessSignature {
+    /// Concrete source vertex; its encoded label also seeds `src_label`.
     pub src: VertexId,
     pub src_label: i32,
     pub edge_type: Option<EdgeType>,
     pub direction: EdgeDirection,
+    /// Optional query class; segment classes are local contribution bounds, so
+    /// matching remains conservative for a source's degree across segments.
     pub degree_class: Option<DegreeClass>,
     pub dst_label: Option<i32>,
+    /// Inclusive lower bound on record timestamps used for admission.
     pub min_ts: Option<u64>,
+    /// Inclusive upper bound on record timestamps used for admission.
     pub max_ts: Option<u64>,
+    /// Optional property-presence requirement; this is not a value predicate.
     pub property_predicate: Option<PropertyPredicate>,
 }
 
@@ -139,8 +163,15 @@ impl GraphAccessSignature {
     }
 }
 
+/// Property-presence semantics supported by storage admission.
+///
+/// Equality, range, and general `WHERE` predicates are outside this enum. They
+/// require a separate value-index/prototype path after candidate admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PropertyPredicate {
+    /// Candidate records must contain the property; a proven-empty,
+    /// tombstone-clean summary can skip.
     RequiredPresent { property_id: PropertyId },
+    /// Missing values or schema defaults are acceptable, so absence alone cannot skip.
     AbsentOrDefault { property_id: PropertyId },
 }

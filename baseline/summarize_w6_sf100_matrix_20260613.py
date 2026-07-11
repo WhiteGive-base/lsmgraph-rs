@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the W6 SF100 matrix report from raw runner artifacts.
+"""Render a W6 scale matrix report from raw runner artifacts.
 
 The script is intentionally conservative: it reads only JSON/TSV/stderr
 artifacts produced by baseline/run_w6_sf100_matrix_20260613.sh and labels
@@ -112,6 +112,11 @@ def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str
     for row in rows:
         out.append("| " + " | ".join(str(cell) for cell in row) + " |")
     return "\n".join(out)
+
+
+def infer_scale(log_dir: Path) -> str:
+    match = re.search(r"(?:^|[-_/])sf(\d+)(?:[-_/]|$)", str(log_dir), re.IGNORECASE)
+    return f"SF{match.group(1)}" if match else "unknown-scale"
 
 
 def read_manifest(log_dir: Path) -> Dict[Tuple[str, str], Dict[str, str]]:
@@ -404,9 +409,37 @@ def render_report(log_dir: Path, out_path: Path) -> str:
     failed = (log_dir / "FAILED").exists()
     status = "DONE" if done else "FAILED" if failed else "RUNNING/PARTIAL"
     generated = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    scale = infer_scale(log_dir)
+
+    if resource:
+        resource_block = [
+            "## Resource Envelope",
+            "",
+            markdown_table(
+                ["first sample", "last sample", "samples", "min MemAvailable GiB", "min /data free GiB", "last W6 store"],
+                [
+                    [
+                        resource.get("first_ts", "PENDING"),
+                        resource.get("last_ts", "PENDING"),
+                        resource.get("samples", "PENDING"),
+                        fmt_num(resource.get("mem_min_gib"), 0),
+                        fmt_num(resource.get("disk_min_gib"), 0),
+                        resource.get("store_last", "PENDING"),
+                    ]
+                ],
+            ),
+            "",
+        ]
+    else:
+        resource_block = [
+            "## Resource Envelope",
+            "",
+            "No `resource-monitor.tsv` was recorded for this run. Per-variant import RSS below remains measured from `/usr/bin/time -v`; no all-PENDING envelope is emitted.",
+            "",
+        ]
 
     lines = [
-        "# W6 SF100 Matrix Report",
+        f"# W6 {scale} Matrix Report",
         "",
         f"Generated: {generated}",
         f"Run dir: `{log_dir}`",
@@ -414,22 +447,7 @@ def render_report(log_dir: Path, out_path: Path) -> str:
         "",
         "This report is regenerated from raw W6 JSON/TSV artifacts. Missing variants are labeled `PENDING`; no simulated/model-derived rows are promoted to measured results.",
         "",
-        "## Resource Envelope",
-        "",
-        markdown_table(
-            ["first sample", "last sample", "samples", "min MemAvailable GiB", "min /data free GiB", "last W6 store"],
-            [
-                [
-                    resource.get("first_ts", "PENDING"),
-                    resource.get("last_ts", "PENDING"),
-                    resource.get("samples", "PENDING"),
-                    fmt_num(resource.get("mem_min_gib"), 0),
-                    fmt_num(resource.get("disk_min_gib"), 0),
-                    resource.get("store_last", "PENDING"),
-                ]
-            ],
-        ),
-        "",
+        *resource_block,
         "## Aggregate Matrix",
         "",
         "The p50/p90/p99 column is the mean of per-edge-type percentiles across repeats; it is not a raw global percentile over all operations.",

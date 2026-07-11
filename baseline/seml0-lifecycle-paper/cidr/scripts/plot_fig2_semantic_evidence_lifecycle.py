@@ -48,8 +48,9 @@ def configure_matplotlib() -> None:
 
 def save_figure(fig: mpl.figure.Figure, out_dir: Path, stem: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for ext in ("pdf", "svg"):
-        fig.savefig(out_dir / f"{stem}.{ext}")
+    for ext in ("pdf", "svg", "png"):
+        kwargs = {"dpi": 220} if ext == "png" else {}
+        fig.savefig(out_dir / f"{stem}.{ext}", **kwargs)
     plt.close(fig)
 
 
@@ -121,33 +122,32 @@ def plot_semantic_evidence_lifecycle(out_dir: Path) -> None:
     evidence_row(
         0.060,
         0.765,
-        0.445,
+        0.515,
         0.055,
-        [("LBL", 1.0), ("ETYPE", 1.15), ("DIR", 0.9), ("PROP", 1.0), ("SNAP", 1.0), ("EPOCH", 1.15)],
+        [("SRC", 0.8), ("SRC-LBL", 1.0), ("ETYPE", 1.0), ("DIR", 0.7), ("DEG", 0.75), ("DST-LBL", 1.0), ("TIME", 0.8), ("PROP-PRES", 1.25)],
         title="Query row: GraphAccessSignature",
         ec=PALETTE["blue"],
         fill=PALETTE["blue_light"],
-        fs=6.4,
+        fs=5.2,
     )
+    box(0.060, 0.670, 0.235, 0.055, "Read snapshot: visibility context", fc=PALETTE["orange_light"], ec=PALETTE["orange"], fs=6.1, bold=True)
+    box(0.320, 0.670, 0.255, 0.055, "Schema catalog + segment epoch: resolution context", fc=PALETTE["purple_light"], ec=PALETTE["purple"], fs=5.5, bold=True)
     evidence_row(
         0.060,
-        0.575,
-        0.505,
+        0.550,
+        0.515,
         0.055,
-        [("file", 0.9), ("level", 0.9), ("LBL", 0.85), ("ETYPE", 1.05), ("bitmap", 1.2), ("epoch", 1.0), ("exactness", 1.25)],
+        [("file/level", 1.0), ("SRC/DST-LBL", 1.25), ("ETYPE", 0.85), ("DIR/DEG", 0.95), ("TIME", 0.75), ("PROP-BM", 1.0), ("SCHEMA-EPOCH", 1.25), ("COMPL", 0.9)],
         title="Segment row: CsrSegmentMeta",
         ec=PALETTE["green"],
         fill=PALETTE["green_light"],
-        fs=6.1,
+        fs=4.8,
     )
-    arrow((0.285, 0.765), (0.285, 0.630), color=PALETTE["red"])
-    txt(0.315, 0.695, "compare under\nexactness contract", fs=6.8, ha="left", color=PALETTE["red"])
-
-    box(0.610, 0.590, 0.310, 0.210, "", fc=PALETTE["white"], ec=PALETTE["red"], lw=1.0)
-    txt(0.630, 0.760, "Rule", fs=8.0, bold=True, ha="left", color=PALETTE["red"])
-    txt(0.630, 0.715, "Exact disjoint / absence  ->  SKIP", fs=6.8, ha="left", color=PALETTE["green"])
-    txt(0.630, 0.670, "Exact overlap  ->  READ", fs=6.8, ha="left", color=PALETTE["orange"])
-    txt(0.630, 0.625, "Conservative / Unknown  ->  READ", fs=6.8, ha="left", color=PALETTE["orange"])
+    box(0.610, 0.575, 0.325, 0.245, "", fc=PALETTE["white"], ec=PALETTE["red"], lw=1.0)
+    txt(0.630, 0.785, "Safe admission contract", fs=8.0, bold=True, ha="left", color=PALETTE["red"])
+    txt(0.630, 0.735, "Exact disjoint / proven absence  ->  SKIP", fs=6.3, ha="left", color=PALETTE["green"])
+    txt(0.630, 0.685, "Conservative over-approx disjoint  ->  SKIP", fs=6.1, ha="left", color=PALETTE["green"])
+    txt(0.630, 0.635, "Unknown / possible overlap  ->  READ", fs=6.3, ha="left", color=PALETTE["orange"])
 
     # Separator.
     ax.plot([0.045, 0.955], [0.505, 0.505], color=PALETTE["line"], linewidth=0.8)
@@ -155,13 +155,13 @@ def plot_semantic_evidence_lifecycle(out_dir: Path) -> None:
     # Bottom: catalog lifecycle as a closed loop.
     txt(0.060, 0.455, "Catalog lifecycle", fs=8.8, bold=True, ha="left")
     box(0.065, 0.275, 0.175, 0.085, "Flush / Compaction\ncreate or update\nevidence rows", fc=PALETTE["blue_light"], ec=PALETTE["blue"], fs=6.7, bold=True)
-    box(0.335, 0.250, 0.235, 0.130, "Persistent Evidence Catalog\nsegment evidence rows\nschema / epoch state\nlive-file state", fc=PALETTE["white"], ec=PALETTE["green"], fs=6.8, bold=True)
+    box(0.335, 0.250, 0.235, 0.130, "Persistent metadata\nmanifest segment metadata\nschema catalog\ndegree sidecar", fc=PALETTE["white"], ec=PALETTE["green"], fs=6.8, bold=True)
     box(0.670, 0.275, 0.190, 0.085, "In-memory\nSemantic Index", fc=PALETTE["green_light"], ec=PALETTE["green"], fs=7.0, bold=True)
     box(0.670, 0.110, 0.190, 0.095, "Read admission\n+\nRewrite policy", fc=PALETTE["purple_light"], ec=PALETTE["purple"], fs=7.0, bold=True)
-    box(0.110, 0.095, 0.205, 0.090, "Schema / visibility\nuncertainty\n-> Conservative / Unknown", fc=PALETTE["orange_light"], ec=PALETTE["orange"], fs=6.7, bold=True)
+    box(0.110, 0.095, 0.205, 0.090, "Resolution uncertainty\nprevents exact evidence\n-> Conservative / Unknown", fc=PALETTE["orange_light"], ec=PALETTE["orange"], fs=6.5, bold=True)
 
     # Connection from row representation into catalog.
-    arrow((0.315, 0.575), (0.405, 0.380), color=PALETTE["green"], rad=0.06)
+    arrow((0.315, 0.550), (0.405, 0.380), color=PALETTE["green"], rad=0.06)
     txt(0.365, 0.462, "publish / persist", fs=6.6, color=PALETTE["green"], ha="left")
 
     # Lifecycle loop.

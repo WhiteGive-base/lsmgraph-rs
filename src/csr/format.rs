@@ -105,6 +105,12 @@ impl CsrHeader {
     }
 }
 
+/// Manifest metadata used to admit or skip an immutable CSR segment.
+///
+/// `schema_epoch` records the catalog epoch used to encode the segment; it is
+/// resolved independently from [`GraphAccessSignature`]. `min_ts`/`max_ts`
+/// summarize record timestamps and are not MVCC snapshot bounds. A read snapshot
+/// remains an independent graph API argument.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CsrSegmentMeta {
     pub file_id: FileId,
@@ -113,10 +119,13 @@ pub struct CsrSegmentMeta {
     pub src_label: i32,
     #[serde(default = "default_unknown_source_label")]
     pub dst_label: i32,
+    /// Schema catalog epoch under which this segment was encoded.
     #[serde(default)]
     pub schema_epoch: SchemaEpoch,
+    /// Completeness of topology summaries such as labels and edge type.
     #[serde(default)]
     pub summary_completeness: SemanticSummaryCompleteness,
+    /// Completeness of the property-presence bitmap.
     #[serde(default)]
     pub property_summary_completeness: SemanticSummaryCompleteness,
     #[serde(default)]
@@ -139,6 +148,8 @@ pub struct CsrSegmentMeta {
     pub source_bloom_bit_count: u64,
     #[serde(default = "default_may_contain_tombstones")]
     pub may_contain_tombstones: bool,
+    /// A concrete edge type is exact for this partition; `MIXED_EDGE_TYPE`
+    /// conservatively admits every requested edge type.
     #[serde(default = "default_mixed_edge_type")]
     pub edge_type_partition: EdgeType,
     #[serde(default)]
@@ -151,6 +162,7 @@ pub struct CsrSegmentMeta {
     pub sort_key: SegmentSortKey,
     pub min_src: VertexId,
     pub max_src: VertexId,
+    /// Minimum record timestamp in the segment, not an MVCC snapshot.
     #[serde(default)]
     pub min_ts: Timestamp,
     pub edge_count: u64,
@@ -162,6 +174,7 @@ pub struct CsrSegmentMeta {
     pub max_degree: u64,
     #[serde(default)]
     pub segment_bytes: u64,
+    /// Maximum record timestamp in the segment, not an MVCC snapshot.
     pub max_ts: Timestamp,
 }
 
@@ -428,7 +441,10 @@ impl PruningSurfaceSummary {
             if matches!(state.tombstone, TombstoneState::Sensitive) {
                 summary.tombstone_sensitive_segments += 1;
             }
-            if matches!(state.schema, SchemaState::OlderEpoch | SchemaState::Uncertain) {
+            if matches!(
+                state.schema,
+                SchemaState::OlderEpoch | SchemaState::Uncertain
+            ) {
                 summary.older_epoch_segments += 1;
             }
         }
@@ -704,6 +720,53 @@ mod tests {
     }
 
     #[test]
+    fn unknown_summary_never_prunes_semantic_dimensions() {
+        let mut meta = semantic_meta(2);
+        meta.summary_completeness = SemanticSummaryCompleteness::Unknown;
+        meta.src_label = 2;
+        meta.direction = EdgeDirection::In;
+
+        let decision = meta.signature_pruning_decision(&GraphAccessSignature::neighbor_scan(
+            person_vid(7),
+            Some(1),
+        ));
+        assert!(!decision.pruned);
+        assert_eq!(decision.reason, "mixed_unknown_fallback");
+    }
+
+    #[test]
+    fn conservative_property_bitmap_can_prove_safe_absence() {
+        let mut meta = semantic_meta(1);
+        meta.property_summary_completeness = SemanticSummaryCompleteness::Conservative;
+        meta.property_presence_bitmap = property_presence_bit(1).unwrap();
+        let src = person_vid(7);
+
+        let absent = meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2),
+        );
+        assert!(absent.pruned);
+        assert_eq!(absent.reason, "property_absence");
+
+        let possible = meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(1),
+        );
+        assert!(!possible.pruned);
+    }
+
+    #[test]
+    fn mixed_edge_type_never_proves_edge_type_disjointness() {
+        let mut meta = semantic_meta(1);
+        meta.edge_type_partition = MIXED_EDGE_TYPE;
+
+        let decision = meta.signature_pruning_decision(&GraphAccessSignature::neighbor_scan(
+            person_vid(7),
+            Some(99),
+        ));
+        assert!(!decision.pruned);
+        assert_eq!(decision.reason, "kept_candidate");
+    }
+
+    #[test]
     fn signature_pruning_decision_reports_semantic_reason() {
         let meta = semantic_meta(1);
         let edge_decision = meta.signature_pruning_decision(&GraphAccessSignature::neighbor_scan(
@@ -844,18 +907,22 @@ mod tests {
     }
 
     #[test]
-    fn required_property_keeps_exact_absent_tombstone_segments() {
+    fn tombstone_absence_never_prunes_required_property() {
         let mut meta = semantic_meta(1);
         let src = person_vid(7);
 
-        assert!(!meta.may_contain_signature(
-            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2)
-        ));
+        let clean = meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2),
+        );
+        assert!(clean.pruned);
+        assert_eq!(clean.reason, "property_absence");
 
         meta.may_contain_tombstones = true;
-        assert!(meta.may_contain_signature(
-            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2)
-        ));
+        let tombstone_sensitive = meta.signature_pruning_decision(
+            &GraphAccessSignature::neighbor_scan(src, Some(1)).with_required_property(2),
+        );
+        assert!(!tombstone_sensitive.pruned);
+        assert_eq!(tombstone_sensitive.reason, "schema_tombstone_fallback");
     }
 
     #[test]
@@ -1025,7 +1092,10 @@ mod tests {
             false,
             3,
         );
-        assert_eq!(exact_degree.semantic_state(3).degree, DegreeSummaryState::Exact);
+        assert_eq!(
+            exact_degree.semantic_state(3).degree,
+            DegreeSummaryState::Exact
+        );
         assert_eq!(exact_degree.semantic_state(3).schema, SchemaState::Current);
     }
 

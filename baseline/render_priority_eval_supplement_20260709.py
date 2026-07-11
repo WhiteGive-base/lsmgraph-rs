@@ -112,6 +112,28 @@ def read_external_metrics(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f, delimiter="\t"))
 
 
+def parse_duration_seconds(value: str) -> float:
+    """Parse GNU time durations in seconds, m:ss, or h:mm:ss form."""
+    parts = value.strip().split(":")
+    if not 1 <= len(parts) <= 3 or any(not part for part in parts):
+        raise ValueError(f"unsupported duration: {value!r}")
+    try:
+        values = [float(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError(f"unsupported duration: {value!r}") from exc
+    if any(part < 0 for part in values):
+        raise ValueError(f"negative duration: {value!r}")
+    if len(values) == 1:
+        return values[0]
+    if values[-1] >= 60 or (len(values) == 3 and values[-2] >= 60):
+        raise ValueError(f"invalid clock duration: {value!r}")
+    if len(values) == 2:
+        minutes, seconds = values
+        return minutes * 60 + seconds
+    hours, minutes, seconds = values
+    return hours * 3600 + minutes * 60 + seconds
+
+
 def parse_time_v(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -120,7 +142,6 @@ def parse_time_v(path: Path) -> dict[str, str]:
         "user_cpu_s": r"User time \(seconds\):\s*([0-9.]+)",
         "sys_cpu_s": r"System time \(seconds\):\s*([0-9.]+)",
         "cpu_pct": r"Percent of CPU this job got:\s*([0-9%]+)",
-        "elapsed": r"Elapsed \(wall clock\) time.*:\s*([0-9:.]+)",
         "max_rss_kb": r"Maximum resident set size \(kbytes\):\s*(\d+)",
         "fs_inputs": r"File system inputs:\s*(\d+)",
         "fs_outputs": r"File system outputs:\s*(\d+)",
@@ -131,13 +152,20 @@ def parse_time_v(path: Path) -> dict[str, str]:
         match = re.search(pattern, text)
         if match:
             out[key] = match.group(1)
+    elapsed = re.search(
+        r"^\s*Elapsed \(wall clock\) time.*\):\s*([0-9:.]+)\s*$",
+        text,
+        flags=re.MULTILINE,
+    )
+    if elapsed:
+        out["import_wall_s"] = f"{parse_duration_seconds(elapsed.group(1)):.2f}"
     return out
 
 
 def write_tsv(path: Path, headers: Iterable[str], rows: Iterable[Iterable[str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, delimiter="\t")
+        writer = csv.writer(f, delimiter="\t", lineterminator="\n")
         writer.writerow(list(headers))
         writer.writerows(rows)
 
@@ -224,7 +252,7 @@ def build_resource_table(w6_log: Path, sf10: dict[str, W6Row]) -> tuple[list[str
         "variant",
         "store_gib",
         "l0_files",
-        "import_elapsed",
+        "import_wall_s",
         "user_cpu_s",
         "sys_cpu_s",
         "cpu_pct",
@@ -244,7 +272,7 @@ def build_resource_table(w6_log: Path, sf10: dict[str, W6Row]) -> tuple[list[str
                 variant,
                 row.store_gib if row else "",
                 row.l0_files if row else "",
-                timev.get("elapsed", ""),
+                timev.get("import_wall_s", ""),
                 timev.get("user_cpu_s", ""),
                 timev.get("sys_cpu_s", ""),
                 timev.get("cpu_pct", ""),

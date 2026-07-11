@@ -1,16 +1,14 @@
-# W6 SF100 Matrix Report
+# W6 SF10 Matrix Report
 
-Generated: 2026-07-10T00:50:31+08:00
-Run dir: `remote-logs/w6-sf10-priority-20260709`
+Generated: 2026-07-11T13:33:49+08:00
+Run dir: `/data/WorkSpace/lsmgraph-rs/remote-logs/w6-sf10-priority-20260709`
 Status: `DONE`
 
 This report is regenerated from raw W6 JSON/TSV artifacts. Missing variants are labeled `PENDING`; no simulated/model-derived rows are promoted to measured results.
 
 ## Resource Envelope
 
-| first sample | last sample | samples | min MemAvailable GiB | min /data free GiB | last W6 store |
-| --- | --- | --- | --- | --- | --- |
-| PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
+No `resource-monitor.tsv` was recorded for this run. Per-variant import RSS below remains measured from `/usr/bin/time -v`; no all-PENDING envelope is emitted.
 
 ## Aggregate Matrix
 

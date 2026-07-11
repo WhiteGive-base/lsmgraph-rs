@@ -69,8 +69,9 @@ def configure_matplotlib() -> None:
 
 def save_figure(fig: mpl.figure.Figure, out_dir: Path, stem: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for ext in ("pdf", "svg"):
-        fig.savefig(out_dir / f"{stem}.{ext}")
+    for ext in ("pdf", "svg", "png"):
+        kwargs = {"dpi": 220} if ext == "png" else {}
+        fig.savefig(out_dir / f"{stem}.{ext}", **kwargs)
     plt.close(fig)
 
 
@@ -114,7 +115,7 @@ def plot_c2_lifecycle(out_dir: Path) -> None:
     panels = [
         ("ret", "Semantic surface retention", "Retention", (0, 1.12), "{:.1f}"),
         ("write_amp", "Write amplification", "Write amp", (0.95, 2.05), "{:.2f}"),
-        ("read_after", "Read consequence", "Relative read cost", (0, 8.0), "{:.2g}x"),
+        ("read_after", "Candidate-byte proxy", "Ratio (exact-before=1)", (0, 8.0), "{:.2g}x"),
     ]
 
     for ax, (key, title, ylabel, ylim, fmt) in zip(axes, panels):

@@ -571,11 +571,18 @@ pub enum PropertyOwner {
     EdgeLabel(EdgeLabelId),
 }
 
+/// Strength of the set-valued evidence stored in a semantic summary.
+///
+/// Both `Exact` and `Conservative` can prove disjointness. `Unknown` cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticSummaryCompleteness {
+    /// The recorded set equals the values represented by the segment.
     Exact,
+    /// The recorded set is a safe over-approximation. It may contain false
+    /// positives, but it omits no represented value; disjointness is safe.
     Conservative,
+    /// No set-containment guarantee is available; semantic pruning is disabled.
     Unknown,
 }
 
@@ -610,6 +617,8 @@ impl Default for SemanticSummaryCompleteness {
 }
 
 impl SemanticSummaryCompleteness {
+    /// Whether this summary can prove safe disjointness. This does not mean a
+    /// conservative summary can prove membership or absence within its set.
     pub fn allows_semantic_pruning(self) -> bool {
         matches!(self, Self::Exact | Self::Conservative)
     }

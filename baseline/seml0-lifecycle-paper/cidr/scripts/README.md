@@ -18,14 +18,20 @@ python3 plot_fig2_semantic_evidence_lifecycle.py
 python3 plot_fig2_sf100_read_budget.py
 python3 plot_fig3_c2_lifecycle_retention.py
 python3 plot_fig4_dynamic_sf30_p99.py
+python3 plot_fig5_baseline_positioning.py
 ```
 
 Linux generation path:
 
 ```text
-/data/WorkSpace/lsmgraph-rs/baseline/seml0-lifecycle-paper/cidr
+/data/WorkSpace/lsmgraph-rs-cidr-paper/baseline/seml0-lifecycle-paper/cidr
 ```
 
-Outputs are written to `../images` as both PDF and SVG. Baseline context is
-reported in the paper as a reproducibility-gate table rather than a standalone
-figure.
+Outputs are written to `../images` as matching PDF, SVG, and PNG files. The
+orchestrator contains no plotting data or duplicate figure logic; it invokes
+the standalone generators in a fixed order. LaTeX consumes PDF, while the
+Chinese reading edition embeds PNG.
+
+The detailed evidence-lifecycle, dynamic SF30, and baseline-positioning figures
+are artifact/reading-edition material. The six-page English paper keeps the
+merged control-plane, budget/resource, and C2 figures.
