@@ -8,7 +8,6 @@ Each figure also has a single-figure entry point:
 - `plot_fig2_sf100_read_budget.py`
 - `plot_fig3_c2_lifecycle_retention.py`
 - `plot_fig4_dynamic_sf30_p99.py`
-- `plot_fig5_baseline_positioning.py`
 
 The current PDF/SVG files were generated on the Linux host under:
 
@@ -16,12 +15,11 @@ The current PDF/SVG files were generated on the Linux host under:
 
 Each figure is emitted as both PDF and SVG:
 
-- `fig1_system_control_plane`: architecture/control-plane diagram.
+- `fig1_system_control_plane`: conceptual query-semantic control-plane architecture.
+- `fig2_semantic_evidence_lifecycle`: evidence rows and persistent catalog lifecycle.
 - `fig2_sf100_read_budget`: SF100 read amplification, latency, and memory cliff.
 - `fig3_c2_lifecycle_retention`: C2 lifecycle retention under compaction.
 - `fig4_dynamic_sf30_p99`: SF30 dynamic mixed read/write tail-latency signal.
-- `fig5_baseline_positioning`: scope-limited external/internal baseline positioning.
 
-Important scope note: the baseline figure is a positioning study. Five systems are
-measured external rows under the digest-gated typed-neighbor workload; the LSM-style row
-is an internal SF100 layout row.
+Baseline context is now reported as a reproducibility-gate table in the paper rather
+than as a standalone figure.

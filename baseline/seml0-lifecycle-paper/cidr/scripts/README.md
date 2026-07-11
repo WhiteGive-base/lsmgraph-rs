@@ -14,10 +14,10 @@ Run one figure:
 
 ```bash
 python3 plot_fig1_system_control_plane.py
+python3 plot_fig2_semantic_evidence_lifecycle.py
 python3 plot_fig2_sf100_read_budget.py
 python3 plot_fig3_c2_lifecycle_retention.py
 python3 plot_fig4_dynamic_sf30_p99.py
-python3 plot_fig5_baseline_positioning.py
 ```
 
 Linux generation path:
@@ -26,4 +26,6 @@ Linux generation path:
 /data/WorkSpace/lsmgraph-rs/baseline/seml0-lifecycle-paper/cidr
 ```
 
-Outputs are written to `../images` as both PDF and SVG.
+Outputs are written to `../images` as both PDF and SVG. Baseline context is
+reported in the paper as a reproducibility-gate table rather than a standalone
+figure.

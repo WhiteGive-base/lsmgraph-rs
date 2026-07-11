@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import subprocess
+import sys
 import textwrap
 
 import matplotlib as mpl
@@ -252,6 +254,16 @@ def save_figure(fig: mpl.figure.Figure, out_dir: Path, stem: str) -> None:
     for ext in ("pdf", "svg"):
         fig.savefig(out_dir / f"{stem}.{ext}")
     plt.close(fig)
+
+
+def plot_control_plane_architecture(out_dir: Path) -> None:
+    script = Path(__file__).resolve().parent / "plot_fig1_system_control_plane.py"
+    subprocess.run([sys.executable, str(script), "--out-dir", str(out_dir)], check=True)
+
+
+def plot_semantic_evidence_lifecycle(out_dir: Path) -> None:
+    script = Path(__file__).resolve().parent / "plot_fig2_semantic_evidence_lifecycle.py"
+    subprocess.run([sys.executable, str(script), "--out-dir", str(out_dir)], check=True)
 
 
 def add_panel_label(ax: mpl.axes.Axes, label: str) -> None:
@@ -499,6 +511,15 @@ def plot_system_control_plane(out_dir: Path) -> None:
     save_figure(fig, out_dir, "fig1_system_control_plane")
 
 
+# Keep the all-figures entry point aligned with the standalone Figure 1 script.
+# The standalone script is the source of truth for the detailed architecture
+# diagram because it can be copied and run independently.
+try:
+    from plot_fig1_system_control_plane import plot_system_control_plane
+except ImportError:
+    pass
+
+
 def variant_style(variant: str) -> dict[str, str]:
     if variant in {"naive", "kv-lsm"}:
         return STYLE["naive"]
@@ -605,71 +626,8 @@ def c2_value(scale: str, policy: str, key: str) -> float:
 
 
 def plot_c2_lifecycle(out_dir: Path) -> None:
-    scales = ["SF1 synth", "SF10c synth", "SF30 real"]
-    x = np.arange(len(scales))
-    width = 0.36
-    policies = [
-        ("naive", STYLE["naive"], "Naive merge"),
-        ("semantic", STYLE["semantic"], "Semantic merge"),
-    ]
-
-    fig, axes = plt.subplots(1, 3, figsize=(10.6, 3.05), constrained_layout=True)
-
-    panels = [
-        ("ret", "Semantic surface retention", "Retention", (0, 1.12), "{:.1f}"),
-        ("write_amp", "Write amplification", "Write amp", (0.95, 2.05), "{:.2f}"),
-        ("read_after", "Read consequence", "Relative read cost", (0, 7.2), "{:.2g}x"),
-    ]
-
-    for ax, (key, title, ylabel, ylim, fmt) in zip(axes, panels):
-        for offset, (policy, style, label) in zip([-width / 2, width / 2], policies):
-            values = [c2_value(scale, policy, key) for scale in scales]
-            bars = ax.bar(
-                x + offset,
-                values,
-                width,
-                label=label,
-                color=style["color"],
-                hatch=style["hatch"],
-                edgecolor="#374151",
-                linewidth=0.45,
-            )
-            if key != "ret":
-                autolabel_bars(ax, bars, fmt=fmt)
-            else:
-                for bar, value in zip(bars, values):
-                    y = max(value, 0.015)
-                    ax.annotate(
-                        fmt.format(value),
-                        xy=(bar.get_x() + bar.get_width() / 2, y),
-                        xytext=(0, 2),
-                        textcoords="offset points",
-                        ha="center",
-                        va="bottom",
-                        fontsize=6.8,
-                        color=PALETTE["dark"],
-                    )
-        ax.set_title(title)
-        ax.set_ylabel(ylabel)
-        ax.set_ylim(*ylim)
-        ax.set_xticks(x, scales, rotation=18, ha="right")
-
-    axes[0].legend(frameon=False, loc="upper left")
-    for i, ax in enumerate(axes):
-        add_panel_label(ax, f"({chr(ord('a') + i)})")
-
-    axes[2].text(
-        0.98,
-        0.94,
-        "SF30: metadata replay",
-        transform=axes[2].transAxes,
-        ha="right",
-        va="top",
-        fontsize=7,
-        color=PALETTE["dark"],
-    )
-    fig.suptitle("C2 lifecycle retention under compaction", y=1.03, fontweight="bold")
-    save_figure(fig, out_dir, "fig3_c2_lifecycle_retention")
+    script = Path(__file__).resolve().parent / "plot_fig3_c2_lifecycle_retention.py"
+    subprocess.run([sys.executable, str(script), "--out-dir", str(out_dir)], check=True)
 
 
 def plot_dynamic_sf30(out_dir: Path) -> None:
@@ -711,101 +669,8 @@ def baseline_bar_style(row: dict) -> tuple[str, str]:
 
 
 def plot_baseline_positioning(out_dir: Path) -> None:
-    systems = [row["system"] for row in BASELINES]
-    x = np.arange(len(BASELINES))
-
-    fig, axes = plt.subplots(1, 3, figsize=(11.7, 3.25), constrained_layout=True)
-
-    ax = axes[0]
-    bars = ax.bar(
-        x,
-        [row["avg_us"] for row in BASELINES],
-        color=[baseline_bar_style(row)[0] for row in BASELINES],
-        edgecolor="#374151",
-        linewidth=0.45,
-    )
-    for bar, row in zip(bars, BASELINES):
-        bar.set_hatch(baseline_bar_style(row)[1])
-    ax.set_yscale("log")
-    ax.set_ylabel("Average latency (us, log)")
-    ax.set_xticks(x, systems, rotation=28, ha="right")
-    ax.set_title("Average latency")
-    add_panel_label(ax, "(a)")
-
-    p99_rows = [row for row in BASELINES if row["p99_us"] is not None]
-    p99_systems = [row["system"] for row in p99_rows]
-    p99_x = np.arange(len(p99_rows))
-    ax = axes[1]
-    bars = ax.bar(
-        p99_x,
-        [row["p99_us"] for row in p99_rows],
-        color=[baseline_bar_style(row)[0] for row in p99_rows],
-        edgecolor="#374151",
-        linewidth=0.45,
-    )
-    for bar, row in zip(bars, p99_rows):
-        bar.set_hatch(baseline_bar_style(row)[1])
-    ax.set_yscale("log")
-    ax.set_ylabel("P99 latency (us, log)")
-    ax.set_xticks(p99_x, p99_systems, rotation=28, ha="right")
-    ax.set_title("P99 latency")
-    ax.text(
-        0.02,
-        0.94,
-        "LiveGraph p99 not reported",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=7,
-        color=PALETTE["dark"],
-    )
-    add_panel_label(ax, "(b)")
-
-    ax = axes[2]
-    bars = ax.bar(
-        x,
-        [row["disk_gib"] for row in BASELINES],
-        color=[baseline_bar_style(row)[0] for row in BASELINES],
-        edgecolor="#374151",
-        linewidth=0.45,
-        alpha=0.92,
-        label="Disk",
-    )
-    for bar, row in zip(bars, BASELINES):
-        bar.set_hatch(baseline_bar_style(row)[1])
-    ax.set_ylabel("Disk footprint (GiB)")
-    ax.set_xticks(x, systems, rotation=28, ha="right")
-    ax.set_title("Footprint and load cost")
-    ax2 = ax.twinx()
-    load_x = [i for i, row in enumerate(BASELINES) if row["load_s"] is not None]
-    load_y = [row["load_s"] for row in BASELINES if row["load_s"] is not None]
-    ax2.plot(
-        load_x,
-        load_y,
-        color=PALETTE["red"],
-        marker="D",
-        linewidth=1.3,
-        markersize=4,
-        label="Load time",
-    )
-    ax2.set_ylabel("Load time (s)")
-    ax2.spines["right"].set_visible(True)
-    handles1, labels1 = ax.get_legend_handles_labels()
-    handles2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(handles1 + handles2, labels1 + labels2, frameon=False, loc="upper left")
-    add_panel_label(ax, "(c)")
-
-    fig.text(
-        0.995,
-        -0.02,
-        "* LSM-style is an internal SF100 layout row; external rows are SF10.",
-        ha="right",
-        va="top",
-        fontsize=7,
-        color=PALETTE["dark"],
-    )
-    fig.suptitle("Scope-limited baseline positioning", y=1.03, fontweight="bold")
-    save_figure(fig, out_dir, "fig5_baseline_positioning")
+    script = Path(__file__).resolve().parent / "plot_fig5_baseline_positioning.py"
+    subprocess.run([sys.executable, str(script), "--out-dir", str(out_dir)], check=True)
 
 
 def write_readme(out_dir: Path) -> None:
@@ -820,7 +685,6 @@ def write_readme(out_dir: Path) -> None:
         "- `plot_fig2_sf100_read_budget.py`",
         "- `plot_fig3_c2_lifecycle_retention.py`",
         "- `plot_fig4_dynamic_sf30_p99.py`",
-        "- `plot_fig5_baseline_positioning.py`",
         "",
         "The current PDF/SVG files were generated on the Linux host under:",
         "",
@@ -828,16 +692,15 @@ def write_readme(out_dir: Path) -> None:
         "",
         "Each figure is emitted as both PDF and SVG:",
         "",
-        "- `fig1_system_control_plane`: architecture/control-plane diagram.",
+        "- `fig1_system_control_plane`: conceptual query-semantic control-plane architecture.",
+        "- `fig2_semantic_evidence_lifecycle`: evidence rows and persistent catalog lifecycle.",
         "- `fig2_sf100_read_budget`: SF100 read amplification, latency, and memory cliff.",
         "- `fig3_c2_lifecycle_retention`: C2 lifecycle retention under compaction.",
         "- `fig4_dynamic_sf30_p99`: SF30 dynamic mixed read/write tail-latency signal.",
-        "- `fig5_baseline_positioning`: scope-limited external/internal baseline positioning.",
         "",
         textwrap.fill(
-            "Important scope note: the baseline figure is a positioning study. "
-            "Five systems are measured external rows under the digest-gated typed-neighbor "
-            "workload; the LSM-style row is an internal SF100 layout row.",
+            "Baseline context is now reported as a reproducibility-gate table in "
+            "the paper rather than as a standalone figure.",
             width=88,
         ),
         "",
@@ -860,11 +723,11 @@ def main() -> None:
     args = parse_args()
     out_dir = args.out_dir.resolve()
     configure_matplotlib()
-    plot_system_control_plane(out_dir)
+    plot_control_plane_architecture(out_dir)
+    plot_semantic_evidence_lifecycle(out_dir)
     plot_sf100_read_budget(out_dir)
     plot_c2_lifecycle(out_dir)
     plot_dynamic_sf30(out_dir)
-    plot_baseline_positioning(out_dir)
     write_readme(out_dir)
     print(f"Wrote figures to {out_dir}")
 

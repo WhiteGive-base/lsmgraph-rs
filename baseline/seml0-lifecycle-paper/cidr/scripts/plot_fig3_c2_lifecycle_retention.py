@@ -109,12 +109,12 @@ def plot_c2_lifecycle(out_dir: Path) -> None:
         ("semantic", STYLE["semantic"], "Semantic merge"),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(10.6, 3.05), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(10.8, 3.45), constrained_layout=True)
 
     panels = [
         ("ret", "Semantic surface retention", "Retention", (0, 1.12), "{:.1f}"),
         ("write_amp", "Write amplification", "Write amp", (0.95, 2.05), "{:.2f}"),
-        ("read_after", "Read consequence", "Relative read cost", (0, 7.2), "{:.2g}x"),
+        ("read_after", "Read consequence", "Relative read cost", (0, 8.0), "{:.2g}x"),
     ]
 
     for ax, (key, title, ylabel, ylim, fmt) in zip(axes, panels):
@@ -150,21 +150,32 @@ def plot_c2_lifecycle(out_dir: Path) -> None:
         ax.set_ylim(*ylim)
         ax.set_xticks(x, scales, rotation=18, ha="right")
 
-    axes[0].legend(frameon=False, loc="upper left")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        frameon=False,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.085),
+        ncol=2,
+        handlelength=2.0,
+        columnspacing=1.4,
+    )
     for i, ax in enumerate(axes):
         add_panel_label(ax, f"({chr(ord('a') + i)})")
 
     axes[2].text(
         0.98,
-        0.94,
-        "SF30: metadata replay",
+        0.955,
+        "SF30 real: metadata replay",
         transform=axes[2].transAxes,
         ha="right",
         va="top",
         fontsize=7,
         color=PALETTE["dark"],
+        bbox={"facecolor": "white", "edgecolor": "none", "pad": 1.0, "alpha": 0.90},
     )
-    fig.suptitle("C2 lifecycle retention under compaction", y=1.03, fontweight="bold")
+    fig.suptitle("C2 lifecycle retention under compaction", y=1.175, fontweight="bold")
     save_figure(fig, out_dir, "fig3_c2_lifecycle_retention")
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone generator for Figure 5: scope-limited baseline positioning."""
+"""Standalone generator for Figure 5: baseline context, not head-to-head."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import FancyBboxPatch
 
 
 DEFAULT_OUT_DIR = Path(__file__).resolve().parents[1] / "images"
@@ -37,6 +38,9 @@ BASELINES = [
     {"system": "Neo4j", "scale": "SF10", "avg_us": 1_974_806.09, "p99_us": 34_522_340.13, "disk_gib": 15.52, "load_s": 216.845, "kind": "external"},
     {"system": "LSM-style*", "scale": "SF100", "avg_us": 556.741, "p99_us": 10_000, "disk_gib": 130.94, "load_s": None, "kind": "internal"},
 ]
+
+EXTERNAL_ROWS = [row for row in BASELINES if row["kind"] == "external"]
+INTERNAL_ROW = next(row for row in BASELINES if row["kind"] == "internal")
 
 
 def configure_matplotlib() -> None:
@@ -77,51 +81,41 @@ def add_panel_label(ax: mpl.axes.Axes, label: str) -> None:
     ax.text(-0.08, 1.05, label, transform=ax.transAxes, ha="left", va="bottom", fontweight="bold", color=PALETTE["dark"])
 
 
-def baseline_bar_style(row: dict) -> tuple[str, str]:
-    if row["kind"] == "internal":
-        return STYLE["internal"]["color"], STYLE["internal"]["hatch"]
-    return PALETTE["blue"], ""
-
-
 def plot_baseline_positioning(out_dir: Path) -> None:
-    systems = [row["system"] for row in BASELINES]
-    x = np.arange(len(BASELINES))
+    systems = [row["system"] for row in EXTERNAL_ROWS]
+    x = np.arange(len(EXTERNAL_ROWS))
 
-    fig, axes = plt.subplots(1, 3, figsize=(11.7, 3.25), constrained_layout=True)
+    fig, axes = plt.subplots(1, 4, figsize=(11.9, 3.25), constrained_layout=True, gridspec_kw={"width_ratios": [1.05, 1.0, 1.05, 0.76]})
 
     ax = axes[0]
     bars = ax.bar(
         x,
-        [row["avg_us"] for row in BASELINES],
-        color=[baseline_bar_style(row)[0] for row in BASELINES],
+        [row["avg_us"] for row in EXTERNAL_ROWS],
+        color=PALETTE["blue"],
         edgecolor="#374151",
         linewidth=0.45,
     )
-    for bar, row in zip(bars, BASELINES):
-        bar.set_hatch(baseline_bar_style(row)[1])
     ax.set_yscale("log")
     ax.set_ylabel("Average latency (us, log)")
     ax.set_xticks(x, systems, rotation=28, ha="right")
-    ax.set_title("Average latency")
+    ax.set_title("External SF10 avg")
     add_panel_label(ax, "(a)")
 
-    p99_rows = [row for row in BASELINES if row["p99_us"] is not None]
+    p99_rows = [row for row in EXTERNAL_ROWS if row["p99_us"] is not None]
     p99_systems = [row["system"] for row in p99_rows]
     p99_x = np.arange(len(p99_rows))
     ax = axes[1]
     bars = ax.bar(
         p99_x,
         [row["p99_us"] for row in p99_rows],
-        color=[baseline_bar_style(row)[0] for row in p99_rows],
+        color=PALETTE["cyan"],
         edgecolor="#374151",
         linewidth=0.45,
     )
-    for bar, row in zip(bars, p99_rows):
-        bar.set_hatch(baseline_bar_style(row)[1])
     ax.set_yscale("log")
     ax.set_ylabel("P99 latency (us, log)")
     ax.set_xticks(p99_x, p99_systems, rotation=28, ha="right")
-    ax.set_title("P99 latency")
+    ax.set_title("External SF10 p99")
     ax.text(
         0.02,
         0.94,
@@ -137,22 +131,20 @@ def plot_baseline_positioning(out_dir: Path) -> None:
     ax = axes[2]
     bars = ax.bar(
         x,
-        [row["disk_gib"] for row in BASELINES],
-        color=[baseline_bar_style(row)[0] for row in BASELINES],
+        [row["disk_gib"] for row in EXTERNAL_ROWS],
+        color=PALETTE["green"],
         edgecolor="#374151",
         linewidth=0.45,
         alpha=0.92,
         label="Disk",
     )
-    for bar, row in zip(bars, BASELINES):
-        bar.set_hatch(baseline_bar_style(row)[1])
     ax.set_ylabel("Disk footprint (GiB)")
     ax.set_xticks(x, systems, rotation=28, ha="right")
-    ax.set_title("Footprint and load cost")
+    ax.set_title("External SF10 footprint/load")
 
     ax2 = ax.twinx()
-    load_x = [i for i, row in enumerate(BASELINES) if row["load_s"] is not None]
-    load_y = [row["load_s"] for row in BASELINES if row["load_s"] is not None]
+    load_x = [i for i, row in enumerate(EXTERNAL_ROWS) if row["load_s"] is not None]
+    load_y = [row["load_s"] for row in EXTERNAL_ROWS if row["load_s"] is not None]
     ax2.plot(load_x, load_y, color=PALETTE["red"], marker="D", linewidth=1.3, markersize=4, label="Load time")
     ax2.set_ylabel("Load time (s)")
     ax2.spines["right"].set_visible(True)
@@ -161,16 +153,36 @@ def plot_baseline_positioning(out_dir: Path) -> None:
     ax.legend(handles1 + handles2, labels1 + labels2, frameon=False, loc="upper left")
     add_panel_label(ax, "(c)")
 
-    fig.text(
-        0.995,
-        -0.02,
-        "* LSM-style is an internal SF100 layout row; external rows are SF10.",
-        ha="right",
-        va="top",
+    ax = axes[3]
+    ax.set_axis_off()
+    ax.set_title("Internal context", pad=8)
+    add_panel_label(ax, "(d)")
+    box = FancyBboxPatch(
+        (0.04, 0.14),
+        0.92,
+        0.70,
+        boxstyle="round,pad=0.02,rounding_size=0.03",
+        facecolor="#FFF7ED",
+        edgecolor=PALETTE["orange"],
+        linewidth=1.0,
+        transform=ax.transAxes,
+    )
+    ax.add_patch(box)
+    ax.text(0.50, 0.74, "LSM-style* / SF100", transform=ax.transAxes, ha="center", va="center", fontweight="bold", color=PALETTE["dark"])
+    ax.text(0.50, 0.58, f"avg {INTERNAL_ROW['avg_us']:.1f} us", transform=ax.transAxes, ha="center", va="center", color=PALETTE["dark"])
+    ax.text(0.50, 0.46, f"p99 {INTERNAL_ROW['p99_us']:.0f} us", transform=ax.transAxes, ha="center", va="center", color=PALETTE["dark"])
+    ax.text(0.50, 0.34, f"disk {INTERNAL_ROW['disk_gib']:.1f} GiB", transform=ax.transAxes, ha="center", va="center", color=PALETTE["dark"])
+    ax.text(
+        0.50,
+        0.20,
+        "internal layout row,\nnot an official external\nLSMGraph artifact",
+        transform=ax.transAxes,
+        ha="center",
+        va="center",
         fontsize=7,
         color=PALETTE["dark"],
     )
-    fig.suptitle("Scope-limited baseline positioning", y=1.03, fontweight="bold")
+    fig.suptitle("Baseline context, not head-to-head comparison", y=1.03, fontweight="bold")
     save_figure(fig, out_dir, "fig5_baseline_positioning")
 
 

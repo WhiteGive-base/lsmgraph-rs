@@ -6,7 +6,7 @@
 
 SemL0 是一个 LSM-based property-graph store 原型。它把查询签名作为存储控制平面：在 flush 时生成 segment-level semantic state，在读路径上只用 exact evidence 做安全剪枝，在 compaction 中保留或重建 semantic pruning surface，并在 schema、snapshot、tombstone 不确定时保守回退。SemL0 要验证的不是“完整图数据库”，而是一个系统架构原则：mutable graph storage 不应该只受 key order 和 level structure 控制，也应该受它要服务的 graph query semantics 控制。
 
-在 LDBC SNB up to SF100 的原型实验中，SemL0 降低 candidate segments 和 read bytes；同一组实验也暴露出 unbudgeted semantic materialization 的 118.03 GiB memory cliff。真实 SF30 compaction input 上，semantic-aware compaction 以有界 write amplification 保留 pruning surface；schema/snapshot 测试覆盖 no-false-negative fallback 路径。外部比较使用 typed-neighbor digest gate，包含五个 measured external systems 和一个 internal LSMGraph-style layout row；它的作用是定位存储机制，不是宣称完整图数据库 head-to-head。
+在 LDBC SNB up to SF100 的原型实验中，SemL0 降低 candidate segments 和 read bytes；同一组实验也暴露出 unbudgeted semantic materialization 的 118.03 GiB memory cliff。真实 SF30 compaction input 上，semantic-aware compaction 保留 pruning surface；schema/snapshot 测试覆盖 no-false-negative fallback 路径。外部比较只作为 typed-neighbor interface 的 digest-gated positioning evidence，不宣称完整图数据库 head-to-head。
 
 ## 1. Introduction
 
@@ -49,13 +49,17 @@ LSM-style storage 适合动态图更新。写入可以先进内存或 append-fri
 
 ## 3. System Design
 
-图1表达的不是“又一个图存储模块”，而是 SemL0 在 property-graph query interface 和 LSM-style graph store 之间插入的 query-semantic control plane。它的作用是让 graph query semantics 在整个 storage lifecycle 中保持可见：query compilation、read admission、physical rewrite，以及 conservative correctness fallback。底层存储仍然属于 write-friendly delta 和 CSR-like read path 这一类设计背景 [9,10]；SemL0 的差异在于把 query-semantic evidence 持久化为 read 和 compaction 都能使用的控制信号。
+图1把 SemL0 画成 query-semantic control plane，而不是另一个 graph storage engine。Property-graph read 先被编译成 storage-visible signature；control plane 把这个 signature 和 segment-level evidence 比较，并用 exactness contract 决定 read admission。只有 exact evidence 能证明 disjointness 或 absence 时，segment 才能被 skip；否则就读。相同的 evidence 也进入 semantic-aware compaction，让 physical rewrite 保留或重建 pruning surface，而不是静默破坏它。底部的 Persistent Evidence Catalog 表示 evidence 会跨 flush、compaction、restart 和 future reads 保留下来。底层存储仍然属于 write-friendly delta 和 CSR-like read path 这一类设计背景 [9,10]；SemL0 的差异在于把 query-semantic evidence 持久化为 read 和 compaction 都能使用的控制信号。图右侧的 read admission gate 和 semantic-aware compaction 是由 SemL0 控制的 store-side decision hooks，不是底层 store 自己独立决定的普通策略。
 
-![图1：SemL0 系统结构](../images/fig1_system_control_plane.svg)
+![图1：SemL0 query-semantic control plane](../images/fig1_system_control_plane_clean.png)
 
 SemL0 把一个 graph access 中对 storage 可见的部分表示为 query signature。Signature 不是完整 logical query plan，而是那些会影响 storage decisions 的 query semantics 子集。当前原型主要覆盖 LDBC SNB-style 数据上的 typed-neighbor 和 property-aware reads。Signature 可以包含 source label、edge type、direction、degree class、property predicate class、snapshot 和 schema epoch。Signature 可以是 partial 的；当某个组件 unknown、unsupported，或者在当前 schema/snapshot 下不安全时，SemL0 会保守携带它，而不是把不确定性转成 pruning evidence。
 
 每个 segment 保存 compact semantic state，描述它可能包含什么，以及这个 summary 有多可信。一个 segment 可以 exact for 某个 `(source label, edge type)`，也可以只对 edge type exact，或者因为混合多个 labels/epochs 而 Conservative，或者因为 schema/visibility 信息不足而 Unknown。真正有用的不只是 metadata format，而是 exactness state：Exact evidence 可以相对于 query signature 证明 absence 或 disjointness；Conservative/Unknown evidence 不能。因此 SemL0 把 exact segment metadata 当作 read admission 的 proof object，而不是 best-effort cache hint。
+
+图2展开了 control plane 背后的 evidence representation。SemL0 把 query-side access pattern 和 storage-side segment summary 都表示成可比较的 evidence rows：`GraphAccessSignature` 描述 query 对 storage 可见的语义，`CsrSegmentMeta` 描述 segment 能提供的 semantic evidence。两者共享 label、edge type、epoch 等维度，因此 exactness contract 可以判断一个 segment 是否和 query signature provably disjoint，或者必须 conservative read。Flush 和 compaction 会把新的 evidence rows publish 到 persistent catalog；read 和后续 rewrite 再从 catalog reload 到 in-memory semantic index。schema 或 visibility uncertainty 会把 evidence 降级为 Conservative/Unknown，而不是允许不安全剪枝。
+
+![图2：Semantic evidence rows and catalog lifecycle](../images/fig2_semantic_evidence_lifecycle_clean.png)
 
 ### Exactness-aware pruning
 
@@ -65,7 +69,9 @@ Read path 把 query signature 和 segment metadata 做匹配。只有当 metadat
 
 ### Semantic compaction
 
-SemL0 和 query-time filter 的主要区别在 compaction。如果 semantic metadata 只在 flush 时产生，后面就被忽略，那么这个优化会随着 LSM tree 演化而衰减。SemL0 因此把 physical rewrite 当成 semantic rewrite。当某个 partition 对 workload 有价值且保持 exact 的成本可接受时，SemL0 输出 semantic-aware outputs，例如按 `(source label, edge type)` 分组。当 exact preservation 太贵或不安全时，SemL0 把 output 标成 Conservative，让 read path 回退扫描。图1右侧的 numbered path 表达的是这个 semantic evidence lifecycle：compile、register、admit、schedule、rewrite、reuse。
+SemL0 和 query-time filter 的主要区别在 compaction。如果 semantic metadata 只在 flush 时产生，后面就被忽略，那么这个优化会随着 LSM tree 演化而衰减。SemL0 因此把 physical rewrite 当成 semantic rewrite。当某个 partition 对 workload 有价值且保持 exact 的成本可接受时，SemL0 输出 semantic-aware outputs，例如按 `(source label, edge type)` 分组。当 exact preservation 太贵或不安全时，SemL0 把 output 标成 Conservative，让 read path 回退扫描。
+
+例如，compaction 前几个 segments 可能分别对 `(Person, knows)`、`(Person, likes)`、`(Forum, hasMember)` 有 exact evidence。Naive merge 可以把它们合成一个 mixed segment；逻辑图内容仍然正确，但未来 query 失去了跳过无关 neighborhood 所需的 proof。Semantic-aware compaction 则在 read benefit 值得 rewrite cost 时保留 exact outputs；否则把 output 标成 Conservative，而不是假装它仍然 exact。
 
 这个设计把 correctness 和 optimization 分开。Correctness 不依赖 semantic partitioning 成功。如果 metadata exact，read path 可以 prune；如果 metadata Conservative/Unknown，read path 读取。最坏情况是少剪枝，不是 false negative。这就是 query signatures 能成为 storage control plane，而不是危险 shortcut 的原因。
 
@@ -73,25 +79,25 @@ SemL0 和 query-time filter 的主要区别在 compaction。如果 semantic meta
 
 控制平面不能无预算地物化所有语义。属性图暴露很多维度：labels、edge types、directions、degree classes、property predicates、snapshots、schema epochs。把这些维度的笛卡尔积都物化，会造成 memory/file-count cliff。SemL0 因此把 query signatures 当成 budgeted control signals。这个方向也呼应了 storage format functional decomposition 和 columnar graph DBMS 的经验：数据布局、搜索加速元数据、图访问模式不应该被一个固定物理粒度绑死 [18,19]。SemL0 原型支持 coarse signatures、edge-type-only signatures 和 budgeted variants，在不全量语义划分的前提下保留有价值的 semantic distinctions。
 
-## 4. Preliminary Experiments
+## 4. Prototype Evidence
 
 我们从四个维度评估 SemL0 的原型实现：read amplification、metadata budget、compaction lifecycle，以及 schema/snapshot 不确定时的 conservative fallback。
 
 ### SF100 read amplification
 
-W6 SF100 read-only matrix 是主结果，对应图2。`naive` 和 `kv-lsm` 都检查 49,257,601 个 L0 candidates，read bytes 是 3,461.6 MiB。Semantic variants 把 candidates 降到约 5.9M 到 7.9M，read bytes 降到 642.7 到 820.0 MiB。所有 comparable rows 都 checked 45,000 operations，并且 zero mismatches。
+W6 SF100 read-only matrix 是主结果，对应图3。`naive` 和 `kv-lsm` 都检查 49,257,601 个 L0 candidates，read bytes 是 3,461.6 MiB。Semantic variants 把 candidates 降到约 5.9M 到 7.9M，read bytes 降到 642.7 到 820.0 MiB。所有 comparable rows 都 checked 45,000 operations，并且 zero mismatches。图3里的 variant 含义是：`schema` 使用 label/epoch-aware metadata，`edge-only` 只保留 edge-type summary，`budg-b*` 是 budgeted semantic materialization，`semantic` 是 full semantic split，`oracle` 是 pruning upper bound reference。
 
-![图2：SF100 read amplification and budget tradeoff](../images/fig2_sf100_read_budget.svg)
+![图3：SF100 read amplification and budget tradeoff](../images/fig2_sf100_read_budget.svg)
 
-同一个实验还说明 control plane 必须 budgeted。图2(c) 的 full unbudgeted semantic materialization peak import RSS 到 118.03 GiB，而 budgeted/schema variants 仍接近 naive 的内存范围，约 2.2 到 2.5 GiB。这是一条有用的负面结果：query semantics 可以指导 storage，但 practical system 不能无预算地物化所有语义划分。
+同一个实验还说明 control plane 必须 budgeted。图3(c) 的 full unbudgeted semantic materialization peak import RSS 到 118.03 GiB，而 budgeted/schema variants 仍接近 naive 的内存范围，约 2.2 到 2.5 GiB。这是一条有用的负面结果：query semantics 可以指导 storage，但 practical system 不能无预算地物化所有语义划分。
 
 ### Lifecycle retention under compaction
 
-图3的 C2 实验直接检验 compaction 生命周期这一点。Controlled rows 隔离 merge policy，并在完整 read workload 上测 read-amplification consequence。Naive merge 会破坏 exact semantic surfaces，造成 4x 到 6x typed-neighbor read blow-up；semantic-aware merge 保持 read cost flat，并且 zero mismatches。
+图4的 C2 实验直接检验 compaction 生命周期这一点。Controlled rows 隔离 merge policy，并在完整 read workload 上测 read-amplification consequence。Naive merge 会破坏 exact semantic surfaces，造成 4x 到 6x typed-neighbor read blow-up；semantic-aware merge 保持 read cost flat，并且 zero mismatches。
 
-![图3：C2 lifecycle retention under compaction](../images/fig3_c2_lifecycle_retention.svg)
+![图4：C2 lifecycle retention under compaction](../images/fig3_c2_lifecycle_retention.svg)
 
-真实 SF30 rows 在 real LDBC input 上测 retention 和 write cost：1.09B directed edges，40 个 `(source label, edge type)` partitions，528 个 exact L1 segments。Naive compaction 的 semantic retention 是 0.0；semantic-aware compaction 是 1.0。成本可控：semantic-aware write amplification 1.24，naive 1.07。真实 SF30 post-merge metadata replay 中，naive 的 weighted candidate-byte proxy 是 6.52x，而 semantic-aware 是 1.00x。
+真实 SF30 rows 在 real LDBC input 上测 retention 和 write cost：1.09B directed edges，40 个 `(source label, edge type)` partitions，528 个 exact L1 segments。Naive compaction 的 semantic retention 是 0.0；semantic-aware compaction 是 1.0。synthetic rows 暴露了保留 exact partitions 的 worst-case rewrite premium；真实 SF30 input 的 premium 更温和，semantic-aware write amplification 是 1.24，naive 是 1.07。真实 SF30 post-merge metadata replay 中，naive 的 weighted candidate-byte proxy 是 6.52x，而 semantic-aware 是 1.00x。
 
 Real SF30 的 read amplification 是 metadata-level proxy，不是 full body-read workload。Controlled rows 测 full read workload + correctness；real SF30 rows 测 retention、write cost 和 metadata replay。
 
@@ -99,15 +105,21 @@ Real SF30 的 read amplification 是 metadata-level proxy，不是 full body-rea
 
 W13 schema-evolution runner 验证 conservative fallback。测试覆盖 old segment readability、mixed deltas across compaction/reopen、alias/drop、encoding epoch、new-label exact-vs-mixed pruning。两次 completed runs 中，10 个 selected schema-evolution tests 全部通过。这些测试覆盖的是设计中的正确性边界：SemL0 在 metadata 仍然 exact 时剪枝，在 schema/snapshot uncertainty 会影响安全性时保守读取。
 
-W9 观察 dynamic workload 下的 read path，对应图4。SF30 30 分钟 mixed read/write run，6 个 checkpoints，约 163 queries/s，0 writer errors。Latency 不能写成 universal speedup，但 dynamic run 给出随时间变化的同一模式：1800 秒时 schema p99 是 8,740.2 us，semantic p99 是 1,274.0 us。这说明跨时间保留 query-semantic state 可以保护动态 LSM layout 下的 read path。
+W9 观察 dynamic workload 下的 read path，对应图5。SF30 30 分钟 mixed read/write run，6 个 checkpoints，约 163 queries/s，0 writer errors。Latency 不能写成 universal speedup，但 dynamic run 给出随时间变化的同一模式：1800 秒时 schema p99 是 8,740.2 us，semantic p99 是 1,274.0 us。这说明跨时间保留 query-semantic state 可以保护动态 LSM layout 下的 read path。
 
-![图4：SF30 dynamic mixed read/write p99](../images/fig4_dynamic_sf30_p99.svg)
+![图5：SF30 dynamic mixed read/write p99](../images/fig4_dynamic_sf30_p99.svg)
 
-### Baselines under a typed-neighbor gate
+### Digest-gated baseline context
 
-外部 baseline 进入数值比较的条件是：加载同一个 LDBC dense edge set，执行同一个 fixed-seed sampled typed-neighbor workload，并且对每个 sampled query 做 count/hash digest correctness。3+3 结构包含五个 measured external systems 和一个 internal LSMGraph-style layout row；后者不是官方 external LSMGraph artifact。图5把这些 rows 画成 positioning figure，引用对象包括 LiveGraph、Aster、TuGraph、NebulaGraph 和 property-graph/Cypher 背景 [4,11,12,13,14]。
+外部 baseline 只用于定位 typed-neighbor interface。一个 row 进入这个 context 的条件是：加载同一个 LDBC dense edge set，执行同一个 fixed-seed sampled typed-neighbor workload，并且对每个 sampled query 做 count/hash digest correctness。LiveGraph、Aster RocksGraph、TuGraph、NebulaGraph 和 Neo4j 在 SF10 上通过了这个 gate。这不是完整图数据库 head-to-head；它测试的是现有系统是否暴露可比较的 typed-neighbor interface，而不是 SemL0 是否已经是完整 graph database。internal LSM-style SF100 row 只作为 storage-layout context 保留，不是官方 external LSMGraph artifact。
 
-![图5：Scope-limited baseline positioning](../images/fig5_baseline_positioning.svg)
+| System | Dataset | Loader/converter | Query driver | Digest | Avg/P99 | Disk | Load | Commit/log |
+|---|---|---|---|---|---|---|---|---|
+| LiveGraph | SF10 | yes | yes | pass | yes | yes | yes | archived |
+| Aster RocksGraph | SF10 | bridge | yes | pass | yes | yes | yes | archived |
+| TuGraph | SF10 | yes | embedded C++ | pass | yes | yes | yes | archived |
+| NebulaGraph | SF10 | nGQL edge types | yes | pass | yes | yes | yes | archived |
+| Neo4j Community | SF10 | rel.-type import | Cypher | pass | yes | yes | yes | archived |
 
 这些 rows 用于定位，不是完整 SOTA 结论。Aster RocksGraph 是 typed-neighbor bridge，不是完整 AsterDB/Gremlin benchmark。NebulaGraph 是 same-workload nGQL edge-type model，不是生产部署或完整 LDBC Interactive benchmark。LSMGraph-style 是 internal layout row，不能写成官方外部 artifact。
 
@@ -123,7 +135,7 @@ W9 观察 dynamic workload 下的 read path，对应图4。SF30 30 分钟 mixed 
 
 **Baseline 必须匹配被测试的接口。** 很多系统是 transaction、analytics、CSR snapshot 或 distributed graph service 的强 baseline，但不暴露 SemL0 研究的 property-graph typed-neighbor interface 和 semantic rewrite control。CIDR 比纯 benchmark paper 更合适，因为贡献是系统架构原则和工程经验。
 
-SemL0 仍是 prototype，不是 production graph database。下一步是更干净的 semantic-aware compaction scheduler、更完整的 property-predicate summaries、更完整的 schema/property encoding changes 处理，以及更严格的 external baseline clean-checkout artifact story。这个原则保持不变：在 mutable graph storage 中，physical lifecycle policy 不只决定 bytes 放在哪里，也决定未来查询是否还保留避免读取这些 bytes 的 evidence。
+SemL0 仍是 prototype，不是 production graph database。下一步是更干净的 semantic-aware compaction scheduler、更完整的 property-predicate summaries、更完整的 schema/property encoding changes 处理。投更强 benchmark claim 之前，最优先补三类证据：第一，catalog / semantic-index overhead，包括 catalog size、in-memory index size、reload/build time、metadata per segment；第二，property-aware read 小实验，覆盖 typed-neighbor only、typed-neighbor + property predicate class、property absence exact pruning，证明 `PROP` 字段不是装饰；第三，在 controlled SF1/SF10 上验证 metadata replay proxy 和 full body-read cost 的趋势一致，再用 SF30 proxy 会更稳。其他可补项包括同一 SF10 external workload 下的 SemL0 rows、更大的随机 insert/delete/tombstone/schema epoch differential correctness stress，以及 dynamic run 的 compaction count、L0 segment count、candidate bytes、writer throughput、CPU/RSS 等资源和事件指标。这个原则保持不变：在 mutable graph storage 中，physical lifecycle policy 不只决定 bytes 放在哪里，也决定未来查询是否还保留避免读取这些 bytes 的 evidence。
 
 ## 参考文献
 
