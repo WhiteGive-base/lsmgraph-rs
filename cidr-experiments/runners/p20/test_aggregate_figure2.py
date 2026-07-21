@@ -95,7 +95,10 @@ def collapsed(stage, repeat, mode):
         "latency_histogram_json": "{}",
         "summary_path": "/fixture",
         "summary_sha256": ("6" if mode == "latency" else "7") * 64,
-        "clean_window_sentinel_sha256": "8" * 64,
+        "p02b_sentinel_result_sha256": "8" * 64,
+        "p02b_pass_marker_sha256": "9" * 64,
+        "p02b_provenance_sha256": "a" * 64,
+        "p02b_validator_sha256": "b" * 64,
     }
     return value
 
@@ -145,7 +148,10 @@ class Figure2AggregatorTest(unittest.TestCase):
                 "mode": "latency",
                 "benchmark_entry_index": "0",
                 "query_cpu_total_ns": "",
-                "clean_window_sentinel_sha256": "8" * 64,
+                "p02b_sentinel_result_sha256": "8" * 64,
+                "p02b_pass_marker_sha256": "9" * 64,
+                "p02b_provenance_sha256": "a" * 64,
+                "p02b_validator_sha256": "b" * 64,
             }
         )
         for field in MODULE.ADDITIVE:
@@ -177,6 +183,19 @@ class Figure2AggregatorTest(unittest.TestCase):
         merged = MODULE.collapse_summary(Path(__file__), [first, second])
         self.assertEqual(merged["measured_operations"], 4)
         self.assertEqual(merged["latency_p99_us"], 100)
+
+    def test_paired_modes_reject_different_p02b_gate(self):
+        values = self.canonical_inputs()
+        cpu = next(
+            value
+            for value in values
+            if value["stage"] == "A2"
+            and value["repeat_index"] == "1"
+            and value["mode"] == "cpu-phase"
+        )
+        cpu["p02b_sentinel_result_sha256"] = "0" * 64
+        with self.assertRaises(MODULE.AggregateError):
+            MODULE.build_run_rows(values, 3)
 
 
 if __name__ == "__main__":

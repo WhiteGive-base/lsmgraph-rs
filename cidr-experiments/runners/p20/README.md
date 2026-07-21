@@ -11,12 +11,22 @@ silently upgraded.
 Each invocation of `run_single_profile.py` executes one mode, stage, workload,
 and independent repeat.  It requires a fresh stage-store clone whose complete
 file inventory and per-file SHA-256 match a frozen pristine-store manifest.
-Formal performance modes additionally require CPU pinning and a
-`p20-clean-window-sentinel` JSON artifact bound to the binary, dataset, sample
-plan, truth, pristine-store tree hash, scale, and host.  The sentinel must have
-at least three observations with QPS CV at most 3% and P99 CV at most 5%.
-It expires one hour after `completed_at_utc`, so an old quiet period cannot be
-reused after host load has changed.
+Every measured mode, including the diagnostic `cpu-phase`, requires a formal
+P02B `p02b-sf10-sentinel-result-v1` release for consumer `P20`.  P20 invokes
+the canonical P02B validator rather than interpreting a second sentinel
+schema.  The validator binds the adjacent `PASS` marker and `provenance.json`,
+the clean Git HEAD and benchmark binary, a common P31 host fingerprint, and a
+maximum age of six hours.  P02B is explicitly a same-host, host-global release
+gate: its SF10 workload/store and 48-thread protocol are not required to equal
+the later P20 scale, workload, store, or thread count.  Those P20 inputs remain
+independently frozen by the correctness and pristine-store manifests.  Legacy
+flat `p20-clean-window-sentinel` artifacts are rejected.
+
+The generated `p02b-admission.json` joins the P02B receipt to the current P20
+task/run/repeat, all current input hashes, CPU isolation, and P31 collection
+settings.  The P31 collector wrapper is pinned to a housekeeping cpuset while
+the benchmark tail is pinned to a disjoint benchmark cpuset.  Paper-use runs
+require auxiliary collectors and at least ten P31 samples.
 
 `summary.tsv` remains entry-level provenance.  It carries the complete latency
 histogram for every benchmark entry, the measured-round `query_cpu_total_ns`,
@@ -32,7 +42,7 @@ the matching diagnostic `cpu-phase` run, and only then computes across-run
 95% CIs.  It refuses missing pairs, missing repeats, noncanonical stages, or
 entry-level pseudo-replication.  A paired CPU-phase run remains
 `performance_eligible=false` for latency claims, but it must carry the same
-fresh clean-window sentinel as its latency half so its CPU/op values are
+P02B result/PASS/provenance chain as its latency half so its CPU/op values are
 eligible for the diagnostic panel.  A6 has no CPU-phase half because its automatic
 lifecycle CPU is reported by the closed-loop resource experiment.
 

@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -104,7 +105,11 @@ SUMMARY_COLUMNS = [
     "sample_plan_sha256",
     "truth_sha256",
     "correctness_pass_sha256",
-    "clean_window_sentinel_sha256",
+    "p02b_sentinel_result_sha256",
+    "p02b_pass_marker_sha256",
+    "p02b_provenance_sha256",
+    "p02b_validator_sha256",
+    "p02b_admission_sha256",
     "profiles_sha256",
     "invocation_config_sha256",
     "resolved_profile_sha256",
@@ -260,6 +265,11 @@ def read_input_manifest(path):
         "sample_plan",
         "truth",
         "correctness_pass",
+        "p02b_sentinel_result",
+        "p02b_pass_marker",
+        "p02b_provenance",
+        "p02b_validator",
+        "p02b_admission",
         "pristine_store",
         "pristine_store_manifest",
         "stage_store_provenance",
@@ -377,6 +387,10 @@ def validate_p31(run_root, command, inputs, invocation):
     require(
         manifest.get("performance_eligible_declared") is invocation.get("performance_eligible"),
         "P31 performance eligibility drift",
+    )
+    require(
+        manifest.get("collector", {}).get("require_aux_tools") is True,
+        "paper-use P20 requires P31 auxiliary collectors",
     )
     expected_p31_inputs = {
         "binary": inputs["binary"]["sha256"],
@@ -539,47 +553,215 @@ def validate_current_digests(truth, benchmarks, invocation, inputs):
             )
 
 
-def validate_clean_window_sentinel(sentinel, invocation, inputs, p31):
-    require(
-        sentinel.get("schema_version") == 1
-        and sentinel.get("state") == "PASS"
-        and sentinel.get("purpose") == "p20-clean-window-sentinel"
-        and sentinel.get("performance_eligible") is False
-        and sentinel.get("gate_mode") == "seml0",
-        "clean-window sentinel schema/state drift",
+def cpuset_members(raw):
+    require(isinstance(raw, str) and re.fullmatch(r"[0-9,-]+", raw), "invalid cpuset")
+    result = set()
+    for token in raw.split(","):
+        if "-" in token:
+            fields = token.split("-")
+            require(len(fields) == 2, "invalid cpuset range")
+            left, right = (int(value) for value in fields)
+            require(left <= right, "descending cpuset range")
+            values = range(left, right + 1)
+        else:
+            values = [int(token)]
+        for value in values:
+            require(value not in result, "duplicate CPU in cpuset")
+            result.add(value)
+    require(bool(result), "empty cpuset")
+    return result
+
+
+def validate_p02b_receipt(inputs, invocation, command, p31):
+    repo_root = option_value(command["p31_argv"], "--repo-root")
+    repo_head = p31["manifest"].get("repo", {}).get("git_sha")
+    validator_argv = [
+        sys.executable,
+        inputs["p02b_validator"]["path"],
+        "--result",
+        inputs["p02b_sentinel_result"]["path"],
+        "--consumer",
+        "P20",
+        "--require-formal",
+        "--expected-repo-root",
+        repo_root,
+        "--expected-repo-head",
+        repo_head,
+        "--expected-binary-sha256",
+        inputs["binary"]["sha256"],
+        "--max-age-seconds",
+        "21600",
+    ]
+    require(command.get("p02b_validator_argv") == validator_argv, "P02B validator argv drift")
+    completed = subprocess.run(
+        validator_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
     require(
-        sentinel.get("scale") == invocation.get("scale")
-        and sentinel.get("host") == p31["manifest"].get("host", {}).get("hostname"),
-        "clean-window sentinel scale/host drift",
+        completed.returncode == 0,
+        "P02B sentinel validator failed: {}".format(completed.stderr.strip()),
     )
-    require(
-        isinstance(sentinel.get("observations"), int)
-        and not isinstance(sentinel.get("observations"), bool)
-        and sentinel["observations"] >= 3,
-        "clean-window sentinel observation count drift",
-    )
-    for name, limit in (("qps_cv", 0.03), ("p99_cv", 0.05)):
-        value = sentinel.get(name)
+    try:
+        receipt = json.loads(completed.stdout, object_pairs_hook=_unique_object)
+    except (json.JSONDecodeError, SummaryError) as exc:
+        raise SummaryError("P02B validator emitted invalid JSON: {}".format(exc))
+    require(isinstance(receipt, dict), "P02B receipt must be an object")
+    expected = {
+        "state": "PASS",
+        "consumer": "P20",
+        "formal_required": True,
+        "fixture_only": False,
+        "scope": "host-global",
+        "sentinel_result_sha256": inputs["p02b_sentinel_result"]["sha256"],
+        "pass_marker_sha256": inputs["p02b_pass_marker"]["sha256"],
+        "provenance_sha256": inputs["p02b_provenance"]["sha256"],
+        "repo_head": repo_head,
+        "binary_sha256": inputs["binary"]["sha256"],
+        "scale": "sf10",
+    }
+    for name, value in expected.items():
+        require(receipt.get(name) == value, "P02B receipt drift: {}".format(name))
+    invocation_receipt = {
+        "p02b_run_id": receipt.get("run_id"),
+        "p02b_completed_at_utc": receipt.get("completed_at_utc"),
+        "p02b_host_fingerprint_sha256": receipt.get("host", {}).get(
+            "fingerprint_sha256"
+        ),
+    }
+    for name, value in invocation_receipt.items():
+        require(invocation.get(name) == value, "P02B invocation receipt drift: {}".format(name))
+    for field, input_name in (
+        ("sentinel_result", "p02b_sentinel_result"),
+        ("pass_marker", "p02b_pass_marker"),
+        ("provenance", "p02b_provenance"),
+    ):
         require(
-            not isinstance(value, bool)
-            and isinstance(value, (int, float))
-            and 0 <= value <= limit,
-            "clean-window sentinel {} exceeds threshold".format(name),
+            Path(receipt.get(field, "")).resolve()
+            == Path(inputs[input_name]["path"]).resolve(),
+            "P02B receipt path drift: {}".format(field),
         )
     require(
-        bool(SHA256_RE.fullmatch(sentinel.get("monitor_ready_sha256", ""))),
-        "clean-window monitor READY hash is invalid",
+        Path(receipt.get("repo_root", "")).resolve() == Path(repo_root).resolve(),
+        "P02B receipt repo root drift",
     )
-    expected = {
-        "binary_sha256": inputs["binary"]["sha256"],
-        "dataset_sha256": inputs["dataset"]["sha256"],
-        "sample_plan_sha256": inputs["sample_plan"]["sha256"],
-        "truth_sha256": inputs["truth"]["sha256"],
-        "pristine_store_sha256": inputs["pristine_store"]["sha256"],
+    sentinel_host = receipt.get("host")
+    current_host = p31["manifest"].get("host")
+    require(
+        isinstance(sentinel_host, dict) and isinstance(current_host, dict),
+        "P02B/current P31 host identity is missing",
+    )
+    require(
+        sentinel_host.get("fingerprint_sha256")
+        == current_host.get("fingerprint_sha256"),
+        "P02B host-global admission fingerprint differs from current P31 host",
+    )
+    require(
+        sentinel_host.get("hostname") == current_host.get("hostname"),
+        "P02B host-global admission hostname differs from current P31 host",
+    )
+    return receipt
+
+
+def validate_p02b_admission(admission, receipt, resolved, invocation, command, inputs):
+    require(
+        admission.get("schema_version") == "p20-p02b-admission-v1"
+        and admission.get("state") == "PASS"
+        and admission.get("scope") == "host-global",
+        "P02B admission schema/state/scope drift",
+    )
+    policy = admission.get("policy")
+    require(
+        isinstance(policy, dict)
+        and policy.get("consumer") == "P20"
+        and policy.get("formal_pass_required") is True
+        and policy.get("fixture_forbidden") is True
+        and policy.get("maximum_age_seconds") == 21600
+        and policy.get("same_host_fingerprint_required") is True
+        and policy.get("release_is_scale_store_workload_independent") is True,
+        "P02B admission policy drift",
+    )
+    p02b = admission.get("p02b")
+    require(isinstance(p02b, dict), "P02B admission receipt is missing")
+    require(p02b.get("receipt") == receipt, "P02B admission receipt drift")
+    require(
+        p02b.get("validator_sha256") == inputs["p02b_validator"]["sha256"]
+        and p02b.get("validator_command") == command.get("p02b_validator_argv"),
+        "P02B admission validator binding drift",
+    )
+    p20 = admission.get("p20")
+    require(isinstance(p20, dict), "P02B admission P20 binding is missing")
+    identity = {
+        "task_id": invocation.get("task_id"),
+        "run_id": invocation.get("run_id"),
+        "repeat_index": invocation.get("repeat_index"),
+        "scale": invocation.get("scale"),
+        "stage": invocation.get("stage"),
+        "mode": invocation.get("mode"),
+        "workload": invocation.get("workload"),
+        "property_id": invocation.get("property_id"),
+        "repo_head": receipt.get("repo_head"),
     }
-    for name, expected_sha in expected.items():
-        require(sentinel.get(name) == expected_sha, "clean-window binding drift: {}".format(name))
+    for name, value in identity.items():
+        require(p20.get(name) == value, "P02B admission P20 identity drift: {}".format(name))
+    require(
+        Path(p20.get("repo_root", "")).resolve()
+        == Path(receipt.get("repo_root", "")).resolve(),
+        "P02B admission repo root drift",
+    )
+    expected_inputs = {
+        "binary": inputs["binary"]["sha256"],
+        "dataset": inputs["dataset"]["sha256"],
+        "sample_plan": inputs["sample_plan"]["sha256"],
+        "truth": inputs["truth"]["sha256"],
+    }
+    require(p20.get("input_sha256") == expected_inputs, "P02B admission current input drift")
+    expected_hashes = {
+        "correctness_pass_sha256": inputs["correctness_pass"]["sha256"],
+        "pristine_store_sha256": inputs["pristine_store"]["sha256"],
+        "pristine_store_manifest_sha256": inputs["pristine_store_manifest"]["sha256"],
+        "profiles_sha256": inputs["profiles"]["sha256"],
+        "resolved_profile_sha256": inputs["resolved_profile"]["sha256"],
+    }
+    for name, value in expected_hashes.items():
+        require(p20.get(name) == value, "P02B admission current hash drift: {}".format(name))
+    isolation = p20.get("cpu_isolation")
+    require(isinstance(isolation, dict) and isolation.get("disjoint") is True, "P20 CPU isolation missing")
+    benchmark_cpuset = isolation.get("benchmark_cpuset")
+    collector_cpuset = isolation.get("collector_cpuset")
+    require(
+        benchmark_cpuset == invocation.get("cpuset")
+        and collector_cpuset == invocation.get("housekeeping_cpuset")
+        and isolation.get("worker_threads") == invocation.get("worker_threads"),
+        "P20 CPU isolation binding drift",
+    )
+    require(
+        not (cpuset_members(benchmark_cpuset) & cpuset_members(collector_cpuset)),
+        "P20 benchmark/collector cpusets overlap",
+    )
+    require(
+        command["benchmark_argv"][:3] == ["taskset", "-c", benchmark_cpuset]
+        and command["p31_argv"][:3] == ["taskset", "-c", collector_cpuset],
+        "P20 taskset placement drift",
+    )
+    p31_policy = p20.get("p31")
+    require(isinstance(p31_policy, dict), "P02B admission P31 policy missing")
+    p31_argv = command["p31_argv"]
+    require(
+        p31_policy.get("wrapper_sha256") == inputs["p31_wrapper"]["sha256"]
+        and p31_policy.get("device") == option_value(p31_argv, "--device")
+        and p31_policy.get("data_mount") == option_value(p31_argv, "--data-mount")
+        and str(p31_policy.get("interval_seconds")) == option_value(p31_argv, "--interval")
+        and str(p31_policy.get("disk_interval_seconds")) == option_value(p31_argv, "--disk-interval")
+        and str(p31_policy.get("min_samples")) == option_value(p31_argv, "--min-samples")
+        and p31_policy.get("min_samples", 0) >= 10
+        and p31_policy.get("require_aux_tools") is True
+        and "--allow-missing-aux-tools" not in p31_argv,
+        "P02B admission P31 policy drift",
+    )
+    require(
+        resolved.get("scale") == p20.get("scale")
+        and resolved.get("stage", {}).get("id") == p20.get("stage"),
+        "P02B admission resolved profile drift",
+    )
 
 
 def build_rows(run_root):
@@ -598,6 +780,7 @@ def build_rows(run_root):
     stage_post_state = load_json(
         inputs["stage_store_post_state"]["path"], "stage-store post state"
     )
+    p02b_admission = load_json(inputs["p02b_admission"]["path"], "P02B admission")
     require(
         sha256_file(run_root / "correctness-pass.json") == inputs["correctness_pass"]["sha256"],
         "copied correctness PASS hash mismatch",
@@ -692,27 +875,19 @@ def build_rows(run_root):
     require("--" in p31_argv, "P31 argv separator is missing")
     require(p31_argv[p31_argv.index("--") + 1 :] == benchmark_argv, "P31 command tail drift")
     p31 = validate_p31(run_root, command, inputs, invocation)
-    if "clean_window_sentinel" in inputs:
-        require(
-            invocation.get("clean_window_sentinel_sha256")
-            == inputs["clean_window_sentinel"]["sha256"],
-            "clean-window sentinel SHA drift",
-        )
-        validate_clean_window_sentinel(
-            load_json(inputs["clean_window_sentinel"]["path"], "clean-window sentinel"),
-            invocation,
-            inputs,
-            p31,
-        )
-    else:
-        require(
-            invocation.get("performance_eligible") is not True,
-            "formal run lacks clean-window sentinel",
-        )
-        require(
-            invocation.get("clean_window_sentinel_sha256") == "",
-            "absent clean-window sentinel has a non-empty SHA",
-        )
+    expected_p02b_hashes = {
+        "p02b_sentinel_result_sha256": inputs["p02b_sentinel_result"]["sha256"],
+        "p02b_pass_marker_sha256": inputs["p02b_pass_marker"]["sha256"],
+        "p02b_provenance_sha256": inputs["p02b_provenance"]["sha256"],
+        "p02b_validator_sha256": inputs["p02b_validator"]["sha256"],
+        "p02b_admission_sha256": inputs["p02b_admission"]["sha256"],
+    }
+    for name, value in expected_p02b_hashes.items():
+        require(invocation.get(name) == value, "P02B invocation hash drift: {}".format(name))
+    p02b_receipt = validate_p02b_receipt(inputs, invocation, command, p31)
+    validate_p02b_admission(
+        p02b_admission, p02b_receipt, resolved, invocation, command, inputs
+    )
 
     raw_path = p31["root"] / "command.stdout.log"
     raw = load_json(raw_path, "storage-bench stdout")
@@ -771,7 +946,11 @@ def build_rows(run_root):
         "sample_plan_sha256": inputs["sample_plan"]["sha256"],
         "truth_sha256": inputs["truth"]["sha256"],
         "correctness_pass_sha256": inputs["correctness_pass"]["sha256"],
-        "clean_window_sentinel_sha256": invocation.get("clean_window_sentinel_sha256", ""),
+        "p02b_sentinel_result_sha256": inputs["p02b_sentinel_result"]["sha256"],
+        "p02b_pass_marker_sha256": inputs["p02b_pass_marker"]["sha256"],
+        "p02b_provenance_sha256": inputs["p02b_provenance"]["sha256"],
+        "p02b_validator_sha256": inputs["p02b_validator"]["sha256"],
+        "p02b_admission_sha256": inputs["p02b_admission"]["sha256"],
         "profiles_sha256": inputs["profiles"]["sha256"],
         "invocation_config_sha256": inputs["invocation_config"]["sha256"],
         "resolved_profile_sha256": inputs["resolved_profile"]["sha256"],

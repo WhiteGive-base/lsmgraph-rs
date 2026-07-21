@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,11 @@ def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def file_ref(path):
+    path = Path(path).resolve()
+    return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": sha256(path)}
+
+
 def canonical_inventory_sha(files):
     payload = json.dumps(
         sorted(files, key=lambda value: value["path"]),
@@ -39,6 +45,23 @@ class SingleProfileRunnerTest(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         self.repo = self.root / "repo"
         self.repo.mkdir()
+        (self.repo / "fixture.txt").write_text("fixture repo\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "P20 Fixture"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(self.repo), "add", "fixture.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-q", "-m", "fixture"], check=True
+        )
+        self.repo_head = subprocess.check_output(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True
+        ).strip()
         self.mount = self.root / "data-mount"
         self.mount.mkdir()
         self.dataset = self.root / "dataset.bin"
@@ -137,7 +160,9 @@ class SingleProfileRunnerTest(unittest.TestCase):
         self.p31.chmod(0o755)
         self.correctness = self.root / "correctness-pass.json"
         self.write_correctness()
-        self.sentinel = self.root / "clean-window-sentinel.json"
+        self.sentinel_dir = self.root / "p02b-sentinel"
+        self.sentinel = self.sentinel_dir / "sentinel-result.json"
+        self.write_sentinel()
         self.output = self.root / "output"
         self.stage = self.root / "stage-store"
 
@@ -166,30 +191,341 @@ class SingleProfileRunnerTest(unittest.TestCase):
         self.correctness.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 
     def write_sentinel(self, **changes):
-        value = {
-            "schema_version": 1,
+        self.sentinel_dir.mkdir(parents=True, exist_ok=True)
+        p02b_dataset = self.root / "p02b-dataset"
+        p02b_dataset.mkdir(exist_ok=True)
+        (p02b_dataset / "dataset.tsv").write_text("fixture\n", encoding="utf-8")
+        dataset_manifest = self.root / "p02b-dataset-manifest.json"
+        dataset_content_sha = sha256(p02b_dataset / "dataset.tsv")
+        dataset_manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": "p02b-dataset-manifest-v1",
+                    "dataset_root": str(p02b_dataset.resolve()),
+                    "dataset_sha256": dataset_content_sha,
+                    "hash_method": "fixture-single-file-sha256",
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sentinel_store_manifest = self.root / "p02b-store-manifest.json"
+        sentinel_store_manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": "p02b-store-manifest-v1",
+                    "store_path": str(self.pristine.resolve()),
+                    "store_sha256": self.store_inventory_sha,
+                    "hash_method": "p20-store-inventory-v1",
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        config = self.root / "p02b-config.json"
+        config.write_text('{"schema_version":"p02b-sf10-sentinel-config-v1"}\n', encoding="utf-8")
+        id_map = self.root / "p02b-id-map"
+        id_map.mkdir(exist_ok=True)
+        dense = id_map / "dense-to-original.tsv"
+        original = id_map / "original-to-dense.tsv"
+        dense.write_text("dense_id\toriginal_id\n0\t100\n", encoding="utf-8")
+        original.write_text("original_id\tdense_id\n100\t0\n", encoding="utf-8")
+        id_map_manifest = id_map / "id-map-manifest.json"
+        id_map_manifest.write_text(
+            json.dumps(
+                {
+                    "format": "seml0-shared-id-map",
+                    "format_version": 1,
+                    "status": "PASS",
+                    "formal_pass": True,
+                    "verification_complete": True,
+                    "mapping_hash": "0123456789abcdef",
+                    "mapping_hash_algorithm": "fnv1a64-le-dense-original-v1",
+                    "dense_to_original": {"sha256": sha256(dense)},
+                    "original_to_dense": {"sha256": sha256(original)},
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        formal_pass = id_map / "FORMAL-PASS"
+        formal_pass.write_text(
+            "id-map-manifest.json sha256 {}\n".format(sha256(id_map_manifest)),
+            encoding="utf-8",
+        )
+        checksums = id_map / "SHA256SUMS"
+        checksums.write_text("fixture checksums\n", encoding="utf-8")
+        file_references = {
+            "binary": file_ref(self.binary),
+            "truth": file_ref(self.truth),
+            "query_plan": file_ref(self.sample_plan),
+            "config": file_ref(config),
+            "dataset_manifest": file_ref(dataset_manifest),
+            "store_manifest": file_ref(sentinel_store_manifest),
+            "id_map_manifest": file_ref(id_map_manifest),
+            "p31_wrapper": file_ref(self.p31),
+        }
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        ready = self.root / "p02b-READY"
+        ready.write_text("readiness_gate=PASS\n", encoding="utf-8")
+        clean_ready = {
+            "schema_version": "p02b-clean-ready-binding-v1",
             "state": "PASS",
-            "purpose": "p20-clean-window-sentinel",
-            "performance_eligible": False,
-            "gate_mode": "seml0",
-            "scale": "sf10",
+            "run_id": "fixture-clean",
+            "ready_time": now,
+            "age_seconds_at_binding": 0.0,
+            "required_consecutive_samples": 10,
+            "observed_consecutive_samples": 10,
+            "git_head": self.repo_head,
             "host": socket.gethostname(),
-            "completed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "observations": 3,
-            "qps_cv": 0.02,
-            "p99_cv": 0.04,
-            "monitor_ready_sha256": "9" * 64,
-            "binary_sha256": sha256(self.binary),
-            "dataset_sha256": sha256(self.dataset),
-            "sample_plan_sha256": sha256(self.sample_plan),
-            "truth_sha256": sha256(self.truth),
-            "pristine_store_sha256": self.store_inventory_sha,
+            "artifacts": {"READY": file_ref(ready)},
+        }
+        clean_binding = self.sentinel_dir / "clean-ready-binding.json"
+        clean_binding.write_text(json.dumps(clean_ready, sort_keys=True) + "\n", encoding="utf-8")
+        regenerated_plan = self.sentinel_dir / "regenerated-query-plan.json"
+        regenerated_plan.write_bytes(self.sample_plan.read_bytes())
+        shared_truth_result = self.sentinel_dir / "shared-truth-result.json"
+        shared_truth_result.write_text('{"state":"PASS"}\n', encoding="utf-8")
+        host = {"hostname": socket.gethostname(), "fingerprint_sha256": "f" * 64}
+        repeats = []
+        stability_runs = []
+        qps_values = [100.0, 101.0, 99.0]
+        p99_values = [1000.0, 1005.0, 995.0]
+        for index, (qps, p99) in enumerate(zip(qps_values, p99_values), start=1):
+            run_id = "p02b-fixture-r{}".format(index)
+            repeat_dir = self.sentinel_dir / "repeats" / "r{}".format(index)
+            p31_dir = repeat_dir / "p31"
+            p31_dir.mkdir(parents=True, exist_ok=True)
+            metrics_path = repeat_dir / "run-metrics.json"
+            metrics_value = {
+                "schema_version": "p02b-sentinel-run-metrics-v1",
+                "state": "PASS",
+                "run_index": index,
+                "run_id": run_id,
+                "query_count": 1700,
+                "qps": qps,
+                "p99_us": p99,
+                "measured_seconds": 30.0,
+            }
+            metrics_path.write_text(json.dumps(metrics_value, sort_keys=True) + "\n", encoding="utf-8")
+            stability_runs.append(
+                {
+                    "path": str(metrics_path.resolve()),
+                    "sha256": sha256(metrics_path),
+                    "run_index": index,
+                    "run_id": run_id,
+                    "query_count": 1700,
+                    "qps": qps,
+                    "p99_us": p99,
+                    "measured_seconds": 30.0,
+                }
+            )
+            manifest_path = p31_dir / "run-manifest.json"
+            validation_path = p31_dir / "validation.json"
+            done_path = p31_dir / "DONE"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "cidr-run-manifest-v1",
+                        "resource_schema_version": "cidr-resource-v1",
+                        "state": "PASS",
+                        "run_id": run_id,
+                        "task_id": "P02B-SF10-SENTINEL-r{}".format(index),
+                        "performance_eligible_declared": False,
+                        "repo": {"git_sha": self.repo_head, "dirty": False},
+                        "host": host,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            validation_path.write_text('{"state":"PASS"}\n', encoding="utf-8")
+            done_path.write_text(
+                json.dumps(
+                    {
+                        "state": "PASS",
+                        "manifest_sha256": sha256(manifest_path),
+                        "validation_sha256": sha256(validation_path),
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            repeats.append(
+                {
+                    "run_index": index,
+                    "run_id": run_id,
+                    "metrics": file_ref(metrics_path),
+                    "p31": {
+                        "run_dir": str(p31_dir.resolve()),
+                        "manifest": file_ref(manifest_path),
+                        "validation": file_ref(validation_path),
+                        "done": file_ref(done_path),
+                    },
+                }
+            )
+
+        def cv_metric(values, maximum):
+            mean = statistics.mean(values)
+            stdev = statistics.stdev(values)
+            return {
+                "values": values,
+                "mean": mean,
+                "sample_stdev": stdev,
+                "cv": stdev / mean,
+                "maximum_cv": maximum,
+                "pass": True,
+            }
+
+        stability = {
+            "schema_version": "p02b-sentinel-cv-v1",
+            "state": "PASS",
+            "method": "sample_standard_deviation_over_arithmetic_mean",
+            "independent_process_runs": 3,
+            "query_count_per_run": 1700,
+            "qps": cv_metric(qps_values, 0.03),
+            "p99_us": cv_metric(p99_values, 0.05),
+            "runs": stability_runs,
+        }
+        provenance = {
+            "schema_version": "p02b-sentinel-provenance-v1",
+            "created_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "repo": {
+                "root": str(self.repo.resolve()),
+                "head": self.repo_head,
+                "dirty": False,
+                "status_lines": [],
+            },
+            "fixture_mode": False,
+            "files": file_references,
+            "dataset": {
+                "manifest": file_references["dataset_manifest"],
+                "root": str(p02b_dataset.resolve()),
+                "content_sha256": dataset_content_sha,
+                "hash_method": "fixture-single-file-sha256",
+            },
+            "store": {
+                "manifest": file_references["store_manifest"],
+                "root": str(self.pristine.resolve()),
+                "content_sha256": self.store_inventory_sha,
+                "hash_method": "p20-store-inventory-v1",
+            },
+            "id_map": {
+                "path": str(id_map.resolve()),
+                "manifest": file_references["id_map_manifest"],
+                "formal_pass": file_ref(formal_pass),
+                "checksums": file_ref(checksums),
+                "mapping_hash": "0123456789abcdef",
+                "mapping_hash_algorithm": "fnv1a64-le-dense-original-v1",
+                "dense_to_original_sha256": sha256(dense),
+                "original_to_dense_sha256": sha256(original),
+            },
+            "query_plan_summary": {
+                "version": 1,
+                "source": "shared-truth-tsv",
+                "entries": 1,
+                "queries": 1700,
+                "semantic_degree_hint": True,
+                "force_signature": False,
+                "sha256": sha256(self.sample_plan),
+            },
+            "clean_ready_binding_sha256": sha256(clean_binding),
+        }
+        provenance_path = self.sentinel_dir / "provenance.json"
+        provenance_path.write_text(json.dumps(provenance, sort_keys=True) + "\n", encoding="utf-8")
+        fixture_only = bool(changes.get("fixture_only", False))
+        value = {
+            "schema_version": "p02b-sf10-sentinel-result-v1",
+            "state": "PASS",
+            "fixture_only": fixture_only,
+            "performance_eligible": False,
+            "formal_gate_eligible": not fixture_only,
+            "downstream_release_eligible": not fixture_only,
+            "consumers": ["P10", "P20"],
+            "task_id": "P02B-SF10-SENTINEL",
+            "scale": "sf10",
+            "run_id": "p02b-fixture",
+            "started_at_utc": now,
+            "completed_at_utc": now,
+            "clean_ready": clean_ready,
+            "protocol": {
+                "independent_process_runs": 3,
+                "expected_queries": 1700,
+                "warmup_runs": 1,
+                "measured_repeats": 1,
+                "minimum_measured_seconds_per_run": 30.0,
+                "cache_policy": "no-drop-caches;independent-process;in-process-warmup;os-cache-as-is",
+                "cpu": {"housekeeping_cpuset": "0", "formal_cpuset": "1", "threads": 1},
+                "io_backend": "blocking",
+                "l0_layout": "semantic-budgeted",
+                "semantic_degree_hint": True,
+                "force_signature": False,
+                "p31": {
+                    "device": "fixture-device",
+                    "data_mount": str(self.mount.resolve()),
+                    "interval_seconds": 1.0,
+                    "disk_interval_seconds": 15.0,
+                    "min_samples": 10,
+                    "require_aux_tools": True,
+                },
+            },
+            "provenance": {
+                "path": str(provenance_path.resolve()),
+                "sha256": sha256(provenance_path),
+                "repo_head": self.repo_head,
+                "binary_sha256": sha256(self.binary),
+                "truth_sha256": sha256(self.truth),
+                "query_plan_sha256": sha256(self.sample_plan),
+                "store_sha256": self.store_inventory_sha,
+                "dataset_sha256": dataset_content_sha,
+                "config_sha256": sha256(config),
+            },
+            "correctness": {
+                "state": "PASS",
+                "checked": 1700,
+                "mismatches": 0,
+                "total_neighbors": 1700,
+                "mapping_hash": "0123456789abcdef",
+                "result": file_ref(shared_truth_result),
+                "regenerated_query_plan": file_ref(regenerated_plan),
+            },
+            "stability": stability,
+            "repeats": repeats,
         }
         value.update(changes)
         self.sentinel.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+        for marker_name in ("PASS", "FIXTURE-PASS", "FAILED"):
+            marker_path = self.sentinel_dir / marker_name
+            if marker_path.exists():
+                marker_path.unlink()
+        marker_name = "FIXTURE-PASS" if value.get("fixture_only") is True else "PASS"
+        (self.sentinel_dir / marker_name).write_text(
+            json.dumps(
+                {
+                    "state": "PASS",
+                    "fixture_only": value.get("fixture_only") is True,
+                    "result": str(self.sentinel.resolve()),
+                    "result_sha256": sha256(self.sentinel),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
-    def command(self, extra=None, output=None, stage=None, correctness_sha=None):
-        cpuset = str(min(os.sched_getaffinity(0))) if hasattr(os, "sched_getaffinity") else None
+    def command(
+        self, extra=None, output=None, stage=None, correctness_sha=None, include_sentinel=True
+    ):
+        allowed = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else [0, 1]
+        if len(allowed) < 2:
+            self.skipTest("P20 fixture requires two allowed CPUs")
+        cpuset = str(allowed[0])
+        housekeeping_cpuset = str(allowed[1])
         command = [
             sys.executable,
             str(RUNNER),
@@ -249,12 +585,24 @@ class SingleProfileRunnerTest(unittest.TestCase):
             str(self.mount),
             "--device",
             "fixture-device",
-            "--allow-missing-aux-tools",
+            "--min-samples",
+            "10",
             "--worker-threads",
             "1",
+            "--cpuset",
+            cpuset,
+            "--housekeeping-cpuset",
+            housekeeping_cpuset,
         ]
-        if cpuset is not None:
-            command.extend(["--cpuset", cpuset])
+        if include_sentinel:
+            command.extend(
+                [
+                    "--p02b-sentinel-result",
+                    str(self.sentinel),
+                    "--p02b-sentinel-result-sha256",
+                    sha256(self.sentinel),
+                ]
+            )
         if extra:
             command.extend(extra)
         return command
@@ -293,6 +641,7 @@ class SingleProfileRunnerTest(unittest.TestCase):
             "command.json",
             "inputs.sha256.tsv",
             "correctness-pass.json",
+            "p02b-admission.json",
             "stage-store-provenance.json",
             "stage-store-post-state.json",
             "summary.tsv",
@@ -316,7 +665,7 @@ class SingleProfileRunnerTest(unittest.TestCase):
         self.assertEqual(command["p31_argv"][command["p31_argv"].index("--") + 1 :], command["benchmark_argv"])
         self.assertIn("taskset", command["benchmark_argv"])
         p31_capture = json.loads((self.output / "p31" / "p31-argv.json").read_text(encoding="utf-8"))
-        self.assertIn("--allow-missing-aux-tools", p31_capture["flags"])
+        self.assertNotIn("--allow-missing-aux-tools", p31_capture["flags"])
         self.assertIn("false", p31_capture["argv"])
         self.assertEqual((self.stage / "store.bin").read_bytes(), b"immutable-pristine\n")
         (self.stage / "store.bin").write_bytes(b"stage-mutated\n")
@@ -324,14 +673,12 @@ class SingleProfileRunnerTest(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("P20_REAL_P31_WRAPPER"), "real P31 fixture smoke not requested")
     def test_real_p31_wrapper_with_sleeping_fixture_only(self):
-        command = self.command(
-            extra=["--disk-interval", "1", "--min-samples", "2"]
-        )
+        command = self.command(extra=["--disk-interval", "1", "--min-samples", "10"])
         command[command.index("--p31-wrapper") + 1] = os.environ["P20_REAL_P31_WRAPPER"]
         command[command.index("--data-mount") + 1] = "/data"
         command[command.index("--device") + 1] = "nvme1n1"
         environment = os.environ.copy()
-        environment["P20_FIXTURE_SLEEP"] = "4"
+        environment["P20_FIXTURE_SLEEP"] = "12"
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
@@ -384,19 +731,9 @@ class SingleProfileRunnerTest(unittest.TestCase):
         self.assertFalse(self.stage.exists())
 
     def test_formal_mode_derives_true_and_forbids_missing_aux_tools(self):
-        self.write_sentinel()
         command = self.command()
         command[command.index("--mode") + 1] = "latency"
         command[command.index("--performance-eligible") + 1] = "true"
-        command.remove("--allow-missing-aux-tools")
-        command.extend(
-            [
-                "--clean-window-sentinel",
-                str(self.sentinel),
-                "--clean-window-sentinel-sha256",
-                sha256(self.sentinel),
-            ]
-        )
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         p31_capture = json.loads((self.output / "p31" / "p31-argv.json").read_text(encoding="utf-8"))
@@ -409,6 +746,7 @@ class SingleProfileRunnerTest(unittest.TestCase):
         blocked = self.command(output=blocked_output, stage=blocked_stage)
         blocked[blocked.index("--mode") + 1] = "latency"
         blocked[blocked.index("--performance-eligible") + 1] = "true"
+        blocked.append("--allow-missing-aux-tools")
         result = subprocess.run(blocked, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot allow missing", result.stderr)
@@ -510,43 +848,113 @@ class SingleProfileRunnerTest(unittest.TestCase):
         self.assertIn("consumes an external correctness PASS", result.stderr)
         self.assertFalse(self.stage.exists())
 
-    def test_formal_mode_requires_valid_clean_window_sentinel(self):
-        command = self.command()
-        command[command.index("--mode") + 1] = "latency"
-        command[command.index("--performance-eligible") + 1] = "true"
-        command.remove("--allow-missing-aux-tools")
+    def test_every_measured_mode_requires_formal_p02b_result(self):
+        command = self.command(include_sentinel=False)
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("requires a clean-window sentinel", result.stderr)
+        self.assertIn("--p02b-sentinel-result", result.stderr)
+        self.assertFalse(self.stage.exists())
 
-        self.write_sentinel(qps_cv=0.031)
-        command.extend(
-            [
-                "--clean-window-sentinel",
-                str(self.sentinel),
-                "--clean-window-sentinel-sha256",
-                sha256(self.sentinel),
-            ]
+    def test_old_flat_p20_sentinel_schema_is_rejected_before_clone(self):
+        self.sentinel.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "state": "PASS",
+                    "purpose": "p20-clean-window-sentinel",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = self.invoke()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("qps_cv exceeds", result.stderr)
+        self.assertIn("sentinel result key drift", result.stderr)
+        self.assertFalse(self.stage.exists())
 
-    def test_cpu_phase_can_bind_same_clean_window_for_figure_pair(self):
+    def test_p02b_caller_hash_and_collection_floor_fail_before_clone(self):
+        wrong_hash = self.command()
+        wrong_hash[wrong_hash.index("--p02b-sentinel-result-sha256") + 1] = "0" * 64
+        result = subprocess.run(
+            wrong_hash, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("p02b_sentinel_result SHA-256 mismatch", result.stderr)
+        self.assertFalse(self.stage.exists())
+
+        low_samples = self.command()
+        low_samples[low_samples.index("--min-samples") + 1] = "9"
+        result = subprocess.run(
+            low_samples, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("min_samples >= 10", result.stderr)
+        self.assertFalse(self.stage.exists())
+
+        overlap = self.command()
+        overlap[overlap.index("--housekeeping-cpuset") + 1] = overlap[
+            overlap.index("--cpuset") + 1
+        ]
+        result = subprocess.run(
+            overlap, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cpusets must be disjoint", result.stderr)
+        self.assertFalse(self.stage.exists())
+
+    def test_p02b_consumer_marker_and_provenance_tamper_fail_closed(self):
+        cases = []
+        self.write_sentinel(consumers=["P10"])
+        cases.append(("consumer", "canonical consumer list drift"))
+        for index, (_, expected_message) in enumerate(cases):
+            result = self.invoke(
+                output=self.root / "tamper-output-{}".format(index),
+                stage=self.root / "tamper-stage-{}".format(index),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(expected_message, result.stderr)
+
         self.write_sentinel()
+        marker = self.sentinel_dir / "PASS"
+        marker_value = json.loads(marker.read_text(encoding="utf-8"))
+        marker_value["result_sha256"] = "0" * 64
+        marker.write_text(json.dumps(marker_value) + "\n", encoding="utf-8")
         result = self.invoke(
-            extra=[
-                "--clean-window-sentinel",
-                str(self.sentinel),
-                "--clean-window-sentinel-sha256",
-                sha256(self.sentinel),
-            ]
+            output=self.root / "marker-output", stage=self.root / "marker-stage"
         )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("marker", result.stderr)
+
+        self.write_sentinel()
+        provenance = self.sentinel_dir / "provenance.json"
+        provenance.write_text(provenance.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        result = self.invoke(
+            output=self.root / "provenance-output", stage=self.root / "provenance-stage"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("provenance", result.stderr)
+
+    def test_cpu_phase_binds_p02b_gate_for_figure_pair(self):
+        result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         with (self.output / "summary.tsv").open("r", encoding="utf-8", newline="") as handle:
             row = next(csv.DictReader(handle, delimiter="\t"))
-        self.assertEqual(row["clean_window_sentinel_sha256"], sha256(self.sentinel))
+        self.assertEqual(row["p02b_sentinel_result_sha256"], sha256(self.sentinel))
         self.assertEqual(row["performance_eligible"], "false")
+
+    def test_summary_rejects_p02b_marker_toctou(self):
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        marker = self.sentinel_dir / "PASS"
+        marker.write_text(marker.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        summary = subprocess.run(
+            [sys.executable, str(SUMMARIZER), "--run-root", str(self.output)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertNotEqual(summary.returncode, 0)
+        self.assertIn("p02b_pass_marker", summary.stderr)
 
 
 if __name__ == "__main__":

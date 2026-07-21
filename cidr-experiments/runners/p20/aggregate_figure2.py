@@ -66,7 +66,10 @@ RUN_CONSTANTS = (
     "p31_wrapper_sha256",
     "pristine_store_sha256",
     "pristine_store_manifest_sha256",
-    "clean_window_sentinel_sha256",
+    "p02b_sentinel_result_sha256",
+    "p02b_pass_marker_sha256",
+    "p02b_provenance_sha256",
+    "p02b_validator_sha256",
     "current_digest_pass",
     "current_digest_mismatches",
 )
@@ -114,7 +117,10 @@ PAIR_SHARED = (
     "p31_wrapper_sha256",
     "pristine_store_sha256",
     "pristine_store_manifest_sha256",
-    "clean_window_sentinel_sha256",
+    "p02b_sentinel_result_sha256",
+    "p02b_pass_marker_sha256",
+    "p02b_provenance_sha256",
+    "p02b_validator_sha256",
 )
 RUN_COLUMNS = [
     "figure2_schema_version",
@@ -149,7 +155,10 @@ RUN_COLUMNS = [
     "profiles_sha256",
     "pristine_store_sha256",
     "pristine_store_manifest_sha256",
-    "clean_window_sentinel_sha256",
+    "p02b_sentinel_result_sha256",
+    "p02b_pass_marker_sha256",
+    "p02b_provenance_sha256",
+    "p02b_validator_sha256",
     "latency_summary_sha256",
     "cpu_phase_summary_sha256",
 ]
@@ -214,7 +223,7 @@ def load_rows(path):
         "benchmark_entry_index",
         "get_neighbors_latency_histogram_json",
         "query_cpu_total_ns",
-        "clean_window_sentinel_sha256",
+        "p02b_sentinel_result_sha256",
     }
     require(required <= set(reader.fieldnames or []), "summary schema is missing Figure 2 fields")
     return path, rows
@@ -365,11 +374,11 @@ def build_run_rows(collapsed, expected_repeats):
         latency = modes["latency"]
         cpu = modes.get("cpu-phase")
         require(latency["performance_eligible"] == "true", "latency half is not formal")
-        require(latency["clean_window_sentinel_sha256"], "latency half lacks clean-window sentinel")
+        require(latency["p02b_sentinel_result_sha256"], "latency half lacks P02B admission")
         require(latency["current_digest_pass"] == "1", "latency digest gate failed")
         if cpu is not None:
             require(cpu["performance_eligible"] == "false", "CPU half must remain diagnostic")
-            require(cpu["clean_window_sentinel_sha256"], "CPU half lacks clean-window sentinel")
+            require(cpu["p02b_sentinel_result_sha256"], "CPU half lacks P02B admission")
             require(cpu["current_digest_pass"] == "1", "CPU digest gate failed")
             for field in PAIR_SHARED:
                 require(latency[field] == cpu[field], "paired-mode {} drift".format(field))
@@ -410,7 +419,10 @@ def build_run_rows(collapsed, expected_repeats):
             "profiles_sha256": latency["profiles_sha256"],
             "pristine_store_sha256": latency["pristine_store_sha256"],
             "pristine_store_manifest_sha256": latency["pristine_store_manifest_sha256"],
-            "clean_window_sentinel_sha256": latency["clean_window_sentinel_sha256"],
+            "p02b_sentinel_result_sha256": latency["p02b_sentinel_result_sha256"],
+            "p02b_pass_marker_sha256": latency["p02b_pass_marker_sha256"],
+            "p02b_provenance_sha256": latency["p02b_provenance_sha256"],
+            "p02b_validator_sha256": latency["p02b_validator_sha256"],
             "latency_summary_sha256": latency["summary_sha256"],
             "cpu_phase_summary_sha256": "" if cpu is None else cpu["summary_sha256"],
         }

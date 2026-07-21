@@ -11,10 +11,10 @@ use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig, QueryContr
 use lsmgraph::csr::CsrPropertyValuePredicate;
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
+use lsmgraph::metrics::process_cpu_time_ns;
 use lsmgraph::shared_truth::{
     build_storage_sample_plan, read_truth_tsv, verify_engine_truth, SharedIdMap,
 };
-use lsmgraph::metrics::process_cpu_time_ns;
 use lsmgraph::snb::{
     import_snb_full, import_snb_full_multi, import_snb_updates, rebuild_snb_edge_props,
     start_dgs_compatible_server, validate_ic1_ic14_dynamic, validate_ic_batch_dynamic,
@@ -1805,7 +1805,10 @@ async fn main() -> Result<()> {
             }
             let ids = SharedIdMap::load(&id_map_dir)?;
             if let Some(path) = &sample_plan_out {
-                if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
                     fs::create_dir_all(parent)?;
                 }
                 let plan =
@@ -1847,7 +1850,10 @@ async fn main() -> Result<()> {
             });
             let encoded = serde_json::to_vec_pretty(&report)?;
             if let Some(path) = output {
-                if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(path, &encoded)?;

@@ -99,6 +99,9 @@ def main():
         stores.append(
             {"role": "store", "label": label, "path": str(Path(store_path).resolve())}
         )
+    git_sha = subprocess.check_output(
+        ["git", "-C", values["--repo-root"][-1], "rev-parse", "HEAD"], text=True
+    ).strip()
     manifest = {
         "schema_version": "cidr-run-manifest-v1",
         "resource_schema_version": "cidr-resource-v1",
@@ -107,8 +110,9 @@ def main():
         "run_id": values["--run-id"][-1],
         "ended_at_utc": now(),
         "performance_eligible_declared": values["--performance-eligible"][-1] == "true",
-        "repo": {"root": values["--repo-root"][-1], "git_sha": "fixture-git-sha", "dirty": False},
+        "repo": {"root": values["--repo-root"][-1], "git_sha": git_sha, "dirty": False},
         "host": {"hostname": platform.node(), "fingerprint_sha256": "f" * 64},
+        "collector": {"require_aux_tools": True},
         "disk_roots": stores,
         "inputs": inputs,
         "artifacts": artifacts,

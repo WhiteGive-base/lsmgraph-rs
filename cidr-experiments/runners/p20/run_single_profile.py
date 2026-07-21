@@ -16,7 +16,6 @@ import os
 import re
 import signal
 import shutil
-import socket
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -32,7 +31,9 @@ CANONICAL_STAGES = {
     "sf10": ["A0", "A1", "A2", "A3", "A4", "A5", "A6"],
     "sf30": ["A0", "A2", "A4", "A6"],
 }
-CLEAN_WINDOW_MAX_AGE_SECONDS = 3600
+P02B_MAX_AGE_SECONDS = 6 * 60 * 60
+P02B_SENTINEL_SCHEMA = "p02b-sf10-sentinel-result-v1"
+P02B_ADMISSION_SCHEMA = "p20-p02b-admission-v1"
 
 
 class RunnerError(ValueError):
@@ -221,71 +222,89 @@ def validate_correctness_evidence(path, expected, scale, stage, workload, expect
     return evidence
 
 
-def validate_clean_window_sentinel(path, expected, scale, pristine_store_sha256):
-    sentinel = read_json(path, "clean-window sentinel")
-    required = {
-        "schema_version",
-        "state",
-        "purpose",
-        "performance_eligible",
-        "gate_mode",
-        "scale",
-        "host",
-        "completed_at_utc",
-        "observations",
-        "qps_cv",
-        "p99_cv",
-        "monitor_ready_sha256",
-        "binary_sha256",
-        "dataset_sha256",
-        "sample_plan_sha256",
-        "truth_sha256",
-        "pristine_store_sha256",
-    }
-    missing = sorted(required - set(sentinel))
-    if missing:
-        raise RunnerError("clean-window sentinel missing: {}".format(", ".join(missing)))
-    if (
-        sentinel.get("schema_version") != 1
-        or sentinel.get("state") != "PASS"
-        or sentinel.get("purpose") != "p20-clean-window-sentinel"
-        or sentinel.get("performance_eligible") is not False
-        or sentinel.get("gate_mode") != "seml0"
-    ):
-        raise RunnerError("clean-window sentinel schema/state drift")
-    if sentinel.get("scale") != scale or sentinel.get("host") != socket.gethostname():
-        raise RunnerError("clean-window sentinel scale/host drift")
-    observations = sentinel.get("observations")
-    if not isinstance(observations, int) or isinstance(observations, bool) or observations < 3:
-        raise RunnerError("clean-window sentinel requires at least three observations")
-    for name, limit in (("qps_cv", 0.03), ("p99_cv", 0.05)):
-        value = sentinel.get(name)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > limit:
-            raise RunnerError("clean-window sentinel {} exceeds {:.2f}".format(name, limit))
-    normalize_sha(sentinel.get("monitor_ready_sha256", ""), "monitor READY SHA-256")
-    expected_bindings = {
-        "binary_sha256": expected["binary"],
-        "dataset_sha256": expected["dataset"],
-        "sample_plan_sha256": expected["sample_plan"],
-        "truth_sha256": expected["truth"],
-        "pristine_store_sha256": pristine_store_sha256,
-    }
-    for name, expected_sha in expected_bindings.items():
-        if sentinel.get(name) != expected_sha:
-            raise RunnerError("clean-window sentinel binding drift: {}".format(name))
-    completed = sentinel.get("completed_at_utc")
-    if not isinstance(completed, str) or not completed:
-        raise RunnerError("clean-window sentinel completion time is missing")
+def git_head(repo_root):
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RunnerError("cannot resolve current Git HEAD: {}".format(result.stderr.strip()))
+    return result.stdout.strip()
+
+
+def validate_p02b_sentinel(validator, result_row, repo_root, repo_head, binary_sha256):
+    command = [
+        sys.executable,
+        str(validator),
+        "--result",
+        result_row["path"],
+        "--consumer",
+        "P20",
+        "--require-formal",
+        "--expected-repo-root",
+        str(repo_root),
+        "--expected-repo-head",
+        repo_head,
+        "--expected-binary-sha256",
+        binary_sha256,
+        "--max-age-seconds",
+        str(P02B_MAX_AGE_SECONDS),
+    ]
+    completed = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if completed.returncode != 0:
+        raise RunnerError("P02B sentinel validator failed: {}".format(completed.stderr.strip()))
     try:
-        completed_time = datetime.fromisoformat(completed.replace("Z", "+00:00"))
-    except ValueError:
-        raise RunnerError("clean-window sentinel completion time is invalid")
-    if completed_time.tzinfo is None:
-        raise RunnerError("clean-window sentinel completion time must include a timezone")
-    age_seconds = (datetime.now(timezone.utc) - completed_time.astimezone(timezone.utc)).total_seconds()
-    if age_seconds < -300 or age_seconds > CLEAN_WINDOW_MAX_AGE_SECONDS:
-        raise RunnerError("clean-window sentinel is stale or from the future")
-    return sentinel
+        receipt = json.loads(completed.stdout, object_pairs_hook=_unique_object)
+    except (json.JSONDecodeError, RunnerError) as exc:
+        raise RunnerError("P02B sentinel validator emitted invalid JSON: {}".format(exc))
+    if not isinstance(receipt, dict):
+        raise RunnerError("P02B sentinel validator receipt must be an object")
+    expected = {
+        "state": "PASS",
+        "consumer": "P20",
+        "formal_required": True,
+        "fixture_only": False,
+        "scope": "host-global",
+        "sentinel_result": result_row["path"],
+        "sentinel_result_sha256": result_row["sha256"],
+        "repo_root": str(repo_root),
+        "repo_head": repo_head,
+        "binary_sha256": binary_sha256,
+        "scale": "sf10",
+    }
+    for name, value in expected.items():
+        actual = receipt.get(name)
+        if name in {"sentinel_result", "repo_root"}:
+            try:
+                matches = Path(actual).resolve() == Path(value).resolve()
+            except (TypeError, OSError):
+                matches = False
+        else:
+            matches = actual == value
+        if not matches:
+            raise RunnerError("P02B sentinel validator receipt drift: {}".format(name))
+    for path_name, sha_name in (
+        ("pass_marker", "pass_marker_sha256"),
+        ("provenance", "provenance_sha256"),
+    ):
+        if not isinstance(receipt.get(path_name), str):
+            raise RunnerError("P02B receipt omitted {}".format(path_name))
+        normalize_sha(receipt.get(sha_name, ""), "P02B receipt {}".format(sha_name))
+    host = receipt.get("host")
+    if not isinstance(host, dict) or not isinstance(host.get("hostname"), str):
+        raise RunnerError("P02B receipt omitted the host identity")
+    normalize_sha(host.get("fingerprint_sha256", ""), "P02B host fingerprint")
+    if not isinstance(receipt.get("protocol"), dict):
+        raise RunnerError("P02B receipt omitted its protocol")
+    if not isinstance(receipt.get("run_id"), str) or not receipt["run_id"]:
+        raise RunnerError("P02B receipt omitted run_id")
+    if not isinstance(receipt.get("completed_at_utc"), str):
+        raise RunnerError("P02B receipt omitted completion time")
+    return receipt, command
 
 
 def resolve_profile(args):
@@ -391,7 +410,7 @@ def parse_runtime_overrides(values):
 
 def parse_cpuset(raw):
     if raw is None:
-        return None, 0
+        return None, 0, set()
     if not re.fullmatch(r"[0-9,-]+", raw):
         raise RunnerError("invalid taskset cpuset syntax")
     cpus = []
@@ -410,7 +429,7 @@ def parse_cpuset(raw):
             cpus.append(int(part))
     if not cpus or len(cpus) != len(set(cpus)):
         raise RunnerError("cpuset must be non-empty and contain no duplicate CPUs")
-    return raw, len(cpus)
+    return raw, len(cpus), set(cpus)
 
 
 def paths_overlap(left, right):
@@ -619,6 +638,10 @@ def run(args):
     profiles = require_absolute(args.profiles, "profiles")
     profile_validator = require_absolute(args.profile_validator, "profile validator")
     summarizer = require_absolute(args.summarizer, "summarizer")
+    p02b_validator = require_absolute(
+        HERE.parent / "p02b" / "validate_sentinel_result.py",
+        "P02B sentinel validator",
+    )
     p31_wrapper = require_absolute(args.p31_wrapper, "P31 wrapper")
     data_mount = require_absolute(args.data_mount, "data mount")
     if args.mode == "correctness":
@@ -643,6 +666,7 @@ def run(args):
         (profiles, "profiles"),
         (profile_validator, "profile validator"),
         (summarizer, "summarizer"),
+        (p02b_validator, "P02B sentinel validator"),
         (p31_wrapper, "P31 wrapper"),
     ):
         if not path.is_file():
@@ -658,10 +682,15 @@ def run(args):
     run_id = args.run_id or output_root.name
     if not ID_RE.fullmatch(run_id):
         raise RunnerError("invalid run id")
-    cpuset, cpuset_count = parse_cpuset(args.cpuset)
-    if cpuset is not None and shutil.which("taskset") is None:
-        raise RunnerError("--cpuset requested but taskset is unavailable")
-    if cpuset is not None and args.worker_threads > cpuset_count:
+    cpuset, cpuset_count, benchmark_cpus = parse_cpuset(args.cpuset)
+    housekeeping_cpuset, _, housekeeping_cpus = parse_cpuset(args.housekeeping_cpuset)
+    if cpuset is None or housekeeping_cpuset is None:
+        raise RunnerError("every measured P20 mode requires --cpuset and --housekeeping-cpuset")
+    if shutil.which("taskset") is None:
+        raise RunnerError("P20 CPU isolation requires taskset")
+    if benchmark_cpus & housekeeping_cpus:
+        raise RunnerError("benchmark and housekeeping cpusets must be disjoint")
+    if args.worker_threads > cpuset_count:
         raise RunnerError("worker threads cannot exceed the pinned CPU count")
     runtime = parse_runtime_overrides(args.runtime_override)
     property_id = validate_bindings(args.workload, args.bind)
@@ -680,18 +709,10 @@ def run(args):
                 args.performance_eligible, args.mode, resolved_perf
             )
         )
-    if resolved_perf and args.allow_missing_aux_tools:
-        raise RunnerError("formal performance mode cannot allow missing P31 auxiliary tools")
-    if resolved_perf and cpuset is None:
-        raise RunnerError("formal performance mode requires an explicit --cpuset")
-    sentinel_args_present = args.clean_window_sentinel is not None or args.clean_window_sentinel_sha256 is not None
-    if sentinel_args_present and not (
-        args.clean_window_sentinel is not None
-        and args.clean_window_sentinel_sha256 is not None
-    ):
-        raise RunnerError("clean-window sentinel path and SHA-256 must be supplied together")
-    if resolved_perf and not sentinel_args_present:
-        raise RunnerError("formal performance mode requires a clean-window sentinel")
+    if args.allow_missing_aux_tools:
+        raise RunnerError("paper-use P20 modes cannot allow missing P31 auxiliary tools")
+    if args.min_samples < 10:
+        raise RunnerError("paper-use P20 modes require P31 min_samples >= 10")
 
     frozen_environment = os.environ.copy()
     for name in FORBIDDEN_ENVIRONMENT:
@@ -727,6 +748,7 @@ def run(args):
     profiles_sha = sha256_file(profiles)
     validator_sha = sha256_file(profile_validator)
     summarizer_sha = sha256_file(summarizer)
+    p02b_validator_sha = sha256_file(p02b_validator)
     runner_sha = sha256_file(Path(__file__).resolve())
     p31_sha = sha256_file(p31_wrapper)
     expected_queries = validate_sample_plan(sample_row["path"])
@@ -747,17 +769,32 @@ def run(args):
         "sample_plan": sample_row["sha256"],
         "truth": truth_row["sha256"],
     }
-    clean_window_row = None
-    if sentinel_args_present:
-        clean_window_row = artifact_row(
-            "clean_window_sentinel",
-            args.clean_window_sentinel,
-            args.clean_window_sentinel_sha256,
-            require_file=True,
-        )
-        validate_clean_window_sentinel(
-            clean_window_row["path"], expected, args.scale, pristine_row["sha256"]
-        )
+    p02b_result_row = artifact_row(
+        "p02b_sentinel_result",
+        args.p02b_sentinel_result,
+        args.p02b_sentinel_result_sha256,
+        require_file=True,
+    )
+    current_git_head = git_head(repo_root)
+    p02b_receipt, p02b_validator_command = validate_p02b_sentinel(
+        p02b_validator,
+        p02b_result_row,
+        repo_root,
+        current_git_head,
+        binary_row["sha256"],
+    )
+    p02b_marker_row = artifact_row(
+        "p02b_pass_marker",
+        p02b_receipt["pass_marker"],
+        p02b_receipt["pass_marker_sha256"],
+        require_file=True,
+    )
+    p02b_provenance_row = artifact_row(
+        "p02b_provenance",
+        p02b_receipt["provenance"],
+        p02b_receipt["provenance_sha256"],
+        require_file=True,
+    )
     validate_correctness_evidence(
         correctness_row["path"], expected, args.scale, args.stage, args.workload, expected_queries
     )
@@ -805,6 +842,67 @@ def run(args):
             "verification": "computed-file",
         }
         shutil.copy2(correctness_row["path"], str(output_root / "correctness-pass.json"))
+        resolved_profile_sha = sha256_file(output_root / "resolved-profile.json")
+        p02b_admission = {
+            "schema_version": P02B_ADMISSION_SCHEMA,
+            "state": "PASS",
+            "scope": "host-global",
+            "admitted_at_utc": utc_now(),
+            "policy": {
+                "consumer": "P20",
+                "formal_pass_required": True,
+                "fixture_forbidden": True,
+                "maximum_age_seconds": P02B_MAX_AGE_SECONDS,
+                "same_host_fingerprint_required": True,
+                "release_is_scale_store_workload_independent": True,
+            },
+            "p02b": {
+                "validator_command": p02b_validator_command,
+                "validator_sha256": p02b_validator_sha,
+                "receipt": p02b_receipt,
+            },
+            "p20": {
+                "task_id": args.task_id,
+                "run_id": run_id,
+                "repeat_index": args.repeat_index,
+                "scale": args.scale,
+                "stage": args.stage,
+                "mode": args.mode,
+                "workload": args.workload,
+                "property_id": property_id,
+                "repo_root": str(repo_root),
+                "repo_head": current_git_head,
+                "input_sha256": expected,
+                "correctness_pass_sha256": correctness_row["sha256"],
+                "pristine_store_sha256": pristine_row["sha256"],
+                "pristine_store_manifest_sha256": pristine_manifest_row["sha256"],
+                "profiles_sha256": profiles_sha,
+                "resolved_profile_sha256": resolved_profile_sha,
+                "cpu_isolation": {
+                    "benchmark_cpuset": cpuset,
+                    "collector_cpuset": housekeeping_cpuset,
+                    "disjoint": True,
+                    "worker_threads": args.worker_threads,
+                },
+                "p31": {
+                    "wrapper_sha256": p31_sha,
+                    "device": args.device,
+                    "data_mount": str(data_mount),
+                    "interval_seconds": args.interval,
+                    "disk_interval_seconds": args.disk_interval,
+                    "min_samples": args.min_samples,
+                    "require_aux_tools": True,
+                },
+            },
+        }
+        atomic_json(output_root / "p02b-admission.json", p02b_admission)
+        p02b_admission_row = {
+            "name": "p02b_admission",
+            "path": str(output_root / "p02b-admission.json"),
+            "kind": "file",
+            "sha256": sha256_file(output_root / "p02b-admission.json"),
+            "verification": "computed-file",
+        }
         invocation_config = {
             "schema_version": 1,
             "experiment_id": resolved["experiment_id"],
@@ -826,17 +924,23 @@ def run(args):
             "runtime": runtime,
             "csr_metadata_cache_entries": args.csr_metadata_cache_entries,
             "cpuset": cpuset or "",
+            "housekeeping_cpuset": housekeeping_cpuset,
             "frozen_environment": recorded_environment,
             "input_sha256": expected,
             "correctness_pass_sha256": correctness_row["sha256"],
-            "clean_window_sentinel_sha256": (
-                clean_window_row["sha256"] if clean_window_row is not None else ""
-            ),
+            "p02b_validator_sha256": p02b_validator_sha,
+            "p02b_sentinel_result_sha256": p02b_result_row["sha256"],
+            "p02b_pass_marker_sha256": p02b_marker_row["sha256"],
+            "p02b_provenance_sha256": p02b_provenance_row["sha256"],
+            "p02b_admission_sha256": p02b_admission_row["sha256"],
+            "p02b_run_id": p02b_receipt["run_id"],
+            "p02b_completed_at_utc": p02b_receipt["completed_at_utc"],
+            "p02b_host_fingerprint_sha256": p02b_receipt["host"]["fingerprint_sha256"],
             "pristine_store_sha256": pristine_row["sha256"],
             "pristine_store_manifest_sha256": pristine_manifest_row["sha256"],
             "stage_store_provenance_sha256": stage_provenance_row["sha256"],
             "profiles_sha256": profiles_sha,
-            "resolved_profile_sha256": sha256_file(output_root / "resolved-profile.json"),
+            "resolved_profile_sha256": resolved_profile_sha,
         }
         atomic_json(output_root / "invocation-config.json", invocation_config)
         invocation_config_sha = sha256_file(output_root / "invocation-config.json")
@@ -867,6 +971,9 @@ def run(args):
             benchmark_argv = ["taskset", "-c", cpuset] + benchmark_argv
 
         p31_argv = [
+            "taskset",
+            "-c",
+            housekeeping_cpuset,
             str(p31_wrapper),
             "--run-dir",
             str(p31_run_root),
@@ -921,9 +1028,11 @@ def run(args):
             "run_id": run_id,
             "repeat_index": args.repeat_index,
             "cpuset": cpuset or "",
+            "housekeeping_cpuset": housekeeping_cpuset,
             "worker_threads": args.worker_threads,
             "frozen_environment": recorded_environment,
             "runtime_overrides": runtime,
+            "p02b_validator_argv": p02b_validator_command,
             "storage_bench_argv": storage_argv,
             "benchmark_argv": benchmark_argv,
             "p31_argv": p31_argv,
@@ -941,17 +1050,20 @@ def run(args):
             pristine_row,
             pristine_manifest_row,
             stage_provenance_row,
+            p02b_result_row,
+            p02b_marker_row,
+            p02b_provenance_row,
+            p02b_admission_row,
             {"name": "profiles", "path": str(profiles), "kind": "file", "sha256": profiles_sha, "verification": "computed-file"},
             {"name": "invocation_config", "path": str(output_root / "invocation-config.json"), "kind": "file", "sha256": invocation_config_sha, "verification": "computed-file"},
             {"name": "profile_validator", "path": str(profile_validator), "kind": "file", "sha256": validator_sha, "verification": "computed-file"},
+            {"name": "p02b_validator", "path": str(p02b_validator), "kind": "file", "sha256": p02b_validator_sha, "verification": "computed-file"},
             {"name": "p20_runner", "path": str(Path(__file__).resolve()), "kind": "file", "sha256": runner_sha, "verification": "computed-file"},
             {"name": "p20_summarizer", "path": str(summarizer), "kind": "file", "sha256": summarizer_sha, "verification": "computed-file"},
             {"name": "p31_wrapper", "path": str(p31_wrapper), "kind": "file", "sha256": p31_sha, "verification": "computed-file"},
             {"name": "resolved_profile", "path": str(output_root / "resolved-profile.json"), "kind": "file", "sha256": sha256_file(output_root / "resolved-profile.json"), "verification": "computed-file"},
             {"name": "command", "path": str(output_root / "command.json"), "kind": "file", "sha256": sha256_file(output_root / "command.json"), "verification": "computed-file"},
         ]
-        if clean_window_row is not None:
-            rows.append(clean_window_row)
         write_input_tsv(output_root / "inputs.sha256.tsv", rows)
 
         p31_returncode = run_with_signal_forwarding(
@@ -1006,6 +1118,11 @@ def run(args):
             "p31_manifest_sha256": sha256_file(p31_run_root / "run-manifest.json"),
             "stage_store_provenance_sha256": stage_provenance_row["sha256"],
             "stage_store_post_state_sha256": post_state_row["sha256"],
+            "input_manifest_sha256": sha256_file(output_root / "inputs.sha256.tsv"),
+            "p02b_admission_sha256": p02b_admission_row["sha256"],
+            "p02b_sentinel_result_sha256": p02b_result_row["sha256"],
+            "p02b_pass_marker_sha256": p02b_marker_row["sha256"],
+            "p02b_provenance_sha256": p02b_provenance_row["sha256"],
             "summary_sha256": sha256_file(output_root / "summary.tsv"),
         }
         atomic_json(output_root / "P20-PASS.json", pass_doc)
@@ -1048,8 +1165,8 @@ def build_parser():
     parser.add_argument("--truth-sha256", required=True)
     parser.add_argument("--correctness-pass", required=True, type=Path)
     parser.add_argument("--correctness-pass-sha256", required=True)
-    parser.add_argument("--clean-window-sentinel", type=Path)
-    parser.add_argument("--clean-window-sentinel-sha256")
+    parser.add_argument("--p02b-sentinel-result", required=True, type=Path)
+    parser.add_argument("--p02b-sentinel-result-sha256", required=True)
     parser.add_argument("--scale", required=True, choices=("sf10", "sf30"))
     parser.add_argument("--stage", required=True, choices=tuple("A{}".format(i) for i in range(7)))
     parser.add_argument(
@@ -1070,7 +1187,8 @@ def build_parser():
     )
     parser.add_argument("--csr-metadata-cache-entries", type=int, default=4096)
     parser.add_argument("--worker-threads", type=int, default=1)
-    parser.add_argument("--cpuset")
+    parser.add_argument("--cpuset", required=True)
+    parser.add_argument("--housekeeping-cpuset", required=True)
     parser.add_argument("--runtime-override", action="append", default=[], metavar="NAME=VALUE")
     parser.add_argument("--device", default="nvme1n1")
     parser.add_argument("--data-mount", required=True, type=Path)
