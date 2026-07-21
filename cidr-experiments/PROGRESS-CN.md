@@ -1,6 +1,6 @@
 # CIDR 正式实验进度表
 
-更新时间：2026-07-22 02:49 CST
+更新时间：2026-07-22 04:16 CST
 正式验收真源：`plan/ARTICLE-EXPERIMENT-OUTLINE-CN.md`。大纲决定必须覆盖的 RQ、指标和正确性边界；本文件第 3 节冻结七天内的代表性配置。用户于 2026-07-21 提供的最新 ZIP 用于核对当前稿已有内容与缺口，其 SHA-256、逐项清单和 claim 审计见 `work/latest-paper-audit/`。
 
 ## 0. 最新执行看板
@@ -10,15 +10,15 @@
 | 工作包 | 状态 | 已完成/已验证 | 尚缺或下一步 |
 |---|---|---|---|
 | P00 论文与旧证据审计 | `DONE` | 20 个来源完成 `REUSE=5 / FIX=6 / RERUN=9` 分类；六图和 RQ 证据边界已冻结 | 后续正式数据回填后再做 claim-to-evidence 终审 |
-| S0 Linux 同步、SHA、commit | `PASS_INITIAL` | Windows/Linux `145/145` payload SHA 一致，目录总文件数 146；初始同步包提交为 `acb167e`；已建立 clean 集成分支 | 当前集成 HEAD `70acae3550bf`，P20/P02B 最终接口验收后再做全量 SHA 和最终 commit |
+| S0 Linux 同步、SHA、commit | `PASS_INITIAL` | Windows/Linux `145/145` payload SHA 一致，目录总文件数 146；初始同步包提交为 `acb167e`；已建立 clean 集成分支 | 当前集成 HEAD `b76e80818c4f`；Neo4j/Nebula adapter 收口后做最终全量 SHA、反向同步和封板 commit |
 | P01 shared truth / ID bridge | `PASS_INTEGRATED` | 完整扫描 `355,185,382` edges、`29,987,835` vertices；双向 ID map、lockstep、bijection、输入/输出 SHA 全 PASS；独立执行 `sha256sum -c SHA256SUMS` 3/3 OK；历史 converter lineage 已固化 | 集成态 8 Python + 6 Rust shared-truth tests 均 PASS |
 | P02A correctness | `PASS` | W13 `10/10`；W6 SF1 九变体的 8 组 compare 均 `checked=180, mismatches=0` | 只作 correctness 证据，不能引用该轮 timing |
-| P02B SF10 sentinel | `PREPARED_BLOCKED_LOAD` | fail-closed runner/consumer 已集成；7/7 tests + 3-repeat fake P31 smoke PASS；dataset/store tree manifest 与 1,700-query plan 已生成，预检 `1700/1700, mismatches=0` | P20 admission receipt 正在做最终兼容验收；随后只等 P03 READY，清场后放行链预计 23--35 min |
-| P20 A0--A6 组件消融 | `INTEGRATED_VALIDATING` | A0--A6 core、formal runner、current-binary correctness generator、run-level Figure 2 aggregator 已合入；Python 35 tests、Rust 8/8、real-P31 fake smoke、cargo check 均 PASS | 将 P20 旧 sentinel schema 改为强绑定 P02B formal admission；通过后才启动正式 A0--A6 |
+| P02B SF10 sentinel | `PREPARED_BLOCKED_LOAD` | fail-closed runner/consumer 已集成；14/14 tests + 3-repeat fake P31 smoke PASS；dataset、四套 SemL0 store、plan/preflight 的 `SHA256SUMS` 7/7 PASS；四 store 各 `1700/1700, mismatches=0` | 只等 P03 READY；清场后放行链预计 23--35 min |
+| P20 A0--A6 组件消融 | `PASS_INTEGRATED_BLOCKED_LOAD` | A0--A6 core、formal runner、current-binary correctness generator、run-level Figure 2 aggregator 与 canonical P02B admission 已合入；Python 40/40（另 1 项按设计条件运行）、Rust 8/8、real-P31 fake smoke、cargo check 均 PASS | 正式 A0--A6 只等 P02B formal PASS 与 clean window |
 | P31 资源采集与并发规则 | `PASS_INTEGRATED` | collector/validator、11 项单测、fixture smoke、11/11 双端 SHA 均 PASS；已接入 P02B/P20/P40/P10；正式实验单任务串行 | clean window 中验证真实长任务采样数量与 cpuset 绑定 |
 | P40 fixed trace | `PASS_CORRECTNESS_INTEGRATED` | clean-head run `P40-CLEAN-HEAD-36Q-20260721T181522Z-d7c283c5808f`：3×4 arms、36 queries、0 mismatch、62/62 SHA PASS | `performance_eligible=false`；正式 30 min×3 等 clean window |
-| P10/P11 跨系统 orchestrator | `IMPLEMENTED_BLOCKED_ADAPTERS` | 六系统统一 warmup/measured、P50/P95/P99、digest、timeout、P31 与 embedded/client-server 分组契约已集成；8 tests PASS | 六套真实 adapter/binary/image/store 仍需逐项 READY；正式预算修正为 18--24 h |
-| P03 clean-window monitor | `BLOCKED_LOAD` | monitor 持续运行；02:48 样本 load1=1.83、CPU idle=99.21%、磁盘 util=0%、`/data` 可用 956.77 GiB | 仍有 1 个 zcl 大内存任务、4 个 rsync、GPStore、TuGraph；MemAvailable 355.53 GiB，未达 400 GiB 门槛 |
+| P10/P11 跨系统 orchestrator | `4_OF_6_ADAPTERS_INTEGRATED` | SemL0、LiveGraph、Aster、TuGraph 真实 adapter 已合入；P10 主回归 24/24、TuGraph embedded 2/2，均为真实 tiny fixture 且 0 skip；生命周期/runtime SHA/P02B/P31 fail-closed 已交叉绑定 | Neo4j、NebulaGraph adapter 并行实现；Aster clean-tree final binary 构建中；随后补各外部系统 SF10 frozen store/importer gate |
+| P03 clean-window monitor | `BLOCKED_LOAD` | monitor 持续运行；03:57 样本 load1=1.17、CPU idle=99.199%、磁盘 util/await=0/0、`/data` 可用 925.774 GiB | zcl 119.52 GiB worker、4 个 rsync（其中 2 个暂停、2 个活动）、GPStore、TuGraph；MemAvailable 355.003 GiB，未达 400 GiB；清场后还需连续 15 个 60 s 样本 |
 | P10/P11/P20/P31/P40/P50/P60 正式性能 | `NOT_STARTED` | 前置 runner/contract 按优先级并行准备 | 清场后先连续观察 15 min，再跑 P02B sentinel；通过后正式任务严格串行 |
 
 进度口径：上表的 `PASS` 表示对应工程或正确性 gate 已验收，不代表论文性能数据已经完成。当前 **正式性能数据点完成数为 0**。按五个外部系统历史单次耗时复核后，E01 从 12 h 修正为 18--24 h；当前计划为 `132--138 h` 主路径 + `30--36 h` 风险缓冲，硬上限仍为 `168 h`。已在 T0 前完成的工程会直接形成实际余量。
@@ -33,11 +33,11 @@
 | 当前可做的 correctness-only smoke | `PASS` | W13 已 10/10 PASS；W6 SF1 九变体 neighbor-compare 已全部 PASS，二者均为 `performance_eligible=false` |
 | 正式 timing/resource 实验 | `BLOCKED_LOAD` | `zcl` 大内存任务+rsync、GPStore/TuGraph 常驻服务未释放；并行完成 runner/collector 工程，不启动正式 timing |
 
-远端快照（2026-07-22 01:43 CST）：load1=`1.47`、CPU idle=`99.21%`、MemAvailable=`356.04 GiB`、`/data` 可用=`957.94 GiB`、NVMe util/await=`0/0`。瞬时 CPU 与磁盘已较空闲，但 1 个 zcl 大内存任务、4 个 rsync 以及 GPStore/TuGraph 仍在；共享内存、page cache、NUMA 和服务干扰不能排除，所以当前 timing 数据不具备论文资格。
+远端快照（2026-07-22 03:57 CST）：load1=`1.17`、CPU idle=`99.199%`、MemAvailable=`355.003 GiB`、`/data` 可用=`925.774 GiB`、NVMe util/await=`0/0`。瞬时 CPU 与磁盘已较空闲，但 zcl 的 119.52 GiB worker、4 个 rsync 以及 GPStore/TuGraph 仍在；共享内存、page cache、NUMA 和服务干扰不能排除，所以当前 timing 数据不具备论文资格。
 
-执行恢复点（2026-07-22 00:07--01:43 CST）：W13 与 W6 SF1 correctness-only 均已完成；P01 全量 ID map 恢复与独立 SHA 校验完成；P31 collector/validator 和并发门禁完成；P20 正在收口 runner 与汇总器。正式性能仍等待 clean-window gate。
+执行恢复点（2026-07-22 00:07--04:16 CST）：W13 与 W6 SF1 correctness-only、P01 全量 ID map、P31 collector、P20 runner/admission、P40 fixed trace 均已验收；SemL0 四 store 和 P10 的 SemL0/LiveGraph/Aster/TuGraph adapter 已完成 correctness/contract 回归。正式性能仍等待 clean-window gate。
 
-当前 clean-window 阻塞（2026-07-22 01:43 CST）：`zcl` 仍有 1 个大内存 worker 和 4 个 rsync；正式测 SemL0 时还需暂停 GPStore 与 TuGraph。释放后连续观察 10--15 分钟，并要求 load <5、CPU idle >95%、MemAvailable >=400 GiB、`/data` util <5%、await <5 ms，再执行 QPS CV <=3%、P99 CV <=5% 的 SF10 sentinel。
+当前 clean-window 阻塞（2026-07-22 03:57 CST）：`zcl` 的大内存 worker 占 119.52 GiB；SF1 rsync 两进程已暂停约 38.6 h，SF300 rsync 两进程按当前速率仍可能需要 2--3 天；正式测量前还需由维护者停止 GPStore 与 TuGraph。全部释放后要求连续 15 个 60 s 样本满足 load <5、CPU idle >95%、MemAvailable >=400 GiB、`/data` util <5%、await <5 ms，再执行 QPS CV <=3%、P99 CV <=5% 的 SF10 sentinel。
 
 ### P02A correctness-only 实时结果
 
@@ -45,6 +45,19 @@
 |---|---|---|---|
 | W13 schema evolution | `PASS` | `P02-W13-CORRECTNESS-20260721T160741Z-acb167eba8fd` | exit 0；DONE；10/10 pass；49 artifacts SHA-256 全部 OK；manifest `77c9b3c1...9fb8e` |
 | W6 SF1 九变体 compare | `PASS` | `P02-W6-SF1-CORRECTNESS-20260721T161132Z-acb167eba8fd` | 8 个 compare 均 checked=180、mismatches=0；76 artifacts SHA-256 全部 OK；仅 correctness，不采信 timing |
+
+### P02B / SemL0 SF10 frozen store 证据
+
+四套 store 均通过同一 1,700-query truth：`checked=1700`、`mismatches=0`、`total_neighbors=84,104,814`。`/data/WorkSpace/results/P02B/SHA256SUMS` 为 7/7 PASS；清单 SHA-256 为 `9bb5270cb2cc9a4eefee4865c1929deb65d565eac9e92d69c4e026a54c0d3c35`。
+
+| store | files | logical bytes | frozen tree SHA-256 |
+|---|---:|---:|---|
+| naive | 173 | 14,399,231,973 | `133e2ab535dd2c915d93e6e5ded65295151e199ec7268609f0a3e2f65387ddd2` |
+| schema | 379 | 14,306,672,496 | `b7217d6d839d11255c7e7c9c4e6c317469da650091eaefa453f3b5908019348e` |
+| budg-b64 | 448 | 14,312,271,718 | `ae77255c03c40d9d7e55071374ab3adc1dc67942f9443ad7d97dacacbe78c8b5` |
+| semantic | 740 | 15,716,301,617 | `ae1d0021a759cef6d68b4c57a144fa0e6f5bdba813cb35f7235a82b40a3e72f6` |
+
+构建证据位于 `/data/WorkSpace/results/P10-SEML0-STORES/P10-SEML0-SF10-STORE-REBUILD-20260721T193325Z-d123990/`，小文件 `SHA256SUMS` 11/11 PASS。该目录明确写入 `correctness_only=true`、`performance_eligible=false`、`formal_performance_points=0`；为避免在共享服务器重复约 58 GB I/O，本次独立复核重算了目录文件数和逻辑字节，但没有二次读取 store 内容重哈希，这一边界已写入 `DONE.correctness-only`。
 
 状态枚举：`DONE`、`PREPARING`、`READY`、`RUNNING`、`VALIDATING`、`PASS`、`FAIL`、`BLOCKED_LOAD`。进程退出码为 0 不等于 `PASS`；正式完成还必须有 raw、manifest、hash、正确性 gate 和规定的独立重复。
 
@@ -60,7 +73,7 @@
 - `P02A-SF1-CORRECTNESS-SMOKE`：`NOW_SAFE`。包括 W13 10-test 和 W6 SF1 9-variant neighbor-compare；保存 digest/mismatch/manifest，只判 PASS/FAIL。
 - `P02B-CROSS-SYSTEM-SHARED-TRUTH-GATE`：`NEED_CLEAN_WINDOW`。跨系统同 truth/order/cache gate 及其资源记录要等服务器释放；它是 P10/P11 的正式放行条件。
 
-进入 clean window 的最低条件：其他用户重负载已释放；连续 10 分钟 `/data` 无明显后台 I/O；host/load/memory 采样稳定；当前任务磁盘水位满足；5--10 分钟 sentinel 的 QPS CV ≤3%、P99 CV ≤5%。任一条件失败就回到 `BLOCKED_LOAD`。
+进入 clean window 的最低条件：其他用户重负载已释放；P03 连续 15 个 60 s 样本无明显后台 I/O 且 host/load/memory 全部达标；当前任务磁盘水位满足；随后 sentinel 的 QPS CV ≤3%、P99 CV ≤5%。任一条件失败就回到 `BLOCKED_LOAD`。
 
 ## 3. 七天封顶执行计划（当前执行真源）
 
