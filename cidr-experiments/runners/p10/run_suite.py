@@ -37,7 +37,7 @@ from p10_contract import (
     read_p31_summary,
     sha256_file,
     validate_adapter_outputs,
-    validate_seml0_p31_binding,
+    validate_adapter_p31_binding,
 )
 
 
@@ -414,8 +414,12 @@ def execute_repeat(
         truth_rows=truth_rows,
         max_timeouts=suite["protocol"]["max_timeouts"],
     )
-    if mode == "formal" and system["id"] == "seml0":
-        validate_seml0_p31_binding(validated.get("adapter_provenance"), p31)
+    if mode == "formal" and system["id"] in {"seml0", "aster"}:
+        validate_adapter_p31_binding(
+            validated.get("adapter_provenance"),
+            p31,
+            system_id=system["id"],
+        )
     validated["p31"] = p31
     validated["request"] = {
         "path": str(request_path.resolve()),

@@ -887,8 +887,25 @@ def validate_adapter_outputs(
             command = adapter_provenance.get("command")
             if not isinstance(command, dict) or command.get("invocations") != 1 or command.get("exit_code") != 0:
                 raise ContractError("SemL0 adapter must record exactly one successful storage-bench invocation")
+        elif system["id"] == "aster":
+            if adapter_provenance.get("schema_version") != "p10-aster-adapter-provenance-v1":
+                raise ContractError("Aster adapter provenance has wrong schema_version")
+            if adapter_provenance.get("lifecycle") not in {"fresh", "reopen"}:
+                raise ContractError("Aster adapter provenance has unknown lifecycle")
+            command = adapter_provenance.get("command")
+            if not isinstance(command, dict) or command.get("invocations") != 1 or command.get("exit_code") != 0:
+                raise ContractError("Aster adapter must record exactly one successful RocksGraph worker invocation")
+            if request.get("execution_mode") == "formal":
+                if adapter_provenance.get("mode") != "formal" or adapter_provenance.get("lifecycle") != "reopen":
+                    raise ContractError("formal Aster provenance must describe a reopen lifecycle")
+                p02b = adapter_provenance.get("p02b")
+                admission = p02b.get("admission") if isinstance(p02b, dict) else None
+                if not isinstance(admission, dict) or admission.get("state") != "PASS" or admission.get("formal_required") is not True:
+                    raise ContractError("formal Aster provenance lacks a formal P02B PASS admission")
     elif system["id"] == "seml0" and not system.get("fixture_only", False):
         raise ContractError("formal SemL0 adapter omitted adapter-provenance.json")
+    elif system["id"] == "aster" and not system.get("fixture_only", False):
+        raise ContractError("formal Aster adapter omitted adapter-provenance.json")
     artifact_paths = [result_path, observations_path, events_path]
     if provenance_path.is_file():
         artifact_paths.append(provenance_path)
@@ -1039,11 +1056,20 @@ def read_p31_summary(run_dir: Path, *, performance_eligible: bool) -> dict[str, 
     }
 
 
-def validate_seml0_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
-    """Cross-bind SemL0's internal lineage to the enclosing P31 observation."""
+def validate_adapter_p31_binding(
+    provenance: object,
+    p31: dict[str, Any],
+    *,
+    system_id: str,
+) -> None:
+    """Cross-bind an embedded adapter's internal lineage to enclosing P31."""
+
+    if system_id not in {"seml0", "aster"}:
+        raise ContractError(f"unsupported P31 provenance binding for {system_id!r}")
+    display = "SemL0" if system_id == "seml0" else "Aster"
 
     if not isinstance(provenance, dict):
-        raise ContractError("formal SemL0 result lacks parsed adapter provenance")
+        raise ContractError(f"formal {display} result lacks parsed adapter provenance")
     expected_refs = {
         "binary": provenance.get("binary"),
         "truth": provenance.get("truth"),
@@ -1051,21 +1077,21 @@ def validate_seml0_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
     }
     for label, ref in expected_refs.items():
         if not isinstance(ref, dict) or not isinstance(ref.get("path"), str) or not isinstance(ref.get("sha256"), str):
-            raise ContractError(f"SemL0 provenance lacks {label} path/SHA binding")
+            raise ContractError(f"{display} provenance lacks {label} path/SHA binding")
     harness = p31.get("harness")
     inputs = p31.get("inputs")
     repo = p31.get("repo")
     disk_roots = p31.get("disk_roots")
     if not isinstance(harness, dict) or not isinstance(inputs, dict) or not isinstance(repo, dict) or not isinstance(disk_roots, list):
-        raise ContractError("P31 manifest lacks lineage objects required by SemL0")
+        raise ContractError(f"P31 manifest lacks lineage objects required by {display}")
 
     def same_ref(observed: object, expected: dict[str, Any], label: str) -> None:
         if not isinstance(observed, dict):
             raise ContractError(f"P31 lacks {label} artifact reference")
         if Path(str(observed.get("path", ""))).resolve() != Path(expected["path"]).resolve():
-            raise ContractError(f"P31 {label} path differs from SemL0 provenance")
+            raise ContractError(f"P31 {label} path differs from {display} provenance")
         if observed.get("sha256") != expected["sha256"]:
-            raise ContractError(f"P31 {label} SHA-256 differs from SemL0 provenance")
+            raise ContractError(f"P31 {label} SHA-256 differs from {display} provenance")
 
     same_ref(harness.get("wrapper"), expected_refs["p31_wrapper"], "wrapper")
     same_ref(inputs.get("binary"), expected_refs["binary"], "binary")
@@ -1073,12 +1099,12 @@ def validate_seml0_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
     same_ref(inputs.get("query_or_trace"), expected_refs["truth"], "query_or_trace")
     provenance_repo = provenance.get("repo")
     if not isinstance(provenance_repo, dict) or repo.get("git_sha") != provenance_repo.get("head"):
-        raise ContractError("P31 Git SHA differs from SemL0 provenance")
+        raise ContractError(f"P31 Git SHA differs from {display} provenance")
     if repo.get("dirty") is not False:
-        raise ContractError("formal SemL0 P31 manifest reports a dirty repository")
+        raise ContractError(f"formal {display} P31 manifest reports a dirty repository")
     store = provenance.get("store")
     if not isinstance(store, dict) or not isinstance(store.get("path"), str):
-        raise ContractError("SemL0 provenance lacks store path")
+        raise ContractError(f"{display} provenance lacks store path")
     store_path = Path(store["path"]).resolve()
     matching_roots = [
         root
@@ -1088,4 +1114,10 @@ def validate_seml0_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
         and Path(str(root.get("path", ""))).resolve() == store_path
     ]
     if len(matching_roots) != 1:
-        raise ContractError("P31 does not monitor exactly the SemL0 provenance store")
+        raise ContractError(f"P31 does not monitor exactly the {display} provenance store")
+
+
+def validate_seml0_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
+    """Backward-compatible SemL0-specific entry point."""
+
+    validate_adapter_p31_binding(provenance, p31, system_id="seml0")
