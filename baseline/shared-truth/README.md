@@ -38,20 +38,27 @@ truth TSV, even if vertex and edge counts happen to match.
 ### Recover the archived SF10 map without rebuilding the graph
 
 The 2026-06-24 SF10 run predates `--id-map-dir`, but its exact raw edge list,
-dense edge list, and historical converter are preserved.  Recover the map with
-the pinned lineage profile:
+dense edge list, and historical converter are preserved.  The archived
+converter is deliberately separate from `baseline/convert_livegraph_edges.py`:
+the latter now writes durable ID maps and therefore does not have the
+historical source hash.  Recover the map with the pinned lineage profile:
 
 ```bash
 python3 baseline/recover_dense_id_map.py \
   --lineage-profile sf10-20260624 \
   --raw /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/edges-raw.tsv \
   --dense /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/edges-dense.txt \
-  --converter /data/WorkSpace/lsmgraph-rs/baseline/convert_livegraph_edges.py \
+  --converter baseline/shared-truth/archived/convert_livegraph_edges_20260624.py \
   --output-dir run/sf10-recovered-id-map
 
 (cd run/sf10-recovered-id-map && sha256sum -c SHA256SUMS)
 test -f run/sf10-recovered-id-map/FORMAL-PASS
 ```
+
+The archived converter must have SHA-256
+`4d0448ab8b4d9abdb93bb6de0a85ac6ff1568d3f53181921b93a0a08e10974b0`.
+The recovery command checks this value before reading the edge streams and
+again before publishing the map.
 
 This command hashes all three inputs before recovery, reads raw and dense edges
 in lockstep, enforces the historical first-seen assignment for every endpoint,

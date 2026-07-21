@@ -2,6 +2,7 @@
 import hashlib
 import json
 import pathlib
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,16 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RECOVER = ROOT / "baseline" / "recover_dense_id_map.py"
 CONVERTER = ROOT / "baseline" / "convert_livegraph_edges.py"
+ARCHIVED_CONVERTER = (
+    ROOT
+    / "baseline"
+    / "shared-truth"
+    / "archived"
+    / "convert_livegraph_edges_20260624.py"
+)
+ARCHIVED_CONVERTER_SHA256 = (
+    "4d0448ab8b4d9abdb93bb6de0a85ac6ff1568d3f53181921b93a0a08e10974b0"
+)
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 RAW = FIXTURES / "raw-edges.tsv"
 DENSE = FIXTURES / "dense-edges.txt"
@@ -21,6 +32,17 @@ def sha256(path):
 
 
 class RecoverDenseIdMapTest(unittest.TestCase):
+    def test_archived_converter_matches_pinned_sf10_lineage(self):
+        self.assertTrue(ARCHIVED_CONVERTER.is_file())
+        self.assertEqual(sha256(ARCHIVED_CONVERTER), ARCHIVED_CONVERTER_SHA256)
+        recovery_module = runpy.run_path(str(RECOVER))
+        self.assertEqual(
+            recovery_module["LINEAGE_PROFILES"]["sf10-20260624"][
+                "converter_sha256"
+            ],
+            ARCHIVED_CONVERTER_SHA256,
+        )
+
     def command(self, output, raw=RAW, dense=DENSE, *extra):
         return [
             sys.executable,
