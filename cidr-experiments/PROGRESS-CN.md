@@ -1,6 +1,6 @@
 # CIDR 正式实验进度表
 
-更新时间：2026-07-22 06:16 CST
+更新时间：2026-07-22 06:34 CST
 正式验收真源：`plan/ARTICLE-EXPERIMENT-OUTLINE-CN.md`。大纲决定必须覆盖的 RQ、指标和正确性边界；本文件第 3 节冻结七天内的代表性配置。用户于 2026-07-21 提供的最新 ZIP 用于核对当前稿已有内容与缺口，其 SHA-256、逐项清单和 claim 审计见 `work/latest-paper-audit/`。
 
 ## 0. 最新执行看板
@@ -17,7 +17,7 @@
 | P20 A0--A6 组件消融 | `PASS_INTEGRATED_BLOCKED_LOAD` | A0--A6 core、formal runner、current-binary correctness generator、run-level Figure 2 aggregator 与 canonical P02B admission 已合入；Python 40/40（另 1 项按设计条件运行）、Rust 8/8、real-P31 fake smoke、cargo check 均 PASS | 正式 A0--A6 只等 P02B formal PASS 与 clean window |
 | P31 资源采集与并发规则 | `PASS_INTEGRATED` | collector/validator、11 项单测、fixture smoke、11/11 双端 SHA 均 PASS；已接入 P02B/P20/P40/P10；正式实验单任务串行 | clean window 中验证真实长任务采样数量与 cpuset 绑定 |
 | P40 fixed trace | `PASS_CORRECTNESS_INTEGRATED` | clean-head run `P40-CLEAN-HEAD-36Q-20260721T181522Z-d7c283c5808f`：3×4 arms、36 queries、0 mismatch、62/62 SHA PASS | `performance_eligible=false`；正式 30 min×3 等 clean window |
-| P10/P11 跨系统 orchestrator | `6_OF_6_ADAPTERS_INTEGRATED / 3_STORE_GATES_PASS` | SemL0、Aster、TuGraph 的 SF10 frozen store gate 已 PASS；Aster fresh/reopen 四阶段均 1700/0，37/37 SHA；TuGraph 3400/0，45/45 SHA；六系统真实 adapter、Aster/LiveGraph/TuGraph 构建或 importer identity 已冻结 | Neo4j 独立审查发现 formal/P31 缺口并分批修复；并行审计 NebulaGraph isolated store/lifecycle，随后完成两者 SF10 gate |
+| P10/P11 跨系统 orchestrator | `6_OF_6_ADAPTERS / 3_STORE_GATES_PASS / 3_FORMAL_HARDENING` | SemL0、Aster、TuGraph 的 SF10 frozen store gate 已 PASS；Aster fresh/reopen 四阶段均 1700/0，37/37 SHA；TuGraph 3400/0，45/45 SHA；六系统真实 adapter 已集成 | LiveGraph binary/source 可复用但旧 build receipt HEAD 自相矛盾，正在重做 formal template/P02B/P31；Neo4j 三批 lifecycle/P31 修复组合测试中；NebulaGraph 审计已发现 runner-request 与 RAFT logical-host P0 |
 | P03 clean-window monitor | `BLOCKED_LOAD` | monitor 持续运行；03:57 样本 load1=1.17、CPU idle=99.199%、磁盘 util/await=0/0、`/data` 可用 925.774 GiB | zcl 119.52 GiB worker、4 个 rsync（其中 2 个暂停、2 个活动）、GPStore、TuGraph；MemAvailable 355.003 GiB，未达 400 GiB；清场后还需连续 15 个 60 s 样本 |
 | P10/P11/P20/P31/P40/P50/P60 正式性能 | `NOT_STARTED` | 前置 runner/contract 按优先级并行准备 | 清场后先连续观察 15 min，再跑 P02B sentinel；通过后正式任务严格串行 |
 
@@ -33,11 +33,11 @@
 | 当前可做的 correctness-only smoke | `PASS` | W13 已 10/10 PASS；W6 SF1 九变体 neighbor-compare 已全部 PASS，二者均为 `performance_eligible=false` |
 | 正式 timing/resource 实验 | `BLOCKED_LOAD` | `zcl` 大内存任务+rsync、GPStore/TuGraph 常驻服务未释放；并行完成 runner/collector 工程，不启动正式 timing |
 
-远端快照（2026-07-22 03:57 CST）：load1=`1.17`、CPU idle=`99.199%`、MemAvailable=`355.003 GiB`、`/data` 可用=`925.774 GiB`、NVMe util/await=`0/0`。瞬时 CPU 与磁盘已较空闲，但 zcl 的 119.52 GiB worker、4 个 rsync 以及 GPStore/TuGraph 仍在；共享内存、page cache、NUMA 和服务干扰不能排除，所以当前 timing 数据不具备论文资格。
+远端快照（2026-07-22 06:25 CST）：load1=`1.09`、CPU idle=`99.191%`、MemAvailable=`353.937 GiB`、`/data` 可用=`872.324 GiB`、NVMe util/await=`0/0`。瞬时 CPU 与磁盘已较空闲，但 zcl 的约 120 GiB worker、4 个 rsync以及 GPStore/TuGraph 仍在；共享内存、page cache、NUMA 和服务干扰不能排除，所以当前 timing 数据不具备论文资格。
 
-执行恢复点（2026-07-22 00:07--06:16 CST）：W13 与 W6 SF1 correctness-only、P01 全量 ID map、P31 collector、P20 runner/admission、P40 fixed trace 均已验收；SemL0 四 store 和六系统 P10 adapter 已完成 correctness/contract 回归。TuGraph 4.5.2 SF10 fresh import、查询修复和 3400-query gate 已 PASS；Aster SF10 fresh-import/freeze/reopen gate 也已 PASS。正式性能仍等待 clean-window gate。
+执行恢复点（2026-07-22 00:07--06:34 CST）：W13 与 W6 SF1 correctness-only、P01 全量 ID map、P31 collector、P20 runner/admission、P40 fixed trace 均已验收；SemL0 四 store 和六系统 P10 adapter 已完成 correctness/contract 回归。TuGraph 4.5.2 SF10 fresh import、查询修复和 3400-query gate 已 PASS；Aster SF10 fresh-import/freeze/reopen gate 也已 PASS。LiveGraph/Neo4j/NebulaGraph 的独立 formal-readiness 审查发现并正在修复此前 tiny tests 未覆盖的生命周期/证据缺口。正式性能仍等待 clean-window gate。
 
-当前 clean-window 阻塞（2026-07-22 03:57 CST）：`zcl` 的大内存 worker 占 119.52 GiB；SF1 rsync 两进程已暂停约 38.6 h，SF300 rsync 两进程按当前速率仍可能需要 2--3 天；正式测量前还需由维护者停止 GPStore 与 TuGraph。全部释放后要求连续 15 个 60 s 样本满足 load <5、CPU idle >95%、MemAvailable >=400 GiB、`/data` util <5%、await <5 ms，再执行 QPS CV <=3%、P99 CV <=5% 的 SF10 sentinel。
+当前 clean-window 阻塞（2026-07-22 06:25 CST）：`zcl` 的大内存 worker 仍约占 120 GiB；SF1 rsync 两进程暂停约 41 h，SF300 rsync 两进程仍在活动；正式测量前还需由维护者停止 GPStore 与 TuGraph。P03 当前 `0/15`。全部释放后要求连续 15 个 60 s 样本满足 load <5、CPU idle >95%、MemAvailable >=400 GiB、`/data` util <5%、await <5 ms，再执行 QPS CV <=3%、P99 CV <=5% 的 SF10 sentinel。
 
 ### P02A correctness-only 实时结果
 
@@ -64,11 +64,11 @@
 | 系统 | 当前工程证据 | 剩余 formal 前置 |
 |---|---|---|
 | SemL0 | 四套 SF10 store 各 1700/0 mismatch；7/7 P02B SHA | fresh P02B PASS + clean window |
-| LiveGraph | real API/lifecycle tests 7/7；fresh-import→warmup→measured 与 `liblivegraph.so` SHA 已绑定；final build 15/15 PASS，artifact 30/30 SHA | 正式 repeat 内 fresh import |
+| LiveGraph | worker source/binary/lib 与当前代码一致，tiny 15/15；fresh-import→warmup→measured lifecycle 可复用 | 旧 build receipt 的 integration HEAD 字段互相矛盾，且缺 formal template/P02B/P31/PID/env 绑定；正在重建结构化 receipt 和 SF10 wrapper，旧 artifact 不得直接用于 formal |
 | Aster | clean source `6abb258e...`；final worker SHA `12f848aa5aa7595d8626e67066280cc6dd023067b597d123fdc6caa067a6c1b8`；SF10 fresh/reopen 四阶段各 1700/0 mismatch/0 timeout/84,104,814；154 files/11,919,938,925 B；37/37 SHA | correctness-only store gate 已 PASS；正式 repeat 仍等 clean window |
 | TuGraph | final corrected worker SHA `2c36738688ffe6227194032c266a018eddf9e0e4fcc3b3ea10791290ca6e103e`；fresh store 29,987,835 vertices/355,185,382 edges/34 labels；warmup+measured 各 1700/0 mismatch/0 timeout/84,104,814；45/45 SHA PASS | correctness-only store gate 已 PASS；正式 repeat 仍等 clean window |
 | Neo4j | `neo4j:5.26.24` RepoDigest `f66304b9...96435`；real Bolt 4/4；历史 SF10 store 已只读审计为 canonical-compatible | 独立审查发现 import receipt、完整 tree、P31 observed PID、repeat lifecycle、runtime/logs 等 formal 缺口，正在分批修复；历史 store 只允许 correctness，不升级为 formal import lineage |
-| NebulaGraph | v3.8.0 三镜像 digest 3/3 与历史一致；real nGQL 5/5；runtime manifest SHA `66497ff04cfdde7532efb7eb2a00fbbf1fb0f03c25967d02ea446cdc2aa787f6` | 对历史 44 GB store 做独立 clone、manifest、三容器 P31 correctness gate |
+| NebulaGraph | v3.8.0 三镜像 digest 3/3 与历史一致；real nGQL 5/5；历史 46.19 GB store 为 1700/0 correctness seed | 当前权威 runner 生成的 `external_service` 会被 adapter 拒绝；历史 RAFT store 还绑定旧 logical hosts，且 import/P31/repeat/mount/readiness 未闭环；只读审计收口后先修 runner/launcher，再决定 clone |
 
 六系统最终主分支回归为 P10 `33/33` 加 TuGraph 独立 `2/2`，全部使用真实 tiny API 且 0 skip。上述 build/fixture/兼容性数字均为 `performance_eligible=false`；正式性能数据点仍为 0。
 
