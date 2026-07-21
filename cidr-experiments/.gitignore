@@ -1,0 +1,10 @@
+# Large or transient experiment artifacts.
+runs/**/raw/
+runs/**/*.log
+runs/**/*.tgz
+runs/**/*.tar.gz
+validation/rendered-pdf-pages/
+work/tmp/
+work/latest-paper-audit/tmp-extracted/
+**/__pycache__/
+*.py[cod]

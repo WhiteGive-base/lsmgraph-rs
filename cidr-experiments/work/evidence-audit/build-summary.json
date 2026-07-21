@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-07-20T16:51:24.512Z",
+  "registry_rows": 20,
+  "candidate_rows": {
+    "normalized-candidate-fig1-end-to-end.tsv": 132,
+    "normalized-candidate-fig2-component-ablation.tsv": 374,
+    "normalized-candidate-fig3-resource-tradeoff.tsv": 126,
+    "normalized-candidate-fig4-dynamic-compaction.tsv": 232,
+    "normalized-candidate-fig5-workload-coverage.tsv": 138,
+    "normalized-candidate-fig6-scalability.tsv": 80
+  }
+}

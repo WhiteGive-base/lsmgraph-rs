@@ -1,0 +1,12 @@
+{
+  "figure": "fig1_context_not_matched",
+  "canvas_px": [
+    705,
+    255
+  ],
+  "visible_text_count": 47,
+  "out_of_bounds": [],
+  "font_below_6pt": [],
+  "text_collisions": [],
+  "status": "PASS"
+}

@@ -1,0 +1,118 @@
+{
+  "status": "PROVISIONAL_ONLY",
+  "generator": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalize_existing.py",
+  "generator_sha256": "eb7c8eb669c703c54770fa07b4ad4c071bc0e67ad74fba02af95cc68c25e02e5",
+  "inputs": [
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\metrics.tsv",
+      "sha256": "cbd06be9029c1e6a52e1c6c05ed40183f745759aac85c2f2767e9c7c9bc0e2a0"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\rq3-formal-1800-20260623-174053\\feedback.jsonl",
+      "sha256": "4eee05881cb24a42362c4e55060cce9764f55711b7d5f5c23a96321a6c7f8572"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\rq3-formal-1800-20260623-174053\\full.jsonl",
+      "sha256": "fbab6fa6567289dc0705104593483ae37a6deb98765a688431410b0d58c0e118"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\rq3-formal-1800-20260623-174053\\none.jsonl",
+      "sha256": "79578f0eaea4fec8ec92fa1bbfb3780819a05d506dc3ee22ca572f720aafb578"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\sf100-matrix-20260613-cn.md",
+      "sha256": "c5d7f7fc89db1ae48c4e46ebf0d41122b0fa18897db0746a038f0eb69386f32c"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\stage7-sf30-readamp-proxy-summary-20260622-cn.md",
+      "sha256": "3a9af0d8856eddecdafd3f3167e4e8d02c861f2c755f600eb6778d1c2c4787c5"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w13-schema-evolution-20260615-143649\\summary.md",
+      "sha256": "5de7fc4a30cae253320e32a2d45b29ed4feff6e1734b15240e2221eb2fc06b28"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709\\budg-b1024-import.stderr",
+      "sha256": "5b0bc71a3a35f926fde3be8a58a8400c09981ed0cb84e281e6d43ffcacdd6d47"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709\\budg-b256-import.stderr",
+      "sha256": "0b6419ed23ca2668fcccffa67e48a22cd8811812fcb09d413c603939c3c218dd"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709\\budg-b64-import.stderr",
+      "sha256": "5f3599c2f464ea92a1bfd522db644434a5d536add50f2e42734247ce11bced87"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709\\edge-type-only-import.stderr",
+      "sha256": "f4cac61e90113546a366b3c7e55f2dcdf01d41eac47fa22b583578a33697aaaf"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709\\kv-lsm-import.stderr",
+      "sha256": "b0080c23d7e5a2fbe62c48e744f952b9dcda7713a71b684b10c89bca4d123f99"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709\\naive-import.stderr",
+      "sha256": "c3822e99eb42f70f02d987b1371fb43f5e28c66262ad2166a3049eb2ea78856a"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709\\oracle-import.stderr",
+      "sha256": "f86d77d2163bf4260eba787f81e65cee2b1cd1dc916964f2e827798de8be77d9"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709\\schema-import.stderr",
+      "sha256": "de61db118e3a73d35acb36eaa0f52efc9b33dd673b7c1c39fd19a588d23f7980"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709\\semantic-import.stderr",
+      "sha256": "b9da3cefda595da2cb04f52a2c2450f40d6b61969d45447dfa489b833f86d257"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w6-sf10-priority-20260709-summary.md",
+      "sha256": "6b0090f4c452f360b55e396e5f4b5936f692eeaa60d8ab75068e5b8c05202b03"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w8-property-2hop-summary-20260615-cn.md",
+      "sha256": "a29b0beb55983fd2eead60491fc406e9932ae1316b81388507c122c0056190ef"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\source-cache\\w9-steady-state-summary-20260615-cn.md",
+      "sha256": "0e117e89a20b060f14131d3bd38b61b96eacdc770caed60b47ec0fe6c28bc6ee"
+    }
+  ],
+  "outputs": [
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalized\\provisional\\c2-sf30-metadata-proxy.tsv",
+      "sha256": "8352995cc18f9b6e59ecb4323704363fe7b847c9a10efd373a48fdd96f0d6698"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalized\\provisional\\external-sf10-context.tsv",
+      "sha256": "5507881529119a05e184b8ea12ed99c3aaf3fb265dec6f3304ab88ef447fa4a9"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalized\\provisional\\rq3-compaction-provisional.tsv",
+      "sha256": "1c2463a256c106b432c7c25c3d7b39416249a88077086d6a96b5e16df4f9edf4"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalized\\provisional\\w13-bounded-correctness.tsv",
+      "sha256": "92bf3e20d143a75f464fd2595d07e0a70abc1da740d0fff25637bb6c36783f3f"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalized\\provisional\\w6-layout-typed-neighbor.tsv",
+      "sha256": "6469b5e1b2dc3fa777bd2842b1b6c213b8e7aa68adb35f3eeef9ca84d9315370"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalized\\provisional\\w6-sf10-import-resource.tsv",
+      "sha256": "7480221b127a8c0a9c562c224d9c1e832097e4cb4612a14e77ea33c3b2f28415"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalized\\provisional\\w8-property-twohop.tsv",
+      "sha256": "4305eb1c0608766b11fd17a8559e8c9fff635c0aaca60317e89a7df046878c29"
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalized\\provisional\\w9-no-compaction-timeline.tsv",
+      "sha256": "ea7c710f8b8b45e61f035b5bb08e235a5df6c280cf1dbbe6bb1dcfd3b6d1a62a"
+    }
+  ],
+  "warning": "These files preserve legacy evidence and caveats; they do not satisfy the frozen final-figure run contract."
+}

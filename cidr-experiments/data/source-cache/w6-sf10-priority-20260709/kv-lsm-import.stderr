@@ -1,0 +1,245 @@
+[snb-full] SKIP vertex JSONL + edge-prop persistence (SNB_SKIP_ADJ_CACHE set)
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_knows_person_0_0.csv edge=Knows src=Person dst=Person
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_knows_person_0_0.csv rows=1000000 directed_edges=3000000 elapsed_s=1.6
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_knows_person_0_0.csv rows=1938516 directed_edges=5815548 elapsed_s=3.2
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv edge=LikesComment src=Person dst=Comment
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=3.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=4.8
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=5.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=7.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=8.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=8000000 directed_edges=16000000 elapsed_s=9.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=9000000 directed_edges=18000000 elapsed_s=10.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=10000000 directed_edges=20000000 elapsed_s=11.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=11000000 directed_edges=22000000 elapsed_s=12.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=12000000 directed_edges=24000000 elapsed_s=13.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=13000000 directed_edges=26000000 elapsed_s=15.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=14000000 directed_edges=28000000 elapsed_s=16.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=15000000 directed_edges=30000000 elapsed_s=17.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=16000000 directed_edges=32000000 elapsed_s=18.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=17000000 directed_edges=34000000 elapsed_s=19.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=18000000 directed_edges=36000000 elapsed_s=20.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=19000000 directed_edges=38000000 elapsed_s=21.3
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_comment_0_0.csv rows=19949351 directed_edges=39898702 elapsed_s=22.3
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv edge=LikesPost src=Person dst=Post
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=3.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=4.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=5.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=6.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=7.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv rows=8000000 directed_edges=16000000 elapsed_s=8.9
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_likes_post_0_0.csv rows=8839872 directed_edges=17679744 elapsed_s=9.8
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_hasInterest_tag_0_0.csv edge=HasInterest src=Person dst=Tag
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_hasInterest_tag_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.0
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_hasInterest_tag_0_0.csv rows=1535511 directed_edges=3071022 elapsed_s=1.5
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_studyAt_organisation_0_0.csv edge=StudyAt src=Person dst=Organisation
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_studyAt_organisation_0_0.csv rows=52632 directed_edges=105264 elapsed_s=0.1
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_workAt_organisation_0_0.csv edge=WorkAt src=Person dst=Organisation
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_workAt_organisation_0_0.csv rows=143553 directed_edges=287106 elapsed_s=0.2
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv edge=HasMember src=Forum dst=Person
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=3.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=4.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=5.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=6.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=7.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=8000000 directed_edges=16000000 elapsed_s=8.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=9000000 directed_edges=18000000 elapsed_s=9.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=10000000 directed_edges=20000000 elapsed_s=10.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=11000000 directed_edges=22000000 elapsed_s=11.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=12000000 directed_edges=24000000 elapsed_s=12.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=13000000 directed_edges=26000000 elapsed_s=13.8
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=14000000 directed_edges=28000000 elapsed_s=14.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=15000000 directed_edges=30000000 elapsed_s=15.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=16000000 directed_edges=32000000 elapsed_s=17.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=17000000 directed_edges=34000000 elapsed_s=18.0
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasMember_person_0_0.csv rows=17168614 directed_edges=34337228 elapsed_s=18.2
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasTag_tag_0_0.csv edge=HasTag src=Forum dst=Tag
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasTag_tag_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasTag_tag_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.1
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_hasTag_tag_0_0.csv rows=2065319 directed_edges=4130638 elapsed_s=2.2
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv edge=HasTag src=Comment dst=Tag
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=0.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=3.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=4.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=5.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=6.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=7.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=8000000 directed_edges=16000000 elapsed_s=8.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=9000000 directed_edges=18000000 elapsed_s=9.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=10000000 directed_edges=20000000 elapsed_s=10.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=11000000 directed_edges=22000000 elapsed_s=11.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=12000000 directed_edges=24000000 elapsed_s=12.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=13000000 directed_edges=26000000 elapsed_s=13.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=14000000 directed_edges=28000000 elapsed_s=14.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=15000000 directed_edges=30000000 elapsed_s=15.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=16000000 directed_edges=32000000 elapsed_s=16.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=17000000 directed_edges=34000000 elapsed_s=17.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=18000000 directed_edges=36000000 elapsed_s=18.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=19000000 directed_edges=38000000 elapsed_s=19.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=20000000 directed_edges=40000000 elapsed_s=20.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=21000000 directed_edges=42000000 elapsed_s=21.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=22000000 directed_edges=44000000 elapsed_s=22.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=23000000 directed_edges=46000000 elapsed_s=23.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=24000000 directed_edges=48000000 elapsed_s=24.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=25000000 directed_edges=50000000 elapsed_s=25.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=26000000 directed_edges=52000000 elapsed_s=26.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=27000000 directed_edges=54000000 elapsed_s=27.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=28000000 directed_edges=56000000 elapsed_s=28.5
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_hasTag_tag_0_0.csv rows=28740194 directed_edges=57480388 elapsed_s=29.2
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_hasTag_tag_0_0.csv edge=HasTag src=Post dst=Tag
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_hasTag_tag_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_hasTag_tag_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_hasTag_tag_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=2.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_hasTag_tag_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=3.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_hasTag_tag_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=5.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_hasTag_tag_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=6.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_hasTag_tag_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=6.9
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_hasTag_tag_0_0.csv rows=7599701 directed_edges=15199402 elapsed_s=7.5
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_0_0.csv edge=IsLocatedIn src=Person dst=Place
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/person_0_0.csv rows=65645 directed_edges=131290 elapsed_s=0.1
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_0_0.csv edge=HasModerator src=Forum dst=Person
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/forum_0_0.csv rows=595453 directed_edges=1190906 elapsed_s=0.6
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv edge=HasCreator src=Post dst=Person
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=3.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=4.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=5.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=6.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=7.5
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=7435696 directed_edges=14871392 elapsed_s=8.0
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv edge=ContainerOf src=Forum dst=Post
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=3.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=4.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=5.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=6.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=7.5
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=7435696 directed_edges=14871392 elapsed_s=7.9
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv edge=IsLocatedIn src=Post dst=Place
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=3.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=4.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=6.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=7.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=8.4
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/post_0_0.csv rows=7435696 directed_edges=14871392 elapsed_s=9.1
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv edge=HasCreator src=Comment dst=Person
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=0.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=3.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=4.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=5.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=7.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=8.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=8000000 directed_edges=16000000 elapsed_s=9.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=9000000 directed_edges=18000000 elapsed_s=10.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=10000000 directed_edges=20000000 elapsed_s=12.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=11000000 directed_edges=22000000 elapsed_s=13.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=12000000 directed_edges=24000000 elapsed_s=14.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=13000000 directed_edges=26000000 elapsed_s=15.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=14000000 directed_edges=28000000 elapsed_s=16.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=15000000 directed_edges=30000000 elapsed_s=18.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=16000000 directed_edges=32000000 elapsed_s=19.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=17000000 directed_edges=34000000 elapsed_s=20.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=18000000 directed_edges=36000000 elapsed_s=21.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=19000000 directed_edges=38000000 elapsed_s=22.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=20000000 directed_edges=40000000 elapsed_s=23.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=21000000 directed_edges=42000000 elapsed_s=25.1
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=21865475 directed_edges=43730950 elapsed_s=26.2
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv edge=IsLocatedIn src=Comment dst=Place
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=1000000 directed_edges=2000000 elapsed_s=1.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=2000000 directed_edges=4000000 elapsed_s=2.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=3000000 directed_edges=6000000 elapsed_s=3.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=4000000 directed_edges=8000000 elapsed_s=4.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=5000000 directed_edges=10000000 elapsed_s=6.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=6000000 directed_edges=12000000 elapsed_s=7.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=7000000 directed_edges=14000000 elapsed_s=8.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=8000000 directed_edges=16000000 elapsed_s=9.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=9000000 directed_edges=18000000 elapsed_s=10.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=10000000 directed_edges=20000000 elapsed_s=12.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=11000000 directed_edges=22000000 elapsed_s=13.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=12000000 directed_edges=24000000 elapsed_s=14.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=13000000 directed_edges=26000000 elapsed_s=15.8
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=14000000 directed_edges=28000000 elapsed_s=16.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=15000000 directed_edges=30000000 elapsed_s=17.8
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=16000000 directed_edges=32000000 elapsed_s=19.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=17000000 directed_edges=34000000 elapsed_s=20.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=18000000 directed_edges=36000000 elapsed_s=21.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=19000000 directed_edges=38000000 elapsed_s=22.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=20000000 directed_edges=40000000 elapsed_s=23.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=21000000 directed_edges=42000000 elapsed_s=24.8
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=21865475 directed_edges=43730950 elapsed_s=25.9
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv edge=ReplyOfPost src=Comment dst=Post
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=2000000 directed_edges=1966820 elapsed_s=1.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=3000000 directed_edges=2951128 elapsed_s=2.1
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=4000000 directed_edges=3938874 elapsed_s=2.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=7000000 directed_edges=6895194 elapsed_s=4.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=9000000 directed_edges=8868626 elapsed_s=5.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=11000000 directed_edges=10840942 elapsed_s=6.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=12000000 directed_edges=11826512 elapsed_s=7.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=15000000 directed_edges=14782244 elapsed_s=9.3
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=17000000 directed_edges=16753088 elapsed_s=10.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=18000000 directed_edges=17740086 elapsed_s=11.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=20000000 directed_edges=19715512 elapsed_s=12.4
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=21865475 directed_edges=21552204 elapsed_s=13.4
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv edge=ReplyOfComment src=Comment dst=Comment
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=1000000 directed_edges=1015800 elapsed_s=0.6
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=5000000 directed_edges=5075598 elapsed_s=3.0
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=6000000 directed_edges=6089008 elapsed_s=3.5
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=8000000 directed_edges=8117510 elapsed_s=4.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=10000000 directed_edges=10145200 elapsed_s=5.9
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=13000000 directed_edges=13189496 elapsed_s=7.7
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=14000000 directed_edges=14203306 elapsed_s=8.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=16000000 directed_edges=16233194 elapsed_s=9.4
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=19000000 directed_edges=19271832 elapsed_s=11.2
+[snb-full][edge] progress file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=21000000 directed_edges=21299348 elapsed_s=12.4
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/dynamic/comment_0_0.csv rows=21865475 directed_edges=22178746 elapsed_s=12.8
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/static/organisation_0_0.csv edge=IsLocatedIn src=Organisation dst=Place
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/static/organisation_0_0.csv rows=7955 directed_edges=15910 elapsed_s=0.0
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/static/place_0_0.csv edge=IsPartOf src=Place dst=Place
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/static/place_0_0.csv rows=1460 directed_edges=2908 elapsed_s=0.0
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/static/tag_0_0.csv edge=HasType src=Tag dst=TagClass
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/static/tag_0_0.csv rows=16080 directed_edges=32160 elapsed_s=0.0
+[snb-full][edge] start file=/data/WorkSpace/ldbc-sf10/social_network/static/tagclass_0_0.csv edge=IsSubclassOf src=TagClass dst=TagClass
+[snb-full][edge] done file=/data/WorkSpace/ldbc-sf10/social_network/static/tagclass_0_0.csv rows=71 directed_edges=140 elapsed_s=0.0
+[snb-full] edge import complete input_rows=198488915 directed_edges=355185382 edge_props=/dev/null elapsed_s=198.1
+[snb-full] flushing active MemGraph to CSR engines=1
+[snb-full] flush engine_index=0 start
+[snb-full] flush engine_index=0 complete
+[snb-full] flush complete elapsed_s=0.7
+[snb-full] SKIP adjacency cache (SNB_SKIP_ADJ_CACHE set) directed_edges=355185382 total_elapsed_s=198.8
+[import] persist semantic sidecars start elapsed_s=0.0
+[import] persist semantic sidecars complete elapsed_s=0.0
+	Command being timed: "env SNB_SKIP_ADJ_CACHE=1 /data/WorkSpace/lsmgraph-rs/target/release/lsmgraph --io-backend blocking import --input /data/WorkSpace/ldbc-sf10/social_network --data-dir /data/WorkSpace/lsmgraph-rs/store/w6-sf10-priority-20260709/kv-lsm --relation snb-full --memgraph-bytes 67108864 --l0-layout kv-lsm"
+	User time (seconds): 326.96
+	System time (seconds): 59.66
+	Percent of CPU this job got: 194%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 3:18.85
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2439460
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 31192968
+	Voluntary context switches: 5036965
+	Involuntary context switches: 997
+	Swaps: 0
+	File system inputs: 96
+	File system outputs: 28125688
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

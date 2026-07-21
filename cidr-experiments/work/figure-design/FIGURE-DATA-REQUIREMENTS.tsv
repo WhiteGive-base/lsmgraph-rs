@@ -1,0 +1,129 @@
+figure_id	panel	row_grain	field_name	dtype	unit	required	role	aggregation_or_derivation	validation	notes
+COMMON	all	one row per independent run	experiment_id	string	-	yes	key	direct	unique with run_id	Stable experiment family ID such as E01
+COMMON	all	one row per independent run	run_id	string	-	yes	key	direct	globally unique	Never reuse across variants
+COMMON	all	one row per independent run	repeat_index	int	-	yes	key	direct	>=1	Independent process run, not checkpoint
+COMMON	all	one row per independent run	timestamp_utc	string	ISO-8601	yes	provenance	direct	valid UTC timestamp	Record start time
+COMMON	all	one row per independent run	host_fingerprint	string	-	yes	provenance	direct	non-empty	CPU/RAM/storage/kernel fingerprint hash
+COMMON	all	one row per independent run	git_sha	string	-	yes	provenance	direct	40 hex or documented equivalent	SemL0 source revision
+COMMON	all	one row per independent run	binary_sha256	string	-	yes	provenance	direct	64 hex	External systems may use image digest
+COMMON	all	one row per independent run	system	string	-	yes	key	direct	controlled vocabulary	SemL0, LiveGraph, Aster, TuGraph, NebulaGraph, Neo4j
+COMMON	all	one row per independent run	variant	string	-	yes	key	direct	controlled vocabulary	naive, schema, budg-b64, semantic, etc.
+COMMON	all	one row per independent run	dataset_id	string	-	yes	key	direct	non-empty	Includes generator/version
+COMMON	all	one row per independent run	scale_factor	float	SF	no	dimension	direct	>0 when applicable	Do not use as numeric x without actual edges
+COMMON	all	one row per independent run	vertex_count	uint64	vertices	yes	dimension	direct	>0	Actual loaded vertices
+COMMON	all	one row per independent run	directed_edge_count	uint64	edges	yes	dimension	direct	>0	Actual loaded directed edges
+COMMON	all	one row per independent run	property_count	uint64	property values	no	dimension	direct	>=0	Required for property workloads
+COMMON	all	one row per independent run	input_sha256	string	-	yes	provenance	direct	64 hex	Hash of loaded truth data
+COMMON	all	one row per independent run	workload_id	string	-	yes	key	direct	non-empty	Versioned workload definition
+COMMON	all	one row per independent run	query_trace_sha256	string	-	yes	provenance	direct	64 hex	Must match across compared systems
+COMMON	all	one row per independent run	seed	uint64	-	yes	provenance	direct	>=0	Sampling/randomization seed
+COMMON	all	one row per independent run	cache_state	enum	-	yes	dimension	direct	cold|warm|fixed_budget	Never pool cold and warm
+COMMON	all	one row per independent run	concurrency	int	clients	yes	dimension	direct	>=1	Client concurrency
+COMMON	all	one row per independent run	warmup_s	float	s	yes	method	direct	>=0	Excluded from measurement
+COMMON	all	one row per independent run	measurement_s	float	s	yes	measure	direct	>0	Timed interval
+COMMON	all	one row per independent run	digest_pass	bool	-	yes	gate	direct	true for performance plot	False runs retained in correctness output
+COMMON	all	one row per independent run	mismatch_count	uint64	queries	yes	gate	sum	=0 for performance plot	Count/hash mismatch
+COMMON	all	one row per independent run	unsupported_reason	string	-	no	missingness	direct	required when support_state!=supported	Empty value is not zero
+F1	a	one row per run and system	latency_p50_us	float	us	yes	measure	within-run P50 then median/CI across runs	>0	Derived from raw per-query latency
+F1	a	one row per run and system	latency_p95_us	float	us	yes	measure	within-run P95 then median/CI across runs	>=P50	Do not pool runs
+F1	a	one row per run and system	latency_p99_us	float	us	no	measure	within-run P99 then median/CI across runs	>=P95 or null with reason	LiveGraph legacy missing value cannot be zero
+F1	b	one row per run and system	completed_queries	uint64	queries	yes	raw	direct	>=0	Exclude timed-out requests
+F1	b	one row per run and system	timeout_queries	uint64	queries	yes	raw	direct	>=0	Required even when zero
+F1	b	one row per run and system	offered_qps	float	queries/s	no	context	direct	>0 for open-loop	Null for closed-loop
+F1	b	one row per run and system	completed_qps	float	queries/s	yes	measure	completed_queries/measurement_s	>=0	Plot on log only when >0
+F1	c	one row per load run and system	load_wall_s	float	s	yes	measure	direct	>0	Include conversion/build phase definition
+F1	c	one row per load run and system	final_disk_bytes	uint64	bytes	yes	measure	direct	>0	Same filesystem accounting rule
+F1	c	one row per load run and system	load_peak_rss_bytes	uint64	bytes	no	secondary	direct	>0	Reported in companion table
+F1	all	one row per run and system	interface_scope	string	-	yes	gate	direct	must equal matched scope	Expected fixed-source outgoing typed-neighbor
+F1	all	one row per run and system	system_version	string	-	yes	provenance	direct	non-empty	Exact release/commit/image
+F2	all	one row per run and stage	ablation_stage	enum	-	yes	key	direct	A0|A1|A2|A3|A4|A5|A6	Ordered categorical
+F2	all	one row per run and stage	feature_switches	string	-	yes	provenance	direct	non-empty	Machine-readable JSON preferred in raw source
+F2	a	one row per run and stage	latency_p99_us	float	us	yes	measure	within-run P99	>0	Same query trace across stages
+F2	b	one row per run and stage	candidate_segments_total	uint64	segments	yes	raw	direct	>=body_read_segments_total	Use totals to derive per-op
+F2	b	one row per run and stage	body_read_segments_total	uint64	segments	yes	raw	direct	>=0	Physical segment bodies opened
+F2	b	one row per run and stage	measured_operations	uint64	ops	yes	denominator	direct	>0	Same operation count unless timeout reported
+F2	c	one row per run and stage	body_read_bytes_total	uint64	bytes	yes	raw	direct	>=0	Logical body bytes used by main plot
+F2	c	one row per run and stage	device_read_bytes_total	uint64	bytes	no	secondary	direct	>=0	OS/device counter, not substituted silently
+F2	d	one row per run and stage	cpu_signature_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
+F2	d	one row per run and stage	cpu_admission_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
+F2	d	one row per run and stage	cpu_routing_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
+F2	d	one row per run and stage	cpu_body_decode_filter_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
+F2	d	one row per run and stage	cpu_mvcc_result_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
+F2	d	one row per run and stage	cpu_total_ns	uint64	ns	yes	check	sum	>=sum(phases)	Unattributed CPU reported separately if nonzero
+F2	all	one row per run and stage	l0_file_count	uint64	files	no	explanation	direct	>=0	Explain candidate non-monotonicity
+F2	all	one row per run and stage	compaction_write_amplification	float	ratio	no	explanation	direct	>=1 or documented definition	Same formula across stages
+F3	all	one row per run, budget, workload and phase	semantic_budget	string	-	yes	key	direct	schema|B16|B64|B256|B1024|full	Do not infer physical file cap
+F3	all	one row per run, budget, workload and phase	workload_distribution	enum	-	yes	dimension	direct	uniform|zipf_hot|shift_A_B	Stable spelling
+F3	all	one row per run, budget, workload and phase	measurement_phase	enum	-	yes	dimension	direct	import|open|warm_read|mixed|compaction	RSS must be phase-specific
+F3	a	one row per run, budget and workload	steady_rss_bytes	uint64	bytes	yes	measure	median steady window	>0	Not import peak
+F3	a	one row per run, budget and workload	peak_import_rss_bytes	uint64	bytes	yes	secondary	max during import	>0	118 GiB cliff belongs here
+F3	a	one row per run, budget and workload	latency_p99_us	float	us	yes	measure	within-run P99	>0	Matched workload
+F3	b	one row per run, budget and workload	body_read_bytes_total	uint64	bytes	yes	raw	direct	>=0	Divide by measured_operations
+F3	b	one row per run, budget and workload	measured_operations	uint64	ops	yes	denominator	direct	>0	Matched operation set
+F3	c	one row per run and budget	segment_metadata_bytes	uint64	bytes	yes	measure	direct	>=0	Persistent segment metadata only
+F3	c	one row per run and budget	semantic_catalog_bytes	uint64	bytes	yes	measure	direct	>=0	Catalog/index persistent bytes
+F3	c	one row per run and budget	degree_sidecar_bytes	uint64	bytes	yes	measure	direct	>=0	Degree directory/sidecar
+F3	c	one row per run and budget	manifest_bytes	uint64	bytes	yes	measure	direct	>=0	Increment attributable to control plane
+F3	c	one row per run and budget	wal_extra_bytes	uint64	bytes	yes	measure	direct	>=0	Increment attributable to control plane
+F3	c	one row per run and budget	payload_bytes	uint64	bytes	yes	context	direct	>0	Reference only, not stacked with overhead
+F3	c	one row per run and budget	live_file_count	uint64	files	yes	annotation	direct	>0	Measured at frozen state
+F3	all	one row per run and budget	temporary_peak_disk_bytes	uint64	bytes	yes	secondary	max during phase	>=final disk	Report outside main panel if crowded
+F3	all	one row per run and budget	load_wall_s	float	s	yes	secondary	direct	>0	Import/build duration
+F3	all	one row per run and budget	reopen_wall_s	float	s	yes	secondary	direct	>0	Cold reopen/rebuild definition fixed
+F3	all	one row per run and budget	cpu_total_ns	uint64	ns	yes	secondary	direct	>0	Phase-specific CPU
+F3	all	one row per run and budget	compaction_write_amplification	float	ratio	no	secondary	direct	>=1 or documented	Required for mixed/compaction phase
+F4	all	one row per run, policy and time window	compaction_policy	enum	-	yes	key	direct	none|capacity_naive|semantic_static|semantic_feedback	None is diagnostic only
+F4	all	one row per run, policy and time window	window_start_s	float	s	yes	key	direct	>=0	Fixed windows across runs
+F4	all	one row per run, policy and time window	window_end_s	float	s	yes	key	direct	>window_start_s	No overlapping windows within run
+F4	all	one row per run, policy and time window	workload_phase	enum	-	yes	dimension	direct	steady|burst|shift_A_B|recovery	Phase boundaries synchronized
+F4	a	one row per run, policy and time window	read_latency_p99_us	float	us	yes	measure	within-window P99	>0 or missing with reason	Do not interpolate missing windows
+F4	b	one row per run, policy and time window	offered_read_qps	float	queries/s	yes	context	direct	>=0	Fixed by trace
+F4	b	one row per run, policy and time window	achieved_read_qps	float	queries/s	yes	measure	completed/window duration	>=0	Report backlog/timeouts
+F4	c	one row per run, policy and time window	writer_throughput_ops_s	float	ops/s	yes	measure	completed writes/window duration	>=0	Separate from read QPS
+F4	d	one row per run, policy and time window	candidate_bytes_total	uint64	bytes	yes	raw	direct	>=0	Divide by completed reads
+F4	d	one row per run, policy and time window	completed_reads	uint64	queries	yes	denominator	direct	>0 for plotted point	Full query execution
+F4	d	one row per run, policy and time window	candidate_metric_kind	enum	-	yes	gate	direct	full_execution|metadata_proxy	Proxy uses hollow marker
+F4	e	one row per run, policy and time window	live_l0_file_count	uint64	files	yes	measure	end-of-window snapshot	>=0	Step plot
+F4	f	one row per run, policy and time window	cpu_quota_percent	float	percent	yes	measure	CPU seconds/(wall*allocated cores)*100	0..100 plus small measurement tolerance	Do not use raw multi-core percent
+F4	g	one row per run, policy and time window	rss_bytes	uint64	bytes	yes	measure	window max or median, choose once	>0	Aggregation recorded in metadata
+F4	g	one row per run, policy and time window	swap_in_bytes	uint64	bytes	yes	gate	direct	>=0	Nonzero flagged in caption/table
+F4	g	one row per run, policy and time window	swap_out_bytes	uint64	bytes	yes	gate	direct	>=0	Nonzero flagged in caption/table
+F4	h	one row per run, policy and time window	compaction_count_cumulative	uint64	compactions	yes	measure	cumulative	monotonic	Step/rug source
+F4	h	one row per run, policy and time window	compaction_input_bytes_cumulative	uint64	bytes	yes	measure	cumulative	monotonic	WA numerator/denominator audit
+F4	h	one row per run, policy and time window	compaction_output_bytes_cumulative	uint64	bytes	yes	measure	cumulative	monotonic	Main panel h
+F4	h	one row per run, policy and time window	write_amplification	float	ratio	yes	annotation	fixed documented formula	>=1 or documented exception	Final annotation
+F4	all	one row per run, policy and time window	writer_error_count	uint64	errors	yes	gate	sum	=0 for performance claim	Never replace with process survival
+F5	a-b	one row per run and workload cell	query_semantic	enum	-	yes	dimension	direct	typed_only|dst_label|record_time|prop_present|prop_absence|two_hop	Property prototype flagged separately
+F5	a-b	one row per run and workload cell	edge_selectivity_class	enum	-	yes	dimension	direct	rare|medium|frequent	Thresholds versioned in workload_id
+F5	a-b	one row per run and workload cell	source_degree_class	enum	-	yes	dimension	direct	low|medium|high	Writer-side vs visible degree documented
+F5	a-b	one row per run and workload cell	support_state	enum	-	yes	gate	direct	supported|prototype|unsupported|missing	Unsupported is not zero
+F5	a	one row per run and workload cell	latency_p99_us	float	us	yes	measure	within-run P99	>0 for supported cells	Both naive and b64 required
+F5	b	one row per run and workload cell	body_read_bytes_total	uint64	bytes	yes	raw	direct	>=0	Both variants required
+F5	a-b	one row per run and workload cell	measured_operations	uint64	ops	yes	denominator	direct	>0	Matched truth set
+F5	c	one row per run and workload mix	read_percent	float	percent	yes	dimension	direct	0..100	Paired with write_percent
+F5	c	one row per run and workload mix	write_percent	float	percent	yes	dimension	direct	0..100 and read+write=100	Use 0,10,50,90 for main x
+F5	c	one row per run and workload mix	update_pattern	enum	-	yes	dimension	direct	uniform|burst|hotspot|shift_A_B	One line per pattern
+F5	c	one row per run and workload mix	latency_p99_us	float	us	yes	measure	within-run P99	>0	Both naive and b64 required
+F5	d	one row per run and fallback scenario	fallback_scenario	enum	-	yes	dimension	direct	stable|schema_epoch|alias_drop|high_tombstone|old_snapshot|reopen	Fixed order
+F5	d	one row per run and fallback scenario	fallback_rate	float	ratio	yes	annotation	fallback decisions/admission decisions	0..1	Show on bar top
+F5	d	one row per run and fallback scenario	fallback_read_bytes_total	uint64	bytes	yes	raw	direct	>=0	Numerator of extra read ratio
+F5	d	one row per run and fallback scenario	exact_read_bytes_total	uint64	bytes	yes	raw	direct	>0	Denominator of extra read ratio
+F5	all	one row per run and workload cell	schema_state	string	-	yes	dimension	direct	non-empty	Stable/epoch/encoding context
+F5	all	one row per run and workload cell	version_state	string	-	yes	dimension	direct	non-empty	Snapshot/tombstone context
+F6	a-d	one row per run, scale and variant	directed_edge_count	uint64	edges	yes	x	direct	>0	Use actual count on x
+F6	a-d	one row per run, scale and variant	generator_config_sha256	string	-	yes	provenance	direct	64 hex	Same generator family across scale
+F6	a-d	one row per run, scale and variant	sampling_method_version	string	-	yes	provenance	direct	non-empty	Same stratification at every scale
+F6	a	one row per run, scale and variant	latency_p99_us	float	us	yes	measure	within-run P99	>0	Same cache protocol
+F6	b	one row per run, scale and variant	body_read_bytes_total	uint64	bytes	yes	raw	direct	>=0	Full execution main marker
+F6	b	one row per run, scale and variant	measured_operations	uint64	ops	yes	denominator	direct	>0	Same count/strata per scale
+F6	b	one row per run, scale and variant	read_metric_kind	enum	-	yes	gate	direct	full_execution|metadata_proxy	Proxy uses hollow marker
+F6	c	one row per run, scale and variant	final_disk_bytes	uint64	bytes	yes	measure	direct	>0	Same filesystem accounting rule
+F6	d	one row per run, scale and variant	steady_rss_bytes	uint64	bytes	yes	measure	median fixed steady window	>0	Peak import is separate
+F6	e-f	one row per run, concurrency and variant	concurrency	int	clients	yes	x	direct	1|4|8|16|32	Log2 x
+F6	e-f	one row per run, concurrency and variant	cpu_quota_cores	float	cores	yes	control	direct	constant across variants	Same cpuset/quota
+F6	e	one row per run, concurrency and variant	completed_qps	float	queries/s	yes	measure	completed/measurement_s	>=0	Timeouts excluded
+F6	f	one row per run, concurrency and variant	latency_p99_us	float	us	yes	measure	within-run P99	>0 or censored	Timeouts reported separately
+F6	f	one row per run, concurrency and variant	timeout_rate	float	ratio	yes	annotation	timeouts/offered	0..1	Top-triangle when nonzero
+F6	all	one row per run, scale/concurrency and variant	protocol	enum	-	yes	gate	direct	open_loop|closed_loop	Never mix on one line
+F6	all	one row per run, scale/concurrency and variant	oom_flag	bool	-	yes	censoring	direct	true|false	OOM point retained as censored
+F6	all	one row per run, scale/concurrency and variant	resource_limit_bytes	uint64	bytes	yes	context	direct	>0	Required to interpret OOM

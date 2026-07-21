@@ -1,0 +1,131 @@
+{
+  "status": "PASS",
+  "scope": "PROVISIONAL_ONLY",
+  "generator": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\scripts\\plot_provisional_evidence.py",
+  "generator_sha256": "74bae7fa1254434a8c14343d01bf4282ea8ca6b21fabafde69dd9cd7add0c92e",
+  "style_sha256": "78953abe4b3fc0abd631f867a1add996ac97532cef4504f9cacbcec1ecc181ee",
+  "normalized_data_manifest": "E:\\文档\\DGS项目复现\\cidr-experiments\\data\\normalized\\provisional\\manifest.json",
+  "normalized_data_manifest_sha256": "4132f27eb74a1f0ec63cefb8b8712743deff0539eb068bee8b8b9dfcd38e02f9",
+  "artifacts": [
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig1_context_not_matched.layout.json",
+      "sha256": "0e2bd2dd629b144a73bc8edfb6b9ab0a208fb1328997950be14813306dd629ac",
+      "bytes": 214
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig1_context_not_matched.pdf",
+      "sha256": "62a8c2580848ca8d9837ac410cde98e9b54fc50682404b20aec0b1328d2e784e",
+      "bytes": 27613
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig1_context_not_matched.png",
+      "sha256": "f07070277ebdc891420ac88231e757011a2f1196e44c6096ea0b38801c77ad48",
+      "bytes": 144964
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig1_context_not_matched.svg",
+      "sha256": "4af9f817af69401b81775486e10496ef306cffcf543bdd0f7505fc35fac0b39a",
+      "bytes": 31958
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig2_layout_ablation_provisional.layout.json",
+      "sha256": "5057cd92656c3bc1cb8d175f2b6fe84c8d351768a7d5f36f314178abfb14bde5",
+      "bytes": 222
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig2_layout_ablation_provisional.pdf",
+      "sha256": "6c15fc750775834d67f9a0ef02322bda46e3332e1e7c6eaf7c4dbcdeabdd2abb",
+      "bytes": 26619
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig2_layout_ablation_provisional.png",
+      "sha256": "134e26d7b5f74ce5de69d561168f073f3340fa52547ba674324e100120d9c980",
+      "bytes": 184247
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig2_layout_ablation_provisional.svg",
+      "sha256": "29ed9960b4dec27b956cc4959a59596e0d529e1de5d9cb106c58daad2c1a41b6",
+      "bytes": 55734
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig3_import_resource_provisional.layout.json",
+      "sha256": "ca911c1c83453ed2cb54fd3fcdf8dc1fab20cc9d908c0a9925d3ba2add4caea1",
+      "bytes": 222
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig3_import_resource_provisional.pdf",
+      "sha256": "79fdf7965efb09b3b9b3ef0d67e999861a280c63f129c1a227eaa2e2ddbe8ce8",
+      "bytes": 26039
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig3_import_resource_provisional.png",
+      "sha256": "2d880741dd39c7da4d126e1ca6db6a7352aa3efadc807a294675d1a56e64ef48",
+      "bytes": 127322
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig3_import_resource_provisional.svg",
+      "sha256": "338fde871ffba6f780f311c934d03484bb63f056b8ac5340f5699bf72bda01ab",
+      "bytes": 33021
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig4_compaction_timeline_provisional.layout.json",
+      "sha256": "48a7be72be6c2715702bdefc817f274a39097a2a6d01c407228f7fe3e497a370",
+      "bytes": 226
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig4_compaction_timeline_provisional.pdf",
+      "sha256": "3ee854e5114151f5edf7a1e27fa74bfbaec796f884ee6f7aedf171857b9f61c0",
+      "bytes": 29650
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig4_compaction_timeline_provisional.png",
+      "sha256": "0b0b1d49855105fd5af3d8c7b679cc2aaa07935e29a790d22a151407f59ca94d",
+      "bytes": 231360
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig4_compaction_timeline_provisional.svg",
+      "sha256": "c8614095fac375960e0395de8659a1f697934afac152a125833104f79c970a00",
+      "bytes": 46944
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig5_workload_coverage_provisional.layout.json",
+      "sha256": "9c211121aafaaf0e8d9af000f56ef90086e6917fe185739b170ce57e523e7575",
+      "bytes": 224
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig5_workload_coverage_provisional.pdf",
+      "sha256": "e6caa44dad25c1b4e98d332596062aa8b1830bc32b31d367744fc0e4fca4f26d",
+      "bytes": 28474
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig5_workload_coverage_provisional.png",
+      "sha256": "e676f021dff0bcd7617b202d8f2c731241990ffa86bb9b4907be9277759065f0",
+      "bytes": 162523
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig5_workload_coverage_provisional.svg",
+      "sha256": "fa63eab40a6f823e1401bfef885b9ebddbb1b1b7d88d0b0467eea08cea574c9b",
+      "bytes": 34473
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig6_two_point_scale_diagnostic.layout.json",
+      "sha256": "34813be8f49e1767bfd53038b963db50979e6bbcfd35eab77ac652b42d591ab3",
+      "bytes": 221
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig6_two_point_scale_diagnostic.pdf",
+      "sha256": "b8c6e90504f65fb8c19d51b29eef76e8cb4aa8b4ce736a5b6651233fbcf867a8",
+      "bytes": 26548
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig6_two_point_scale_diagnostic.png",
+      "sha256": "bbcb8fd4d1c2daf7e706eeb7cd2bd400c1979d1ea0744e3838c20a20e5b239c5",
+      "bytes": 222974
+    },
+    {
+      "path": "E:\\文档\\DGS项目复现\\cidr-experiments\\figures\\output\\provisional\\fig6_two_point_scale_diagnostic.svg",
+      "sha256": "9eecaeafe0d13c4fd254f74978a28e2850720ea6f5e4a383f918056a89b20fa5",
+      "bytes": 47966
+    }
+  ]
+}

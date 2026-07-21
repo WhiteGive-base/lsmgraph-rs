@@ -1,0 +1,102 @@
+{
+  "figures": [
+    {
+      "pdf": "fig1_context_not_matched.pdf",
+      "rendered_png": "cidr-experiments\\validation\\rendered-provisional\\fig1_context_not_matched.png",
+      "pages": 1,
+      "ink_margins_px": {
+        "size_px": [
+          1269,
+          459
+        ],
+        "left": 6,
+        "top": 7,
+        "right": 9,
+        "bottom": 8
+      },
+      "status": "PASS"
+    },
+    {
+      "pdf": "fig2_layout_ablation_provisional.pdf",
+      "rendered_png": "cidr-experiments\\validation\\rendered-provisional\\fig2_layout_ablation_provisional.png",
+      "pages": 1,
+      "ink_margins_px": {
+        "size_px": [
+          1269,
+          693
+        ],
+        "left": 6,
+        "top": 7,
+        "right": 7,
+        "bottom": 12
+      },
+      "status": "PASS"
+    },
+    {
+      "pdf": "fig3_import_resource_provisional.pdf",
+      "rendered_png": "cidr-experiments\\validation\\rendered-provisional\\fig3_import_resource_provisional.png",
+      "pages": 1,
+      "ink_margins_px": {
+        "size_px": [
+          1269,
+          675
+        ],
+        "left": 6,
+        "top": 7,
+        "right": 7,
+        "bottom": 12
+      },
+      "status": "PASS"
+    },
+    {
+      "pdf": "fig4_compaction_timeline_provisional.pdf",
+      "rendered_png": "cidr-experiments\\validation\\rendered-provisional\\fig4_compaction_timeline_provisional.png",
+      "pages": 1,
+      "ink_margins_px": {
+        "size_px": [
+          1269,
+          685
+        ],
+        "left": 6,
+        "top": 7,
+        "right": 7,
+        "bottom": 13
+      },
+      "status": "PASS"
+    },
+    {
+      "pdf": "fig5_workload_coverage_provisional.pdf",
+      "rendered_png": "cidr-experiments\\validation\\rendered-provisional\\fig5_workload_coverage_provisional.png",
+      "pages": 1,
+      "ink_margins_px": {
+        "size_px": [
+          1269,
+          720
+        ],
+        "left": 9,
+        "top": 7,
+        "right": 8,
+        "bottom": 13
+      },
+      "status": "PASS"
+    },
+    {
+      "pdf": "fig6_two_point_scale_diagnostic.pdf",
+      "rendered_png": "cidr-experiments\\validation\\rendered-provisional\\fig6_two_point_scale_diagnostic.png",
+      "pages": 1,
+      "ink_margins_px": {
+        "size_px": [
+          1269,
+          675
+        ],
+        "left": 6,
+        "top": 7,
+        "right": 8,
+        "bottom": 12
+      },
+      "status": "PASS"
+    }
+  ],
+  "failures": [],
+  "status": "PASS"
+}
