@@ -32,8 +32,10 @@ sys.path.insert(0, str(P10_DIR))
 
 from p10_contract import (  # noqa: E402
     CONTRACT_VERSION,
+    FIXTURE_PROCESS_LIFETIME,
     INTERFACE_SCOPE,
     REQUEST_SCHEMA_VERSION,
+    PREBUILT_PROCESS_LIFETIME,
     SEQUENCE_DIGEST_ALGORITHM,
     TIMING_BOUNDARY,
     CLOCK_NAME,
@@ -301,8 +303,12 @@ class TuGraphAdapterTests(unittest.TestCase):
             "system_version": "TuGraph-4.5.2-native-embedded",
             "interface_scope": INTERFACE_SCOPE,
             "repeat_index": 1,
+            "process_lifetime": FIXTURE_PROCESS_LIFETIME,
             "binary": {"path": str(worker), "sha256": sha256_file(worker)},
             "dataset": {"path": str(dataset), "sha256": sha256_file(dataset)},
+            "runtime_libraries": [
+                json.loads(runtime_manifest.read_text(encoding="utf-8"))["liblgraph"]
+            ],
             "store_roots": [
                 {
                     "label": "tugraph",
@@ -385,6 +391,9 @@ class TuGraphAdapterTests(unittest.TestCase):
             self.assertEqual(validated["completed_queries"], 1700)
             self.assertEqual(validated["mismatch_queries"], 0)
             self.assertEqual(validated["timeout_queries"], 0)
+            self.assertEqual(
+                validated["process_lifetime"], FIXTURE_PROCESS_LIFETIME
+            )
             self.assertGreater(validated["latency_p50_us"], 0)
             self.assertLessEqual(validated["latency_p50_us"], validated["latency_p95_us"])
             self.assertLessEqual(validated["latency_p95_us"], validated["latency_p99_us"])
@@ -392,9 +401,36 @@ class TuGraphAdapterTests(unittest.TestCase):
                 (output / "tugraph-runtime-provenance.json").read_text(encoding="utf-8")
             )
             self.assertEqual(provenance["execution_model"], "native-embedded-single-worker-process-v1")
+            self.assertEqual(provenance["process_lifetime"], FIXTURE_PROCESS_LIFETIME)
+            self.assertEqual(
+                provenance["runtime_libraries"], fixture["request"]["runtime_libraries"]
+            )
             self.assertEqual(provenance["image_digests"], [])
             self.assertEqual(provenance["container_names"], [])
             self.assertGreater(provenance["worker_pid"], 1)
+
+            adapter = load_adapter_module()
+            wrong_lifetime = json.loads(json.dumps(fixture["request"]))
+            wrong_lifetime["process_lifetime"] = PREBUILT_PROCESS_LIFETIME
+            wrong_lifetime_path = root / "wrong-lifetime-request.json"
+            wrong_lifetime_path.write_text(
+                json.dumps(wrong_lifetime, indent=2) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(Exception, "request.process_lifetime"):
+                adapter.validate_request(
+                    wrong_lifetime_path, "tugraph", sha256_file(fixture["truth"])
+                )
+
+            wrong_library = json.loads(json.dumps(fixture["request"]))
+            wrong_library["runtime_libraries"][0]["sha256"] = "0" * 64
+            wrong_library_path = root / "wrong-library-request.json"
+            wrong_library_path.write_text(
+                json.dumps(wrong_library, indent=2) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(Exception, "SHA-256 mismatch"):
+                adapter.validate_request(
+                    wrong_library_path, "tugraph", sha256_file(fixture["truth"])
+                )
 
     def test_formal_p02b_is_mandatory_and_fixture_cannot_claim_it(self) -> None:
         adapter = load_adapter_module()

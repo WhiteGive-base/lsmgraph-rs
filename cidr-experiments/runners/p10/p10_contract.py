@@ -919,10 +919,40 @@ def validate_adapter_outputs(
                 admission = p02b.get("admission") if isinstance(p02b, dict) else None
                 if not isinstance(admission, dict) or admission.get("state") != "PASS" or admission.get("formal_required") is not True:
                     raise ContractError("formal Aster provenance lacks a formal P02B PASS admission")
+        elif system["id"] == "tugraph":
+            if adapter_provenance.get("schema_version") != "cidr-p10-tugraph-provenance-v1":
+                raise ContractError("TuGraph adapter provenance has wrong schema_version")
+            if adapter_provenance.get("execution_model") != "native-embedded-single-worker-process-v1":
+                raise ContractError("TuGraph adapter provenance has wrong execution model")
+            if adapter_provenance.get("process_lifetime") != process_lifetime:
+                raise ContractError("TuGraph adapter provenance process lifetime differs from request")
+            provenance_libraries = adapter_provenance.get("runtime_libraries")
+            request_libraries = request.get("runtime_libraries")
+            if not isinstance(provenance_libraries, list) or not isinstance(request_libraries, list):
+                raise ContractError("TuGraph adapter provenance lacks runtime-library lineage")
+            if len(provenance_libraries) != len(request_libraries):
+                raise ContractError("TuGraph adapter provenance runtime-library count differs from request")
+            for index, (observed, expected) in enumerate(zip(provenance_libraries, request_libraries)):
+                if not isinstance(observed, dict) or not isinstance(expected, dict):
+                    raise ContractError(f"TuGraph runtime library {index} is not an artifact reference")
+                if Path(str(observed.get("path", ""))).resolve() != Path(str(expected.get("path", ""))).resolve():
+                    raise ContractError(f"TuGraph runtime library {index} path differs from request")
+                if observed.get("sha256") != expected.get("sha256"):
+                    raise ContractError(f"TuGraph runtime library {index} SHA-256 differs from request")
+            if request.get("execution_mode") == "formal":
+                if adapter_provenance.get("execution_mode") != "formal":
+                    raise ContractError("formal TuGraph provenance has wrong execution_mode")
+                if process_lifetime != PREBUILT_PROCESS_LIFETIME:
+                    raise ContractError("formal TuGraph provenance must use the prebuilt-store process lifetime")
+                p02b = adapter_provenance.get("p02b_release")
+                if not isinstance(p02b, dict) or p02b.get("require_formal") is not True:
+                    raise ContractError("formal TuGraph provenance lacks a formal P02B release")
     elif system["id"] == "seml0" and not system.get("fixture_only", False):
         raise ContractError("formal SemL0 adapter omitted adapter-provenance.json")
     elif system["id"] == "aster" and not system.get("fixture_only", False):
         raise ContractError("formal Aster adapter omitted adapter-provenance.json")
+    elif system["id"] == "tugraph" and not system.get("fixture_only", False):
+        raise ContractError("formal TuGraph adapter omitted adapter-provenance.json")
     artifact_paths = [result_path, observations_path, events_path]
     if provenance_path.is_file():
         artifact_paths.append(provenance_path)

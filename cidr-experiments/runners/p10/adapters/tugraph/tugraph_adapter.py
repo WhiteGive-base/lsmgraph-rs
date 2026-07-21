@@ -27,8 +27,10 @@ sys.path.insert(0, str(P10_DIR))
 from p10_contract import (  # noqa: E402
     CLOCK_NAME,
     CONTRACT_VERSION,
+    FIXTURE_PROCESS_LIFETIME,
     INTERFACE_SCOPE,
     OBSERVATION_COLUMNS,
+    PREBUILT_PROCESS_LIFETIME,
     REQUEST_SCHEMA_VERSION,
     RESULT_SCHEMA_VERSION,
     SEQUENCE_DIGEST_ALGORITHM,
@@ -159,8 +161,10 @@ def validate_request(path: Path, store_label: str, expected_truth_sha: str) -> t
             "system_version",
             "interface_scope",
             "repeat_index",
+            "process_lifetime",
             "binary",
             "dataset",
+            "runtime_libraries",
             "store_roots",
             "truth",
             "timing",
@@ -179,6 +183,15 @@ def validate_request(path: Path, store_label: str, expected_truth_sha: str) -> t
             raise ContractError(f"request.{key}: {request[key]!r} != {expected!r}")
     if request["execution_mode"] not in ("fixture", "formal"):
         raise ContractError("request.execution_mode must be fixture or formal")
+    expected_lifetime = (
+        PREBUILT_PROCESS_LIFETIME
+        if request["execution_mode"] == "formal"
+        else FIXTURE_PROCESS_LIFETIME
+    )
+    if request["process_lifetime"] != expected_lifetime:
+        raise ContractError(
+            f"request.process_lifetime: {request['process_lifetime']!r} != {expected_lifetime!r}"
+        )
     if request["execution_mode"] == "formal" and expected_truth_sha != FORMAL_TRUTH_SHA256:
         raise ContractError("formal TuGraph P10 requires the frozen P01 SF10 truth SHA-256")
     nonempty(request["suite_id"], "request.suite_id")
@@ -187,6 +200,20 @@ def validate_request(path: Path, store_label: str, expected_truth_sha: str) -> t
     integer(request["repeat_index"], "request.repeat_index", 1)
 
     binary, _ = file_ref(request["binary"], "request.binary", executable=True)
+    runtime_libraries = request["runtime_libraries"]
+    if not isinstance(runtime_libraries, list) or not runtime_libraries:
+        raise ContractError("request.runtime_libraries must contain liblgraph.so")
+    normalized_libraries: list[dict[str, str]] = []
+    runtime_paths: set[str] = set()
+    for index, raw_library in enumerate(runtime_libraries):
+        library_path, library_sha = file_ref(
+            raw_library, f"request.runtime_libraries[{index}]"
+        )
+        if str(library_path) in runtime_paths:
+            raise ContractError("request.runtime_libraries contains a duplicate path")
+        runtime_paths.add(str(library_path))
+        normalized_libraries.append({"path": str(library_path), "sha256": library_sha})
+    request["runtime_libraries"] = normalized_libraries
     dataset_ref = exact_keys(request["dataset"], ("path", "sha256"), "request.dataset")
     dataset = canonical_path(dataset_ref["path"], "request.dataset.path")
     if not dataset.exists():
@@ -429,6 +456,13 @@ def validate_runtime_manifest(
     if worker != request_binary:
         raise ContractError("runtime worker differs from P10 request.binary")
     liblgraph, _ = file_ref(value["liblgraph"], "runtime.liblgraph")
+    requested_libraries = request["runtime_libraries"]
+    if not any(
+        Path(library["path"]) == liblgraph
+        and library["sha256"] == value["liblgraph"]["sha256"]
+        for library in requested_libraries
+    ):
+        raise ContractError("request.runtime_libraries does not bind runtime liblgraph.so")
     headers = exact_keys(
         value["header_tree"],
         ("path", "sha256", "hash_method", "file_count", "total_bytes"),
@@ -881,6 +915,7 @@ def publish_contract_outputs(
         "system_version": request["system_version"],
         "interface_scope": INTERFACE_SCOPE,
         "repeat_index": request["repeat_index"],
+        "process_lifetime": request["process_lifetime"],
         "truth_sha256": request["truth"]["sha256"],
         "sequence_digest_algorithm": SEQUENCE_DIGEST_ALGORITHM,
         "timing_boundary": TIMING_BOUNDARY,
@@ -1009,6 +1044,8 @@ def main() -> int:
             "schema_version": PROVENANCE_SCHEMA,
             "execution_mode": request["execution_mode"],
             "execution_model": EXECUTION_MODEL,
+            "process_lifetime": request["process_lifetime"],
+            "runtime_libraries": request["runtime_libraries"],
             "worker_pid": worker["pid"],
             "worker_ppid": worker["ppid"],
             "worker": runtime_manifest["worker"],
@@ -1036,6 +1073,7 @@ def main() -> int:
             },
         }
         atomic_json(output_dir / "tugraph-runtime-provenance.json", provenance)
+        atomic_json(output_dir / "adapter-provenance.json", provenance)
         return 0
     except (ContractError, OSError, subprocess.SubprocessError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

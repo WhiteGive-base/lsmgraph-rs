@@ -60,6 +60,11 @@ python3 -B cidr-experiments/runners/p10/adapters/tugraph/make_store_manifest.py 
 ## fail-closed 边界
 
 - formal request 只能使用权威 1700-row truth SHA；fixture truth 不能冒充 formal。
+- fixture 必须声明 `fixture-process-lifetime-v1`；formal 必须声明
+  `prebuilt-store-query-process-lifetime-v1`，并在同一个 native worker
+  进程内依次完成 store open、warmup 和 measured trace。
+- request 的 `runtime_libraries` 必须包含 runtime manifest 中同路径、同
+  SHA-256 的 `liblgraph.so`；adapter provenance 会再次回写并交叉校验。
 - formal store 必须 `formal_eligible=true`，且 dataset/store/binary SHA 必须与 P10 request 完全一致。
 - formal 必须携带 P02B result、validator 和 validator SHA，并通过 `--consumer P10 --require-formal`；fixture 禁止携带 P02B 声明。
 - 每条查询超过 deadline 会记录 `timeout`；formal 的 `max_timeouts=0`，因此任何 timeout 都拒绝发布。无法从库调用内部安全抢占的永久阻塞由 P10 adapter 整体 timeout 与 P31 root-process 作用域终止并拒绝。

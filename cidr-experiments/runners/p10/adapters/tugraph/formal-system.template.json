@@ -6,6 +6,7 @@
   "system_version": "TuGraph-4.5.2-native-embedded",
   "fixture_only": false,
   "service_lifecycle": "in-process",
+  "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
   "adapter": {
     "path": "__ABSOLUTE_REPO__/cidr-experiments/runners/p10/adapters/tugraph/tugraph_adapter.py",
     "sha256": "__ADAPTER_SHA256__",
@@ -32,6 +33,12 @@
     "path": "__ABSOLUTE_ARTIFACTS__/tugraph-p10-worker",
     "sha256": "__WORKER_SHA256__"
   },
+  "runtime_libraries": [
+    {
+      "path": "__ABSOLUTE_TUGRAPH_LIBLGRAPH__",
+      "sha256": "__LIBLGRAPH_SHA256__"
+    }
+  ],
   "store_roots": [
     {
       "label": "tugraph",
