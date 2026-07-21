@@ -121,6 +121,11 @@ store manifest、P02B result/validator 和 P31 wrapper 路径/SHA 与 system/req
 一致。Aster worker 静态链接 RocksGraph，因此模板的 `runtime_libraries` 为空；
 `store_roots[aster].sha256` 填逻辑 query-store SHA，而不是物理 tree SHA。
 
+SF10 fresh import、离线 freeze 和冻结 store correctness 的唯一准备入口是
+`aster/prepare_sf10_store.py`；精确命令、产物与时长见
+`aster/SF10-PREPARATION-CN.md`。该流程固定为 correctness-only，不能替代正式 P02B
+admission 或 P31 timing。
+
 ## 当前正式运行前仍需准备
 
 - 已建立 detached clean source view
