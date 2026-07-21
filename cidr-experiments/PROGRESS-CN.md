@@ -1,7 +1,27 @@
 # CIDR 正式实验进度表
 
-更新时间：2026-07-21 22:57 CST  
+更新时间：2026-07-22 02:49 CST
 正式验收真源：`plan/ARTICLE-EXPERIMENT-OUTLINE-CN.md`。大纲决定必须覆盖的 RQ、指标和正确性边界；本文件第 3 节冻结七天内的代表性配置。用户于 2026-07-21 提供的最新 ZIP 用于核对当前稿已有内容与缺口，其 SHA-256、逐项清单和 claim 审计见 `work/latest-paper-audit/`。
+
+## 0. 最新执行看板
+
+当前结论：**前置工程和 correctness 已取得可验收结果，但正式 timing/resource 数据点仍为 0；当前论文性能图仍不能升级为正式图。** 正式性能任务必须等 clean-window gate 与 SF10 sentinel 通过后再串行启动。
+
+| 工作包 | 状态 | 已完成/已验证 | 尚缺或下一步 |
+|---|---|---|---|
+| P00 论文与旧证据审计 | `DONE` | 20 个来源完成 `REUSE=5 / FIX=6 / RERUN=9` 分类；六图和 RQ 证据边界已冻结 | 后续正式数据回填后再做 claim-to-evidence 终审 |
+| S0 Linux 同步、SHA、commit | `PASS_INITIAL` | Windows/Linux `145/145` payload SHA 一致，目录总文件数 146；初始同步包提交为 `acb167e`；已建立 clean 集成分支 | 当前集成 HEAD `70acae3550bf`，P20/P02B 最终接口验收后再做全量 SHA 和最终 commit |
+| P01 shared truth / ID bridge | `PASS_INTEGRATED` | 完整扫描 `355,185,382` edges、`29,987,835` vertices；双向 ID map、lockstep、bijection、输入/输出 SHA 全 PASS；独立执行 `sha256sum -c SHA256SUMS` 3/3 OK；历史 converter lineage 已固化 | 集成态 8 Python + 6 Rust shared-truth tests 均 PASS |
+| P02A correctness | `PASS` | W13 `10/10`；W6 SF1 九变体的 8 组 compare 均 `checked=180, mismatches=0` | 只作 correctness 证据，不能引用该轮 timing |
+| P02B SF10 sentinel | `PREPARED_BLOCKED_LOAD` | fail-closed runner/consumer 已集成；7/7 tests + 3-repeat fake P31 smoke PASS；dataset/store tree manifest 与 1,700-query plan 已生成，预检 `1700/1700, mismatches=0` | P20 admission receipt 正在做最终兼容验收；随后只等 P03 READY，清场后放行链预计 23--35 min |
+| P20 A0--A6 组件消融 | `INTEGRATED_VALIDATING` | A0--A6 core、formal runner、current-binary correctness generator、run-level Figure 2 aggregator 已合入；Python 35 tests、Rust 8/8、real-P31 fake smoke、cargo check 均 PASS | 将 P20 旧 sentinel schema 改为强绑定 P02B formal admission；通过后才启动正式 A0--A6 |
+| P31 资源采集与并发规则 | `PASS_INTEGRATED` | collector/validator、11 项单测、fixture smoke、11/11 双端 SHA 均 PASS；已接入 P02B/P20/P40/P10；正式实验单任务串行 | clean window 中验证真实长任务采样数量与 cpuset 绑定 |
+| P40 fixed trace | `PASS_CORRECTNESS_INTEGRATED` | clean-head run `P40-CLEAN-HEAD-36Q-20260721T181522Z-d7c283c5808f`：3×4 arms、36 queries、0 mismatch、62/62 SHA PASS | `performance_eligible=false`；正式 30 min×3 等 clean window |
+| P10/P11 跨系统 orchestrator | `IMPLEMENTED_BLOCKED_ADAPTERS` | 六系统统一 warmup/measured、P50/P95/P99、digest、timeout、P31 与 embedded/client-server 分组契约已集成；8 tests PASS | 六套真实 adapter/binary/image/store 仍需逐项 READY；正式预算修正为 18--24 h |
+| P03 clean-window monitor | `BLOCKED_LOAD` | monitor 持续运行；02:48 样本 load1=1.83、CPU idle=99.21%、磁盘 util=0%、`/data` 可用 956.77 GiB | 仍有 1 个 zcl 大内存任务、4 个 rsync、GPStore、TuGraph；MemAvailable 355.53 GiB，未达 400 GiB 门槛 |
+| P10/P11/P20/P31/P40/P50/P60 正式性能 | `NOT_STARTED` | 前置 runner/contract 按优先级并行准备 | 清场后先连续观察 15 min，再跑 P02B sentinel；通过后正式任务严格串行 |
+
+进度口径：上表的 `PASS` 表示对应工程或正确性 gate 已验收，不代表论文性能数据已经完成。当前 **正式性能数据点完成数为 0**。按五个外部系统历史单次耗时复核后，E01 从 12 h 修正为 18--24 h；当前计划为 `132--138 h` 主路径 + `30--36 h` 风险缓冲，硬上限仍为 `168 h`。已在 T0 前完成的工程会直接形成实际余量。
 
 ## 1. 当前状态
 
@@ -10,12 +30,21 @@
 | 最新论文与旧证据审计 | `DONE` | 20 个来源已分为 REUSE=5、FIX=6、RERUN=9；当前图仍是 provisional evidence |
 | W6/RQ3/W13 parser 与来源指针修复 | `DONE` | 可复用 raw 已规范化；不能把历史单次/不同硬件数据升级为正式性能点 |
 | Linux 目录同步、文件数与 SHA-256 校验、commit | `PASS` | 最终 145/145 payload SHA、146 个总文件已双端校验；本文件所在提交 SHA 以远端 `git log -1` 为准 |
-| 当前可做的 correctness-only smoke | `READY` | 用户要求先评审大纲；未启动。确认后才执行 W13 10-test 与 W6 SF1 9-variant neighbor-compare |
-| 正式 timing/resource 实验 | `BLOCKED_LOAD` | 等待 clean window；当前不启动 latency/QPS/CPU/RSS/I/O/compaction/concurrency 正式采集 |
+| 当前可做的 correctness-only smoke | `PASS` | W13 已 10/10 PASS；W6 SF1 九变体 neighbor-compare 已全部 PASS，二者均为 `performance_eligible=false` |
+| 正式 timing/resource 实验 | `BLOCKED_LOAD` | `zcl` 大内存任务+rsync、GPStore/TuGraph 常驻服务未释放；并行完成 runner/collector 工程，不启动正式 timing |
 
-远端快照（2026-07-21 22:57 CST）：`/data` 可用约 `968 GiB`；其他用户 `zcl` 的任务约占 `156 GiB RSS`。磁盘容量可支持串行执行，但共享内存、page cache 和 I/O 干扰不能排除，所以当前 timing 数据不具备论文资格。
+远端快照（2026-07-22 01:43 CST）：load1=`1.47`、CPU idle=`99.21%`、MemAvailable=`356.04 GiB`、`/data` 可用=`957.94 GiB`、NVMe util/await=`0/0`。瞬时 CPU 与磁盘已较空闲，但 1 个 zcl 大内存任务、4 个 rsync 以及 GPStore/TuGraph 仍在；共享内存、page cache、NUMA 和服务干扰不能排除，所以当前 timing 数据不具备论文资格。
 
-执行暂停点（2026-07-21 23:34 CST）：只交付并评审实验大纲；correctness-only 和正式性能补跑均未启动，等待用户确认范围。
+执行恢复点（2026-07-22 00:07--01:43 CST）：W13 与 W6 SF1 correctness-only 均已完成；P01 全量 ID map 恢复与独立 SHA 校验完成；P31 collector/validator 和并发门禁完成；P20 正在收口 runner 与汇总器。正式性能仍等待 clean-window gate。
+
+当前 clean-window 阻塞（2026-07-22 01:43 CST）：`zcl` 仍有 1 个大内存 worker 和 4 个 rsync；正式测 SemL0 时还需暂停 GPStore 与 TuGraph。释放后连续观察 10--15 分钟，并要求 load <5、CPU idle >95%、MemAvailable >=400 GiB、`/data` util <5%、await <5 ms，再执行 QPS CV <=3%、P99 CV <=5% 的 SF10 sentinel。
+
+### P02A correctness-only 实时结果
+
+| 子任务 | 状态 | Run ID | 验收 |
+|---|---|---|---|
+| W13 schema evolution | `PASS` | `P02-W13-CORRECTNESS-20260721T160741Z-acb167eba8fd` | exit 0；DONE；10/10 pass；49 artifacts SHA-256 全部 OK；manifest `77c9b3c1...9fb8e` |
+| W6 SF1 九变体 compare | `PASS` | `P02-W6-SF1-CORRECTNESS-20260721T161132Z-acb167eba8fd` | 8 个 compare 均 checked=180、mismatches=0；76 artifacts SHA-256 全部 OK；仅 correctness，不采信 timing |
 
 状态枚举：`DONE`、`PREPARING`、`READY`、`RUNNING`、`VALIDATING`、`PASS`、`FAIL`、`BLOCKED_LOAD`。进程退出码为 0 不等于 `PASS`；正式完成还必须有 raw、manifest、hash、正确性 gate 和规定的独立重复。
 
@@ -56,21 +85,21 @@
 - 共享 truth、dense/original ID bridge 和通过兼容性/hash gate 的 SF10/SF30/SF100 immutable base store 直接复用；只补缺失的正式 timing、telemetry、独立 repeats 与 matched protocol。
 - 跨系统主性能、A0--A6 因果消融、fixed-trace dynamic、四点 scaling 和 concurrency 必须补跑，因为旧数据无法靠 parser 补出可比性。
 
-### 3.3 126 h 计划 + 42 h 缓冲
+### 3.3 132--138 h 计划 + 30--36 h 缓冲
 
 | 顺序 | 大纲映射 | 执行内容 | 期望 wall time | 累计 | 主要复用/停止条件 |
 |---:|---|---|---:|---:|---|
 | 0 | E00/E09 前置 | 同步、双端 SHA、commit、manifest/truth/collector/feature-switch 工程、P02A correctness | **12 h** | 12 h | 工程多 agent 并行；correctness 失败立即停 timing |
 | 1 | E00 | clean-window sentinel、setup 表和 P02B shared-truth gate | **2 h** | 14 h | sentinel 或 shared truth 不通过则保持 `BLOCKED_LOAD` |
-| 2 | E01 | SemL0 `naive/schema/B64/semantic` + 五个外部系统，同 truth 的 3-run matched comparison | **12 h** | 26 h | 复用可验证 store；必须重建的系统顺序 fresh load |
-| 3 | E03 + E04/SF10 | SF10 A0--A6×typed/degree/property；SF30 A0/A2/A4/A6 代表复验；六个 budget uniform 全阶段、四核心点补 Zipf/shift mixed/compaction | **14 h** | 40 h | 共用 import/store/collector，不重复构建 |
-| 4 | E04/SF100 | 六个 budget 点，import×3、query×3 起跑、1,700-query truth、完整资源数据 | **40 h** | 80 h | variants 串行；高方差 query 才补到 5；空间硬水位 180 GiB |
-| 5 | E05 | controlled proxy/full-read 校准、real SF30 C2、四 arms×30 min×3 dynamic | **14 h** | 94 h | 同 immutable base、fixed trace；四 arms 串行 |
-| 6 | E06 | 分层代表 workload/property/two-hop/RW/shift cells，3-run | **8 h** | 102 h | 不做全笛卡尔积，但每个维度至少有正式证据 |
-| 7 | E07/E08 | 四规模×四 variants，以及 1/4/8/16/32 concurrency | **10 h** | 112 h | 全部复用前序 stores；只运行 query/concurrency phase |
-| 8 | E09 | 3 个固定 seed×至少 20,000 ops 的 differential safety、fallback rate/cost、失败 trace shrink | **5 h** | 117 h | false negative 必须为 0；失败时优先修正确性 |
-| 9 | 全部 | normalize、统计/CI、缺字段检查、claim-to-evidence 审计和数据封板 | **9 h** | **126 h** | 任何缺 raw/hash/manifest 的点不得进入正式结果 |
-| 10 | 缓冲 | 高方差补到 5 runs、runner 修复、失败重跑、可选 E02 | **42 h** | **168 h** | 不用于扩大 variant/cell 范围 |
+| 2 | E01 | SemL0 `naive/schema/B64/semantic` + 五个外部系统，同 truth 的 3-run matched comparison | **18--24 h** | 32--38 h | 历史五系统三轮下限已约 11.3 h；另计 warmup、P31、SemL0 与切换；按 embedded/client-server 分组报告 |
+| 3 | E03 + E04/SF10 | SF10 A0--A6×typed/degree/property；SF30 A0/A2/A4/A6 代表复验；六个 budget uniform 全阶段、四核心点补 Zipf/shift mixed/compaction | **14 h** | 46--52 h | 共用 import/store/collector，不重复构建 |
+| 4 | E04/SF100 | 六个 budget 点，import×3、query×3 起跑、1,700-query truth、完整资源数据 | **40 h** | 86--92 h | variants 串行；高方差 query 才补到 5；空间硬水位 180 GiB |
+| 5 | E05 | controlled proxy/full-read 校准、real SF30 C2、四 arms×30 min×3 dynamic | **14 h** | 100--106 h | 同 immutable base、fixed trace；四 arms 串行 |
+| 6 | E06 | 分层代表 workload/property/two-hop/RW/shift cells，3-run | **8 h** | 108--114 h | 不做全笛卡尔积，但每个维度至少有正式证据 |
+| 7 | E07/E08 | 四规模×四 variants，以及 1/4/8/16/32 concurrency | **10 h** | 118--124 h | 全部复用前序 stores；只运行 query/concurrency phase |
+| 8 | E09 | 3 个固定 seed×至少 20,000 ops 的 differential safety、fallback rate/cost、失败 trace shrink | **5 h** | 123--129 h | false negative 必须为 0；失败时优先修正确性 |
+| 9 | 全部 | normalize、统计/CI、缺字段检查、claim-to-evidence 审计和数据封板 | **9 h** | **132--138 h** | 任何缺 raw/hash/manifest 的点不得进入正式结果 |
+| 10 | 缓冲 | 高方差补到 5 runs、runner 修复、失败重跑、可选 E02 | **30--36 h** | **168 h** | 不用于扩大 variant/cell 范围 |
 
 ### 3.4 七天内的取舍边界
 
