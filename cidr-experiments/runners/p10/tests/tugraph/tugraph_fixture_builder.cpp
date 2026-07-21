@@ -39,30 +39,51 @@ int main(int argc, char** argv) {
         }
 
         auto transaction = database.CreateWriteTxn(false);
-        for (int64_t dense = 0; dense < 4; ++dense) {
+        for (int64_t dense = 0; dense < 64; ++dense) {
             const auto vid = transaction.AddVertex(
                 "vertex", {"dense_id"}, {std::to_string(dense)});
             if (vid != dense) {
                 throw std::runtime_error("fixture internal VID is not the requested dense ID");
             }
         }
-        for (int edge_type = -17; edge_type <= 17; ++edge_type) {
-            if (edge_type == 0) continue;
-            const std::string label = edge_type < 0
-                ? "et_neg_" + std::to_string(-edge_type)
-                : "et_pos_" + std::to_string(edge_type);
-            for (const auto [src, dst] : {
-                     std::pair<int64_t, int64_t>{0, 1},
-                     std::pair<int64_t, int64_t>{0, 2},
-                     std::pair<int64_t, int64_t>{1, 3},
-                 }) {
+        std::vector<int> mixed_edge_types;
+        for (int magnitude = 1; magnitude <= 17; ++magnitude) {
+            mixed_edge_types.push_back(magnitude);
+            mixed_edge_types.push_back(-magnitude);
+        }
+        // Source 0 has 19 destinations for every label.  Rotate the label
+        // order for every destination so equal labels are deliberately not
+        // adjacent in insertion order.  Source 1 supplies a second mixed
+        // source with one destination per label.
+        for (int64_t destination = 1; destination <= 19; ++destination) {
+            const size_t shift = static_cast<size_t>(destination * 7) %
+                                 mixed_edge_types.size();
+            for (size_t offset = 0; offset < mixed_edge_types.size(); ++offset) {
+                const int edge_type =
+                    mixed_edge_types[(offset + shift) % mixed_edge_types.size()];
+                const std::string label = edge_type < 0
+                    ? "et_neg_" + std::to_string(-edge_type)
+                    : "et_pos_" + std::to_string(edge_type);
                 transaction.AddEdge(
-                    src,
-                    dst,
+                    0,
+                    destination,
                     label,
                     std::vector<std::string>{},
                     std::vector<std::string>{});
             }
+        }
+        for (auto iterator = mixed_edge_types.rbegin();
+             iterator != mixed_edge_types.rend(); ++iterator) {
+            const int edge_type = *iterator;
+            const std::string label = edge_type < 0
+                ? "et_neg_" + std::to_string(-edge_type)
+                : "et_pos_" + std::to_string(edge_type);
+            transaction.AddEdge(
+                1,
+                63,
+                label,
+                std::vector<std::string>{},
+                std::vector<std::string>{});
         }
         transaction.Commit();
         database.Flush();

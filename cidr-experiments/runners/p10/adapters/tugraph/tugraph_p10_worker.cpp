@@ -3,8 +3,9 @@
 // The worker opens one immutable TuGraph database through the embedded C++ API,
 // resolves edge-label ids once, and executes warmup followed by measured passes
 // in this same process.  Database open/schema resolution are setup; every
-// per-query interval includes read-transaction creation, source lookup, typed
-// out-edge seek, complete destination materialization, digesting, and abort.
+// per-query interval includes read-transaction creation, source lookup, full
+// outgoing-adjacency traversal with native-label filtering, complete
+// destination materialization, digesting, and abort.
 
 #include <algorithm>
 #include <cstdlib>
@@ -315,23 +316,25 @@ Digest execute_query(
                 throw std::runtime_error("dense source VID is absent: " +
                                          std::to_string(query.src));
             }
-            const lgraph_api::EdgeUid seek{
-                static_cast<int64_t>(query.src),
-                0,
-                label_id,
-                std::numeric_limits<int64_t>::min(),
-                0};
-            auto edge = transaction.GetOutEdgeIterator(seek, true);
+            // TuGraph's public EdgeUid value ordering and its internal
+            // OutEdgeSortOrder are different.  A nearest EdgeUid seek is not
+            // a documented label-range API; on SF10 it can land inside the
+            // requested label and omit later destinations.  Iterate the
+            // complete outgoing adjacency and filter by the resolved native
+            // label id, which is the same API contract used by TuGraph's
+            // reference traversal examples.
+            auto edge = vertex.GetOutEdgeIterator();
             while (edge.IsValid()) {
                 const auto uid = edge.GetUid();
-                if (uid.src != static_cast<int64_t>(query.src) ||
-                    uid.lid != label_id) {
-                    break;
+                if (uid.src != static_cast<int64_t>(query.src)) {
+                    throw std::runtime_error("TuGraph out-edge iterator changed source VID");
                 }
-                if (uid.dst < 0) {
-                    throw std::runtime_error("TuGraph returned a negative destination VID");
+                if (uid.lid == label_id) {
+                    if (uid.dst < 0) {
+                        throw std::runtime_error("TuGraph returned a negative destination VID");
+                    }
+                    materialized.push_back(static_cast<uint64_t>(uid.dst));
                 }
-                materialized.push_back(static_cast<uint64_t>(uid.dst));
                 edge.Next();
             }
         }

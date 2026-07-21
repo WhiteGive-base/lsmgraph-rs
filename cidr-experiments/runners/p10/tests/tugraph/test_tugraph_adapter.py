@@ -67,6 +67,23 @@ def edge_types() -> list[int]:
     return [*range(-17, 0), *range(1, 18)]
 
 
+def mixed_edge_types() -> list[int]:
+    return [value for magnitude in range(1, 18) for value in (magnitude, -magnitude)]
+
+
+def fixture_edges() -> list[tuple[int, int, int]]:
+    order = mixed_edge_types()
+    rows: list[tuple[int, int, int]] = []
+    for destination in range(1, 20):
+        shift = (destination * 7) % len(order)
+        rows.extend(
+            (0, order[(offset + shift) % len(order)], destination)
+            for offset in range(len(order))
+        )
+    rows.extend((1, edge_type, 63) for edge_type in reversed(order))
+    return rows
+
+
 def load_adapter_module() -> types.ModuleType:
     spec = importlib.util.spec_from_file_location("cidr_tugraph_adapter_for_test", ADAPTER)
     assert spec is not None and spec.loader is not None
@@ -221,12 +238,31 @@ class TuGraphAdapterTests(unittest.TestCase):
         self.run_checked([str(builder), str(store)])
 
         dataset = root / "dense-edges.txt"
+        fixture_rows = fixture_edges()
         with dataset.open("w", encoding="utf-8") as handle:
-            handle.write("4\n")
-            for edge_type in edge_types():
-                handle.write(f"0 {edge_type} 1\n")
-                handle.write(f"0 {edge_type} 2\n")
-                handle.write(f"1 {edge_type} 3\n")
+            handle.write("64\n")
+            for source, edge_type, destination in fixture_rows:
+                handle.write(f"{source} {edge_type} {destination}\n")
+        self.assertEqual({row[1] for row in fixture_rows}, set(edge_types()))
+        for edge_type in edge_types():
+            self.assertEqual(
+                [row[2] for row in fixture_rows if row[0] == 0 and row[1] == edge_type],
+                list(range(1, 20)),
+            )
+            self.assertEqual(
+                [row[2] for row in fixture_rows if row[0] == 1 and row[1] == edge_type],
+                [63],
+            )
+        source_zero_types = [row[1] for row in fixture_rows if row[0] == 0]
+        self.assertTrue(
+            all(
+                any(right - left > 1 for left, right in zip(positions, positions[1:]))
+                for edge_type in edge_types()
+                for positions in [
+                    [index for index, value in enumerate(source_zero_types) if value == edge_type]
+                ]
+            )
+        )
 
         truth = root / "truth.tsv"
         with truth.open("w", encoding="utf-8", newline="") as handle:
@@ -236,7 +272,7 @@ class TuGraphAdapterTests(unittest.TestCase):
             for edge_type in edge_types():
                 for sample in range(50):
                     source = sample % 2
-                    destinations = [1, 2] if source == 0 else [3]
+                    destinations = list(range(1, 20)) if source == 0 else [63]
                     count, total, xor = digest(destinations)
                     writer.writerow([query_index, edge_type, source, count, total, xor])
                     query_index += 1
@@ -284,7 +320,7 @@ class TuGraphAdapterTests(unittest.TestCase):
                 "--source-revision",
                 "isolated-small-fixture-not-performance",
                 "--vertex-count",
-                "4",
+                "64",
                 "--password-sha256",
                 hashlib.sha256(b"73@TuGraph").hexdigest(),
                 "--fixture-only",

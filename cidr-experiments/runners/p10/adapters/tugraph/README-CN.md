@@ -4,7 +4,23 @@
 
 本目录实现 TuGraph 4.5.2 的真实 embedded P10 入口。正式运行不连接、复用、启动或停止任何 `lgraph_server`：P10 adapter 只派生一个原生 worker，worker 在同一进程中依次完成一次完整 warmup trace 和一次完整 measured trace。
 
-每条查询的 `CLOCK_MONOTONIC` 区间包含：创建只读事务、按 dense VID 定位源点、按 edge label ID seek 出边、完整物化所有目标 dense VID、计算 `mix64-dense-dst-count-sum-xor-v1`、中止只读事务。Galaxy/GraphDB 打开和 34 个 edge label ID 的解析属于 setup，不计入逐查询区间。
+每条查询的 `CLOCK_MONOTONIC` 区间包含：创建只读事务、按 dense VID 定位源点、完整遍历该点的原生 outgoing adjacency、按已解析的 native edge-label ID 过滤、完整物化所有目标 dense VID、计算 `mix64-dense-dst-count-sum-xor-v1`、中止只读事务。Galaxy/GraphDB 打开和 34 个 edge label ID 的解析属于 setup，不计入逐查询区间。
+
+这里的完整 outgoing scan 是 TuGraph 4.5.2 embedded API 对当前无属性边
+schema 的正确原生路径，而不是实现退化或近似：公开的
+`GetOutEdgeIterator(EdgeUid, nearest)` 只承诺定位指定 edge 或 nearest edge，
+并不承诺返回一个 label range；`GetOutEdgeIterator(src,dst,lid)` 又要求已知
+destination。4.5.2 的 edge-index iterator 必须建立在 edge property field 上，
+而本 matched store 的 34 个 edge labels 都是无属性边；为了索引额外增加字段
+会改变 store schema、磁盘占用和导入口径，因此本基线不这样做。安装头文件和
+官方随附遍历示例也使用无参 `VertexIterator.GetOutEdgeIterator()` 完整遍历。
+正式报告的 latency 因而包含完整 adjacency scan 与 label filter 的真实成本。
+
+曾尝试把 nearest EdgeUid 错当成 label-range 起点；SF10 correctness 显示每个
+phase 有 867/1700 mismatch（例如 truth 为 19 个不同 destination 时只返回
+1 个）。该路径已经删除。真实 embedded 回归现在固定覆盖：同一 source 混合
+34 个 labels、同 label 19 个 destinations，以及按 destination 旋转的非连续
+label 插入顺序。
 
 正式 truth 固定为 1700 条有序查询，SHA-256 为：
 
