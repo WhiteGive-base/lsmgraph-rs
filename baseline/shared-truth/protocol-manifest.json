@@ -1,0 +1,41 @@
+{
+  "artifact": "P01-SHARED-TRUTH-BRIDGE",
+  "format_version": 1,
+  "correctness_only": true,
+  "performance_eligible": false,
+  "truth": {
+    "columns": [
+      "query_index",
+      "edge_type",
+      "src",
+      "count",
+      "sum_hash",
+      "xor_hash"
+    ],
+    "digest": "mix64-dense-dst-count-sum-xor-v1",
+    "query_order": "query_index contiguous from zero",
+    "sf1_sha256": "9b4ce591306d04f8444b9c260d3b94edf40d2c6cc025b20a76c5ca8d1bbb9f8d",
+    "sf10_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788",
+    "sf10_query_count": 1700
+  },
+  "id_map": {
+    "format": "seml0-shared-id-map",
+    "format_version": 1,
+    "mapping_hash_algorithm": "fnv1a64-le-dense-original-v1",
+    "directions": [
+      "original-to-dense.tsv",
+      "dense-to-original.tsv"
+    ],
+    "file_integrity": "SHA256SUMS"
+  },
+  "consumers": {
+    "seml0": "lsmgraph shared-truth-verify",
+    "seml0_performance_plan": "lsmgraph storage-bench --sample-plan-in",
+    "livegraph": "baseline/external-drivers/livegraph_driver --truth-tsv"
+  },
+  "acceptance": {
+    "expected_checked_sf10": 1700,
+    "expected_mismatches": 0,
+    "required_for_each_ablation": true
+  }
+}

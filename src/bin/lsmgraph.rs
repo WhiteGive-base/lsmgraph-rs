@@ -11,6 +11,9 @@ use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig};
 use lsmgraph::csr::CsrPropertyValuePredicate;
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
+use lsmgraph::shared_truth::{
+    build_storage_sample_plan, read_truth_tsv, verify_engine_truth, SharedIdMap,
+};
 use lsmgraph::snb::{
     import_snb_full, import_snb_full_multi, import_snb_updates, rebuild_snb_edge_props,
     start_dgs_compatible_server, validate_ic1_ic14_dynamic, validate_ic_batch_dynamic,
@@ -429,6 +432,33 @@ enum Command {
         property_default_i64: i64,
         #[arg(long, default_value_t = 1)]
         max_mismatches: usize,
+    },
+    /// Verify the versioned dense-ID truth TSV against one SemL0 store.
+    ///
+    /// This is a correctness consumer, not a timing harness.  When
+    /// --sample-plan-out is supplied it also emits a storage-bench-compatible
+    /// plan so later matched performance runs consume the identical query order.
+    SharedTruthVerify {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        truth_tsv: PathBuf,
+        #[arg(long)]
+        id_map_dir: PathBuf,
+        #[arg(long)]
+        sample_plan_out: Option<PathBuf>,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        expected_queries: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        semantic_degree_hint: bool,
+        #[arg(long, default_value_t = false)]
+        force_signature: bool,
+        #[arg(long)]
+        l0_layout: Option<L0LayoutPolicy>,
+        #[arg(long, default_value_t = 20)]
+        max_mismatch_details: usize,
     },
     OracleIndex {
         #[arg(long, default_value = DEFAULT_STORE)]
@@ -1624,6 +1654,83 @@ async fn main() -> Result<()> {
                 }))?
             );
         }
+        Command::SharedTruthVerify {
+            data_dir,
+            truth_tsv,
+            id_map_dir,
+            sample_plan_out,
+            output,
+            expected_queries,
+            semantic_degree_hint,
+            force_signature,
+            l0_layout,
+            max_mismatch_details,
+        } => {
+            let rows = read_truth_tsv(&truth_tsv)?;
+            if let Some(expected_queries) = expected_queries {
+                if rows.len() != expected_queries {
+                    anyhow::bail!(
+                        "shared truth query count mismatch: expected {} found {}",
+                        expected_queries,
+                        rows.len()
+                    );
+                }
+            }
+            let ids = SharedIdMap::load(&id_map_dir)?;
+            if let Some(path) = &sample_plan_out {
+                if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                    fs::create_dir_all(parent)?;
+                }
+                let plan =
+                    build_storage_sample_plan(&rows, &ids, semantic_degree_hint, force_signature)?;
+                fs::write(path, serde_json::to_vec_pretty(&plan)?)?;
+            }
+
+            let mut config = LsmGraphConfig::new(&data_dir)
+                .with_io_backend(io_backend)
+                .with_metadata_cache_entries(csr_metadata_cache_entries);
+            if let Some(l0_layout) = l0_layout {
+                config.l0_layout = l0_layout;
+            }
+            let engine = Engine::open(config).await?;
+            let verification = verify_engine_truth(
+                &engine,
+                &rows,
+                &ids,
+                semantic_degree_hint,
+                force_signature,
+                max_mismatch_details,
+            )
+            .await?;
+            let mismatches = verification.mismatches;
+            let report = json!({
+                "consumer": "seml0-shared-truth-v1",
+                "correctness_only": true,
+                "performance_eligible": false,
+                "data_dir": data_dir,
+                "truth_tsv": truth_tsv,
+                "truth_rows": rows.len(),
+                "id_map_dir": id_map_dir,
+                "id_map_dense_to_original_sha256": ids.dense_to_original_sha256(),
+                "id_map_original_to_dense_sha256": ids.original_to_dense_sha256(),
+                "sample_plan_out": sample_plan_out,
+                "semantic_degree_hint": semantic_degree_hint,
+                "force_signature": force_signature,
+                "verification": verification,
+            });
+            let encoded = serde_json::to_vec_pretty(&report)?;
+            if let Some(path) = output {
+                if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, &encoded)?;
+            } else {
+                println!("{}", String::from_utf8(encoded)?);
+            }
+            if mismatches != 0 {
+                anyhow::bail!("shared truth verification found {mismatches} mismatches");
+            }
+        }
         Command::OracleIndex { data_dir } => {
             let mut config = LsmGraphConfig::new(&data_dir)
                 .with_io_backend(io_backend)
@@ -2312,6 +2419,28 @@ fn metric_u64(metrics: &Value, path: &[&str]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_truth_plan_is_storage_bench_compatible() -> Result<()> {
+        let ids = SharedIdMap::from_dense_to_original(vec![100, 400])?;
+        let rows = vec![lsmgraph::shared_truth::TruthRow {
+            query_index: 0,
+            edge_type: -7,
+            src: 1,
+            count: 3,
+            sum_hash: 4,
+            xor_hash: 5,
+        }];
+        let shared = build_storage_sample_plan(&rows, &ids, true, false)?;
+        let encoded = serde_json::to_string(&shared)?;
+        let parsed: StorageBenchSamplePlan = serde_json::from_str(&encoded)?;
+        assert_eq!(parsed.source, "shared-truth-tsv");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].edge_type, Some(-7));
+        assert_eq!(parsed.entries[0].samples[0].src, 400);
+        assert_eq!(parsed.entries[0].samples[0].degree, 3);
+        Ok(())
+    }
 
     #[test]
     fn w4_two_hop_frontier_truncation_is_stable() {

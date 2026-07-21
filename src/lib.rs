@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod property_encoding;
 pub mod schema;
 pub mod semantic;
+pub mod shared_truth;
 pub mod snb;
 pub mod types;
 pub mod version;

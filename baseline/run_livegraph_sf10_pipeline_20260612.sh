@@ -9,6 +9,8 @@ INPUT="${INPUT:-/data/WorkSpace/ldbc-sf10/social_network}"
 BIN="${BIN:-${ROOT}/target/release/lsmgraph}"
 RAW_EDGES="${RAW_EDGES:-${OUT_DIR}/edges-raw.tsv}"
 DENSE_EDGES="${DENSE_EDGES:-${OUT_DIR}/edges-dense.txt}"
+ID_MAP_DIR="${ID_MAP_DIR:-${OUT_DIR}/id-map}"
+TRUTH_TSV="${TRUTH_TSV:-}"
 SAMPLES="${SAMPLES:-1000}"
 MIN_AVAILABLE_GIB="${MIN_AVAILABLE_GIB:-220}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-90}"
@@ -79,6 +81,11 @@ if livegraph.get("peak_rss_kb", 0) <= 0:
     errors.append("missing LiveGraph peak_rss_kb")
 if not livegraph.get("benchmarks"):
     errors.append("missing LiveGraph benchmark entries")
+if livegraph.get("query_source") == "shared-truth-tsv":
+    if livegraph.get("checked") != 1700:
+        errors.append(f"shared truth checked={livegraph.get('checked')} != 1700")
+    if livegraph.get("mismatches") != 0:
+        errors.append(f"shared truth mismatches={livegraph.get('mismatches')} != 0")
 
 if errors:
     raise SystemExit("; ".join(errors))
@@ -119,15 +126,24 @@ main() {
   ensure_resources "before convert"
   /usr/bin/time -v python3 baseline/convert_livegraph_edges.py \
     --input "$RAW_EDGES" --output "$DENSE_EDGES" --summary "${OUT_DIR}/convert-summary.json" \
+    --id-map-dir "$ID_MAP_DIR" \
     > "${OUT_DIR}/convert.stdout" 2> "${OUT_DIR}/convert.stderr"
+  (cd "$ID_MAP_DIR" && sha256sum -c SHA256SUMS) \
+    > "${OUT_DIR}/id-map-sha256-check.log"
 
   ensure_resources "before livegraph"
   safe_rm "$LG_BLOCK"
   safe_rm "$LG_WAL"
+  truth_args=()
+  if [[ -n "$TRUTH_TSV" ]]; then
+    test -s "$TRUTH_TSV"
+    truth_args+=(--truth-tsv "$TRUTH_TSV")
+  fi
   LD_LIBRARY_PATH="${ROOT}/deps/LiveGraph/build" /usr/bin/time -v \
     baseline/external-drivers/livegraph_driver \
       --edges "$DENSE_EDGES" --samples "$SAMPLES" \
       --block-path "$LG_BLOCK" --wal-path "$LG_WAL" \
+      "${truth_args[@]}" \
       --output "${OUT_DIR}/livegraph-sf10.json" \
     > "${OUT_DIR}/livegraph.stdout" 2> "${OUT_DIR}/livegraph.stderr"
 
