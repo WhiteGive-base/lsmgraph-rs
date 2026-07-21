@@ -156,11 +156,17 @@ python3 -B -m unittest -v \
 
 ### Neo4j adapter 的当前边界
 
-Neo4j 使用 `external-prestarted-query-process-lifetime-v1`。真实 adapter 不管理服务；它在查询前
-复验 manifest 中的唯一容器、`neo4j:5.26.24` RepoDigest、localhost Bolt 端口、`/data`
-mount、`restart=no`、只读默认数据库、Python driver `5.28.3`、dataset/truth/store manifest
-和 canonical P02B admission。详细的安全 runtime-copy 与 store 冻结流程见
-`adapters/NEO4J-ADAPTER-CN.md`。
+Neo4j 使用 `external-prestarted-query-process-lifetime-v1`。真实 adapter 不管理服务；它在查询
+前后各复验一次唯一容器的 ID/PID/StartedAt/RestartCount、`neo4j:5.26.24` RepoDigest、
+localhost Bolt 端口、`/data` mount、`restart=no`、只读默认数据库和 Python driver
+`5.28.3`。连接 readiness 有界；查询前还会实时确认数据库名严格为 `neo4j`，且唯一
+`:V(id)` RANGE index `v_id` 为 `ONLINE`。dataset/truth/store manifest、canonical P02B
+admission 和 P31 采样对象必须逐项闭合；运行中容器漂移会 fail closed。
+
+正式系统片段模板位于 `adapters/neo4j/formal-system.template.json`。store manifest v2 明确区分
+离线 pre-start 快照、允许 Neo4j 启动后改变的 runtime 路径，以及 import/runtime image 身份；
+历史 tag-only import 只能作为 `unverified-tag-only` correctness 证据，不能进入 formal 结果。
+详细的安全 runtime-copy 与 store 冻结流程见 `adapters/NEO4J-ADAPTER-CN.md`。
 
 真实 tiny fixture 自测（明确不是论文性能数据）：
 

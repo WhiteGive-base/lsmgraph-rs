@@ -82,6 +82,8 @@ class Neo4jAdapterTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        if os.environ.get("CIDR_SKIP_REAL_NEO4J_TESTS") == "1":
+            raise unittest.SkipTest("real Neo4j fixture disabled by CIDR_SKIP_REAL_NEO4J_TESTS")
         if shutil.which("docker") is None:
             raise unittest.SkipTest("docker is unavailable")
         inspected = subprocess.run(
@@ -188,6 +190,81 @@ class Neo4jAdapterTests(unittest.TestCase):
             cls._cleanup_resources()
             raise RuntimeError(f"Neo4j tiny import failed:\n{imported.stdout}")
 
+        # Build the frozen :V(id) RANGE index before taking the offline
+        # snapshot.  The later query container is read-only and may not mutate
+        # schema state.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            index_port = listener.getsockname()[1]
+        cls.index_container = f"cidr-p10-neo4j-index-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        indexed = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                cls.index_container,
+                "--restart",
+                "no",
+                "-p",
+                f"127.0.0.1:{index_port}:7687",
+                "-v",
+                f"{cls.store.resolve()}:/data",
+                "-e",
+                "NEO4J_AUTH=none",
+                IMAGE,
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if indexed.returncode != 0:
+            cls._cleanup_resources()
+            raise RuntimeError(f"Neo4j index preparation container failed: {indexed.stderr}")
+        index_uri = f"bolt://127.0.0.1:{index_port}"
+        deadline = time.monotonic() + 180
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            index_driver = None
+            try:
+                index_driver = GraphDatabase.driver(index_uri, auth=None)
+                index_driver.verify_connectivity()
+                with index_driver.session(database="neo4j") as session:
+                    session.run("CREATE INDEX v_id IF NOT EXISTS FOR (v:V) ON (v.id)").consume()
+                    session.run("CALL db.awaitIndexes()").consume()
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                time.sleep(1)
+            finally:
+                if index_driver is not None:
+                    index_driver.close()
+        else:
+            cls._cleanup_resources()
+            raise RuntimeError(f"Neo4j fixture index was not ready: {last_error}")
+        stopped = subprocess.run(
+            ["docker", "stop", "--time", "60", cls.index_container],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if stopped.returncode != 0:
+            cls._cleanup_resources()
+            raise RuntimeError(f"Neo4j index preparation did not stop cleanly: {stopped.stderr}")
+        removed = subprocess.run(
+            ["docker", "rm", cls.index_container],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if removed.returncode != 0:
+            cls._cleanup_resources()
+            raise RuntimeError(f"Neo4j index preparation container was not removed: {removed.stderr}")
+        cls.index_container = None
+
         cls.freezer = P10_DIR / "adapters" / "freeze_neo4j_store.py"
         cls.store_manifest = cls.root / "store-manifest.json"
         frozen = subprocess.run(
@@ -204,6 +281,10 @@ class Neo4jAdapterTests(unittest.TestCase):
                 "--neo4j-version",
                 "5.26.24",
                 "--image-digest",
+                cls.image_digest,
+                "--import-image-identity",
+                "verified-repodigest",
+                "--import-image-digest",
                 cls.image_digest,
                 "--sentinel",
                 "databases/neo4j/neostore.nodestore.db",
@@ -236,6 +317,10 @@ class Neo4jAdapterTests(unittest.TestCase):
                 "--neo4j-version",
                 "5.26.24",
                 "--image-digest",
+                cls.image_digest,
+                "--import-image-identity",
+                "verified-repodigest",
+                "--import-image-digest",
                 cls.image_digest,
                 "--sentinel",
                 "databases/neo4j/neostore.nodestore.db",
@@ -319,7 +404,7 @@ class Neo4jAdapterTests(unittest.TestCase):
 
     @classmethod
     def _cleanup_resources(cls) -> None:
-        for attribute in ("container", "import_container"):
+        for attribute in ("container", "import_container", "index_container"):
             name = getattr(cls, attribute, None)
             if name:
                 subprocess.run(
@@ -496,7 +581,10 @@ class Neo4jAdapterTests(unittest.TestCase):
                 (root / "output" / "adapter-provenance.json").read_text(encoding="utf-8")
             )
             self.assertFalse(provenance["performance_eligible"])
-            self.assertEqual(provenance["container"]["expected_repo_digest"], self.image_digest)
+            self.assertEqual(
+                provenance["container_lifecycle"]["before"]["expected_repo_digest"],
+                self.image_digest,
+            )
             self.assertEqual(provenance["python_driver"]["version"], self.driver_version)
 
     def test_image_and_driver_tamper_fail_before_queries(self) -> None:
