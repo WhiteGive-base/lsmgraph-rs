@@ -12,6 +12,7 @@
     "system_version",
     "interface_scope",
     "repeat_index",
+    "process_lifetime",
     "truth_sha256",
     "sequence_digest_algorithm",
     "timing_boundary",
@@ -29,6 +30,14 @@
     "system_version": {"type": "string", "minLength": 1},
     "interface_scope": {"const": "typed-neighbor-dense-id-v1"},
     "repeat_index": {"type": "integer", "minimum": 1},
+    "process_lifetime": {
+      "enum": [
+        "fresh-import-and-query-process-lifetime-v1",
+        "prebuilt-store-query-process-lifetime-v1",
+        "external-prestarted-query-process-lifetime-v1",
+        "fixture-process-lifetime-v1"
+      ]
+    },
     "truth_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "sequence_digest_algorithm": {"const": "sha256-pass-query-count-sum-xor-v1"},
     "timing_boundary": {"const": "typed-neighbor-call-plus-result-materialization-and-digest-v1"},
@@ -36,9 +45,53 @@
     "concurrency": {"const": 1},
     "per_query_timeout_ms": {"type": "integer", "minimum": 1},
     "warmup": {"$ref": "#/$defs/phase"},
-    "measured": {"$ref": "#/$defs/phase"}
+    "measured": {"$ref": "#/$defs/phase"},
+    "setup": {"$ref": "#/$defs/setup"}
   },
   "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "setup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy",
+        "kind",
+        "started_monotonic_ns",
+        "ended_monotonic_ns",
+        "wall_ns",
+        "user_cpu_ns",
+        "system_cpu_ns",
+        "store_logical_bytes",
+        "store_allocated_bytes",
+        "binary_sha256",
+        "dataset_sha256",
+        "truth_sha256",
+        "runtime_libraries"
+      ],
+      "properties": {
+        "policy": {"const": "fresh-import-and-query-process-lifetime-v1"},
+        "kind": {"const": "fresh-import"},
+        "started_monotonic_ns": {"type": "integer", "minimum": 0},
+        "ended_monotonic_ns": {"type": "integer", "minimum": 1},
+        "wall_ns": {"type": "integer", "minimum": 1},
+        "user_cpu_ns": {"type": "integer", "minimum": 0},
+        "system_cpu_ns": {"type": "integer", "minimum": 0},
+        "store_logical_bytes": {"type": "integer", "minimum": 1},
+        "store_allocated_bytes": {"type": "integer", "minimum": 0},
+        "binary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "dataset_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "truth_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "runtime_libraries": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/artifact"}}
+      }
+    },
     "phase": {
       "type": "object",
       "additionalProperties": false,

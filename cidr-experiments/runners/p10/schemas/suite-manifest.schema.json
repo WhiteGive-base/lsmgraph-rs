@@ -137,8 +137,10 @@
         "system_version",
         "fixture_only",
         "service_lifecycle",
+        "process_lifetime",
         "adapter",
         "binary",
+        "runtime_libraries",
         "store_roots",
         "temp_roots",
         "containers",
@@ -153,8 +155,17 @@
         "system_version": {"type": "string", "minLength": 1},
         "fixture_only": {"type": "boolean"},
         "service_lifecycle": {"enum": ["in-process", "external-prestarted"]},
+        "process_lifetime": {
+          "enum": [
+            "fresh-import-and-query-process-lifetime-v1",
+            "prebuilt-store-query-process-lifetime-v1",
+            "external-prestarted-query-process-lifetime-v1",
+            "fixture-process-lifetime-v1"
+          ]
+        },
         "adapter": {"$ref": "#/$defs/adapter"},
         "binary": {"$ref": "#/$defs/artifact"},
+        "runtime_libraries": {"type": "array", "items": {"$ref": "#/$defs/artifact"}},
         "store_roots": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/store_root"}},
         "temp_roots": {"type": "array", "items": {"$ref": "#/$defs/root"}},
         "containers": {"type": "array", "items": {"type": "string", "minLength": 1}},

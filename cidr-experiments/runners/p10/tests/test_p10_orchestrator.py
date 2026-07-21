@@ -109,6 +109,7 @@ class P10OrchestratorTests(unittest.TestCase):
                 self.assertEqual(row["completed_queries"], "2")
                 self.assertEqual(row["timeout_queries"], "0")
                 self.assertEqual(row["mismatch_queries"], "0")
+                self.assertEqual(row["process_lifetime"], "fixture-process-lifetime-v1")
                 self.assertEqual(row["expected_digest_sha256"], row["actual_digest_sha256"])
                 self.assertGreater(float(row["latency_p95_us"]), 0)
                 self.assertGreater(float(row["latency_p99_us"]), 0)
@@ -128,6 +129,8 @@ class P10OrchestratorTests(unittest.TestCase):
             schemas = P10_DIR / "schemas"
             request = load_json(run_root / "systems" / "seml0" / "repeat-01" / "adapter-request.json")
             self.assertEqual(request["execution_mode"], "fixture")
+            self.assertEqual(request["process_lifetime"], "fixture-process-lifetime-v1")
+            self.assertEqual(request["runtime_libraries"], [])
             self.assertEqual(
                 request["binary"]["sha256"],
                 hashlib.sha256(Path(request["binary"]["path"]).read_bytes()).hexdigest(),
@@ -233,6 +236,12 @@ class P10OrchestratorTests(unittest.TestCase):
             for system in value["systems"]:
                 system["fixture_only"] = False
                 system["system_version"] = system["system_version"].replace("fixture-", "test-mislabeled-")
+                if system["id"] == "livegraph":
+                    system["process_lifetime"] = "fresh-import-and-query-process-lifetime-v1"
+                elif system["group"] == "client-server":
+                    system["process_lifetime"] = "external-prestarted-query-process-lifetime-v1"
+                else:
+                    system["process_lifetime"] = "prebuilt-store-query-process-lifetime-v1"
                 system["adapter"]["sha256"] = adapter_sha
                 system["binary"]["sha256"] = adapter_sha
             manifest = temporary_path / "mislabeled.json"

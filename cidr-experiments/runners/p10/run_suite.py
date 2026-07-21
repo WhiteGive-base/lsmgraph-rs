@@ -24,6 +24,7 @@ from typing import Any
 from p10_contract import (
     CLOCK_NAME,
     CONTRACT_VERSION,
+    FRESH_IMPORT_PROCESS_LIFETIME,
     FROZEN_SYSTEM_GROUPS,
     GROUP_POLICY,
     INTERFACE_SCOPE,
@@ -50,12 +51,18 @@ REPEAT_COLUMNS = [
     "display_name",
     "group",
     "system_version",
+    "process_lifetime",
     "repeat_index",
     "query_count",
     "warmup_passes",
     "measured_passes",
     "warmup_s",
     "measurement_s",
+    "import_wall_s",
+    "import_user_cpu_s",
+    "import_system_cpu_s",
+    "import_store_logical_bytes",
+    "import_store_allocated_bytes",
     "completed_queries",
     "timeout_queries",
     "mismatch_queries",
@@ -81,12 +88,17 @@ SYSTEM_COLUMNS = [
     "display_name",
     "group",
     "system_version",
+    "process_lifetime",
     "repeats",
     "query_count",
     "timeout_queries_total",
     "mismatch_queries_total",
     "median_warmup_s",
     "median_measurement_s",
+    "median_import_wall_s",
+    "median_import_cpu_s",
+    "max_import_store_logical_bytes",
+    "max_import_store_allocated_bytes",
     "median_qps",
     "median_latency_p50_us",
     "median_latency_p95_us",
@@ -183,6 +195,7 @@ def build_request(
         "system_version": system["system_version"],
         "interface_scope": INTERFACE_SCOPE,
         "repeat_index": repeat_index,
+        "process_lifetime": system["process_lifetime"],
         "binary": {
             "path": system["binary"]["path"],
             "sha256": system["binary"]["sha256"],
@@ -191,6 +204,7 @@ def build_request(
             "path": suite["dataset"]["path"],
             "sha256": suite["dataset"]["sha256"],
         },
+        "runtime_libraries": [dict(library) for library in system["runtime_libraries"]],
         "store_roots": [dict(root) for root in system["store_roots"]],
         "truth": {
             "path": suite["truth"]["path"],
@@ -310,6 +324,46 @@ def p31_command(
     return command
 
 
+def materialize_fresh_repeat_roots(
+    system: dict[str, Any], run_root: Path, repeat_index: int
+) -> dict[str, Any]:
+    """Create isolated store/temp directories for one fresh-import repeat."""
+
+    if system["process_lifetime"] != FRESH_IMPORT_PROCESS_LIFETIME:
+        return system
+    effective = dict(system)
+    run_token = hashlib.sha256(str(run_root.resolve()).encode()).hexdigest()[:12]
+    planned: list[tuple[str, dict[str, str], Path]] = []
+    for role in ("store", "temp"):
+        roots: list[dict[str, str]] = []
+        for root in system[f"{role}_roots"]:
+            base = Path(root["path"]).resolve()
+            if not base.is_dir():
+                raise ContractError(f"fresh {role} base root is not an existing directory: {base}")
+            instance = base / (
+                f"{system['id']}-{role}-{root['label']}-{run_token}-r{repeat_index:02d}"
+            )
+            if instance.parent != base:
+                raise ContractError(f"fresh {role} root escaped its declared base: {instance}")
+            if instance.exists():
+                raise ContractError(f"fresh {role} root already exists: {instance}")
+            normalized = dict(root)
+            normalized["path"] = str(instance)
+            roots.append(normalized)
+            planned.append((role, normalized, instance))
+        effective[f"{role}_roots"] = roots
+    paths = [path for _, _, path in planned]
+    if len(paths) != len(set(paths)):
+        raise ContractError("fresh store/temp roots resolve to duplicate paths")
+    for left_index, left in enumerate(paths):
+        for right in paths[left_index + 1 :]:
+            if left in right.parents or right in left.parents:
+                raise ContractError("fresh store/temp roots must not overlap")
+    for _, _, path in planned:
+        path.mkdir()
+    return effective
+
+
 def execute_repeat(
     *,
     suite: dict[str, Any],
@@ -325,12 +379,13 @@ def execute_repeat(
     repeat_dir.mkdir(parents=True, exist_ok=False)
     adapter_output = repeat_dir / "adapter-output"
     adapter_output.mkdir()
-    request = build_request(suite, system, repeat_index, run_root.name, mode)
+    effective_system = materialize_fresh_repeat_roots(system, run_root, repeat_index)
+    request = build_request(suite, effective_system, repeat_index, run_root.name, mode)
     request_path = repeat_dir / "adapter-request.json"
     atomic_json(request_path, request)
     command = p31_command(
         suite=suite,
-        system=system,
+        system=effective_system,
         repeat_index=repeat_index,
         repeat_dir=repeat_dir,
         request_path=request_path,
@@ -355,7 +410,7 @@ def execute_repeat(
     validated = validate_adapter_outputs(
         output_dir=adapter_output,
         request=request,
-        system=system,
+        system=effective_system,
         truth_rows=truth_rows,
         max_timeouts=suite["protocol"]["max_timeouts"],
     )
@@ -410,18 +465,34 @@ def aggregate_systems(repeat_rows: list[dict[str, Any]]) -> list[dict[str, Any]]
             float(row.get("process_user_cpu_s") or 0) + float(row.get("process_sys_cpu_s") or 0)
             for row in rows
         ]
+        import_wall = numeric(rows, "import_wall_s")
+        import_cpu = [
+            float(row["import_user_cpu_s"]) + float(row["import_system_cpu_s"])
+            for row in rows
+            if row.get("import_user_cpu_s", "") != ""
+            and row.get("import_system_cpu_s", "") != ""
+        ]
         output.append(
             {
                 "system_id": system_id,
                 "display_name": rows[0]["display_name"],
                 "group": rows[0]["group"],
                 "system_version": rows[0]["system_version"],
+                "process_lifetime": rows[0]["process_lifetime"],
                 "repeats": len(rows),
                 "query_count": rows[0]["query_count"],
                 "timeout_queries_total": sum(int(row["timeout_queries"]) for row in rows),
                 "mismatch_queries_total": sum(int(row["mismatch_queries"]) for row in rows),
                 "median_warmup_s": statistics.median(numeric(rows, "warmup_s")),
                 "median_measurement_s": statistics.median(numeric(rows, "measurement_s")),
+                "median_import_wall_s": statistics.median(import_wall) if import_wall else "",
+                "median_import_cpu_s": statistics.median(import_cpu) if import_cpu else "",
+                "max_import_store_logical_bytes": max(
+                    numeric(rows, "import_store_logical_bytes"), default=""
+                ),
+                "max_import_store_allocated_bytes": max(
+                    numeric(rows, "import_store_allocated_bytes"), default=""
+                ),
                 "median_qps": statistics.median(numeric(rows, "qps")),
                 "median_latency_p50_us": statistics.median(numeric(rows, "latency_p50_us")),
                 "median_latency_p95_us": statistics.median(numeric(rows, "latency_p95_us")),

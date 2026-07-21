@@ -28,6 +28,16 @@ INTERFACE_SCOPE = "typed-neighbor-dense-id-v1"
 TIMING_BOUNDARY = "typed-neighbor-call-plus-result-materialization-and-digest-v1"
 CLOCK_NAME = "CLOCK_MONOTONIC"
 GROUP_POLICY = "report-separately-no-cross-group-speedups"
+FRESH_IMPORT_PROCESS_LIFETIME = "fresh-import-and-query-process-lifetime-v1"
+PREBUILT_PROCESS_LIFETIME = "prebuilt-store-query-process-lifetime-v1"
+EXTERNAL_PROCESS_LIFETIME = "external-prestarted-query-process-lifetime-v1"
+FIXTURE_PROCESS_LIFETIME = "fixture-process-lifetime-v1"
+PROCESS_LIFETIME_POLICIES = {
+    FRESH_IMPORT_PROCESS_LIFETIME,
+    PREBUILT_PROCESS_LIFETIME,
+    EXTERNAL_PROCESS_LIFETIME,
+    FIXTURE_PROCESS_LIFETIME,
+}
 
 FROZEN_SYSTEM_GROUPS = {
     "seml0": "embedded",
@@ -383,8 +393,10 @@ def load_suite_manifest(
         "system_version",
         "fixture_only",
         "service_lifecycle",
+        "process_lifetime",
         "adapter",
         "binary",
+        "runtime_libraries",
         "store_roots",
         "temp_roots",
         "containers",
@@ -411,6 +423,24 @@ def load_suite_manifest(
         expected_lifecycle = "in-process" if expected_group == "embedded" else "external-prestarted"
         if lifecycle != expected_lifecycle:
             raise ContractError(f"{context}.service_lifecycle must be {expected_lifecycle!r}")
+        process_lifetime = nonempty_string(
+            system["process_lifetime"], f"{context}.process_lifetime"
+        )
+        if process_lifetime not in PROCESS_LIFETIME_POLICIES:
+            raise ContractError(f"{context}.process_lifetime is outside the frozen vocabulary")
+        if process_lifetime == FRESH_IMPORT_PROCESS_LIFETIME and expected_group != "embedded":
+            raise ContractError(f"{context}.process_lifetime: fresh import requires an embedded system")
+        if not system_fixture and system_id == "livegraph" and process_lifetime != FRESH_IMPORT_PROCESS_LIFETIME:
+            raise ContractError(
+                f"{context}.process_lifetime: LiveGraph must declare {FRESH_IMPORT_PROCESS_LIFETIME!r}"
+            )
+        if formal and process_lifetime == FIXTURE_PROCESS_LIFETIME:
+            raise ContractError(f"{context}.process_lifetime: formal mode rejects fixture policy")
+        if formal and expected_group == "client-server" and process_lifetime != EXTERNAL_PROCESS_LIFETIME:
+            raise ContractError(
+                f"{context}.process_lifetime: client-server formal runs must declare "
+                f"{EXTERNAL_PROCESS_LIFETIME!r}"
+            )
 
         adapter_obj = require_keys(
             system["adapter"],
@@ -446,6 +476,26 @@ def load_suite_manifest(
             or Path(binary["path"]).name.lower().startswith(("fixture", "fake"))
         ):
             raise ContractError(f"{context}.binary: formal mode rejects test/fixture binary paths")
+        raw_runtime_libraries = system["runtime_libraries"]
+        if not isinstance(raw_runtime_libraries, list):
+            raise ContractError(f"{context}.runtime_libraries must be an array")
+        runtime_libraries: list[dict[str, str]] = []
+        for library_index, raw_library in enumerate(raw_runtime_libraries):
+            runtime_libraries.append(
+                verify_file_ref(
+                    raw_library,
+                    manifest_dir=manifest_dir,
+                    repo_root=repo_root,
+                    run_root=run_root,
+                    context=f"{context}.runtime_libraries[{library_index}]",
+                    formal=formal,
+                )
+            )
+        runtime_paths = [library["path"] for library in runtime_libraries]
+        if len(runtime_paths) != len(set(runtime_paths)):
+            raise ContractError(f"{context}.runtime_libraries contains duplicate paths")
+        if formal and system_id == "livegraph" and not runtime_libraries:
+            raise ContractError(f"{context}.runtime_libraries: formal LiveGraph requires liblivegraph SHA")
 
         def roots(raw: object, role: str) -> list[dict[str, str]]:
             if not isinstance(raw, list):
@@ -471,7 +521,9 @@ def load_suite_manifest(
                 normalized = {"label": label, "path": str(path)}
                 if role == "store":
                     normalized["sha256"] = normalize_sha(
-                        root.get("sha256"), f"{root_context}.sha256", required=formal
+                        root.get("sha256"),
+                        f"{root_context}.sha256",
+                        required=formal and process_lifetime != FRESH_IMPORT_PROCESS_LIFETIME,
                     )
                 result.append(normalized)
             return result
@@ -509,8 +561,10 @@ def load_suite_manifest(
                 "system_version": nonempty_string(system["system_version"], f"{context}.system_version"),
                 "fixture_only": system_fixture,
                 "service_lifecycle": lifecycle,
+                "process_lifetime": process_lifetime,
                 "adapter": adapter,
                 "binary": binary,
+                "runtime_libraries": runtime_libraries,
                 "store_roots": stores,
                 "temp_roots": temps,
                 "containers": containers,
@@ -654,6 +708,7 @@ def validate_adapter_outputs(
         "system_version",
         "interface_scope",
         "repeat_index",
+        "process_lifetime",
         "truth_sha256",
         "sequence_digest_algorithm",
         "timing_boundary",
@@ -663,7 +718,12 @@ def validate_adapter_outputs(
         "warmup",
         "measured",
     )
-    result = require_keys(read_json(result_path, "adapter result"), required=result_keys, allowed=result_keys, context="adapter result")
+    result = require_keys(
+        read_json(result_path, "adapter result"),
+        required=result_keys,
+        allowed=(*result_keys, "setup"),
+        context="adapter result",
+    )
     exact_top = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "contract_version": CONTRACT_VERSION,
@@ -672,6 +732,7 @@ def validate_adapter_outputs(
         "system_version": system["system_version"],
         "interface_scope": INTERFACE_SCOPE,
         "repeat_index": request["repeat_index"],
+        "process_lifetime": request["process_lifetime"],
         "truth_sha256": request["truth"]["sha256"],
         "sequence_digest_algorithm": SEQUENCE_DIGEST_ALGORITHM,
         "timing_boundary": TIMING_BOUNDARY,
@@ -818,6 +879,71 @@ def validate_adapter_outputs(
     artifact_paths = [result_path, observations_path, events_path]
     if provenance_path.is_file():
         artifact_paths.append(provenance_path)
+    setup_values: dict[str, Any] = {
+        "import_wall_s": "",
+        "import_user_cpu_s": "",
+        "import_system_cpu_s": "",
+        "import_store_logical_bytes": "",
+        "import_store_allocated_bytes": "",
+    }
+    if request["process_lifetime"] == FRESH_IMPORT_PROCESS_LIFETIME:
+        if "setup" not in result:
+            raise ContractError("fresh-import adapter result omitted setup metrics")
+        setup_keys = (
+            "policy",
+            "kind",
+            "started_monotonic_ns",
+            "ended_monotonic_ns",
+            "wall_ns",
+            "user_cpu_ns",
+            "system_cpu_ns",
+            "store_logical_bytes",
+            "store_allocated_bytes",
+            "binary_sha256",
+            "dataset_sha256",
+            "truth_sha256",
+            "runtime_libraries",
+        )
+        setup = require_keys(
+            result["setup"], required=setup_keys, allowed=setup_keys, context="adapter result.setup"
+        )
+        exact_setup = {
+            "policy": FRESH_IMPORT_PROCESS_LIFETIME,
+            "kind": "fresh-import",
+            "binary_sha256": request["binary"]["sha256"],
+            "dataset_sha256": request["dataset"]["sha256"],
+            "truth_sha256": request["truth"]["sha256"],
+            "runtime_libraries": request["runtime_libraries"],
+        }
+        for key, expected in exact_setup.items():
+            if setup.get(key) != expected:
+                raise ContractError(f"adapter result.setup.{key}: {setup.get(key)!r} != {expected!r}")
+        setup_start = integer(setup["started_monotonic_ns"], "adapter result.setup.started_monotonic_ns", 0)
+        setup_end = integer(
+            setup["ended_monotonic_ns"], "adapter result.setup.ended_monotonic_ns", setup_start + 1
+        )
+        setup_wall_ns = integer(setup["wall_ns"], "adapter result.setup.wall_ns", 1)
+        if setup_wall_ns != setup_end - setup_start:
+            raise ContractError("adapter result.setup.wall_ns differs from setup boundary")
+        if setup_end > result["warmup"]["started_monotonic_ns"]:
+            raise ContractError("fresh import overlaps the warmup interval")
+        setup_user_cpu_ns = integer(setup["user_cpu_ns"], "adapter result.setup.user_cpu_ns", 0)
+        setup_system_cpu_ns = integer(setup["system_cpu_ns"], "adapter result.setup.system_cpu_ns", 0)
+        setup_store_logical = integer(
+            setup["store_logical_bytes"], "adapter result.setup.store_logical_bytes", 1
+        )
+        setup_store_allocated = integer(
+            setup["store_allocated_bytes"], "adapter result.setup.store_allocated_bytes", 0
+        )
+        setup_values = {
+            "import_wall_s": setup_wall_ns / 1_000_000_000,
+            "import_user_cpu_s": setup_user_cpu_ns / 1_000_000_000,
+            "import_system_cpu_s": setup_system_cpu_ns / 1_000_000_000,
+            "import_store_logical_bytes": setup_store_logical,
+            "import_store_allocated_bytes": setup_store_allocated,
+        }
+    elif "setup" in result:
+        raise ContractError("non-fresh adapter result must not publish fresh-import setup metrics")
     return {
         "schema_version": "cidr-p10-validated-repeat-v1",
         "system_id": system["id"],
@@ -825,6 +951,7 @@ def validate_adapter_outputs(
         "group": system["group"],
         "system_version": system["system_version"],
         "interface_scope": INTERFACE_SCOPE,
+        "process_lifetime": request["process_lifetime"],
         "repeat_index": request["repeat_index"],
         "query_count": len(truth_rows),
         "warmup_passes": phase_passes["warmup"],
@@ -844,6 +971,7 @@ def validate_adapter_outputs(
         "clock": CLOCK_NAME,
         "concurrency": request["timing"]["concurrency"],
         "per_query_timeout_ms": request["timing"]["per_query_timeout_ms"],
+        **setup_values,
         "adapter_artifacts": {
             path.name: {"path": str(path.resolve()), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
             for path in artifact_paths

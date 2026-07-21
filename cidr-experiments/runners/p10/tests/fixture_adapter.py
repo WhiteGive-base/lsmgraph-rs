@@ -157,6 +157,7 @@ def main() -> int:
         "system_version": request["system_version"],
         "interface_scope": INTERFACE_SCOPE,
         "repeat_index": request["repeat_index"],
+        "process_lifetime": request["process_lifetime"],
         "truth_sha256": request["truth"]["sha256"],
         "sequence_digest_algorithm": SEQUENCE_DIGEST_ALGORITHM,
         "timing_boundary": TIMING_BOUNDARY,
