@@ -1,18 +1,19 @@
 // LiveGraph query worker for the CIDR P10 typed-neighbor adapter.
 //
-// The upstream LiveGraph revision vendored by this repository cannot reopen a
-// block/WAL pair: both files are truncated by Graph's constructor and graph
-// metadata lives only in process memory.  This worker therefore advertises an
-// explicit import-only capability and is usable only for correctness fixtures.
-// The Python adapter refuses formal mode until a future worker advertises the
-// query-only, reopenable-store capability.
+// LiveGraph's graph metadata is process-local and its block/WAL files are
+// created with O_TRUNC.  The explicit formal lifecycle is therefore one fresh
+// frozen-dataset import followed by warmup and measured queries in this same
+// process.  P31 wraps the whole process; this worker reports import cost and
+// query-only timing as separate, non-overlapping boundaries.
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -21,6 +22,9 @@
 #include <tuple>
 #include <vector>
 
+#include <link.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "livegraph.hpp"
@@ -29,7 +33,7 @@ namespace fs = std::filesystem;
 
 constexpr const char* kContractVersion = "cidr-typed-neighbor-adapter-v1";
 constexpr const char* kWorkerSchema = "cidr-livegraph-p10-worker-v1";
-constexpr const char* kStoreCapability = "import-only-process-lifetime-v1";
+constexpr const char* kProcessLifetime = "fresh-import-and-query-process-lifetime-v1";
 
 struct Digest {
     uint64_t count = 0;
@@ -44,12 +48,45 @@ struct TruthQuery {
     Digest expected;
 };
 
+struct Observation {
+    std::string phase;
+    uint64_t pass_index = 0;
+    TruthQuery query;
+    Digest actual;
+    bool timed_out = false;
+    uint64_t latency_ns = 0;
+};
+
 struct PhaseSummary {
     uint64_t started_ns = 0;
     uint64_t ended_ns = 0;
     uint64_t elapsed_ns = 0;
     uint64_t total_query_latency_ns = 0;
     uint64_t passes = 0;
+    uint64_t completed_queries = 0;
+    uint64_t timeout_queries = 0;
+    uint64_t mismatch_queries = 0;
+    std::vector<uint64_t> latencies_ns;
+};
+
+struct CpuSnapshot {
+    uint64_t user_ns = 0;
+    uint64_t system_ns = 0;
+};
+
+struct FileUsage {
+    uint64_t logical_bytes = 0;
+    uint64_t allocated_bytes = 0;
+};
+
+struct SetupSummary {
+    uint64_t started_ns = 0;
+    uint64_t ended_ns = 0;
+    uint64_t wall_ns = 0;
+    uint64_t user_cpu_ns = 0;
+    uint64_t system_cpu_ns = 0;
+    FileUsage block;
+    FileUsage wal;
 };
 
 struct Options {
@@ -74,6 +111,48 @@ static uint64_t monotonic_ns() {
     }
     return static_cast<uint64_t>(value.tv_sec) * 1000000000ULL +
            static_cast<uint64_t>(value.tv_nsec);
+}
+
+static uint64_t timeval_ns(const struct timeval& value) {
+    return static_cast<uint64_t>(value.tv_sec) * 1000000000ULL +
+           static_cast<uint64_t>(value.tv_usec) * 1000ULL;
+}
+
+static CpuSnapshot cpu_snapshot() {
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        throw std::runtime_error("getrusage(RUSAGE_SELF) failed");
+    }
+    return {timeval_ns(usage.ru_utime), timeval_ns(usage.ru_stime)};
+}
+
+static FileUsage file_usage(const fs::path& path) {
+    struct stat value {};
+    if (stat(path.c_str(), &value) != 0 || value.st_size < 0 || value.st_blocks < 0) {
+        throw std::runtime_error("cannot stat store file: " + path.string());
+    }
+    return {
+        static_cast<uint64_t>(value.st_size),
+        static_cast<uint64_t>(value.st_blocks) * 512ULL,
+    };
+}
+
+static int find_livegraph_library(struct dl_phdr_info* info, size_t, void* raw_output) {
+    if (!info->dlpi_name || !*info->dlpi_name) return 0;
+    const fs::path candidate(info->dlpi_name);
+    if (candidate.filename() != "liblivegraph.so") return 0;
+    char* resolved = realpath(info->dlpi_name, nullptr);
+    if (!resolved) return 0;
+    *static_cast<std::string*>(raw_output) = resolved;
+    std::free(resolved);
+    return 1;
+}
+
+static std::string runtime_library_path() {
+    std::string path;
+    dl_iterate_phdr(find_livegraph_library, &path);
+    if (path.empty()) throw std::runtime_error("cannot resolve loaded liblivegraph.so");
+    return path;
 }
 
 static uint64_t parse_u64(const std::string& text, const char* option) {
@@ -113,9 +192,9 @@ static Options parse_options(int argc, char** argv) {
         else throw std::runtime_error("unknown argument: " + arg);
     }
     if (options.capabilities) return options;
-    if (options.store_mode != "import") {
+    if (options.store_mode != "fresh-import") {
         throw std::runtime_error(
-            "this LiveGraph build supports only --store-mode import; query-only reopen is unavailable");
+            "LiveGraph P10 requires --store-mode fresh-import for every independent repeat");
     }
     if (options.edges.empty() || options.truth.empty() || options.block.empty() ||
         options.wal.empty() || options.output_dir.empty()) {
@@ -234,16 +313,24 @@ static uint64_t read_vertex_count(const fs::path& edges) {
     return vertex_count;
 }
 
+static uint64_t nearest_rank(
+    const std::vector<uint64_t>& values, uint64_t numerator, uint64_t denominator) {
+    if (values.empty() || !numerator || numerator > denominator) {
+        throw std::runtime_error("cannot compute nearest-rank percentile");
+    }
+    std::vector<uint64_t> ordered(values);
+    std::sort(ordered.begin(), ordered.end());
+    const uint64_t rank = (numerator * ordered.size() + denominator - 1) / denominator;
+    return ordered.at(static_cast<size_t>(rank - 1));
+}
+
 static PhaseSummary run_phase(
     const std::string& phase,
     uint64_t passes,
     uint64_t timeout_ns,
     const std::vector<TruthQuery>& queries,
     lg::Transaction& transaction,
-    std::ofstream& observations,
-    const std::string& system_id,
-    const std::string& group,
-    uint64_t repeat_index) {
+    std::vector<Observation>& observations) {
     PhaseSummary summary;
     summary.passes = passes;
     summary.started_ns = monotonic_ns();
@@ -263,17 +350,19 @@ static PhaseSummary run_phase(
             const uint64_t latency_ns = std::max<uint64_t>(1, query_end - query_start);
             summary.total_query_latency_ns += latency_ns;
             const bool timed_out = latency_ns >= timeout_ns;
-            observations << kContractVersion << '\t' << system_id << '\t' << group << '\t'
-                         << repeat_index << '\t' << phase << '\t' << pass_index << '\t'
-                         << query.query_index << '\t' << query.edge_type << '\t' << query.src << '\t'
-                         << query.expected.count << '\t';
-            if (!timed_out) observations << actual.count;
-            observations << '\t' << query.expected.sum_hash << '\t';
-            if (!timed_out) observations << actual.sum_hash;
-            observations << '\t' << query.expected.xor_hash << '\t';
-            if (!timed_out) observations << actual.xor_hash;
-            observations << '\t' << (timed_out ? "timeout" : "ok") << '\t' << latency_ns << '\n';
-            if (!observations) throw std::runtime_error("failed writing query observations");
+            const bool mismatch =
+                actual.count != query.expected.count ||
+                actual.sum_hash != query.expected.sum_hash ||
+                actual.xor_hash != query.expected.xor_hash;
+            if (timed_out) {
+                ++summary.timeout_queries;
+            } else {
+                ++summary.completed_queries;
+                summary.latencies_ns.push_back(latency_ns);
+                if (mismatch) ++summary.mismatch_queries;
+            }
+            observations.push_back(
+                {phase, pass_index, query, actual, timed_out, latency_ns});
         }
     }
     do {
@@ -283,6 +372,33 @@ static PhaseSummary run_phase(
     return summary;
 }
 
+static void write_observations(
+    const fs::path& path,
+    const std::vector<Observation>& observations,
+    uint64_t repeat_index) {
+    std::ofstream output(path);
+    if (!output) throw std::runtime_error("cannot create query-observations.tsv");
+    output << "contract_version\tsystem_id\tgroup\trepeat_index\tphase\tpass_index\t"
+              "query_index\tedge_type\tsrc\texpected_count\tactual_count\t"
+              "expected_sum_hash\tactual_sum_hash\texpected_xor_hash\t"
+              "actual_xor_hash\tstatus\tlatency_ns\n";
+    for (const auto& observation : observations) {
+        const auto& query = observation.query;
+        output << kContractVersion << "\tlivegraph\tembedded\t" << repeat_index << '\t'
+               << observation.phase << '\t' << observation.pass_index << '\t'
+               << query.query_index << '\t' << query.edge_type << '\t' << query.src << '\t'
+               << query.expected.count << '\t';
+        if (!observation.timed_out) output << observation.actual.count;
+        output << '\t' << query.expected.sum_hash << '\t';
+        if (!observation.timed_out) output << observation.actual.sum_hash;
+        output << '\t' << query.expected.xor_hash << '\t';
+        if (!observation.timed_out) output << observation.actual.xor_hash;
+        output << '\t' << (observation.timed_out ? "timeout" : "ok") << '\t'
+               << observation.latency_ns << '\n';
+    }
+    if (!output) throw std::runtime_error("failed writing query observations");
+}
+
 static void write_event(std::ofstream& output, const char* phase, const char* event, uint64_t ns) {
     output << "{\"contract_version\":\"" << kContractVersion << "\",\"event\":\""
            << event << "\",\"monotonic_ns\":" << ns << ",\"phase\":\"" << phase
@@ -290,18 +406,46 @@ static void write_event(std::ofstream& output, const char* phase, const char* ev
 }
 
 static void write_phase_json(std::ofstream& output, const char* name, const PhaseSummary& phase) {
+    const double qps = static_cast<double>(phase.completed_queries) * 1000000000.0 /
+                       static_cast<double>(phase.elapsed_ns);
     output << "  \"" << name << "\": {\"elapsed_ns\":" << phase.elapsed_ns
-           << ",\"ended_monotonic_ns\":" << phase.ended_ns << ",\"passes\":" << phase.passes
+           << ",\"ended_monotonic_ns\":" << phase.ended_ns
+           << ",\"completed_queries\":" << phase.completed_queries
+           << ",\"timeout_queries\":" << phase.timeout_queries
+           << ",\"mismatch_queries\":" << phase.mismatch_queries
+           << ",\"latency_p50_ns\":" << nearest_rank(phase.latencies_ns, 50, 100)
+           << ",\"latency_p95_ns\":" << nearest_rank(phase.latencies_ns, 95, 100)
+           << ",\"latency_p99_ns\":" << nearest_rank(phase.latencies_ns, 99, 100)
+           << ",\"passes\":" << phase.passes
+           << ",\"qps\":" << std::setprecision(17) << qps
            << ",\"started_monotonic_ns\":" << phase.started_ns
            << ",\"total_query_latency_ns\":" << phase.total_query_latency_ns << "}";
+}
+
+static void write_setup_json(std::ofstream& output, const SetupSummary& setup) {
+    output << "  \"setup\": {\"block_allocated_bytes\":" << setup.block.allocated_bytes
+           << ",\"block_logical_bytes\":" << setup.block.logical_bytes
+           << ",\"ended_monotonic_ns\":" << setup.ended_ns
+           << ",\"started_monotonic_ns\":" << setup.started_ns
+           << ",\"store_allocated_bytes\":"
+           << setup.block.allocated_bytes + setup.wal.allocated_bytes
+           << ",\"store_logical_bytes\":" << setup.block.logical_bytes + setup.wal.logical_bytes
+           << ",\"system_cpu_ns\":" << setup.system_cpu_ns
+           << ",\"user_cpu_ns\":" << setup.user_cpu_ns
+           << ",\"wall_ns\":" << setup.wall_ns
+           << ",\"wal_allocated_bytes\":" << setup.wal.allocated_bytes
+           << ",\"wal_logical_bytes\":" << setup.wal.logical_bytes << "}";
 }
 
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        const std::string loaded_runtime_library = runtime_library_path();
         if (options.capabilities) {
             std::cout << "{\"schema_version\":\"" << kWorkerSchema
-                      << "\",\"store_capability\":\"" << kStoreCapability << "\"}\n";
+                      << "\",\"process_lifetime\":\"" << kProcessLifetime
+                      << "\",\"runtime_library_path\":\"" << loaded_runtime_library
+                      << "\"}\n";
             return 0;
         }
         if (!fs::is_regular_file(options.edges) || !fs::is_regular_file(options.truth)) {
@@ -311,7 +455,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("output directory must already exist");
         }
         if (fs::exists(options.block) || fs::exists(options.wal)) {
-            throw std::runtime_error("import mode refuses to truncate an existing block or WAL file");
+            throw std::runtime_error("fresh import refuses to truncate an existing block or WAL file");
         }
         const auto queries = read_truth(options.truth, options.expected_query_count);
         const uint64_t vertex_count = read_vertex_count(options.edges);
@@ -321,27 +465,34 @@ int main(int argc, char** argv) {
             }
         }
 
-        const uint64_t import_start = monotonic_ns();
+        SetupSummary setup;
+        setup.started_ns = monotonic_ns();
+        const CpuSnapshot setup_cpu_start = cpu_snapshot();
         lg::Graph graph(options.block.string(), options.wal.string(), 1ULL << 40,
                         std::max<uint64_t>(vertex_count + 1, 2));
         const uint64_t edge_count = import_graph(graph, options.edges, vertex_count);
-        const uint64_t import_elapsed_ns = monotonic_ns() - import_start;
+        setup.block = file_usage(options.block);
+        setup.wal = file_usage(options.wal);
+        const CpuSnapshot setup_cpu_end = cpu_snapshot();
+        setup.ended_ns = monotonic_ns();
+        setup.wall_ns = setup.ended_ns - setup.started_ns;
+        setup.user_cpu_ns = setup_cpu_end.user_ns - setup_cpu_start.user_ns;
+        setup.system_cpu_ns = setup_cpu_end.system_ns - setup_cpu_start.system_ns;
 
-        std::ofstream observations(options.output_dir / "query-observations.tsv");
-        if (!observations) throw std::runtime_error("cannot create query-observations.tsv");
-        observations << "contract_version\tsystem_id\tgroup\trepeat_index\tphase\tpass_index\t"
-                        "query_index\tedge_type\tsrc\texpected_count\tactual_count\t"
-                        "expected_sum_hash\tactual_sum_hash\texpected_xor_hash\t"
-                        "actual_xor_hash\tstatus\tlatency_ns\n";
+        std::vector<Observation> observations;
+        observations.reserve(
+            queries.size() * (options.warmup_passes + options.measured_passes));
         auto transaction = graph.begin_read_only_transaction();
         const uint64_t timeout_ns = options.timeout_ms * 1000000ULL;
         const PhaseSummary warmup = run_phase(
             "warmup", options.warmup_passes, timeout_ns, queries, transaction,
-            observations, "livegraph", "embedded", options.repeat_index);
+            observations);
         const PhaseSummary measured = run_phase(
             "measured", options.measured_passes, timeout_ns, queries, transaction,
-            observations, "livegraph", "embedded", options.repeat_index);
-        observations.close();
+            observations);
+        write_observations(
+            options.output_dir / "query-observations.tsv", observations,
+            options.repeat_index);
 
         std::ofstream events(options.output_dir / "phase-events.jsonl");
         if (!events) throw std::runtime_error("cannot create phase-events.jsonl");
@@ -353,12 +504,13 @@ int main(int argc, char** argv) {
 
         std::ofstream summary(options.output_dir / "livegraph-worker-summary.json");
         if (!summary) throw std::runtime_error("cannot create livegraph-worker-summary.json");
-        summary << "{\n  \"edge_count\":" << edge_count
-                << ",\n  \"import_elapsed_ns\":" << import_elapsed_ns << ",\n";
+        summary << "{\n  \"edge_count\":" << edge_count << ",\n";
         write_phase_json(summary, "measured", measured);
-        summary << ",\n  \"schema_version\":\"" << kWorkerSchema
-                << "\",\n  \"store_capability\":\"" << kStoreCapability
-                << "\",\n  \"truth_query_count\":" << queries.size() << ",\n";
+        summary << ",\n  \"process_lifetime\":\"" << kProcessLifetime
+                << "\",\n  \"runtime_library_path\":\"" << loaded_runtime_library
+                << "\",\n  \"schema_version\":\"" << kWorkerSchema << "\",\n";
+        write_setup_json(summary, setup);
+        summary << ",\n  \"truth_query_count\":" << queries.size() << ",\n";
         write_phase_json(summary, "warmup", warmup);
         summary << ",\n  \"vertex_count\":" << vertex_count << "\n}\n";
         return 0;

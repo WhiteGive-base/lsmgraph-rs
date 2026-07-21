@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Fail-closed LiveGraph adapter for the CIDR P10 typed-neighbor contract.
 
-The adapter binds the P10 request's exact binary, dataset, truth, and store
-lineage to a native LiveGraph worker.  The vendored LiveGraph revision is
-currently import-only: its Graph constructor truncates block/WAL files and
-does not reconstruct graph metadata.  Fixture mode can therefore import a
-small dense graph and exercise the real query path, while formal mode refuses
-to run until the worker advertises an explicitly reopenable query store.
+The adapter binds the P10 request's exact binary, runtime library, dataset,
+truth, and fresh store roots to a native LiveGraph worker.  Every independent
+repeat is explicitly import -> warmup -> measured in one process.  P31 wraps
+that whole lifecycle, while query latency/QPS are derived only from measured
+typed-neighbor observations and import cost is reported separately.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -26,6 +26,7 @@ sys.path.insert(0, str(P10_DIR))
 from p10_contract import (  # noqa: E402
     CLOCK_NAME,
     CONTRACT_VERSION,
+    FRESH_IMPORT_PROCESS_LIFETIME,
     INTERFACE_SCOPE,
     OBSERVATION_COLUMNS,
     REQUEST_SCHEMA_VERSION,
@@ -38,6 +39,7 @@ from p10_contract import (  # noqa: E402
     boolean,
     integer,
     nonempty_string,
+    nearest_rank,
     phase_digest,
     read_json,
     read_truth,
@@ -46,8 +48,7 @@ from p10_contract import (  # noqa: E402
 )
 
 WORKER_SCHEMA = "cidr-livegraph-p10-worker-v1"
-IMPORT_ONLY_CAPABILITY = "import-only-process-lifetime-v1"
-FORMAL_STORE_CAPABILITY = "reopenable-query-store-v1"
+FRESH_IMPORT_CAPABILITY = FRESH_IMPORT_PROCESS_LIFETIME
 SHA256_CHARS = frozenset("0123456789abcdef")
 
 
@@ -81,7 +82,9 @@ def checked_file(ref: object, context: str, *, executable: bool = False) -> Path
     return path
 
 
-def validate_request(request_path: Path, store_label: str) -> tuple[dict[str, Any], list[dict[str, int]], Path, Path, Path]:
+def validate_request(
+    request_path: Path, store_label: str
+) -> tuple[dict[str, Any], list[dict[str, int]], Path, Path, Path, list[Path]]:
     request = require_keys(
         read_json(request_path, "LiveGraph adapter request"),
         required=(
@@ -95,8 +98,10 @@ def validate_request(request_path: Path, store_label: str) -> tuple[dict[str, An
             "system_version",
             "interface_scope",
             "repeat_index",
+            "process_lifetime",
             "binary",
             "dataset",
+            "runtime_libraries",
             "store_roots",
             "truth",
             "timing",
@@ -112,8 +117,10 @@ def validate_request(request_path: Path, store_label: str) -> tuple[dict[str, An
             "system_version",
             "interface_scope",
             "repeat_index",
+            "process_lifetime",
             "binary",
             "dataset",
+            "runtime_libraries",
             "store_roots",
             "truth",
             "timing",
@@ -126,6 +133,7 @@ def validate_request(request_path: Path, store_label: str) -> tuple[dict[str, An
         "system_id": "livegraph",
         "group": "embedded",
         "interface_scope": INTERFACE_SCOPE,
+        "process_lifetime": FRESH_IMPORT_PROCESS_LIFETIME,
     }
     for key, expected in exact_values.items():
         if request[key] != expected:
@@ -139,6 +147,18 @@ def validate_request(request_path: Path, store_label: str) -> tuple[dict[str, An
 
     binary = checked_file(request["binary"], "request.binary", executable=True)
     dataset = checked_file(request["dataset"], "request.dataset")
+    raw_runtime_libraries = request["runtime_libraries"]
+    if not isinstance(raw_runtime_libraries, list) or not raw_runtime_libraries:
+        raise ContractError("request.runtime_libraries must bind liblivegraph.so")
+    runtime_libraries: list[Path] = []
+    normalized_libraries: list[dict[str, str]] = []
+    for index, library in enumerate(raw_runtime_libraries):
+        path = checked_file(library, f"request.runtime_libraries[{index}]")
+        runtime_libraries.append(path)
+        normalized_libraries.append({"path": str(path), "sha256": sha256_file(path)})
+    if len(runtime_libraries) != len(set(runtime_libraries)):
+        raise ContractError("request.runtime_libraries contains duplicate paths")
+    request["runtime_libraries"] = normalized_libraries
     truth_obj = require_keys(
         request["truth"],
         required=("path", "sha256", "query_count", "digest_algorithm"),
@@ -177,8 +197,6 @@ def validate_request(request_path: Path, store_label: str) -> tuple[dict[str, An
         lineage_sha = item["sha256"]
         if lineage_sha:
             exact_sha(lineage_sha, f"{context}.sha256")
-        if request["execution_mode"] == "formal" and not lineage_sha:
-            raise ContractError(f"{context}.sha256 is required in formal mode")
         if label == store_label:
             selected = path
     if selected is None:
@@ -226,10 +244,10 @@ def validate_request(request_path: Path, store_label: str) -> tuple[dict[str, An
     integer(timing["measured_passes"], "request.timing.measured_passes", 1)
     integer(timing["concurrency"], "request.timing.concurrency", 1)
     integer(timing["per_query_timeout_ms"], "request.timing.per_query_timeout_ms", 1)
-    return request, truth_rows, binary, dataset, selected
+    return request, truth_rows, binary, dataset, selected, runtime_libraries
 
 
-def worker_capability(binary: Path) -> str:
+def worker_capability(binary: Path) -> dict[str, str]:
     completed = subprocess.run(
         [str(binary), "--capabilities"],
         stdout=subprocess.PIPE,
@@ -248,13 +266,20 @@ def worker_capability(binary: Path) -> str:
         raise ContractError(f"LiveGraph worker returned malformed capability JSON: {exc}") from exc
     value = require_keys(
         value,
-        required=("schema_version", "store_capability"),
-        allowed=("schema_version", "store_capability"),
+        required=("schema_version", "process_lifetime", "runtime_library_path"),
+        allowed=("schema_version", "process_lifetime", "runtime_library_path"),
         context="LiveGraph worker capabilities",
     )
     if value["schema_version"] != WORKER_SCHEMA:
         raise ContractError("LiveGraph worker capability schema is incompatible")
-    return nonempty_string(value["store_capability"], "worker.store_capability")
+    return {
+        "process_lifetime": nonempty_string(
+            value["process_lifetime"], "worker.process_lifetime"
+        ),
+        "runtime_library_path": str(
+            Path(nonempty_string(value["runtime_library_path"], "worker.runtime_library_path")).resolve()
+        ),
+    }
 
 
 def safe_store_file(root: Path, raw_name: str, context: str) -> Path:
@@ -287,33 +312,78 @@ def validate_worker_output(
         read_json(output_dir / "livegraph-worker-summary.json", "LiveGraph worker summary"),
         required=(
             "schema_version",
-            "store_capability",
+            "process_lifetime",
+            "runtime_library_path",
             "vertex_count",
             "edge_count",
             "truth_query_count",
-            "import_elapsed_ns",
+            "setup",
             "warmup",
             "measured",
         ),
         allowed=(
             "schema_version",
-            "store_capability",
+            "process_lifetime",
+            "runtime_library_path",
             "vertex_count",
             "edge_count",
             "truth_query_count",
-            "import_elapsed_ns",
+            "setup",
             "warmup",
             "measured",
         ),
         context="LiveGraph worker summary",
     )
-    if summary["schema_version"] != WORKER_SCHEMA or summary["store_capability"] != IMPORT_ONLY_CAPABILITY:
-        raise ContractError("LiveGraph worker summary reports an unexpected capability")
+    if summary["schema_version"] != WORKER_SCHEMA:
+        raise ContractError("LiveGraph worker summary has an incompatible schema")
+    if summary["process_lifetime"] != FRESH_IMPORT_PROCESS_LIFETIME:
+        raise ContractError("LiveGraph worker did not report the frozen fresh-import lifecycle")
+    runtime_path = str(
+        Path(nonempty_string(summary["runtime_library_path"], "worker.runtime_library_path")).resolve()
+    )
+    if runtime_path not in [library["path"] for library in request["runtime_libraries"]]:
+        raise ContractError("LiveGraph worker loaded an unbound runtime library")
     integer(summary["vertex_count"], "worker.vertex_count", 1)
     integer(summary["edge_count"], "worker.edge_count", 0)
-    integer(summary["import_elapsed_ns"], "worker.import_elapsed_ns", 1)
     if summary["truth_query_count"] != len(truth_rows):
         raise ContractError("LiveGraph worker truth query count changed")
+    setup_keys = (
+        "started_monotonic_ns",
+        "ended_monotonic_ns",
+        "wall_ns",
+        "user_cpu_ns",
+        "system_cpu_ns",
+        "store_logical_bytes",
+        "store_allocated_bytes",
+        "block_logical_bytes",
+        "block_allocated_bytes",
+        "wal_logical_bytes",
+        "wal_allocated_bytes",
+    )
+    setup = require_keys(
+        summary["setup"], required=setup_keys, allowed=setup_keys, context="worker.setup"
+    )
+    setup_start = integer(setup["started_monotonic_ns"], "worker.setup.start", 0)
+    setup_end = integer(setup["ended_monotonic_ns"], "worker.setup.end", setup_start + 1)
+    setup_wall = integer(setup["wall_ns"], "worker.setup.wall", 1)
+    if setup_wall != setup_end - setup_start:
+        raise ContractError("worker.setup wall differs from its CLOCK_MONOTONIC boundary")
+    integer(setup["user_cpu_ns"], "worker.setup.user_cpu_ns", 0)
+    integer(setup["system_cpu_ns"], "worker.setup.system_cpu_ns", 0)
+    store_logical = integer(setup["store_logical_bytes"], "worker.setup.store_logical_bytes", 1)
+    store_allocated = integer(
+        setup["store_allocated_bytes"], "worker.setup.store_allocated_bytes", 0
+    )
+    block_logical = integer(setup["block_logical_bytes"], "worker.setup.block_logical_bytes", 1)
+    block_allocated = integer(
+        setup["block_allocated_bytes"], "worker.setup.block_allocated_bytes", 0
+    )
+    wal_logical = integer(setup["wal_logical_bytes"], "worker.setup.wal_logical_bytes", 1)
+    wal_allocated = integer(setup["wal_allocated_bytes"], "worker.setup.wal_allocated_bytes", 0)
+    if store_logical != block_logical + wal_logical:
+        raise ContractError("worker.setup store logical bytes do not equal block + WAL")
+    if store_allocated != block_allocated + wal_allocated:
+        raise ContractError("worker.setup store allocated bytes do not equal block + WAL")
     observations = load_observations(output_dir / "query-observations.tsv")
     phase_passes = {
         "warmup": request["timing"]["warmup_passes"],
@@ -324,6 +394,7 @@ def validate_worker_output(
         raise ContractError(f"LiveGraph worker wrote {len(observations)} observations, expected {expected_total}")
 
     position = 0
+    observed_latencies: dict[str, list[int]] = {"warmup": [], "measured": []}
     timeout_ns = request["timing"]["per_query_timeout_ms"] * 1_000_000
     for phase in ("warmup", "measured"):
         for pass_index in range(phase_passes[phase]):
@@ -361,28 +432,31 @@ def validate_worker_output(
                     raise ContractError("LiveGraph timeout makes the repeat ineligible")
                 if row["status"] != "ok" or latency_ns > timeout_ns:
                     raise ContractError("LiveGraph observation has an invalid status/deadline combination")
+                observed_latencies[phase].append(latency_ns)
                 actual = (row["actual_count"], row["actual_sum_hash"], row["actual_xor_hash"])
                 expected_digest = (str(truth["count"]), str(truth["sum_hash"]), str(truth["xor_hash"]))
                 if actual != expected_digest:
                     raise ContractError(f"LiveGraph truth mismatch at query_index={truth['query_index']}")
 
     for phase, passes in phase_passes.items():
+        phase_keys = (
+            "passes",
+            "started_monotonic_ns",
+            "ended_monotonic_ns",
+            "elapsed_ns",
+            "total_query_latency_ns",
+            "completed_queries",
+            "timeout_queries",
+            "mismatch_queries",
+            "qps",
+            "latency_p50_ns",
+            "latency_p95_ns",
+            "latency_p99_ns",
+        )
         phase_summary = require_keys(
             summary[phase],
-            required=(
-                "passes",
-                "started_monotonic_ns",
-                "ended_monotonic_ns",
-                "elapsed_ns",
-                "total_query_latency_ns",
-            ),
-            allowed=(
-                "passes",
-                "started_monotonic_ns",
-                "ended_monotonic_ns",
-                "elapsed_ns",
-                "total_query_latency_ns",
-            ),
+            required=phase_keys,
+            allowed=phase_keys,
             context=f"worker.{phase}",
         )
         if phase_summary["passes"] != passes:
@@ -395,6 +469,28 @@ def validate_worker_output(
         )
         if elapsed != end - start or elapsed < total_query:
             raise ContractError(f"worker.{phase} has inconsistent CLOCK_MONOTONIC boundaries")
+        latencies = observed_latencies[phase]
+        expected_queries = passes * len(truth_rows)
+        exact_phase = {
+            "completed_queries": expected_queries,
+            "timeout_queries": 0,
+            "mismatch_queries": 0,
+            "latency_p50_ns": nearest_rank(latencies, 0.50),
+            "latency_p95_ns": nearest_rank(latencies, 0.95),
+            "latency_p99_ns": nearest_rank(latencies, 0.99),
+        }
+        for key, expected in exact_phase.items():
+            if phase_summary.get(key) != expected:
+                raise ContractError(f"worker.{phase}.{key}: {phase_summary.get(key)!r} != {expected!r}")
+        try:
+            qps = float(phase_summary["qps"])
+        except (TypeError, ValueError) as exc:
+            raise ContractError(f"worker.{phase}.qps is not numeric") from exc
+        expected_qps = expected_queries / (elapsed / 1_000_000_000)
+        if not math.isfinite(qps) or not math.isclose(qps, expected_qps, rel_tol=1e-9):
+            raise ContractError(f"worker.{phase}.qps differs from the query-only phase boundary")
+    if setup_end > summary["warmup"]["started_monotonic_ns"]:
+        raise ContractError("LiveGraph fresh import overlaps warmup")
     if summary["warmup"]["ended_monotonic_ns"] > summary["measured"]["started_monotonic_ns"]:
         raise ContractError("LiveGraph warmup and measured intervals overlap")
     return observations, summary
@@ -434,6 +530,7 @@ def publish_result(
         "system_version": request["system_version"],
         "interface_scope": INTERFACE_SCOPE,
         "repeat_index": request["repeat_index"],
+        "process_lifetime": request["process_lifetime"],
         "truth_sha256": request["truth"]["sha256"],
         "sequence_digest_algorithm": SEQUENCE_DIGEST_ALGORITHM,
         "timing_boundary": TIMING_BOUNDARY,
@@ -442,6 +539,21 @@ def publish_result(
         "per_query_timeout_ms": request["timing"]["per_query_timeout_ms"],
         "warmup": phases["warmup"],
         "measured": phases["measured"],
+        "setup": {
+            "policy": FRESH_IMPORT_PROCESS_LIFETIME,
+            "kind": "fresh-import",
+            "started_monotonic_ns": worker_summary["setup"]["started_monotonic_ns"],
+            "ended_monotonic_ns": worker_summary["setup"]["ended_monotonic_ns"],
+            "wall_ns": worker_summary["setup"]["wall_ns"],
+            "user_cpu_ns": worker_summary["setup"]["user_cpu_ns"],
+            "system_cpu_ns": worker_summary["setup"]["system_cpu_ns"],
+            "store_logical_bytes": worker_summary["setup"]["store_logical_bytes"],
+            "store_allocated_bytes": worker_summary["setup"]["store_allocated_bytes"],
+            "binary_sha256": request["binary"]["sha256"],
+            "dataset_sha256": request["dataset"]["sha256"],
+            "truth_sha256": request["truth"]["sha256"],
+            "runtime_libraries": request["runtime_libraries"],
+        },
     }
     atomic_json(output_dir / "adapter-result.json", result)
 
@@ -449,7 +561,7 @@ def publish_result(
 def main() -> int:
     args = parse_args()
     try:
-        request, truth_rows, binary, dataset, store_root = validate_request(
+        request, truth_rows, binary, dataset, store_root, runtime_libraries = validate_request(
             args.request.resolve(), args.store_label
         )
         block_path = safe_store_file(store_root, args.block_name, "--block-name")
@@ -457,23 +569,14 @@ def main() -> int:
         if block_path == wal_path:
             raise ContractError("LiveGraph block and WAL paths must differ")
         capability = worker_capability(binary)
-        if request["execution_mode"] == "formal":
-            if len(truth_rows) != 1700:
-                raise ContractError("formal LiveGraph P10 requires the frozen 1,700-query truth")
-            if capability != FORMAL_STORE_CAPABILITY:
-                raise ContractError(
-                    "formal LiveGraph P10 requires query-only reusable store capability "
-                    f"{FORMAL_STORE_CAPABILITY!r}; worker reports {capability!r}"
-                )
-            store_mode = "reopen"
-            if not block_path.is_file() or not wal_path.is_file():
-                raise ContractError("formal LiveGraph P10 requires an existing compatible block/WAL store")
-        else:
-            if capability != IMPORT_ONLY_CAPABILITY:
-                raise ContractError("fixture adapter expected the audited import-only LiveGraph worker")
-            store_mode = "import"
-            if block_path.exists() or wal_path.exists():
-                raise ContractError("fixture import refuses to overwrite an existing block/WAL file")
+        if capability["process_lifetime"] != FRESH_IMPORT_CAPABILITY:
+            raise ContractError("LiveGraph worker did not declare the frozen fresh-import lifecycle")
+        if Path(capability["runtime_library_path"]) not in runtime_libraries:
+            raise ContractError("LiveGraph worker loaded a runtime library outside the frozen request")
+        if request["execution_mode"] == "formal" and len(truth_rows) != 1700:
+            raise ContractError("formal LiveGraph P10 requires the frozen 1,700-query truth")
+        if block_path.exists() or wal_path.exists():
+            raise ContractError("fresh import refuses to overwrite an existing block/WAL file")
 
         output_dir = args.output_dir.resolve()
         if output_dir == store_root or store_root in output_dir.parents or output_dir in store_root.parents:
@@ -490,7 +593,9 @@ def main() -> int:
         command = [
             str(binary),
             "--store-mode",
-            store_mode,
+            "fresh-import",
+            "--edges",
+            str(dataset),
             "--truth-tsv",
             request["truth"]["path"],
             "--block-path",
@@ -510,8 +615,6 @@ def main() -> int:
             "--repeat-index",
             str(request["repeat_index"]),
         ]
-        if store_mode == "import":
-            command.extend(("--edges", str(dataset)))
         completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
         (output_dir / "livegraph-worker.stdout.log").write_bytes(completed.stdout)
         (output_dir / "livegraph-worker.stderr.log").write_bytes(completed.stderr)

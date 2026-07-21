@@ -20,7 +20,7 @@ livegraph_digest: livegraph_digest_driver.cpp
 	@echo "built livegraph_digest_driver (run with LD_LIBRARY_PATH=$(LG)/build)"
 
 livegraph_p10: livegraph_p10_driver.cpp
-	$(CXX) $(CXXFLAGS) -I$(LG)/bind $< -L$(LG)/build -llivegraph -lpthread -o livegraph_p10_driver
+	$(CXX) $(CXXFLAGS) -I$(LG)/bind $< -L$(LG)/build -llivegraph -ldl -lpthread -o livegraph_p10_driver
 	@echo "built livegraph_p10_driver (run with LD_LIBRARY_PATH=$(LG)/build)"
 
 clean:

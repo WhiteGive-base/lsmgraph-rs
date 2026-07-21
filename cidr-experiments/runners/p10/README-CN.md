@@ -1,6 +1,6 @@
 # P10/P11 六系统端到端统一运行器
 
-本目录实现 Figure 1 所需的受限 typed-neighbor 端到端实验契约。它只负责调用已经准备好的 adapter，并将每个 repeat 交给 P31 采集资源；**不会启动、停止或重建任何数据库服务，也不会下载镜像**。
+本目录实现 Figure 1 所需的受限 typed-neighbor 端到端实验契约。它调用冻结的 adapter，并将每个 repeat 交给 P31 采集资源；**不会启动或停止外部数据库服务，也不会下载镜像**。只有显式声明 fresh-import 生命周期的 embedded adapter 可以在本 repeat 的全新目录中导入冻结 dataset。
 
 ## 冻结比较边界
 
@@ -9,7 +9,7 @@
 - 两组分别报告，`group_policy=report-separately-no-cross-group-speedups`；结果 manifest 明确写入 `cross_group_speedups_allowed=false`。
 - 接口固定为 `typed-neighbor-dense-id-v1`，查询顺序严格等于 P01 truth 的连续 `query_index`。
 - 计时边界固定为 typed-neighbor 调用、完整结果物化和 digest，时钟为 `CLOCK_MONOTONIC`，并发度为 1。
-- 每个 repeat 在**同一个 adapter 进程**中先跑完整 truth warmup，再跑 measured，避免重启丢失进程内 cache。每个 repeat 都重新 warmup。
+- 每个 repeat 在**同一个 adapter 进程**中完成其声明的 setup（若有）、完整 truth warmup 和 measured，避免重启丢失进程内 cache。每个 repeat 都重新 warmup。
 - timeout、truth mismatch、顺序变化、缺行/多行、digest 不一致、P31 非 `DONE`、未知 manifest 字段都会 fail closed。
 
 ## 文件与可执行契约
@@ -43,16 +43,17 @@ readiness_gate=PASS
 adapter [manifest args...] --request adapter-request.json --output-dir DIR
 ```
 
-request 会把 `execution_mode`、system binary、dataset 以及每个 store root
-的 lineage SHA-256 一并传给 adapter；正式模式中这些 SHA 均不能为空。这样
-adapter 实际打开的 binary/data/store 与 P31 manifest 是同一组冻结输入，
-不能通过 adapter 参数悄悄换成另一份数据。
+request 会把 `execution_mode`、`process_lifetime`、system binary、runtime
+libraries、dataset 以及每个 store root 一并传给 adapter。正式模式中
+binary/dataset/truth/runtime-library SHA-256 均不能为空。prebuilt store 还必须
+绑定 lineage SHA；fresh-import store 在 repeat 开始前不存在，因此以冻结的
+dataset/importer/runtime SHA 和本次实际 store 路径绑定，不能冒充 prebuilt store。
 
 adapter 必须在一次进程生命周期内依次生成：
 
 1. `phase-events.jsonl`：严格四行，依次为 warmup start/end、measured start/end；时间来自 Linux `CLOCK_MONOTONIC`。
 2. `query-observations.tsv`：warmup 和 measured 的每个 pass、每个 truth 查询各一行；固定列在 `p10_contract.py::OBSERVATION_COLUMNS`。
-3. `adapter-result.json`：两阶段的 requested/completed/timeout/mismatch、时间边界和 expected/actual sequence digest。
+3. `adapter-result.json`：两阶段的 requested/completed/timeout/mismatch、时间边界和 expected/actual sequence digest；fresh-import 生命周期还必须提供独立 `setup` 边界、CPU 和导入后 store bytes。
 
 单查询 digest 仍使用 P01 truth 的 `count/sum_hash/xor_hash`。阶段级 digest 为 SHA-256，规范输入逐行为：
 
@@ -82,14 +83,17 @@ adapter 整体由 GNU `timeout` 限制，超时退出会由 P31 正常走 FAILED
 - `suite-summary.json`：分组、协议、输入 SHA 和结果 SHA；
 - `DONE`：仅六系统完整通过时创建；子集只能得到 `PARTIAL-DONE`；任意失败只保留 `FAILED`。
 
-P31 当前覆盖整个 warmup+measured adapter 进程，资源列因此是 repeat 全周期口径；query latency/QPS 只来自 adapter 声明并验证过的 measured 边界。正文和图注必须保持这一区分。
+P31 覆盖 adapter 的完整进程生命周期。对于 LiveGraph，这明确包括
+`fresh import -> warmup -> measured -> teardown`，所以 P31 CPU/RSS/I/O 是完整
+repeat 口径。query latency/QPS/P50/P95/P99 只来自 adapter 声明并验证过的
+measured 边界；import wall/CPU/store bytes 单独报告，不得混入 query speedup。
 
 ## 正式 manifest 尚需填充的系统依赖
 
 | 系统 | adapter 必须提供 | 运行前外部条件 |
 |---|---|---|
 | SemL0 | 共享 truth 消费、同进程 warmup/measured、逐查询观测 | integration release binary；四个变体各自 store；共享 sample plan |
-| LiveGraph | `adapters/livegraph_adapter.py`；原生 worker 同进程 warmup→measured | 需要可重开的 query-only block/WAL store；当前 vendored revision 尚不支持，formal 会 fail closed |
+| LiveGraph | `adapters/livegraph_adapter.py`；原生 worker 同进程 fresh import→warmup→measured | 每个 repeat 使用全新的 store/temp；冻结 dense dataset、worker 和 `liblivegraph.so` SHA |
 | Aster | RocksGraph typed-neighbor bridge | clean/pinned source 与重建 driver；兼容 DB |
 | TuGraph | typed-neighbor adapter | 冻结 runtime/image/binary；正式运行期间独占服务或 in-process 入口 |
 | Neo4j | Bolt typed-neighbor client adapter | 精确 image digest、固定 client；外部预启动且容器名写入 manifest |
@@ -97,9 +101,16 @@ P31 当前覆盖整个 warmup+measured adapter 进程，资源列因此是 repea
 
 正式 manifest 的 adapter、binary、truth、file dataset 必须给出精确 SHA-256；目录 dataset 使用冻结 lineage SHA-256。client-server 还必须声明全部 image digest 和可由 P31 解析的 container/PID，运行器不会代替用户管理服务生命周期。
 
-每个正式 `store_roots[]` 还必须提供 `sha256`。它是已发布 store manifest
-的 lineage SHA-256，不是临时对目录遍历顺序做出的散列；该值会进入 resolved
-suite config、adapter request 和 P31 config provenance。
+每个系统必须显式填写 `process_lifetime` 和 `runtime_libraries`。LiveGraph 的
+正式值只能是 `fresh-import-and-query-process-lifetime-v1`，不能标成 prebuilt、
+reopenable 或 query-only；其 `runtime_libraries` 至少包含实际加载的
+`liblivegraph.so` 绝对路径和 SHA-256。
+
+prebuilt 生命周期中的每个正式 `store_roots[]` 还必须提供 `sha256`，表示已发布
+store manifest 的 lineage SHA-256。`fresh-import-and-query-process-lifetime-v1`
+声明的是空的 base root；运行器为每个 repeat 派生并创建唯一 store/temp 子目录，
+拒绝复用已有目录。实际路径写入 adapter request 和 P31 argv，导入后 logical/
+allocated bytes 写入结果。
 
 ### LiveGraph adapter 的当前边界
 
@@ -110,14 +121,17 @@ make -C baseline/external-drivers livegraph_p10 \
   LG=/abs/path/to/LiveGraph
 ```
 
-`livegraph_p10_driver --capabilities` 会声明 store capability。当前仓库固定的
-LiveGraph 源码在 `Graph` 构造时以 `O_TRUNC` 打开 block/WAL，且 vertex/edge
-metadata 只存在于当前进程；所以历史 block/WAL 文件不能被另一个 repeat
-重新打开。adapter 只允许在 `execution_mode=fixture` 时从小型 dense edge
-list 导入一次，并在同一个原生 worker 中完成完整 warmup 后再 measured。
-`execution_mode=formal` 要求 worker 声明 `reopenable-query-store-v1`，否则在
-任何 store 写入或计时前退出。这些 fixture 结果只用于 correctness，不得进入
-Figure 1。
+`livegraph_p10_driver --capabilities` 固定声明
+`fresh-import-and-query-process-lifetime-v1`，并报告进程实际加载的
+`liblivegraph.so` 绝对路径。adapter 复算该 library SHA 并与 request 比较。
+
+当前 LiveGraph 的 block/WAL 不能跨进程重开，因此正式协议不再假装使用
+query-only reusable store。每个独立 repeat 都从同一冻结 dense dataset 导入到
+全新 store，在同一原生进程中依次执行 import、完整 truth warmup 和 measured。
+driver 分开输出 import CLOCK_MONOTONIC wall、user/system CPU、block/WAL logical/
+allocated bytes，以及 query-only QPS/P50/P95/P99。orchestrator 再从逐查询记录
+独立重算分位数和 digest；两者不一致即 fail closed。跨系统 speedup 只比较
+matched measured phase，import 成本必须在独立列/表中报告。
 
 真实 LiveGraph 小 fixture 自测（不产生性能数据）：
 

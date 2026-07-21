@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import subprocess
@@ -18,6 +19,7 @@ sys.path.insert(0, str(P10_DIR))
 from p10_contract import (  # noqa: E402
     CLOCK_NAME,
     CONTRACT_VERSION,
+    FRESH_IMPORT_PROCESS_LIFETIME,
     INTERFACE_SCOPE,
     REQUEST_SCHEMA_VERSION,
     SEQUENCE_DIGEST_ALGORITHM,
@@ -43,8 +45,25 @@ class LiveGraphAdapterTest(unittest.TestCase):
         cls.fixture_p31 = Path(__file__).resolve().parent / "fixture_p31.sh"
         cls.dataset = REPO_ROOT / "baseline" / "shared-truth" / "fixtures" / "dense-edges.txt"
         cls.truth = REPO_ROOT / "baseline" / "shared-truth" / "fixtures" / "truth.tsv"
+        capability = subprocess.run(
+            [str(cls.binary), "--capabilities"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        cls.capability = json.loads(capability.stdout)
+        cls.runtime_library = Path(cls.capability["runtime_library_path"]).resolve()
 
-    def request(self, store: Path, *, execution_mode: str = "fixture") -> dict:
+    def request(
+        self,
+        store: Path,
+        *,
+        execution_mode: str = "fixture",
+        truth: Path | None = None,
+        query_count: int = 2,
+    ) -> dict:
+        truth = truth or self.truth
         return {
             "schema_version": REQUEST_SCHEMA_VERSION,
             "contract_version": CONTRACT_VERSION,
@@ -56,19 +75,26 @@ class LiveGraphAdapterTest(unittest.TestCase):
             "system_version": "audited-livegraph-fixture",
             "interface_scope": INTERFACE_SCOPE,
             "repeat_index": 2,
+            "process_lifetime": FRESH_IMPORT_PROCESS_LIFETIME,
             "binary": {"path": str(self.binary), "sha256": sha256_file(self.binary)},
             "dataset": {"path": str(self.dataset), "sha256": sha256_file(self.dataset)},
+            "runtime_libraries": [
+                {
+                    "path": str(self.runtime_library),
+                    "sha256": sha256_file(self.runtime_library),
+                }
+            ],
             "store_roots": [
                 {
                     "label": "livegraph",
                     "path": str(store),
-                    "sha256": "" if execution_mode == "fixture" else "0" * 64,
+                    "sha256": "",
                 }
             ],
             "truth": {
-                "path": str(self.truth),
-                "sha256": sha256_file(self.truth),
-                "query_count": 2,
+                "path": str(truth),
+                "sha256": sha256_file(truth),
+                "query_count": query_count,
                 "digest_algorithm": TRUTH_DIGEST_ALGORITHM,
             },
             "timing": {
@@ -134,27 +160,26 @@ class LiveGraphAdapterTest(unittest.TestCase):
             self.assertEqual(validated["query_count"], 2)
             self.assertEqual(validated["completed_queries"], 4)
             self.assertEqual(validated["mismatch_queries"], 0)
+            self.assertGreater(validated["import_wall_s"], 0)
+            self.assertGreater(validated["import_store_logical_bytes"], 0)
             self.assertTrue((store / "livegraph-block").is_file())
             self.assertTrue((store / "livegraph-wal").is_file())
 
-    def test_worker_declares_non_reopenable_store(self) -> None:
-        completed = subprocess.run(
-            [str(self.binary), "--capabilities"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+    def test_worker_declares_fresh_import_and_runtime_library(self) -> None:
+        self.assertEqual(
+            self.capability["process_lifetime"], FRESH_IMPORT_PROCESS_LIFETIME
         )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        capability = json.loads(completed.stdout)
-        self.assertEqual(capability["store_capability"], "import-only-process-lifetime-v1")
+        self.assertEqual(Path(self.capability["runtime_library_path"]).resolve(), self.runtime_library)
 
     def test_orchestrator_and_p31_bridge_execute_real_adapter(self) -> None:
         with tempfile.TemporaryDirectory(prefix="p10-livegraph-orchestrated-") as raw:
             root = Path(raw)
             store = root / "store"
             store.mkdir()
+            temp_base = root / "temp"
+            temp_base.mkdir()
             manifest = json.loads(self.fixture_manifest.read_text(encoding="utf-8"))
+            manifest["protocol"]["repeats"] = 2
             livegraph = next(system for system in manifest["systems"] if system["id"] == "livegraph")
             livegraph["adapter"] = {
                 "path": str(self.adapter),
@@ -165,9 +190,17 @@ class LiveGraphAdapterTest(unittest.TestCase):
                 "path": str(self.binary),
                 "sha256": sha256_file(self.binary),
             }
+            livegraph["process_lifetime"] = FRESH_IMPORT_PROCESS_LIFETIME
+            livegraph["runtime_libraries"] = [
+                {
+                    "path": str(self.runtime_library),
+                    "sha256": sha256_file(self.runtime_library),
+                }
+            ]
             livegraph["store_roots"] = [
                 {"label": "livegraph", "path": str(store), "sha256": ""}
             ]
+            livegraph["temp_roots"] = [{"label": "scratch", "path": str(temp_base)}]
             manifest_path = root / "suite.json"
             manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
             run_root = root / "run"
@@ -206,6 +239,48 @@ class LiveGraphAdapterTest(unittest.TestCase):
             )
             self.assertEqual(validated["completed_queries"], 2)
             self.assertEqual(validated["mismatch_queries"], 0)
+            self.assertEqual(validated["process_lifetime"], FRESH_IMPORT_PROCESS_LIFETIME)
+            self.assertGreater(validated["import_wall_s"], 0)
+            with (run_root / "repeat-results.tsv").open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                repeat_row = next(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual(
+                repeat_row["process_lifetime"], FRESH_IMPORT_PROCESS_LIFETIME
+            )
+            self.assertGreater(float(repeat_row["import_wall_s"]), 0)
+            self.assertGreater(int(repeat_row["import_store_logical_bytes"]), 0)
+            with (run_root / "system-results.tsv").open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                system_row = next(csv.DictReader(handle, delimiter="\t"))
+            self.assertGreater(float(system_row["median_import_wall_s"]), 0)
+            request = json.loads(
+                (
+                    run_root
+                    / "systems"
+                    / "livegraph"
+                    / "repeat-01"
+                    / "adapter-request.json"
+                ).read_text(encoding="utf-8")
+            )
+            actual_store = Path(request["store_roots"][0]["path"])
+            self.assertEqual(actual_store.parent, store)
+            self.assertNotEqual(actual_store, store)
+            self.assertTrue((actual_store / "livegraph-block").is_file())
+            second_request = json.loads(
+                (
+                    run_root
+                    / "systems"
+                    / "livegraph"
+                    / "repeat-02"
+                    / "adapter-request.json"
+                ).read_text(encoding="utf-8")
+            )
+            second_store = Path(second_request["store_roots"][0]["path"])
+            self.assertNotEqual(second_store, actual_store)
+            self.assertEqual(second_store.parent, store)
+            self.assertEqual(len(list(temp_base.iterdir())), 2)
             p31_argv = (
                 run_root / "systems" / "livegraph" / "repeat-01" / "p31" / "argv.txt"
             ).read_text(encoding="utf-8")
@@ -231,6 +306,45 @@ class LiveGraphAdapterTest(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("formal LiveGraph P10", completed.stderr)
             self.assertFalse((root / "output" / "adapter-result.json").exists())
+
+    def test_formal_contract_accepts_1700_query_synthetic_truth(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="p10-livegraph-formal-contract-") as raw:
+            root = Path(raw)
+            store = root / "store"
+            store.mkdir()
+            source_rows = [line.split("\t") for line in self.truth.read_text(encoding="utf-8").splitlines()[1:]]
+            formal_truth = root / "truth-1700.tsv"
+            lines = ["query_index\tedge_type\tsrc\tcount\tsum_hash\txor_hash"]
+            for query_index in range(1700):
+                source = source_rows[query_index % len(source_rows)]
+                lines.append("\t".join((str(query_index), *source[1:])))
+            formal_truth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            request = self.request(
+                store,
+                execution_mode="formal",
+                truth=formal_truth,
+                query_count=1700,
+            )
+            completed = self.invoke(request, root)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(
+                (root / "output" / "adapter-result.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["process_lifetime"], FRESH_IMPORT_PROCESS_LIFETIME)
+            self.assertEqual(result["measured"]["requested_queries"], 3400)
+            self.assertEqual(result["measured"]["mismatch_queries"], 0)
+
+    def test_runtime_library_sha_mismatch_fails_before_store_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="p10-livegraph-lib-sha-negative-") as raw:
+            root = Path(raw)
+            store = root / "store"
+            store.mkdir()
+            request = self.request(store)
+            request["runtime_libraries"][0]["sha256"] = "0" * 64
+            completed = self.invoke(request, root)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("SHA-256 mismatch", completed.stderr)
+            self.assertEqual(list(store.iterdir()), [])
 
     def test_binary_sha_mismatch_fails_before_store_mutation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="p10-livegraph-sha-negative-") as raw:
