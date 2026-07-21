@@ -213,10 +213,27 @@ def validate_store(args: argparse.Namespace, formal: bool, p02b: dict[str, Any])
     return {"path": str(store), "tree_sha256": frozen_sha, "manifest": manifest_ref, "current_tree": current}
 
 
-def validate_p02b(args: argparse.Namespace, formal: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+def validate_p02b(
+    args: argparse.Namespace,
+    formal: bool,
+    git: dict[str, Any],
+    binary: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     result_ref = resolve_file(args.p02b_result, args.p02b_result_sha256, "P02B result")
     validator_ref = resolve_file(args.p02b_validator, args.p02b_validator_sha256, "P02B validator", executable=True)
-    command = [str(args.p02b_validator.resolve()), "--result", str(args.p02b_result.resolve()), "--consumer", "P10"]
+    command = [
+        str(args.p02b_validator.resolve()),
+        "--result",
+        str(args.p02b_result.resolve()),
+        "--consumer",
+        "P10",
+        "--expected-repo-root",
+        str(args.repo_root),
+        "--expected-repo-head",
+        git["head"],
+        "--expected-binary-sha256",
+        binary["sha256"],
+    ]
     if formal:
         command.append("--require-formal")
     completed = subprocess.run(command, text=True, capture_output=True, check=False, timeout=60)
@@ -226,12 +243,66 @@ def validate_p02b(args: argparse.Namespace, formal: bool) -> tuple[dict[str, Any
     except json.JSONDecodeError as exc:
         raise ContractError(f"P02B validator emitted invalid JSON: {exc}") from exc
     require(admission.get("state") == "PASS" and admission.get("consumer") == "P10", "P02B validator returned a non-PASS admission")
+    require(admission.get("formal_required") is formal, "P02B validator receipt formal mode mismatch")
+    require(type(admission.get("fixture_only")) is bool, "P02B validator receipt classification is invalid")
+    if formal:
+        require(admission["fixture_only"] is False, "formal P02B validator receipt is fixture-only")
+    require(admission.get("scale") == "sf10", "P02B validator receipt scale mismatch")
+    same_path(admission.get("sentinel_result"), args.p02b_result, "P02B validator receipt result")
+    require(
+        admission.get("sentinel_result_sha256") == result_ref["sha256"],
+        "P02B validator receipt result SHA-256 mismatch",
+    )
+    same_path(admission.get("repo_root"), args.repo_root, "P02B validator receipt repo root")
+    require(admission.get("repo_head") == git["head"], "P02B validator receipt repo HEAD mismatch")
+    require(admission.get("binary_sha256") == binary["sha256"], "P02B validator receipt binary mismatch")
+    marker_path = Path(str(admission.get("pass_marker", "")))
+    provenance_path = Path(str(admission.get("provenance", "")))
+    marker_ref = resolve_file(
+        marker_path,
+        str(admission.get("pass_marker_sha256", "")),
+        "P02B PASS marker receipt",
+    )
+    provenance_ref = resolve_file(
+        provenance_path,
+        str(admission.get("provenance_sha256", "")),
+        "P02B provenance receipt",
+    )
     result = read_object(args.p02b_result, "P02B result")
+    require(sha256_file(args.p02b_result.resolve()) == result_ref["sha256"], "P02B result changed after validation")
+    require(result.get("run_id") == admission.get("run_id"), "P02B result/receipt run_id mismatch")
+    require(result.get("completed_at_utc") == admission.get("completed_at_utc"), "P02B result/receipt completion mismatch")
     if formal:
         require(result.get("scale") == "sf10", "formal P10 requires an SF10 P02B sentinel")
         require(result.get("formal_gate_eligible") is True and result.get("downstream_release_eligible") is True, "P02B did not release formal P10")
         require(result.get("protocol", {}).get("expected_queries") == 1700, "formal P02B query count must be 1700")
-    return result, {"result": result_ref, "validator": validator_ref, "admission": admission}
+    return result, {
+        "result": result_ref,
+        "pass_marker": marker_ref,
+        "provenance": provenance_ref,
+        "validator": validator_ref,
+        "admission": admission,
+    }
+
+
+def bind_p02b_provenance_files(
+    p02b_binding: dict[str, Any],
+    expected: dict[str, dict[str, Any]],
+) -> None:
+    provenance_path = Path(p02b_binding["provenance"]["path"])
+    provenance = read_object(provenance_path, "P02B canonical provenance")
+    require(
+        sha256_file(provenance_path) == p02b_binding["provenance"]["sha256"],
+        "P02B provenance changed after validation",
+    )
+    files = provenance.get("files")
+    require(isinstance(files, dict), "P02B provenance lacks canonical files")
+    for key, reference in expected.items():
+        observed = files.get(key)
+        require(isinstance(observed, dict), f"P02B provenance lacks files.{key}")
+        same_path(observed.get("path"), Path(reference["path"]), f"P02B provenance files.{key}")
+        require(observed.get("sha256") == reference["sha256"], f"P02B provenance files.{key} SHA-256 mismatch")
+        require(observed.get("size_bytes") == reference["size_bytes"], f"P02B provenance files.{key} size mismatch")
 
 
 def read_raw_observations(path: Path) -> list[dict[str, str]]:
@@ -378,14 +449,15 @@ def run(args: argparse.Namespace) -> None:
     plan = validate_plan(args.sample_plan.resolve(), args.sample_plan_sha256, len(truth_rows))
     id_map = validate_id_map(args.id_map_dir, args.id_map_manifest_sha256)
     p31 = resolve_file(args.p31_wrapper, args.p31_wrapper_sha256, "P31 wrapper", executable=True)
-    p02b_result, p02b = validate_p02b(args, formal)
     git = git_state(args.repo_root)
+    if formal:
+        require(git["clean"], "formal SemL0 adapter requires a clean Git worktree")
+    p02b_result, p02b = validate_p02b(args, formal, git, binary)
     provenance = p02b_result.get("provenance", {})
     require(provenance.get("binary_sha256") == binary["sha256"], "P02B binary differs from P10 binary")
     require(provenance.get("truth_sha256") == truth["sha256"], "P02B truth differs from P10 truth")
     require(provenance.get("query_plan_sha256") == plan["sha256"], "P02B query plan differs from P10 sample plan")
     if formal:
-        require(git["clean"], "formal SemL0 adapter requires a clean Git worktree")
         require(provenance.get("repo_head") == git["head"], "P02B repo HEAD differs from current P10 repo")
         for path, label in (
             (args.binary, "binary"),
@@ -400,6 +472,17 @@ def run(args: argparse.Namespace) -> None:
         ):
             reject_fixtureish(path, label)
     store = validate_store(args, formal, p02b_result)
+    bind_p02b_provenance_files(
+        p02b,
+        {
+            "binary": binary,
+            "truth": truth,
+            "query_plan": plan,
+            "store_manifest": store["manifest"],
+            "id_map_manifest": id_map["manifest"],
+            "p31_wrapper": p31,
+        },
+    )
 
     for protected, label in (
         (args.data_dir.resolve(), "store"),

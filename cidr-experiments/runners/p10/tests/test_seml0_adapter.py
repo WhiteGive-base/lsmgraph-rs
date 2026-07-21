@@ -15,12 +15,19 @@ P10_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = P10_DIR.parents[2]
 ADAPTER = P10_DIR / "adapters" / "seml0_adapter.py"
 FIXTURE_BINARY = Path(__file__).resolve().parent / "fixture_seml0_binary.py"
-P02B_VALIDATOR = P10_DIR.parent / "p02b" / "validate_sentinel_result.py"
+P02B_DIR = P10_DIR.parent / "p02b"
+P02B_PREPARE = P02B_DIR / "tests" / "prepare_fixture.py"
+P02B_RUNNER = P02B_DIR / "run_sf10_sentinel.py"
+P02B_VALIDATOR = P02B_DIR / "validate_sentinel_result.py"
 P31_WRAPPER = P10_DIR.parent / "p31" / "run_with_resources.sh"
 
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def write_json(path: Path, value: object) -> None:
@@ -30,80 +37,110 @@ def write_json(path: Path, value: object) -> None:
 class SemL0AdapterTests(unittest.TestCase):
     maxDiff = None
 
-    def prepare(self, root: Path) -> list[str]:
-        store = root / "store"
-        store.mkdir()
-        store_file = store / "fixture.store"
-        store_file.write_text("fixture store\n", encoding="utf-8")
-        store_tree_sha = sha256(store_file)
-        store_manifest = root / "store-manifest.json"
-        write_json(
-            store_manifest,
-            {
-                "schema_version": "p02b-store-manifest-v1",
-                "store_path": str(store.resolve()),
-                "store_sha256": store_tree_sha,
-                "hash_method": "fixture-single-file-sha256",
-            },
+    def invoke(
+        self,
+        command: list[str],
+        *,
+        expected: int = 0,
+        timeout: int = 180,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environment,
+            timeout=timeout,
         )
+        self.assertEqual(
+            completed.returncode,
+            expected,
+            f"command: {command!r}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+        return completed
 
+    def prepare(self, root: Path) -> list[str]:
+        # Reuse the P02B fixture producer and the real sentinel runner.  This
+        # intentionally creates the complete canonical result, provenance,
+        # three P31 repeats, and FIXTURE-PASS marker consumed below.
+        self.invoke(
+            [
+                sys.executable,
+                "-B",
+                str(P02B_PREPARE),
+                "--root",
+                str(root),
+                "--repo-root",
+                str(REPO_ROOT),
+            ]
+        )
         truth = root / "truth.tsv"
-        truth.write_text(
-            "query_index\tedge_type\tsrc\tcount\tsum_hash\txor_hash\n"
-            "0\t7\t0\t2\t10\t20\n"
-            "1\t-7\t1\t1\t11\t21\n",
-            encoding="utf-8",
-        )
-        plan = root / "sample-plan.json"
-        write_json(
-            plan,
-            {
-                "version": 1,
-                "source": "shared-truth-tsv",
-                "samples_per_edge_type": 1,
-                "semantic_degree_hint": False,
-                "force_signature": False,
-                "src_label": None,
-                "dst_label": None,
-                "entries": [
-                    {
-                        "edge_type": 7,
-                        "src_label": None,
-                        "dst_label": None,
-                        "candidate_edges_for_sampling": 2,
-                        "candidate_sources_for_sampling": 1,
-                        "samples": [{"src": 100, "degree": 2}],
-                    },
-                    {
-                        "edge_type": -7,
-                        "src_label": None,
-                        "dst_label": None,
-                        "candidate_edges_for_sampling": 1,
-                        "candidate_sources_for_sampling": 1,
-                        "samples": [{"src": 200, "degree": 1}],
-                    },
-                ],
-            },
-        )
         id_map = root / "id-map"
-        id_map.mkdir()
-        dense = id_map / "dense-to-original.tsv"
-        original = id_map / "original-to-dense.tsv"
-        dense.write_text("dense_id\toriginal_id\n0\t100\n1\t200\n2\t300\n", encoding="utf-8")
-        original.write_text("original_id\tdense_id\n100\t0\n200\t1\n300\t2\n", encoding="utf-8")
-        id_manifest = id_map / "id-map-manifest.json"
-        write_json(
-            id_manifest,
-            {
-                "format": "seml0-shared-id-map",
-                "format_version": 1,
-                "vertex_count": 3,
-                "mapping_hash_algorithm": "fnv1a64-le-dense-original-v1",
-                "mapping_hash": "fixture",
-                "dense_to_original": {"path": dense.name, "sha256": sha256(dense)},
-                "original_to_dense": {"path": original.name, "sha256": sha256(original)},
-            },
+        store = root / "store"
+        plan = root / "query-plan.json"
+        self.invoke(
+            [
+                str(FIXTURE_BINARY),
+                "--io-backend",
+                "blocking",
+                "shared-truth-verify",
+                "--data-dir",
+                str(store),
+                "--truth-tsv",
+                str(truth),
+                "--id-map-dir",
+                str(id_map),
+                "--expected-queries",
+                "6",
+                "--l0-layout",
+                "schema",
+                "--semantic-degree-hint",
+                "--sample-plan-out",
+                str(plan),
+                "--output",
+                str(root / "preflight.json"),
+            ]
         )
+        p02b_run = root / "p02b-run"
+        self.invoke(
+            [
+                sys.executable,
+                "-B",
+                str(P02B_RUNNER),
+                "--run-dir",
+                str(p02b_run),
+                "--clean-ready",
+                str(root / "P03-CLEAN-WINDOW-MONITOR" / "raw" / "fixture-clean" / "READY"),
+                "--repo-root",
+                str(REPO_ROOT),
+                "--binary",
+                str(FIXTURE_BINARY),
+                "--dataset-manifest",
+                str(root / "dataset-manifest.json"),
+                "--store",
+                str(store),
+                "--store-manifest",
+                str(root / "store-manifest.json"),
+                "--truth",
+                str(truth),
+                "--query-plan",
+                str(plan),
+                "--id-map-dir",
+                str(id_map),
+                "--config",
+                str(root / "config.json"),
+            ]
+        )
+        self.assertTrue((p02b_run / "FIXTURE-PASS").is_file())
+        self.assertTrue((p02b_run / "provenance.json").is_file())
+        self.assertFalse((p02b_run / "FAILED").exists())
+
+        store_manifest = root / "store-manifest.json"
+        id_manifest = id_map / "id-map-manifest.json"
+        dataset_manifest = load_json(root / "dataset-manifest.json")
+        store_lineage = load_json(store_manifest)
         request = root / "request.json"
         write_json(
             request,
@@ -112,15 +149,28 @@ class SemL0AdapterTests(unittest.TestCase):
                 "contract_version": "cidr-typed-neighbor-adapter-v1",
                 "suite_id": "fixture",
                 "run_id": "fixture",
+                "execution_mode": "fixture",
                 "system_id": "seml0",
                 "group": "embedded",
                 "system_version": "fixture-seml0",
                 "interface_scope": "typed-neighbor-dense-id-v1",
                 "repeat_index": 1,
+                "binary": {"path": str(FIXTURE_BINARY), "sha256": sha256(FIXTURE_BINARY)},
+                "dataset": {
+                    "path": str((root / "dataset").resolve()),
+                    "sha256": dataset_manifest["dataset_sha256"],
+                },
+                "store_roots": [
+                    {
+                        "label": "store",
+                        "path": str(store.resolve()),
+                        "sha256": store_lineage["store_sha256"],
+                    }
+                ],
                 "truth": {
                     "path": str(truth.resolve()),
                     "sha256": sha256(truth),
-                    "query_count": 2,
+                    "query_count": 6,
                     "digest_algorithm": "mix64-dense-dst-count-sum-xor-v1",
                 },
                 "timing": {
@@ -136,77 +186,61 @@ class SemL0AdapterTests(unittest.TestCase):
                 },
             },
         )
-        p02b_result = root / "sentinel-result.json"
-        write_json(
-            p02b_result,
-            {
-                "schema_version": "p02b-sf10-sentinel-result-v1",
-                "state": "PASS",
-                "fixture_only": True,
-                "performance_eligible": False,
-                "formal_gate_eligible": False,
-                "downstream_release_eligible": False,
-                "consumers": ["P10", "P20"],
-                "scale": "fixture",
-                "protocol": {"expected_queries": 2},
-                "provenance": {
-                    "repo_head": "0" * 40,
-                    "binary_sha256": sha256(FIXTURE_BINARY),
-                    "truth_sha256": sha256(truth),
-                    "query_plan_sha256": sha256(plan),
-                    "store_sha256": store_tree_sha,
-                },
-                "correctness": {"state": "PASS", "mismatches": 0},
-                "stability": {"state": "PASS", "qps": {"pass": True}, "p99_us": {"pass": True}},
-            },
-        )
-        write_json(
-            root / "FIXTURE-PASS",
-            {
-                "state": "PASS",
-                "fixture_only": True,
-                "result": str(p02b_result.resolve()),
-                "result_sha256": sha256(p02b_result),
-            },
-        )
+        p02b_result = p02b_run / "sentinel-result.json"
         output = root / "output"
         return [
             sys.executable,
             "-B",
             str(ADAPTER),
-            "--mode", "fixture",
-            "--variant", "schema",
-            "--binary", str(FIXTURE_BINARY),
-            "--binary-sha256", sha256(FIXTURE_BINARY),
-            "--data-dir", str(store),
-            "--store-manifest", str(store_manifest),
-            "--store-manifest-sha256", sha256(store_manifest),
-            "--store-tree-sha256", store_tree_sha,
-            "--sample-plan", str(plan),
-            "--sample-plan-sha256", sha256(plan),
-            "--truth", str(truth),
-            "--truth-sha256", sha256(truth),
-            "--id-map-dir", str(id_map),
-            "--id-map-manifest-sha256", sha256(id_manifest),
-            "--p02b-result", str(p02b_result),
-            "--p02b-result-sha256", sha256(p02b_result),
-            "--p02b-validator", str(P02B_VALIDATOR),
-            "--p02b-validator-sha256", sha256(P02B_VALIDATOR),
-            "--p31-wrapper", str(P31_WRAPPER),
-            "--p31-wrapper-sha256", sha256(P31_WRAPPER),
-            "--repo-root", str(REPO_ROOT),
-            "--request", str(request),
-            "--output-dir", str(output),
+            "--mode",
+            "fixture",
+            "--variant",
+            "schema",
+            "--binary",
+            str(FIXTURE_BINARY),
+            "--binary-sha256",
+            sha256(FIXTURE_BINARY),
+            "--data-dir",
+            str(store),
+            "--store-manifest",
+            str(store_manifest),
+            "--store-manifest-sha256",
+            sha256(store_manifest),
+            "--store-tree-sha256",
+            store_lineage["store_sha256"],
+            "--sample-plan",
+            str(plan),
+            "--sample-plan-sha256",
+            sha256(plan),
+            "--truth",
+            str(truth),
+            "--truth-sha256",
+            sha256(truth),
+            "--id-map-dir",
+            str(id_map),
+            "--id-map-manifest-sha256",
+            sha256(id_manifest),
+            "--p02b-result",
+            str(p02b_result),
+            "--p02b-result-sha256",
+            sha256(p02b_result),
+            "--p02b-validator",
+            str(P02B_VALIDATOR),
+            "--p02b-validator-sha256",
+            sha256(P02B_VALIDATOR),
+            "--p31-wrapper",
+            str(P31_WRAPPER),
+            "--p31-wrapper-sha256",
+            sha256(P31_WRAPPER),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--request",
+            str(request),
+            "--output-dir",
+            str(output),
         ]
 
-    def invoke(self, command: list[str], expected: int = 0) -> subprocess.CompletedProcess[str]:
-        environment = dict(os.environ)
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        completed = subprocess.run(command, text=True, capture_output=True, check=False, env=environment)
-        self.assertEqual(completed.returncode, expected, f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}")
-        return completed
-
-    def test_fixture_adapter_uses_one_storage_bench_process_and_publishes_contract(self) -> None:
+    def test_fixture_adapter_consumes_canonical_p02b_receipt_once(self) -> None:
         with tempfile.TemporaryDirectory(prefix="p10-seml0-adapter-") as temporary:
             root = Path(temporary)
             command = self.prepare(root)
@@ -216,25 +250,31 @@ class SemL0AdapterTests(unittest.TestCase):
             self.assertTrue((output / "adapter-result.json").is_file())
             self.assertTrue((output / "query-observations.tsv").is_file())
             self.assertTrue((output / "phase-events.jsonl").is_file())
-            provenance = json.loads((output / "adapter-provenance.json").read_text(encoding="utf-8"))
+            provenance = load_json(output / "adapter-provenance.json")
             self.assertEqual(provenance["command"]["invocations"], 1)
             self.assertEqual(provenance["variant"], "schema")
+            receipt = provenance["p02b"]["admission"]
+            self.assertEqual(receipt["state"], "PASS")
+            self.assertEqual(receipt["consumer"], "P10")
+            self.assertEqual(receipt["sentinel_result_sha256"], provenance["p02b"]["result"]["sha256"])
+            self.assertEqual(receipt["pass_marker_sha256"], provenance["p02b"]["pass_marker"]["sha256"])
+            self.assertEqual(receipt["provenance_sha256"], provenance["p02b"]["provenance"]["sha256"])
 
-    def test_p02b_plan_lineage_mismatch_fails_before_binary_launch(self) -> None:
+    def test_canonical_p02b_lineage_tamper_fails_before_binary_launch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="p10-seml0-lineage-") as temporary:
             root = Path(temporary)
             command = self.prepare(root)
-            result_path = root / "sentinel-result.json"
-            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result_path = root / "p02b-run" / "sentinel-result.json"
+            result = load_json(result_path)
             result["provenance"]["query_plan_sha256"] = "f" * 64
             write_json(result_path, result)
-            marker = json.loads((root / "FIXTURE-PASS").read_text(encoding="utf-8"))
+            marker_path = root / "p02b-run" / "FIXTURE-PASS"
+            marker = load_json(marker_path)
             marker["result_sha256"] = sha256(result_path)
-            write_json(root / "FIXTURE-PASS", marker)
-            index = command.index("--p02b-result-sha256") + 1
-            command[index] = sha256(result_path)
+            write_json(marker_path, marker)
+            command[command.index("--p02b-result-sha256") + 1] = sha256(result_path)
             completed = self.invoke(command, expected=2)
-            self.assertIn("query plan differs", completed.stderr)
+            self.assertIn("P02B admission failed", completed.stderr)
             self.assertFalse((root / "output" / "fixture-invocations.txt").exists())
 
 

@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sys
 from pathlib import Path
+
+P02B_FIXTURE_BINARY = Path(__file__).resolve().parents[2] / "p02b" / "tests" / "fixture_binary.py"
 
 
 def option(name: str) -> str:
@@ -20,6 +23,13 @@ def main() -> int:
     if "--help" in sys.argv:
         print("fixture SemL0 storage-bench")
         return 0
+    if "--p10-raw-output-dir" not in sys.argv:
+        if not P02B_FIXTURE_BINARY.is_file():
+            raise SystemExit(f"missing canonical P02B fixture binary: {P02B_FIXTURE_BINARY}")
+        os.execv(
+            sys.executable,
+            [sys.executable, "-B", str(P02B_FIXTURE_BINARY), *sys.argv[1:]],
+        )
     raw_dir = Path(option("--p10-raw-output-dir"))
     raw_dir.mkdir(parents=True)
     invocation_file = raw_dir.parent / "fixture-invocations.txt"
