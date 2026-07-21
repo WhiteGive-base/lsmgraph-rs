@@ -184,7 +184,7 @@ def build_request(
     mode: str,
 ) -> dict[str, Any]:
     protocol = suite["protocol"]
-    return {
+    request = {
         "schema_version": REQUEST_SCHEMA_VERSION,
         "contract_version": CONTRACT_VERSION,
         "suite_id": suite["suite_id"],
@@ -224,6 +224,14 @@ def build_request(
             "sequence_digest_algorithm": SEQUENCE_DIGEST_ALGORITHM,
         },
     }
+    if system["group"] == "client-server":
+        request["external_service"] = {
+            "service_lifecycle": system["service_lifecycle"],
+            "containers": list(system["containers"]),
+            "extra_pids": list(system["extra_pids"]),
+            "image_digests": list(system["image_digests"]),
+        }
+    return request
 
 
 def p31_command(
