@@ -35,6 +35,36 @@ The map is valid only for the exact dense edge list/truth generation lineage.
 Do not combine a map regenerated from a different scan order with an archived
 truth TSV, even if vertex and edge counts happen to match.
 
+### Recover the archived SF10 map without rebuilding the graph
+
+The 2026-06-24 SF10 run predates `--id-map-dir`, but its exact raw edge list,
+dense edge list, and historical converter are preserved.  Recover the map with
+the pinned lineage profile:
+
+```bash
+python3 baseline/recover_dense_id_map.py \
+  --lineage-profile sf10-20260624 \
+  --raw /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/edges-raw.tsv \
+  --dense /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/edges-dense.txt \
+  --converter /data/WorkSpace/lsmgraph-rs/baseline/convert_livegraph_edges.py \
+  --output-dir run/sf10-recovered-id-map
+
+(cd run/sf10-recovered-id-map && sha256sum -c SHA256SUMS)
+test -f run/sf10-recovered-id-map/FORMAL-PASS
+```
+
+This command hashes all three inputs before recovery, reads raw and dense edges
+in lockstep, enforces the historical first-seen assignment for every endpoint,
+checks both EOFs and the pinned 355,185,382-edge / 29,987,835-vertex counts,
+hashes raw and dense again during the full verification pass, then atomically
+publishes the two maps, manifest, and checksums.  It does not regenerate either
+edge list.
+
+`--max-rows N` is only for small fixtures.  Such a run writes an intentionally
+unsupported `seml0-shared-id-map-partial` manifest, writes no `FORMAL-PASS`, and
+exits with status 3 even when the verified prefix is valid.  Never use it to
+produce a map consumed by an experiment.
+
 ## 2. SemL0 correctness gate and shared sample plan
 
 ```bash
@@ -87,7 +117,9 @@ requires the existing LiveGraph headers and shared library.
 ## 4. Small-fixture tests
 
 ```bash
-python3 -m unittest baseline/shared-truth/test_convert_livegraph_edges.py
+python3 -m unittest \
+  baseline/shared-truth/test_convert_livegraph_edges.py \
+  baseline/shared-truth/test_recover_dense_id_map.py
 cargo test shared_truth --bin lsmgraph --lib
 ```
 
