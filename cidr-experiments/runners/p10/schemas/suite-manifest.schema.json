@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seml0.invalid/cidr/p10/suite-manifest.schema.json",
+  "title": "CIDR P10/P11 six-system suite manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "suite_id",
+    "task_ids",
+    "fixture_only",
+    "dataset",
+    "truth",
+    "protocol",
+    "resources",
+    "systems"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": "cidr-p10-suite-v1"},
+    "suite_id": {"type": "string", "minLength": 1},
+    "task_ids": {"const": ["P10", "P11"]},
+    "fixture_only": {"type": "boolean"},
+    "dataset": {"$ref": "#/$defs/artifact"},
+    "truth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "query_count", "digest_algorithm"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "query_count": {"type": "integer", "minimum": 1},
+        "digest_algorithm": {"const": "mix64-dense-dst-count-sum-xor-v1"}
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "group_policy",
+        "interface_scope",
+        "timing_boundary",
+        "clock",
+        "cache_policy",
+        "process_reuse_between_phases",
+        "warmup_passes",
+        "measured_passes",
+        "repeats",
+        "per_query_timeout_ms",
+        "adapter_process_timeout_s",
+        "concurrency",
+        "max_timeouts"
+      ],
+      "properties": {
+        "group_policy": {"const": "report-separately-no-cross-group-speedups"},
+        "interface_scope": {"const": "typed-neighbor-dense-id-v1"},
+        "timing_boundary": {"const": "typed-neighbor-call-plus-result-materialization-and-digest-v1"},
+        "clock": {"const": "CLOCK_MONOTONIC"},
+        "cache_policy": {"const": "full-shared-trace-before-each-measured-repeat-v1"},
+        "process_reuse_between_phases": {"const": true},
+        "warmup_passes": {"type": "integer", "minimum": 1},
+        "measured_passes": {"type": "integer", "minimum": 1},
+        "repeats": {"type": "integer", "minimum": 1},
+        "per_query_timeout_ms": {"type": "integer", "minimum": 1},
+        "adapter_process_timeout_s": {"type": "integer", "minimum": 1},
+        "concurrency": {"const": 1},
+        "max_timeouts": {"const": 0}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "data_mount", "interval_s", "disk_interval_s", "min_samples"],
+      "properties": {
+        "device": {"type": "string", "minLength": 1},
+        "data_mount": {"type": "string", "pattern": "^/"},
+        "interval_s": {"type": "integer", "minimum": 1},
+        "disk_interval_s": {"type": "integer", "minimum": 1},
+        "min_samples": {"type": "integer", "minimum": 2}
+      }
+    },
+    "systems": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {"$ref": "#/$defs/system"}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^$|^[0-9a-f]{64}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "args"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "args": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "root": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "path"],
+      "properties": {
+        "label": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$"},
+        "path": {"type": "string", "minLength": 1}
+      }
+    },
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "display_name",
+        "group",
+        "interface_scope",
+        "system_version",
+        "fixture_only",
+        "service_lifecycle",
+        "adapter",
+        "binary",
+        "store_roots",
+        "temp_roots",
+        "containers",
+        "extra_pids",
+        "image_digests"
+      ],
+      "properties": {
+        "id": {"enum": ["seml0", "livegraph", "aster", "tugraph", "neo4j", "nebulagraph"]},
+        "display_name": {"type": "string", "minLength": 1},
+        "group": {"enum": ["embedded", "client-server"]},
+        "interface_scope": {"const": "typed-neighbor-dense-id-v1"},
+        "system_version": {"type": "string", "minLength": 1},
+        "fixture_only": {"type": "boolean"},
+        "service_lifecycle": {"enum": ["in-process", "external-prestarted"]},
+        "adapter": {"$ref": "#/$defs/adapter"},
+        "binary": {"$ref": "#/$defs/artifact"},
+        "store_roots": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/root"}},
+        "temp_roots": {"type": "array", "items": {"$ref": "#/$defs/root"}},
+        "containers": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "extra_pids": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+        "image_digests": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

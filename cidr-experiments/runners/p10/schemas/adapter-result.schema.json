@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seml0.invalid/cidr/p10/adapter-result.schema.json",
+  "title": "CIDR P10/P11 adapter result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_version",
+    "system_id",
+    "group",
+    "system_version",
+    "interface_scope",
+    "repeat_index",
+    "truth_sha256",
+    "sequence_digest_algorithm",
+    "timing_boundary",
+    "clock",
+    "concurrency",
+    "per_query_timeout_ms",
+    "warmup",
+    "measured"
+  ],
+  "properties": {
+    "schema_version": {"const": "cidr-p10-adapter-result-v1"},
+    "contract_version": {"const": "cidr-typed-neighbor-adapter-v1"},
+    "system_id": {"type": "string", "minLength": 1},
+    "group": {"enum": ["embedded", "client-server"]},
+    "system_version": {"type": "string", "minLength": 1},
+    "interface_scope": {"const": "typed-neighbor-dense-id-v1"},
+    "repeat_index": {"type": "integer", "minimum": 1},
+    "truth_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sequence_digest_algorithm": {"const": "sha256-pass-query-count-sum-xor-v1"},
+    "timing_boundary": {"const": "typed-neighbor-call-plus-result-materialization-and-digest-v1"},
+    "clock": {"const": "CLOCK_MONOTONIC"},
+    "concurrency": {"const": 1},
+    "per_query_timeout_ms": {"type": "integer", "minimum": 1},
+    "warmup": {"$ref": "#/$defs/phase"},
+    "measured": {"$ref": "#/$defs/phase"}
+  },
+  "$defs": {
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passes",
+        "requested_queries",
+        "completed_queries",
+        "timeout_queries",
+        "mismatch_queries",
+        "started_monotonic_ns",
+        "ended_monotonic_ns",
+        "elapsed_ns",
+        "expected_digest_sha256",
+        "actual_digest_sha256"
+      ],
+      "properties": {
+        "passes": {"type": "integer", "minimum": 1},
+        "requested_queries": {"type": "integer", "minimum": 1},
+        "completed_queries": {"type": "integer", "minimum": 0},
+        "timeout_queries": {"type": "integer", "minimum": 0},
+        "mismatch_queries": {"type": "integer", "minimum": 0},
+        "started_monotonic_ns": {"type": "integer", "minimum": 0},
+        "ended_monotonic_ns": {"type": "integer", "minimum": 1},
+        "elapsed_ns": {"type": "integer", "minimum": 1},
+        "expected_digest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "actual_digest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seml0.invalid/cidr/p10/adapter-request.schema.json",
+  "title": "CIDR P10/P11 adapter request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_version",
+    "suite_id",
+    "run_id",
+    "system_id",
+    "group",
+    "system_version",
+    "interface_scope",
+    "repeat_index",
+    "truth",
+    "timing"
+  ],
+  "properties": {
+    "schema_version": {"const": "cidr-p10-adapter-request-v1"},
+    "contract_version": {"const": "cidr-typed-neighbor-adapter-v1"},
+    "suite_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "system_id": {"type": "string", "minLength": 1},
+    "group": {"enum": ["embedded", "client-server"]},
+    "system_version": {"type": "string", "minLength": 1},
+    "interface_scope": {"const": "typed-neighbor-dense-id-v1"},
+    "repeat_index": {"type": "integer", "minimum": 1},
+    "truth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "query_count", "digest_algorithm"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "query_count": {"type": "integer", "minimum": 1},
+        "digest_algorithm": {"const": "mix64-dense-dst-count-sum-xor-v1"}
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timing_boundary",
+        "clock",
+        "cache_policy",
+        "process_reuse_between_phases",
+        "warmup_passes",
+        "measured_passes",
+        "concurrency",
+        "per_query_timeout_ms",
+        "sequence_digest_algorithm"
+      ],
+      "properties": {
+        "timing_boundary": {"const": "typed-neighbor-call-plus-result-materialization-and-digest-v1"},
+        "clock": {"const": "CLOCK_MONOTONIC"},
+        "cache_policy": {"const": "full-shared-trace-before-each-measured-repeat-v1"},
+        "process_reuse_between_phases": {"const": true},
+        "warmup_passes": {"type": "integer", "minimum": 1},
+        "measured_passes": {"type": "integer", "minimum": 1},
+        "concurrency": {"const": 1},
+        "per_query_timeout_ms": {"type": "integer", "minimum": 1},
+        "sequence_digest_algorithm": {"const": "sha256-pass-query-count-sum-xor-v1"}
+      }
+    }
+  }
+}

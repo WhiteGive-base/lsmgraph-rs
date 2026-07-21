@@ -1,0 +1,216 @@
+{
+  "$schema": "../schemas/suite-manifest.schema.json",
+  "schema_version": "cidr-p10-suite-v1",
+  "suite_id": "p10-p11-six-system-fixture",
+  "task_ids": [
+    "P10",
+    "P11"
+  ],
+  "fixture_only": true,
+  "dataset": {
+    "path": "${REPO_ROOT}/baseline/shared-truth/fixtures/dense-edges.txt",
+    "sha256": ""
+  },
+  "truth": {
+    "path": "${REPO_ROOT}/baseline/shared-truth/fixtures/truth.tsv",
+    "sha256": "",
+    "query_count": 2,
+    "digest_algorithm": "mix64-dense-dst-count-sum-xor-v1"
+  },
+  "protocol": {
+    "group_policy": "report-separately-no-cross-group-speedups",
+    "interface_scope": "typed-neighbor-dense-id-v1",
+    "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+    "clock": "CLOCK_MONOTONIC",
+    "cache_policy": "full-shared-trace-before-each-measured-repeat-v1",
+    "process_reuse_between_phases": true,
+    "warmup_passes": 1,
+    "measured_passes": 1,
+    "repeats": 1,
+    "per_query_timeout_ms": 100,
+    "adapter_process_timeout_s": 10,
+    "concurrency": 1,
+    "max_timeouts": 0
+  },
+  "resources": {
+    "device": "fixture-device",
+    "data_mount": "/data",
+    "interval_s": 1,
+    "disk_interval_s": 1,
+    "min_samples": 2
+  },
+  "systems": [
+    {
+      "id": "seml0",
+      "display_name": "SemL0",
+      "group": "embedded",
+      "interface_scope": "typed-neighbor-dense-id-v1",
+      "system_version": "fixture-seml0-v1",
+      "fixture_only": true,
+      "service_lifecycle": "in-process",
+      "adapter": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": "",
+        "args": ["--profile", "ok", "--latency-base-ns", "100000"]
+      },
+      "binary": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": ""
+      },
+      "store_roots": [
+        {
+          "label": "graph",
+          "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixtures/store"
+        }
+      ],
+      "temp_roots": [],
+      "containers": [],
+      "extra_pids": [],
+      "image_digests": []
+    },
+    {
+      "id": "livegraph",
+      "display_name": "LiveGraph",
+      "group": "embedded",
+      "interface_scope": "typed-neighbor-dense-id-v1",
+      "system_version": "fixture-livegraph-v1",
+      "fixture_only": true,
+      "service_lifecycle": "in-process",
+      "adapter": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": "",
+        "args": ["--profile", "ok", "--latency-base-ns", "110000"]
+      },
+      "binary": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": ""
+      },
+      "store_roots": [
+        {
+          "label": "graph",
+          "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixtures/store"
+        }
+      ],
+      "temp_roots": [],
+      "containers": [],
+      "extra_pids": [],
+      "image_digests": []
+    },
+    {
+      "id": "aster",
+      "display_name": "Aster",
+      "group": "embedded",
+      "interface_scope": "typed-neighbor-dense-id-v1",
+      "system_version": "fixture-aster-v1",
+      "fixture_only": true,
+      "service_lifecycle": "in-process",
+      "adapter": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": "",
+        "args": ["--profile", "ok", "--latency-base-ns", "120000"]
+      },
+      "binary": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": ""
+      },
+      "store_roots": [
+        {
+          "label": "graph",
+          "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixtures/store"
+        }
+      ],
+      "temp_roots": [],
+      "containers": [],
+      "extra_pids": [],
+      "image_digests": []
+    },
+    {
+      "id": "tugraph",
+      "display_name": "TuGraph",
+      "group": "embedded",
+      "interface_scope": "typed-neighbor-dense-id-v1",
+      "system_version": "fixture-tugraph-v1",
+      "fixture_only": true,
+      "service_lifecycle": "in-process",
+      "adapter": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": "",
+        "args": ["--profile", "ok", "--latency-base-ns", "130000"]
+      },
+      "binary": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": ""
+      },
+      "store_roots": [
+        {
+          "label": "graph",
+          "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixtures/store"
+        }
+      ],
+      "temp_roots": [],
+      "containers": [],
+      "extra_pids": [],
+      "image_digests": []
+    },
+    {
+      "id": "neo4j",
+      "display_name": "Neo4j",
+      "group": "client-server",
+      "interface_scope": "typed-neighbor-dense-id-v1",
+      "system_version": "fixture-neo4j-v1",
+      "fixture_only": true,
+      "service_lifecycle": "external-prestarted",
+      "adapter": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": "",
+        "args": ["--profile", "ok", "--latency-base-ns", "140000"]
+      },
+      "binary": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": ""
+      },
+      "store_roots": [
+        {
+          "label": "graph",
+          "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixtures/store"
+        }
+      ],
+      "temp_roots": [],
+      "containers": ["fixture-neo4j"],
+      "extra_pids": [],
+      "image_digests": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]
+    },
+    {
+      "id": "nebulagraph",
+      "display_name": "NebulaGraph",
+      "group": "client-server",
+      "interface_scope": "typed-neighbor-dense-id-v1",
+      "system_version": "fixture-nebulagraph-v1",
+      "fixture_only": true,
+      "service_lifecycle": "external-prestarted",
+      "adapter": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": "",
+        "args": ["--profile", "ok", "--latency-base-ns", "150000"]
+      },
+      "binary": {
+        "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixture_adapter.py",
+        "sha256": ""
+      },
+      "store_roots": [
+        {
+          "label": "graph",
+          "path": "${REPO_ROOT}/cidr-experiments/runners/p10/tests/fixtures/store"
+        }
+      ],
+      "temp_roots": [],
+      "containers": ["fixture-nebula-graphd", "fixture-nebula-metad", "fixture-nebula-storaged"],
+      "extra_pids": [],
+      "image_digests": [
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      ]
+    }
+  ]
+}
