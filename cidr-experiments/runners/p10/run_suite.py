@@ -36,6 +36,7 @@ from p10_contract import (
     read_p31_summary,
     sha256_file,
     validate_adapter_outputs,
+    validate_seml0_p31_binding,
 )
 
 
@@ -358,6 +359,8 @@ def execute_repeat(
         truth_rows=truth_rows,
         max_timeouts=suite["protocol"]["max_timeouts"],
     )
+    if mode == "formal" and system["id"] == "seml0":
+        validate_seml0_p31_binding(validated.get("adapter_provenance"), p31)
     validated["p31"] = p31
     validated["request"] = {
         "path": str(request_path.resolve()),

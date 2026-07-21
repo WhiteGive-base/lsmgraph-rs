@@ -801,6 +801,23 @@ def validate_adapter_outputs(
     completed = counters["measured"]["completed"]
     if completed == 0 or measured_elapsed_ns <= 0:
         raise ContractError("measured phase contains no completed timed query")
+    provenance_path = output_dir / "adapter-provenance.json"
+    adapter_provenance: dict[str, Any] | None = None
+    if provenance_path.is_file():
+        adapter_provenance = read_json(provenance_path, "adapter provenance")
+        if system["id"] == "seml0":
+            if adapter_provenance.get("schema_version") != "p10-seml0-adapter-provenance-v1":
+                raise ContractError("SemL0 adapter provenance has wrong schema_version")
+            if adapter_provenance.get("variant") not in {"naive", "schema", "b64", "budg-b64", "semantic"}:
+                raise ContractError("SemL0 adapter provenance has unknown variant")
+            command = adapter_provenance.get("command")
+            if not isinstance(command, dict) or command.get("invocations") != 1 or command.get("exit_code") != 0:
+                raise ContractError("SemL0 adapter must record exactly one successful storage-bench invocation")
+    elif system["id"] == "seml0" and not system.get("fixture_only", False):
+        raise ContractError("formal SemL0 adapter omitted adapter-provenance.json")
+    artifact_paths = [result_path, observations_path, events_path]
+    if provenance_path.is_file():
+        artifact_paths.append(provenance_path)
     return {
         "schema_version": "cidr-p10-validated-repeat-v1",
         "system_id": system["id"],
@@ -829,8 +846,9 @@ def validate_adapter_outputs(
         "per_query_timeout_ms": request["timing"]["per_query_timeout_ms"],
         "adapter_artifacts": {
             path.name: {"path": str(path.resolve()), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
-            for path in (result_path, observations_path, events_path)
+            for path in artifact_paths
         },
+        "adapter_provenance": adapter_provenance,
     }
 
 
@@ -871,4 +889,60 @@ def read_p31_summary(run_dir: Path, *, performance_eligible: bool) -> dict[str, 
         "done_sha256": sha256_file(done),
         "resources": summary["resources"],
         "disk": summary["disk"],
+        "repo": manifest.get("repo"),
+        "harness": manifest.get("harness"),
+        "inputs": manifest.get("inputs"),
+        "disk_roots": manifest.get("disk_roots"),
     }
+
+
+def validate_seml0_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
+    """Cross-bind SemL0's internal lineage to the enclosing P31 observation."""
+
+    if not isinstance(provenance, dict):
+        raise ContractError("formal SemL0 result lacks parsed adapter provenance")
+    expected_refs = {
+        "binary": provenance.get("binary"),
+        "truth": provenance.get("truth"),
+        "p31_wrapper": provenance.get("p31_wrapper"),
+    }
+    for label, ref in expected_refs.items():
+        if not isinstance(ref, dict) or not isinstance(ref.get("path"), str) or not isinstance(ref.get("sha256"), str):
+            raise ContractError(f"SemL0 provenance lacks {label} path/SHA binding")
+    harness = p31.get("harness")
+    inputs = p31.get("inputs")
+    repo = p31.get("repo")
+    disk_roots = p31.get("disk_roots")
+    if not isinstance(harness, dict) or not isinstance(inputs, dict) or not isinstance(repo, dict) or not isinstance(disk_roots, list):
+        raise ContractError("P31 manifest lacks lineage objects required by SemL0")
+
+    def same_ref(observed: object, expected: dict[str, Any], label: str) -> None:
+        if not isinstance(observed, dict):
+            raise ContractError(f"P31 lacks {label} artifact reference")
+        if Path(str(observed.get("path", ""))).resolve() != Path(expected["path"]).resolve():
+            raise ContractError(f"P31 {label} path differs from SemL0 provenance")
+        if observed.get("sha256") != expected["sha256"]:
+            raise ContractError(f"P31 {label} SHA-256 differs from SemL0 provenance")
+
+    same_ref(harness.get("wrapper"), expected_refs["p31_wrapper"], "wrapper")
+    same_ref(inputs.get("binary"), expected_refs["binary"], "binary")
+    same_ref(inputs.get("truth"), expected_refs["truth"], "truth")
+    same_ref(inputs.get("query_or_trace"), expected_refs["truth"], "query_or_trace")
+    provenance_repo = provenance.get("repo")
+    if not isinstance(provenance_repo, dict) or repo.get("git_sha") != provenance_repo.get("head"):
+        raise ContractError("P31 Git SHA differs from SemL0 provenance")
+    if repo.get("dirty") is not False:
+        raise ContractError("formal SemL0 P31 manifest reports a dirty repository")
+    store = provenance.get("store")
+    if not isinstance(store, dict) or not isinstance(store.get("path"), str):
+        raise ContractError("SemL0 provenance lacks store path")
+    store_path = Path(store["path"]).resolve()
+    matching_roots = [
+        root
+        for root in disk_roots
+        if isinstance(root, dict)
+        and root.get("role") == "store"
+        and Path(str(root.get("path", ""))).resolve() == store_path
+    ]
+    if len(matching_roots) != 1:
+        raise ContractError("P31 does not monitor exactly the SemL0 provenance store")
