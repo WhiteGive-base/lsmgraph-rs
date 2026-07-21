@@ -114,19 +114,23 @@
 
 | 阶段 | 配置 | 隔离的问题 |
 |---|---|---|
-| A0 | Naive LSM-CSR | 无语义控制的锚点 |
-| A1 | + exact label/type evidence，关闭 semantic routing | metadata 判断本身的收益/CPU |
+| A0 | 与 A1 共用 evidence store，但关闭 query control | 单因素阶梯锚点；不把 layout 差异混入 admission |
+| A1 | + exact label/type evidence admission，关闭 semantic routing | metadata 判断本身的收益/CPU |
 | A2 | + semantic L0 index/routing | 路由结构减少多少 candidate lookup |
 | A3 | + budgeted degree promotion | 额外语义维度的边际收益与 fanout |
-| A4 | + feedback-based priority | query feedback 是否优于静态/size-only |
+| A4 | + feedback-driven adaptation | 在与 A3 相同 training/cache 前态上，加入 feedback 决策及其触发的 compaction；不拆分二者的单独贡献，也不宣称优于未测的 static comparator |
 | A5 | + semantic-aware compaction | pruning surface 是否跨 lifecycle 保留 |
 | A6 | Full SemL0 | 完整系统工作点 |
 
 **数据/workload**：SF10 对 A0--A6 完整执行 typed one-hop、degree-stratified、property-presence；SF30 对 A0/A2/A4/A6 做三类 workload 的代表性复验。由此覆盖每个组件和每种语义，但不把 SF30 全阶梯重复一遍。
 
+**隔离约束**：A0/A1 必须使用同一 `semantic-budgeted` 物理 store，A0 仅关闭 evidence admission；真正的 naive LSM-CSR 只在端到端 Figure 1 中作为系统基线。A3/A4 的每个独立 run 必须从同一 frozen pristine store 的新 clone 和相同 cache policy 启动，重放完全相同的 training trace，并在 adaptation 发生前具有相同 compaction 前态；A3 关闭 feedback/maintenance 且不执行反馈 compaction，A4 启用 feedback 并执行其决策。因此 A3→A4 只能归因为“feedback-driven adaptation（含其触发的 compaction）”的整体增益，不能声称隔离了纯 feedback priority 或纯 compaction 算法。A4/A5 必须在各自单次 run 的同一 Engine 进程内保留 training 产生的 feedback 状态，再分别执行 global/semantic feedback compaction；feedback 状态不得跨进程假装复用。
+
 **主指标**：latency/QPS、candidates/op、body reads/op、read bytes/op。
 
-**代价指标**：CPU/op、metadata lookup/build time、RSS、metadata bytes、L0 files、compaction write amplification。
+**运行/统计粒度**：每个 `stage × repeat` 将无 instrumentation 的正式 latency run 与同输入、同 clean-window sentinel 的 CPU-phase diagnostic run 配对。benchmark entry 先用原始 histogram buckets 和可加总 counter 合并成一个 run-stage 观测，再以三个独立 run 计算 CI；不得把 entry 当作重复、平均 entry P99，或用 instrumented P99 冒充正式 latency。
+
+**代价指标**：CPU/op、metadata lookup/build time、RSS、metadata bytes、L0 files、compaction write amplification。A0--A5 做互斥 CPU phase 分解；A6 的 automatic lifecycle 会引入维护 CPU，只在 closed-loop process-tree 资源数据中报告，不伪装成同一套 query phase。
 
 **必须解释**：当前 W6 中 edge-type-only 与 richer semantic 接近，且 budget 增大时 candidate 数不单调；新消融必须解释文件碎片、routing 和 body-read 的相互作用。
 

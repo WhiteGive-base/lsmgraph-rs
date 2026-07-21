@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "experiment_id": "P20-G2-QUERY-CONTROL-STAIRCASE",
+  "description": "Fail-closed canonical profiles for the CIDR A0--A6 query-control ablation.",
+  "fixed_inputs": {
+    "sample_plan": "shared-per-scale-and-workload",
+    "truth": "shared-per-scale-and-workload",
+    "import_order": "shared-per-scale",
+    "io_backend": "blocking",
+    "semantic_budget_profile": "frozen-v1",
+    "store_isolation": "clone-one-pristine-store-per-stage-and-independent-run"
+  },
+  "feature_order": [
+    "exact_evidence_admission",
+    "semantic_routing",
+    "budgeted_degree_promotion",
+    "feedback_priority",
+    "semantic_compaction",
+    "automatic_lifecycle_control"
+  ],
+  "stages": [
+    {
+      "id": "A0",
+      "label": "Evidence present, query control disabled",
+      "l0_layout": "semantic-budgeted",
+      "features": [false, false, false, false, false, false],
+      "pre_measurement": {"kind": "none"}
+    },
+    {
+      "id": "A1",
+      "label": "+ exact evidence admission",
+      "l0_layout": "semantic-budgeted",
+      "features": [true, false, false, false, false, false],
+      "pre_measurement": {"kind": "none"}
+    },
+    {
+      "id": "A2",
+      "label": "+ semantic routing",
+      "l0_layout": "semantic-budgeted",
+      "features": [true, true, false, false, false, false],
+      "pre_measurement": {"kind": "none"}
+    },
+    {
+      "id": "A3",
+      "label": "+ budgeted degree promotion",
+      "l0_layout": "semantic-budgeted",
+      "features": [true, true, true, false, false, false],
+      "pre_measurement": {
+        "kind": "fixed-trace-adaptation-control",
+        "trace": "shared-training-trace",
+        "training_runs": 1,
+        "training_start_cache_state": "fresh-clone-process-start",
+        "adaptation_prestate": "post-identical-training-trace",
+        "feedback": "disabled",
+        "feedback_compactions": 0,
+        "paired_stage": "A4",
+        "claim_scope": "control-for-feedback-driven-adaptation"
+      }
+    },
+    {
+      "id": "A4",
+      "label": "+ feedback-driven adaptation",
+      "l0_layout": "semantic-budgeted",
+      "features": [true, true, true, true, false, false],
+      "pre_measurement": {
+        "kind": "fixed-trace-feedback-adaptation",
+        "trace": "shared-training-trace",
+        "training_runs": 1,
+        "training_start_cache_state": "fresh-clone-process-start",
+        "adaptation_prestate": "post-identical-training-trace",
+        "feedback": "enabled",
+        "feedback_compactions": 1,
+        "paired_stage": "A3",
+        "compaction_output": "legacy-global",
+        "claim_scope": "feedback-driven-adaptation-including-triggered-compaction"
+      }
+    },
+    {
+      "id": "A5",
+      "label": "+ semantic compaction",
+      "l0_layout": "semantic-budgeted",
+      "features": [true, true, true, true, true, false],
+      "pre_measurement": {
+        "kind": "fixed-trace-manual-feedback-compaction",
+        "trace": "shared-training-trace",
+        "compaction_output": "semantic-partitioned"
+      }
+    },
+    {
+      "id": "A6",
+      "label": "Full SemL0 closed loop",
+      "l0_layout": "semantic-budgeted",
+      "features": [true, true, true, true, true, true],
+      "pre_measurement": {
+        "kind": "fixed-trace-automatic-maintenance",
+        "trace": "shared-training-trace",
+        "settle": "engine-quiescence"
+      }
+    }
+  ],
+  "modes": {
+    "latency": {
+      "performance_eligible": true,
+      "query_cpu_phases": false,
+      "automatic_maintenance": "a6-only",
+      "post_round_manual_compaction": false,
+      "max_query_streams": 1,
+      "allowed_stages": ["A0", "A1", "A2", "A3", "A4", "A5", "A6"]
+    },
+    "cpu-phase": {
+      "performance_eligible": false,
+      "query_cpu_phases": true,
+      "automatic_maintenance": "never",
+      "post_round_manual_compaction": false,
+      "max_query_streams": 1,
+      "allowed_stages": ["A0", "A1", "A2", "A3", "A4", "A5"]
+    },
+    "closed-loop-resource": {
+      "performance_eligible": true,
+      "query_cpu_phases": false,
+      "automatic_maintenance": "always",
+      "post_round_manual_compaction": false,
+      "max_query_streams": 1,
+      "allowed_stages": ["A6"]
+    },
+    "correctness": {
+      "performance_eligible": false,
+      "query_cpu_phases": false,
+      "automatic_maintenance": "a6-only",
+      "post_round_manual_compaction": false,
+      "max_query_streams": 1,
+      "allowed_stages": ["A0", "A1", "A2", "A3", "A4", "A5", "A6"]
+    }
+  },
+  "workloads": {
+    "typed-one-hop": {
+      "args": ["--workload-mode", "one-hop", "--emit-result-digests"],
+      "required_bindings": []
+    },
+    "degree-stratified": {
+      "args": [
+        "--workload-mode", "one-hop",
+        "--semantic-degree-hint",
+        "--sample-plan-degree-hint",
+        "--emit-result-digests"
+      ],
+      "required_bindings": []
+    },
+    "property-presence": {
+      "args": [
+        "--workload-mode", "one-hop",
+        "--property-predicate-mode", "presence",
+        "--property-id", "${PROPERTY_ID}",
+        "--emit-result-digests"
+      ],
+      "required_bindings": ["PROPERTY_ID"]
+    }
+  },
+  "matrix": {
+    "sf10": {
+      "stages": ["A0", "A1", "A2", "A3", "A4", "A5", "A6"],
+      "workloads": ["typed-one-hop", "degree-stratified", "property-presence"],
+      "minimum_independent_runs": 3
+    },
+    "sf30": {
+      "stages": ["A0", "A2", "A4", "A6"],
+      "workloads": ["typed-one-hop", "degree-stratified", "property-presence"],
+      "minimum_independent_runs": 3
+    }
+  }
+}

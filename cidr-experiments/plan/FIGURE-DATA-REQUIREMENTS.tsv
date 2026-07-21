@@ -44,12 +44,12 @@ F2	b	one row per run and stage	body_read_segments_total	uint64	segments	yes	raw	
 F2	b	one row per run and stage	measured_operations	uint64	ops	yes	denominator	direct	>0	Same operation count unless timeout reported
 F2	c	one row per run and stage	body_read_bytes_total	uint64	bytes	yes	raw	direct	>=0	Logical body bytes used by main plot
 F2	c	one row per run and stage	device_read_bytes_total	uint64	bytes	no	secondary	direct	>=0	OS/device counter, not substituted silently
-F2	d	one row per run and stage	cpu_signature_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
-F2	d	one row per run and stage	cpu_admission_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
-F2	d	one row per run and stage	cpu_routing_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
-F2	d	one row per run and stage	cpu_body_decode_filter_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
-F2	d	one row per run and stage	cpu_mvcc_result_ns	uint64	ns	yes	measure	sum	>=0	Mutually exclusive CPU phase
-F2	d	one row per run and stage	cpu_total_ns	uint64	ns	yes	check	sum	>=sum(phases)	Unattributed CPU reported separately if nonzero
+F2	d	one row per run and stage	cpu_query_setup_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 only; includes signature construction and degree-directory lookup
+F2	d	one row per run and stage	cpu_admission_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
+F2	d	one row per run and stage	cpu_routing_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
+F2	d	one row per run and stage	cpu_body_decode_filter_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
+F2	d	one row per run and stage	cpu_mvcc_result_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
+F2	d	one row per run and stage	cpu_total_ns	uint64	ns	conditional	check	sum	>=sum(phases)	A0-A5 phase run; A6 closed-loop total is reported separately
 F2	all	one row per run and stage	l0_file_count	uint64	files	no	explanation	direct	>=0	Explain candidate non-monotonicity
 F2	all	one row per run and stage	compaction_write_amplification	float	ratio	no	explanation	direct	>=1 or documented definition	Same formula across stages
 F3	all	one row per run, budget, workload and phase	semantic_budget	string	-	yes	key	direct	schema|B16|B64|B256|B1024|full	Do not infer physical file cap

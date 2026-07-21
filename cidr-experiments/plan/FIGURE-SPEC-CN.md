@@ -92,7 +92,9 @@
 **输出 stem**：`fig_component_ablation`  
 **主版式**：双栏，`figsize=(7.05, 3.75)`，`GridSpec(2, 2)`。单栏拆为性能 `(3.38, 3.55)` 与 CPU 分解 `(3.38, 2.25)`。
 
-**共同 x**：有序配置 `A0..A6`：A0 naive；A1 + exact label/type evidence（routing off）；A2 + semantic routing；A3 + budgeted degree；A4 + feedback priority；A5 + semantic compaction；A6 full SemL0。x 标签使用 `A0` 等短名，完整定义放在 caption，避免斜长标签穿模。
+**共同 x**：有序配置 `A0..A6`：A0 与 A1 共用 evidence store 但关闭 query control；A1 + exact label/type evidence admission（routing off）；A2 + semantic routing；A3 + budgeted degree；A4 + feedback-driven adaptation（含其反馈决策触发的 compaction）；A5 + semantic compaction；A6 full closed-loop SemL0。真正的 naive layout 只放在 Figure 1。x 标签使用 `A0` 等短名，完整定义放在 caption，避免斜长标签穿模。
+
+**配对与聚合协议**：每个 `stage × repeat` 必须分别运行无 instrumentation 的正式 `latency` profile 与同一 binary/dataset/sample-plan/truth/store/sentinel 的 `cpu-phase` profile，再按 `stage + repeat` 配对；不得用 instrumented P99 代替正式 latency。原始 summary 是 benchmark-entry 粒度，必须先合并同一 run 的 histogram buckets 与可加总 counter，得到唯一 run-stage P99/总量，再把三个独立 run 用作 CI 样本；entry 不能当作独立重复，也不能平均 entry-level P99。A6 不要求 `cpu-phase` 配对。
 
 ### Panel (a)：tail latency
 
@@ -115,13 +117,13 @@
 ### Panel (d)：CPU/op 分解
 
 - **y**：CPU us/op，线性，从 0 起。
-- **marks**：stacked bar，依次为 signature build、metadata admission、routing/index、body decode/filter、MVCC/result；bar 顶端是 total CPU/op 的跨 run 95% CI。
+- **marks**：A0--A5 stacked bar，依次为 query setup（含 signature 构造与 degree-directory lookup）、metadata admission、routing/index、body decode/filter、MVCC/result；bar 顶端是 total CPU/op 的跨 run 95% CI。A6 不画伪造的 phase stack，其 closed-loop process-tree CPU 放资源图/补充表。
 - **颜色**：各 phase 使用同一蓝灰色系，由浅到深；body decode/filter 用灰色，避免与 variant 身份颜色冲突。
 - **annotation**：bar 顶只标总 CPU/op；不在细小 stack 内强塞文本。
 
 ### Caption claim
 
-安全模板：**“The staircase isolates the marginal effect and CPU cost of each enabled control-plane component under the same data and query trace. Non-monotonic steps are retained because finer partitioning can trade fewer bytes for more candidate files.”** 只有 A0--A6 真正由独立开关隔离时才可称为 causality/ablation。
+安全模板：**“The staircase isolates the marginal effect and CPU cost of each enabled control-plane component under the same data and query trace. Non-monotonic steps are retained because finer partitioning can trade fewer bytes for more candidate files.”** A0/A1 必须共用物理 store；A3/A4 必须重放完全相同的 training trace，并具有相同 warm/cache 与 compaction 前态，A3 不执行反馈 compaction、A4 执行反馈决策；A4/A5 必须同进程复用 feedback。A3→A4 仅报告 feedback-driven adaptation（含其触发的 compaction）的整体增益，不声称纯单因素或单独 compaction 算法收益。
 
 ### 所需数据字段
 
