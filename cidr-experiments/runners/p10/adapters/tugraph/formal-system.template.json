@@ -1,0 +1,46 @@
+{
+  "id": "tugraph",
+  "display_name": "TuGraph",
+  "group": "embedded",
+  "interface_scope": "typed-neighbor-dense-id-v1",
+  "system_version": "TuGraph-4.5.2-native-embedded",
+  "fixture_only": false,
+  "service_lifecycle": "in-process",
+  "adapter": {
+    "path": "__ABSOLUTE_REPO__/cidr-experiments/runners/p10/adapters/tugraph/tugraph_adapter.py",
+    "sha256": "__ADAPTER_SHA256__",
+    "args": [
+      "--store-manifest",
+      "__ABSOLUTE_ARTIFACTS__/tugraph-store-manifest.json",
+      "--store-manifest-sha256",
+      "__STORE_MANIFEST_SHA256__",
+      "--runtime-manifest",
+      "__ABSOLUTE_ARTIFACTS__/tugraph-runtime-manifest.json",
+      "--runtime-manifest-sha256",
+      "__RUNTIME_MANIFEST_SHA256__",
+      "--expected-truth-sha256",
+      "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788",
+      "--p02b-result",
+      "__ABSOLUTE_P02B__/sentinel-result.json",
+      "--p02b-validator",
+      "__ABSOLUTE_REPO__/cidr-experiments/runners/p02b/validate_sentinel_result.py",
+      "--p02b-validator-sha256",
+      "__P02B_VALIDATOR_SHA256__"
+    ]
+  },
+  "binary": {
+    "path": "__ABSOLUTE_ARTIFACTS__/tugraph-p10-worker",
+    "sha256": "__WORKER_SHA256__"
+  },
+  "store_roots": [
+    {
+      "label": "tugraph",
+      "path": "__ABSOLUTE_TUGRAPH_SF10_STORE__",
+      "sha256": "__P02B_STORE_TREE_SHA256__"
+    }
+  ],
+  "temp_roots": [],
+  "containers": [],
+  "extra_pids": [],
+  "image_digests": []
+}

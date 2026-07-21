@@ -1,0 +1,41 @@
+{
+  "schema_version": "cidr-p10-tugraph-runtime-compatibility-evidence-v1",
+  "observed_date": "2026-07-22",
+  "target_system": "TuGraph-4.5.2-native-embedded",
+  "installed_prefix": "/home/ydl/apps/tugraph-4.5.2/usr/local",
+  "host_compiler": "g++ (Ubuntu 9.4.0-1ubuntu1~20.04.2) 9.4.0",
+  "build_image": {
+    "repo_digest": "tugraph/tugraph-runtime-ubuntu18.04@sha256:b492ccc83f866170b1fb43da5fd89e0ea43199a3144e9faee5b0c02b167bcee5",
+    "image_id": "sha256:b20ef00135b4d8edac13289bd3ec077873714dc4989c770cd8a7cbc51fbe259c",
+    "compiler": "/usr/local/bin/g++",
+    "compiler_version": "g++ (GCC) 8.4.0"
+  },
+  "probes": [
+    {
+      "id": "host-gcc9-c-api",
+      "result": "fail",
+      "evidence": "SIGSEGV in lgraph_api_galaxy_create before database file operations"
+    },
+    {
+      "id": "host-gcc9-cpp-api",
+      "result": "fail",
+      "evidence": "SIGSEGV entering lgraph_api::Galaxy construction"
+    },
+    {
+      "id": "ubuntu18-runtime-with-host-libgfortran",
+      "result": "fail",
+      "evidence": "libgfortran.so.4 requires GLIBC_2.29, unavailable in Ubuntu 18.04"
+    },
+    {
+      "id": "ubuntu18-gcc8-build-host-native-run",
+      "result": "pass",
+      "evidence": "isolated Galaxy store creation and 1700 warmup plus 1700 measured adapter fixture passed"
+    }
+  ],
+  "runtime_execution": {
+    "model": "native-embedded-single-worker-process-v1",
+    "containers": [],
+    "image_digests": [],
+    "existing_service_touched": false
+  }
+}
