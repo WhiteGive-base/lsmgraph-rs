@@ -94,7 +94,7 @@ measured 边界；import wall/CPU/store bytes 单独报告，不得混入 query 
 |---|---|---|
 | SemL0 | 共享 truth 消费、同进程 warmup/measured、逐查询观测 | integration release binary；四个变体各自 store；共享 sample plan |
 | LiveGraph | `adapters/livegraph_adapter.py`；原生 worker 同进程 fresh import→warmup→measured | 每个 repeat 使用全新的 store/temp；冻结 dense dataset、worker 和 `liblivegraph.so` SHA |
-| Aster | RocksGraph typed-neighbor bridge | clean/pinned source 与重建 driver；兼容 DB |
+| Aster | `adapters/aster_adapter.py` + 原生 RocksGraph worker | clean/pinned source、冻结 binary/dataset/logical-store SHA、reopen DB、P02B PASS |
 | TuGraph | typed-neighbor adapter | 冻结 runtime/image/binary；正式运行期间独占服务或 in-process 入口 |
 | Neo4j | Bolt typed-neighbor client adapter | 精确 image digest、固定 client；外部预启动且容器名写入 manifest |
 | NebulaGraph | nGQL typed-neighbor client adapter | graphd/metad/storaged 精确 digest；三个外部预启动容器均写入 manifest |
@@ -111,6 +111,14 @@ store manifest 的 lineage SHA-256。`fresh-import-and-query-process-lifetime-v1
 声明的是空的 base root；运行器为每个 repeat 派生并创建唯一 store/temp 子目录，
 拒绝复用已有目录。实际路径写入 adapter request 和 P31 argv，导入后 logical/
 allocated bytes 写入结果。
+
+### Aster adapter
+
+Aster 已有真实 `RocksGraph::AddVertexWithEdges/GetAllEdges` adapter、fresh/reopen
+生命周期、逐查询延迟与 digest、逻辑 store SHA、P02B/P31 formal gate。完整构建、
+store 发布和剩余正式依赖见
+[`adapters/ASTER-ADAPTER-CN.md`](adapters/ASTER-ADAPTER-CN.md)。`fresh` 仅用于
+tiny/SF1 correctness；正式 Figure 1 必须使用已冻结的 `reopen` store。
 
 ### LiveGraph adapter 的当前边界
 
