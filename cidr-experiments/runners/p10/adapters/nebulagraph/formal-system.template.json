@@ -1,0 +1,61 @@
+{
+  "id": "nebulagraph",
+  "display_name": "NebulaGraph",
+  "group": "client-server",
+  "interface_scope": "typed-neighbor-dense-id-v1",
+  "system_version": "NebulaGraph 3.8.0",
+  "fixture_only": false,
+  "service_lifecycle": "external-prestarted",
+  "process_lifetime": "external-prestarted-query-process-lifetime-v1",
+  "adapter": {
+    "path": "${REPO_ROOT}/cidr-experiments/runners/p10/adapters/nebulagraph/nebula_adapter.py",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "args": [
+      "--service-mode",
+      "external-prestarted",
+      "--runtime-manifest",
+      "/ABS/P10-NEBULA/runtime-manifest.json",
+      "--runtime-manifest-sha256",
+      "REPLACE_RUNTIME_MANIFEST_SHA256",
+      "--store-manifest",
+      "/ABS/P10-NEBULA/store-manifest.json",
+      "--store-manifest-sha256",
+      "REPLACE_STORE_MANIFEST_SHA256",
+      "--p02b-result",
+      "/ABS/P02B/result.json",
+      "--p02b-validator",
+      "${REPO_ROOT}/cidr-experiments/runners/p02b/validate_sentinel_result.py",
+      "--p02b-validator-sha256",
+      "REPLACE_P02B_VALIDATOR_SHA256"
+    ]
+  },
+  "binary": {
+    "path": "/usr/bin/python3.10",
+    "sha256": "REPLACE_PYTHON_SHA256"
+  },
+  "runtime_libraries": [
+    {
+      "path": "/ABS/nebulagraph/pydeps/nebula3_python-3.8.3.dist-info/METADATA",
+      "sha256": "REPLACE_CLIENT_METADATA_SHA256"
+    }
+  ],
+  "store_roots": [
+    {
+      "label": "nebulagraph",
+      "path": "/ABS/P10-NEBULA/sf10-store-copy",
+      "sha256": "REPLACE_PRE_SERVICE_STORE_TREE_SHA256"
+    }
+  ],
+  "temp_roots": [],
+  "containers": [
+    "cidr-p10-nebula-graph",
+    "cidr-p10-nebula-meta",
+    "cidr-p10-nebula-storage"
+  ],
+  "extra_pids": [],
+  "image_digests": [
+    "sha256:1040573cc684ea6cc5e673b667422e9abab607c9d553c2c17c7bac6ad8a74e05",
+    "sha256:ab687bd32d3e441d436842b41427ba0961a5e169c46997ef03fa4dcfd5388b35",
+    "sha256:7142642ee69001a5b5c50520196538d58bb2ec3930707c067cb4c4e2be3890f9"
+  ]
+}
