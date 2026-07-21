@@ -947,12 +947,126 @@ def validate_adapter_outputs(
                 p02b = adapter_provenance.get("p02b_release")
                 if not isinstance(p02b, dict) or p02b.get("require_formal") is not True:
                     raise ContractError("formal TuGraph provenance lacks a formal P02B release")
+        elif system["id"] == "nebulagraph":
+            if adapter_provenance.get("schema_version") != "p10-nebulagraph-adapter-provenance-v1":
+                raise ContractError("NebulaGraph adapter provenance has wrong schema_version")
+            exact = {
+                "execution_mode": request.get("execution_mode"),
+                "group": "client-server",
+                "process_lifetime": process_lifetime,
+                "system_version": system["system_version"],
+            }
+            for key, expected in exact.items():
+                if adapter_provenance.get(key) != expected:
+                    raise ContractError(f"NebulaGraph provenance {key} differs from request")
+
+            def same_artifact(observed: object, expected: object, context: str) -> None:
+                if not isinstance(observed, dict) or not isinstance(expected, dict):
+                    raise ContractError(f"NebulaGraph provenance lacks {context} artifact reference")
+                path = Path(str(observed.get("path", ""))).resolve()
+                if path != Path(str(expected.get("path", ""))).resolve():
+                    raise ContractError(f"NebulaGraph provenance {context} path differs from request")
+                if observed.get("sha256") != expected.get("sha256"):
+                    raise ContractError(f"NebulaGraph provenance {context} SHA-256 differs from request")
+
+            for label in ("binary", "dataset", "truth"):
+                same_artifact(adapter_provenance.get(label), request.get(label), label)
+            request_store = next(
+                (root for root in request.get("store_roots", []) if root.get("label") == "nebulagraph"),
+                None,
+            )
+            same_artifact(adapter_provenance.get("store"), request_store, "store")
+            for label in ("store_manifest", "runtime_manifest"):
+                ref = adapter_provenance.get(label)
+                if not isinstance(ref, dict) or not isinstance(ref.get("path"), str):
+                    raise ContractError(f"NebulaGraph provenance lacks {label}")
+                ref_path = Path(ref["path"]).resolve()
+                if not ref_path.is_file() or ref.get("sha256") != sha256_file(ref_path):
+                    raise ContractError(f"NebulaGraph provenance {label} path/SHA is invalid")
+            client = adapter_provenance.get("client")
+            if not isinstance(client, dict) or client.get("version") != "3.8.3":
+                raise ContractError("NebulaGraph provenance lacks the frozen Python client version")
+            client_tree = client.get("tree")
+            if (
+                not isinstance(client_tree, dict)
+                or client_tree.get("hash_method") != "sha256-tree-v1(relative-path,size,file-sha256)"
+                or not SHA256_RE.fullmatch(str(client_tree.get("sha256", "")))
+            ):
+                raise ContractError("NebulaGraph provenance lacks frozen client-tree lineage")
+            images = adapter_provenance.get("images")
+            if not isinstance(images, list) or len(images) != 3:
+                raise ContractError("NebulaGraph provenance must bind exactly three images")
+            roles = {item.get("role") for item in images if isinstance(item, dict)}
+            if roles != {"graphd", "metad", "storaged"}:
+                raise ContractError("NebulaGraph provenance image-role coverage drift")
+            for image in images:
+                if (
+                    not isinstance(image, dict)
+                    or not IMAGE_DIGEST_RE.fullmatch(str(image.get("image_id", "")))
+                    or "@sha256:" not in str(image.get("repo_digest", ""))
+                ):
+                    raise ContractError("NebulaGraph provenance image identity is malformed")
+            observed_digests = adapter_provenance.get("image_digests")
+            expected_digests = system.get("image_digests", [])
+            if not isinstance(observed_digests, list) or set(observed_digests) != set(expected_digests):
+                raise ContractError("NebulaGraph provenance image digests differ from suite manifest")
+            if len(observed_digests) != 3 or len(set(observed_digests)) != 3:
+                raise ContractError("NebulaGraph provenance requires three distinct image digests")
+            container_runtime = adapter_provenance.get("container_runtime")
+            if not isinstance(container_runtime, list) or len(container_runtime) != 3:
+                raise ContractError("NebulaGraph provenance must bind three live containers")
+            runtime_roles = set()
+            runtime_names = []
+            image_ids = {
+                image.get("role"): image.get("image_id")
+                for image in images
+                if isinstance(image, dict)
+            }
+            for item in container_runtime:
+                if not isinstance(item, dict):
+                    raise ContractError("NebulaGraph container runtime entry is malformed")
+                role = item.get("role")
+                runtime_roles.add(role)
+                runtime_names.append(item.get("name"))
+                if (
+                    item.get("image_id") != image_ids.get(role)
+                    or item.get("restart_count") != 0
+                    or not isinstance(item.get("pid"), int)
+                    or item.get("pid") <= 0
+                    or not isinstance(item.get("container_id"), str)
+                    or not item.get("container_id")
+                ):
+                    raise ContractError("NebulaGraph live-container image/PID/restart lineage is invalid")
+            if runtime_roles != {"graphd", "metad", "storaged"} or runtime_names != adapter_provenance.get("container_names"):
+                raise ContractError("NebulaGraph live-container roles/names differ from provenance")
+            session = adapter_provenance.get("service_session")
+            if (
+                not isinstance(session, dict)
+                or session.get("session_open_count") != 1
+                or session.get("restart_count") != 0
+                or session.get("warmup_measured_same_session") is not True
+            ):
+                raise ContractError("NebulaGraph provenance violates the one-session/no-restart lifecycle")
+            if request.get("execution_mode") == "formal":
+                if adapter_provenance.get("service_mode") != "external-prestarted":
+                    raise ContractError("formal NebulaGraph provenance must attach to an external prestarted service")
+                if adapter_provenance.get("container_names") != system.get("containers"):
+                    raise ContractError("formal NebulaGraph container names differ from suite manifest")
+                admission = adapter_provenance.get("p02b_admission")
+                if (
+                    not isinstance(admission, dict)
+                    or admission.get("state") != "PASS"
+                    or admission.get("formal_required") is not True
+                ):
+                    raise ContractError("formal NebulaGraph provenance lacks a formal P02B PASS admission")
     elif system["id"] == "seml0" and not system.get("fixture_only", False):
         raise ContractError("formal SemL0 adapter omitted adapter-provenance.json")
     elif system["id"] == "aster" and not system.get("fixture_only", False):
         raise ContractError("formal Aster adapter omitted adapter-provenance.json")
     elif system["id"] == "tugraph" and not system.get("fixture_only", False):
         raise ContractError("formal TuGraph adapter omitted adapter-provenance.json")
+    elif system["id"] == "nebulagraph" and not system.get("fixture_only", False):
+        raise ContractError("formal NebulaGraph adapter omitted adapter-provenance.json")
     artifact_paths = [result_path, observations_path, events_path]
     if provenance_path.is_file():
         artifact_paths.append(provenance_path)
@@ -1098,6 +1212,7 @@ def read_p31_summary(run_dir: Path, *, performance_eligible: bool) -> dict[str, 
         "disk": summary["disk"],
         "repo": manifest.get("repo"),
         "harness": manifest.get("harness"),
+        "collector": manifest.get("collector"),
         "inputs": manifest.get("inputs"),
         "disk_roots": manifest.get("disk_roots"),
     }
@@ -1172,3 +1287,43 @@ def validate_seml0_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
     """Backward-compatible SemL0-specific entry point."""
 
     validate_adapter_p31_binding(provenance, p31, system_id="seml0")
+
+
+def validate_nebulagraph_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
+    """Cross-bind formal NebulaGraph client/server lineage to P31 coverage."""
+
+    if not isinstance(provenance, dict):
+        raise ContractError("formal NebulaGraph result lacks parsed adapter provenance")
+    collector = p31.get("collector")
+    inputs = p31.get("inputs")
+    disk_roots = p31.get("disk_roots")
+    if not isinstance(collector, dict) or not isinstance(inputs, dict) or not isinstance(disk_roots, list):
+        raise ContractError("P31 manifest lacks NebulaGraph collector/input/disk lineage")
+    containers = provenance.get("container_names")
+    if not isinstance(containers, list) or collector.get("containers") != containers:
+        raise ContractError("P31 container coverage differs from NebulaGraph provenance")
+
+    def same_ref(observed: object, expected: object, label: str) -> None:
+        if not isinstance(observed, dict) or not isinstance(expected, dict):
+            raise ContractError(f"P31 lacks NebulaGraph {label} artifact reference")
+        if Path(str(observed.get("path", ""))).resolve() != Path(str(expected.get("path", ""))).resolve():
+            raise ContractError(f"P31 {label} path differs from NebulaGraph provenance")
+        if observed.get("sha256") != expected.get("sha256"):
+            raise ContractError(f"P31 {label} SHA-256 differs from NebulaGraph provenance")
+
+    same_ref(inputs.get("binary"), provenance.get("binary"), "binary")
+    same_ref(inputs.get("dataset"), provenance.get("dataset"), "dataset")
+    same_ref(inputs.get("truth"), provenance.get("truth"), "truth")
+    same_ref(inputs.get("query_or_trace"), provenance.get("truth"), "query_or_trace")
+    store = provenance.get("store")
+    if not isinstance(store, dict) or not isinstance(store.get("path"), str):
+        raise ContractError("NebulaGraph provenance lacks store path")
+    matching = [
+        root
+        for root in disk_roots
+        if isinstance(root, dict)
+        and root.get("role") == "store"
+        and Path(str(root.get("path", ""))).resolve() == Path(store["path"]).resolve()
+    ]
+    if len(matching) != 1:
+        raise ContractError("P31 does not monitor exactly the NebulaGraph provenance store")
