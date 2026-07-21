@@ -127,6 +127,16 @@ class P10OrchestratorTests(unittest.TestCase):
                 return
             schemas = P10_DIR / "schemas"
             request = load_json(run_root / "systems" / "seml0" / "repeat-01" / "adapter-request.json")
+            self.assertEqual(request["execution_mode"], "fixture")
+            self.assertEqual(
+                request["binary"]["sha256"],
+                hashlib.sha256(Path(request["binary"]["path"]).read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                request["dataset"]["sha256"],
+                hashlib.sha256(Path(request["dataset"]["path"]).read_bytes()).hexdigest(),
+            )
+            self.assertEqual(request["store_roots"][0]["sha256"], "")
             adapter_result = load_json(
                 run_root / "systems" / "seml0" / "repeat-01" / "adapter-output" / "adapter-result.json"
             )

@@ -164,7 +164,11 @@ def select_systems(suite: dict[str, Any], ids: list[str], group: str | None) -> 
 
 
 def build_request(
-    suite: dict[str, Any], system: dict[str, Any], repeat_index: int, run_id: str
+    suite: dict[str, Any],
+    system: dict[str, Any],
+    repeat_index: int,
+    run_id: str,
+    mode: str,
 ) -> dict[str, Any]:
     protocol = suite["protocol"]
     return {
@@ -172,11 +176,21 @@ def build_request(
         "contract_version": CONTRACT_VERSION,
         "suite_id": suite["suite_id"],
         "run_id": run_id,
+        "execution_mode": mode,
         "system_id": system["id"],
         "group": system["group"],
         "system_version": system["system_version"],
         "interface_scope": INTERFACE_SCOPE,
         "repeat_index": repeat_index,
+        "binary": {
+            "path": system["binary"]["path"],
+            "sha256": system["binary"]["sha256"],
+        },
+        "dataset": {
+            "path": suite["dataset"]["path"],
+            "sha256": suite["dataset"]["sha256"],
+        },
+        "store_roots": [dict(root) for root in system["store_roots"]],
         "truth": {
             "path": suite["truth"]["path"],
             "sha256": suite["truth"]["sha256"],
@@ -310,7 +324,7 @@ def execute_repeat(
     repeat_dir.mkdir(parents=True, exist_ok=False)
     adapter_output = repeat_dir / "adapter-output"
     adapter_output.mkdir()
-    request = build_request(suite, system, repeat_index, run_root.name)
+    request = build_request(suite, system, repeat_index, run_root.name, mode)
     request_path = repeat_dir / "adapter-request.json"
     atomic_json(request_path, request)
     command = p31_command(

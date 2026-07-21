@@ -454,7 +454,13 @@ def load_suite_manifest(
             labels: set[str] = set()
             for root_index, raw_root in enumerate(raw):
                 root_context = f"{context}.{role}_roots[{root_index}]"
-                root = require_keys(raw_root, required=("label", "path"), allowed=("label", "path"), context=root_context)
+                allowed_keys = ("label", "path", "sha256") if role == "store" else ("label", "path")
+                root = require_keys(
+                    raw_root,
+                    required=("label", "path"),
+                    allowed=allowed_keys,
+                    context=root_context,
+                )
                 label = nonempty_string(root["label"], f"{root_context}.label")
                 if not LABEL_RE.fullmatch(label) or label in labels:
                     raise ContractError(f"{root_context}.label: invalid or duplicate label")
@@ -462,7 +468,12 @@ def load_suite_manifest(
                 path = resolve_path(root["path"], manifest_dir=manifest_dir, repo_root=repo_root, run_root=run_root, context=f"{root_context}.path")
                 if formal and role == "store" and not path.exists():
                     raise ContractError(f"{root_context}.path: formal store does not exist: {path}")
-                result.append({"label": label, "path": str(path)})
+                normalized = {"label": label, "path": str(path)}
+                if role == "store":
+                    normalized["sha256"] = normalize_sha(
+                        root.get("sha256"), f"{root_context}.sha256", required=formal
+                    )
+                result.append(normalized)
             return result
 
         stores = roots(system["store_roots"], "store")
