@@ -27,6 +27,12 @@ p10-aster-key-map.tsv
 - `reopen`：正式模式唯一允许的生命周期。adapter 在计时前验证已发布 store
   manifest、key map、store metadata 和逻辑 store SHA，然后只重新打开已有 DB。
 
+对应 P10 的显式进程生命周期为：tiny fixture 使用
+`fixture-process-lifetime-v1`；正式 `reopen` 必须使用
+`prebuilt-store-query-process-lifetime-v1`。Aster worker 静态包含 RocksDB，因此当前
+正式配置的 `runtime_libraries` 应为空；若以后改为动态链接，request 中每个共享库的
+绝对路径与 SHA-256 都会被 adapter 校验并写入 provenance。
+
 RocksDB 以读写方式 reopen 时会滚动 `CURRENT`、MANIFEST、OPTIONS、WAL 和 LOG，
 所以这些物理文件的逐字节 tree hash 不能作为跨 repeat 的不变量。正式
 `store_sha256` 使用下列查询语义不变量：
@@ -100,7 +106,7 @@ manifest、P02B result/validator 与 P31 wrapper 的 SHA-256 均必须在 suite 
    PASS，且 hostname/P31 host fingerprint 与当前机器一致；默认 sentinel 最大年龄为
    3,600 秒。
 4. 外层 orchestrator 必须由真实 P31 包住 adapter。结束后会把 P31 的 Git SHA、
-   binary/truth/wrapper SHA 和唯一 store root 与 Aster provenance 再次交叉绑定。
+   binary/dataset/truth/wrapper SHA 和唯一 store root 与 Aster provenance 再次交叉绑定。
 5. 任一 timeout、truth mismatch、顺序变化、缺/多 observation、phase digest
    不一致、逻辑 store 前后变化、P31 非 DONE 或 provenance 漂移均不产生正式结果。
 
@@ -109,8 +115,13 @@ P31 统计覆盖整个 adapter 生命周期；论文 QPS/P50/P95/P99 只取 meas
 
 ## 当前正式运行前仍需准备
 
-- 在 clean Aster source tree 上构建并发布最终 worker binary；当前服务器的 Aster
-  checkout 还有未跟踪的 `graph_test/graph_example`，formal 会按设计拒绝。
+- 已建立 detached clean source view
+  `/data/WorkSpace/lsmgraph-cidr-deps/Aster-clean`（commit
+  `6abb258e577c479325092a8ac0e7691fdfd154c2`）。原 checkout 的未跟踪
+  `graph_test/graph_example` 保留不动；它不能作为 formal 的 `--source-root`。
+- 仍需从该 clean source view 构建并发布最终 worker binary。当前已有 binary 只用于
+  tiny 联合验证；adapter 会分别冻结 clean source HEAD/clean 状态、worker 源码 SHA
+  与最终可执行文件 SHA，不把“同一路径”当作构建来源证明。
 - 用最终 binary 为 SF10 建立/迁移一个带 P10 key-map 与 metadata 的 reopen store，
   先跑 1,700-query correctness，再发布 store manifest。
 - 获得同机、未过期的正式 P02B PASS，并把真实 P31 wrapper SHA 写入 formal suite。

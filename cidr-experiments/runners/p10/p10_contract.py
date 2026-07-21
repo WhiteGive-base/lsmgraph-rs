@@ -892,12 +892,29 @@ def validate_adapter_outputs(
                 raise ContractError("Aster adapter provenance has wrong schema_version")
             if adapter_provenance.get("lifecycle") not in {"fresh", "reopen"}:
                 raise ContractError("Aster adapter provenance has unknown lifecycle")
+            if adapter_provenance.get("process_lifetime") != process_lifetime:
+                raise ContractError("Aster adapter provenance process lifetime differs from request")
+            provenance_libraries = adapter_provenance.get("runtime_libraries")
+            request_libraries = request.get("runtime_libraries")
+            if not isinstance(provenance_libraries, list) or not isinstance(request_libraries, list):
+                raise ContractError("Aster adapter provenance lacks runtime-library lineage")
+            if len(provenance_libraries) != len(request_libraries):
+                raise ContractError("Aster adapter provenance runtime-library count differs from request")
+            for index, (observed, expected) in enumerate(zip(provenance_libraries, request_libraries)):
+                if not isinstance(observed, dict) or not isinstance(expected, dict):
+                    raise ContractError(f"Aster runtime library {index} is not an artifact reference")
+                if Path(str(observed.get("path", ""))).resolve() != Path(str(expected.get("path", ""))).resolve():
+                    raise ContractError(f"Aster runtime library {index} path differs from request")
+                if observed.get("sha256") != expected.get("sha256"):
+                    raise ContractError(f"Aster runtime library {index} SHA-256 differs from request")
             command = adapter_provenance.get("command")
             if not isinstance(command, dict) or command.get("invocations") != 1 or command.get("exit_code") != 0:
                 raise ContractError("Aster adapter must record exactly one successful RocksGraph worker invocation")
             if request.get("execution_mode") == "formal":
                 if adapter_provenance.get("mode") != "formal" or adapter_provenance.get("lifecycle") != "reopen":
                     raise ContractError("formal Aster provenance must describe a reopen lifecycle")
+                if process_lifetime != PREBUILT_PROCESS_LIFETIME:
+                    raise ContractError("formal Aster provenance must use the prebuilt-store process lifetime")
                 p02b = adapter_provenance.get("p02b")
                 admission = p02b.get("admission") if isinstance(p02b, dict) else None
                 if not isinstance(admission, dict) or admission.get("state") != "PASS" or admission.get("formal_required") is not True:
@@ -1075,6 +1092,8 @@ def validate_adapter_p31_binding(
         "truth": provenance.get("truth"),
         "p31_wrapper": provenance.get("p31_wrapper"),
     }
+    if system_id == "aster":
+        expected_refs["dataset"] = provenance.get("dataset")
     for label, ref in expected_refs.items():
         if not isinstance(ref, dict) or not isinstance(ref.get("path"), str) or not isinstance(ref.get("sha256"), str):
             raise ContractError(f"{display} provenance lacks {label} path/SHA binding")
@@ -1095,6 +1114,8 @@ def validate_adapter_p31_binding(
 
     same_ref(harness.get("wrapper"), expected_refs["p31_wrapper"], "wrapper")
     same_ref(inputs.get("binary"), expected_refs["binary"], "binary")
+    if system_id == "aster":
+        same_ref(inputs.get("dataset"), expected_refs["dataset"], "dataset")
     same_ref(inputs.get("truth"), expected_refs["truth"], "truth")
     same_ref(inputs.get("query_or_trace"), expected_refs["truth"], "query_or_trace")
     provenance_repo = provenance.get("repo")

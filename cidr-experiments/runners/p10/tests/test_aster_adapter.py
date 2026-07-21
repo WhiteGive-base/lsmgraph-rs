@@ -18,7 +18,9 @@ sys.path.insert(0, str(P10_DIR))
 from p10_contract import (  # noqa: E402
     CLOCK_NAME,
     CONTRACT_VERSION,
+    FIXTURE_PROCESS_LIFETIME,
     INTERFACE_SCOPE,
+    PREBUILT_PROCESS_LIFETIME,
     REQUEST_SCHEMA_VERSION,
     SEQUENCE_DIGEST_ALGORITHM,
     TIMING_BOUNDARY,
@@ -67,8 +69,12 @@ class AsterAdapterTest(unittest.TestCase):
             "system_version": f"aster-rocksgraph@{self.source_commit}",
             "interface_scope": INTERFACE_SCOPE,
             "repeat_index": 1,
+            "process_lifetime": (
+                PREBUILT_PROCESS_LIFETIME if mode == "formal" else FIXTURE_PROCESS_LIFETIME
+            ),
             "binary": {"path": str(self.binary), "sha256": sha256_file(self.binary)},
             "dataset": {"path": str(self.dataset), "sha256": sha256_file(self.dataset)},
+            "runtime_libraries": [],
             "store_roots": [{"label": "aster", "path": str(store), "sha256": store_sha256}],
             "truth": {
                 "path": str(self.truth),
@@ -158,6 +164,7 @@ class AsterAdapterTest(unittest.TestCase):
         self.assertEqual(result["completed_queries"], 4)
         self.assertEqual(result["mismatch_queries"], 0)
         self.assertEqual(result["timeout_queries"], 0)
+        self.assertEqual(result["process_lifetime"], request["process_lifetime"])
         return result
 
     def test_real_rocksgraph_fresh_then_frozen_reopen(self) -> None:
@@ -211,6 +218,8 @@ class AsterAdapterTest(unittest.TestCase):
             result = self.assert_valid(root, reopen_request, "reopen-output")
             provenance = result["adapter_provenance"]
             self.assertEqual(provenance["lifecycle"], "reopen")
+            self.assertEqual(provenance["process_lifetime"], FIXTURE_PROCESS_LIFETIME)
+            self.assertEqual(provenance["runtime_libraries"], [])
             self.assertEqual(provenance["store"]["store_sha256"], store_sha)
             self.assertEqual(provenance["store"]["post_store_sha256"], store_sha)
 
@@ -228,6 +237,32 @@ class AsterAdapterTest(unittest.TestCase):
                 output_name="output",
                 binary_sha256="0" * 64,
             )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("SHA-256 mismatch", completed.stderr)
+            self.assertEqual(list(store.iterdir()), [])
+
+    def test_process_lifetime_mismatch_fails_before_fresh_store_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="p10-aster-lifetime-") as raw:
+            root = Path(raw)
+            store = root / "store"
+            store.mkdir()
+            request = self.request(store, mode="fixture")
+            request["process_lifetime"] = PREBUILT_PROCESS_LIFETIME
+            completed = self.invoke(root, request, lifecycle="fresh", output_name="output")
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("request.process_lifetime", completed.stderr)
+            self.assertEqual(list(store.iterdir()), [])
+
+    def test_runtime_library_sha_mismatch_fails_before_fresh_store_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="p10-aster-runtime-") as raw:
+            root = Path(raw)
+            store = root / "store"
+            store.mkdir()
+            library = root / "libaster-fixture.so"
+            library.write_bytes(b"fixture")
+            request = self.request(store, mode="fixture")
+            request["runtime_libraries"] = [{"path": str(library), "sha256": "0" * 64}]
+            completed = self.invoke(root, request, lifecycle="fresh", output_name="output")
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("SHA-256 mismatch", completed.stderr)
             self.assertEqual(list(store.iterdir()), [])
@@ -322,6 +357,7 @@ class AsterAdapterTest(unittest.TestCase):
         wrapper = self.fixture_p31.resolve()
         provenance = {
             "binary": {"path": str(self.binary), "sha256": sha256_file(self.binary)},
+            "dataset": {"path": str(self.dataset), "sha256": sha256_file(self.dataset)},
             "truth": {"path": str(self.truth), "sha256": sha256_file(self.truth)},
             "p31_wrapper": {"path": str(wrapper), "sha256": sha256_file(wrapper)},
             "repo": {"head": "a" * 40},
@@ -331,6 +367,7 @@ class AsterAdapterTest(unittest.TestCase):
             "harness": {"wrapper": dict(provenance["p31_wrapper"])},
             "inputs": {
                 "binary": dict(provenance["binary"]),
+                "dataset": dict(provenance["dataset"]),
                 "truth": dict(provenance["truth"]),
                 "query_or_trace": dict(provenance["truth"]),
             },

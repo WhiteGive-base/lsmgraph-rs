@@ -33,8 +33,10 @@ from build_aster_store_manifest import (  # noqa: E402
 from p10_contract import (  # noqa: E402
     CLOCK_NAME,
     CONTRACT_VERSION,
+    FIXTURE_PROCESS_LIFETIME,
     INTERFACE_SCOPE,
     OBSERVATION_COLUMNS,
+    PREBUILT_PROCESS_LIFETIME,
     REQUEST_SCHEMA_VERSION,
     RESULT_SCHEMA_VERSION,
     SEQUENCE_DIGEST_ALGORITHM,
@@ -150,8 +152,10 @@ def validate_request(args: argparse.Namespace) -> tuple[dict[str, Any], list[dic
             "system_version",
             "interface_scope",
             "repeat_index",
+            "process_lifetime",
             "binary",
             "dataset",
+            "runtime_libraries",
             "store_roots",
             "truth",
             "timing",
@@ -167,8 +171,10 @@ def validate_request(args: argparse.Namespace) -> tuple[dict[str, Any], list[dic
             "system_version",
             "interface_scope",
             "repeat_index",
+            "process_lifetime",
             "binary",
             "dataset",
+            "runtime_libraries",
             "store_roots",
             "truth",
             "timing",
@@ -189,6 +195,34 @@ def validate_request(args: argparse.Namespace) -> tuple[dict[str, Any], list[dic
     nonempty_string(request["run_id"], "request.run_id")
     nonempty_string(request["system_version"], "request.system_version")
     integer(request["repeat_index"], "request.repeat_index", 1)
+    expected_lifetime = (
+        PREBUILT_PROCESS_LIFETIME if args.mode == "formal" else FIXTURE_PROCESS_LIFETIME
+    )
+    require(
+        request["process_lifetime"] == expected_lifetime,
+        f"request.process_lifetime: {request['process_lifetime']!r} != {expected_lifetime!r}",
+    )
+    if args.mode == "formal":
+        require(args.lifecycle == "reopen", "formal Aster process lifetime requires lifecycle=reopen")
+
+    raw_runtime_libraries = request["runtime_libraries"]
+    require(isinstance(raw_runtime_libraries, list), "request.runtime_libraries must be an array")
+    normalized_libraries: list[dict[str, str]] = []
+    runtime_paths: set[str] = set()
+    for index, raw_library in enumerate(raw_runtime_libraries):
+        context = f"request.runtime_libraries[{index}]"
+        library = require_keys(
+            raw_library,
+            required=("path", "sha256"),
+            allowed=("path", "sha256"),
+            context=context,
+        )
+        path = Path(nonempty_string(library["path"], f"{context}.path")).resolve()
+        ref = resolve_file(path, exact_sha(library["sha256"], f"{context}.sha256"), context)
+        require(ref["path"] not in runtime_paths, "request.runtime_libraries contains duplicate paths")
+        runtime_paths.add(ref["path"])
+        normalized_libraries.append({"path": ref["path"], "sha256": ref["sha256"]})
+    request["runtime_libraries"] = normalized_libraries
 
     binary_obj = require_keys(
         request["binary"], required=("path", "sha256"), allowed=("path", "sha256"), context="request.binary"
@@ -564,6 +598,7 @@ def convert_outputs(
         "system_version": request["system_version"],
         "interface_scope": INTERFACE_SCOPE,
         "repeat_index": request["repeat_index"],
+        "process_lifetime": request["process_lifetime"],
         "truth_sha256": request["truth"]["sha256"],
         "sequence_digest_algorithm": SEQUENCE_DIGEST_ALGORITHM,
         "timing_boundary": TIMING_BOUNDARY,
@@ -725,6 +760,10 @@ def run(args: argparse.Namespace) -> None:
         "schema_version": PROVENANCE_SCHEMA,
         "mode": args.mode,
         "lifecycle": args.lifecycle,
+        "process_lifetime": request["process_lifetime"],
+        "runtime_libraries": [
+            artifact_ref(Path(library["path"])) for library in request["runtime_libraries"]
+        ],
         "request": request_ref,
         "repo": repo,
         "source": source,
