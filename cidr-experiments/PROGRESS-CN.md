@@ -1,6 +1,6 @@
 # CIDR 正式实验进度表
 
-更新时间：2026-07-22 04:16 CST
+更新时间：2026-07-22 04:42 CST
 正式验收真源：`plan/ARTICLE-EXPERIMENT-OUTLINE-CN.md`。大纲决定必须覆盖的 RQ、指标和正确性边界；本文件第 3 节冻结七天内的代表性配置。用户于 2026-07-21 提供的最新 ZIP 用于核对当前稿已有内容与缺口，其 SHA-256、逐项清单和 claim 审计见 `work/latest-paper-audit/`。
 
 ## 0. 最新执行看板
@@ -10,14 +10,14 @@
 | 工作包 | 状态 | 已完成/已验证 | 尚缺或下一步 |
 |---|---|---|---|
 | P00 论文与旧证据审计 | `DONE` | 20 个来源完成 `REUSE=5 / FIX=6 / RERUN=9` 分类；六图和 RQ 证据边界已冻结 | 后续正式数据回填后再做 claim-to-evidence 终审 |
-| S0 Linux 同步、SHA、commit | `PASS_INITIAL` | Windows/Linux `145/145` payload SHA 一致，目录总文件数 146；初始同步包提交为 `acb167e`；已建立 clean 集成分支 | 当前集成 HEAD `b76e80818c4f`；Neo4j/Nebula adapter 收口后做最终全量 SHA、反向同步和封板 commit |
+| S0 Linux 同步、SHA、commit | `PASS_INITIAL` | Windows/Linux `145/145` payload SHA 一致，目录总文件数 146；初始同步包提交为 `acb167e`；已建立 clean 集成分支 | 当前集成 HEAD `3965a661f3f0`；外部 store gate 收口后做最终全量 SHA、反向同步和封板 commit |
 | P01 shared truth / ID bridge | `PASS_INTEGRATED` | 完整扫描 `355,185,382` edges、`29,987,835` vertices；双向 ID map、lockstep、bijection、输入/输出 SHA 全 PASS；独立执行 `sha256sum -c SHA256SUMS` 3/3 OK；历史 converter lineage 已固化 | 集成态 8 Python + 6 Rust shared-truth tests 均 PASS |
 | P02A correctness | `PASS` | W13 `10/10`；W6 SF1 九变体的 8 组 compare 均 `checked=180, mismatches=0` | 只作 correctness 证据，不能引用该轮 timing |
 | P02B SF10 sentinel | `PREPARED_BLOCKED_LOAD` | fail-closed runner/consumer 已集成；14/14 tests + 3-repeat fake P31 smoke PASS；dataset、四套 SemL0 store、plan/preflight 的 `SHA256SUMS` 7/7 PASS；四 store 各 `1700/1700, mismatches=0` | 只等 P03 READY；清场后放行链预计 23--35 min |
 | P20 A0--A6 组件消融 | `PASS_INTEGRATED_BLOCKED_LOAD` | A0--A6 core、formal runner、current-binary correctness generator、run-level Figure 2 aggregator 与 canonical P02B admission 已合入；Python 40/40（另 1 项按设计条件运行）、Rust 8/8、real-P31 fake smoke、cargo check 均 PASS | 正式 A0--A6 只等 P02B formal PASS 与 clean window |
 | P31 资源采集与并发规则 | `PASS_INTEGRATED` | collector/validator、11 项单测、fixture smoke、11/11 双端 SHA 均 PASS；已接入 P02B/P20/P40/P10；正式实验单任务串行 | clean window 中验证真实长任务采样数量与 cpuset 绑定 |
 | P40 fixed trace | `PASS_CORRECTNESS_INTEGRATED` | clean-head run `P40-CLEAN-HEAD-36Q-20260721T181522Z-d7c283c5808f`：3×4 arms、36 queries、0 mismatch、62/62 SHA PASS | `performance_eligible=false`；正式 30 min×3 等 clean window |
-| P10/P11 跨系统 orchestrator | `4_OF_6_ADAPTERS_INTEGRATED` | SemL0、LiveGraph、Aster、TuGraph 真实 adapter 已合入；P10 主回归 24/24、TuGraph embedded 2/2，均为真实 tiny fixture 且 0 skip；生命周期/runtime SHA/P02B/P31 fail-closed 已交叉绑定 | Neo4j、NebulaGraph adapter 并行实现；Aster clean-tree final binary 构建中；随后补各外部系统 SF10 frozen store/importer gate |
+| P10/P11 跨系统 orchestrator | `6_OF_6_ADAPTERS_INTEGRATED` | SemL0、LiveGraph、Aster、TuGraph、Neo4j、NebulaGraph 真实 adapter 已合入；主分支 P10 33/33 + TuGraph embedded 2/2，真实 tiny fixture 0 skip；生命周期/runtime/image SHA、P02B/P31 fail-closed 已交叉绑定 | Aster final worker 已冻结；LiveGraph final build 中；TuGraph 旧 4.0 store 已被 4.5.2 gate 拒绝，正重建 4.5.2 SF10 store；随后补 Aster/Neo4j/Nebula isolated SF10 store gate |
 | P03 clean-window monitor | `BLOCKED_LOAD` | monitor 持续运行；03:57 样本 load1=1.17、CPU idle=99.199%、磁盘 util/await=0/0、`/data` 可用 925.774 GiB | zcl 119.52 GiB worker、4 个 rsync（其中 2 个暂停、2 个活动）、GPStore、TuGraph；MemAvailable 355.003 GiB，未达 400 GiB；清场后还需连续 15 个 60 s 样本 |
 | P10/P11/P20/P31/P40/P50/P60 正式性能 | `NOT_STARTED` | 前置 runner/contract 按优先级并行准备 | 清场后先连续观察 15 min，再跑 P02B sentinel；通过后正式任务严格串行 |
 
@@ -35,7 +35,7 @@
 
 远端快照（2026-07-22 03:57 CST）：load1=`1.17`、CPU idle=`99.199%`、MemAvailable=`355.003 GiB`、`/data` 可用=`925.774 GiB`、NVMe util/await=`0/0`。瞬时 CPU 与磁盘已较空闲，但 zcl 的 119.52 GiB worker、4 个 rsync 以及 GPStore/TuGraph 仍在；共享内存、page cache、NUMA 和服务干扰不能排除，所以当前 timing 数据不具备论文资格。
 
-执行恢复点（2026-07-22 00:07--04:16 CST）：W13 与 W6 SF1 correctness-only、P01 全量 ID map、P31 collector、P20 runner/admission、P40 fixed trace 均已验收；SemL0 四 store 和 P10 的 SemL0/LiveGraph/Aster/TuGraph adapter 已完成 correctness/contract 回归。正式性能仍等待 clean-window gate。
+执行恢复点（2026-07-22 00:07--04:42 CST）：W13 与 W6 SF1 correctness-only、P01 全量 ID map、P31 collector、P20 runner/admission、P40 fixed trace 均已验收；SemL0 四 store 和六系统 P10 adapter 已完成 correctness/contract 回归。Aster clean-tree worker 已冻结，TuGraph 4.5.2 SF10 store 正在 correctness-only 重建。正式性能仍等待 clean-window gate。
 
 当前 clean-window 阻塞（2026-07-22 03:57 CST）：`zcl` 的大内存 worker 占 119.52 GiB；SF1 rsync 两进程已暂停约 38.6 h，SF300 rsync 两进程按当前速率仍可能需要 2--3 天；正式测量前还需由维护者停止 GPStore 与 TuGraph。全部释放后要求连续 15 个 60 s 样本满足 load <5、CPU idle >95%、MemAvailable >=400 GiB、`/data` util <5%、await <5 ms，再执行 QPS CV <=3%、P99 CV <=5% 的 SF10 sentinel。
 
@@ -58,6 +58,19 @@
 | semantic | 740 | 15,716,301,617 | `ae1d0021a759cef6d68b4c57a144fa0e6f5bdba813cb35f7235a82b40a3e72f6` |
 
 构建证据位于 `/data/WorkSpace/results/P10-SEML0-STORES/P10-SEML0-SF10-STORE-REBUILD-20260721T193325Z-d123990/`，小文件 `SHA256SUMS` 11/11 PASS。该目录明确写入 `correctness_only=true`、`performance_eligible=false`、`formal_performance_points=0`；为避免在共享服务器重复约 58 GB I/O，本次独立复核重算了目录文件数和逻辑字节，但没有二次读取 store 内容重哈希，这一边界已写入 `DONE.correctness-only`。
+
+### P10 六系统工程证据
+
+| 系统 | 当前工程证据 | 剩余 formal 前置 |
+|---|---|---|
+| SemL0 | 四套 SF10 store 各 1700/0 mismatch；7/7 P02B SHA | fresh P02B PASS + clean window |
+| LiveGraph | real API/lifecycle tests 7/7；fresh-import→warmup→measured 与 `liblivegraph.so` SHA 已绑定；final release build 正在冻结 | final binary manifest；正式 repeat 内 fresh import |
+| Aster | clean source `6abb258e...`；final worker SHA `12f848aa5aa7595d8626e67066280cc6dd023067b597d123fdc6caa067a6c1b8`；tiny 7/7；build artifact 62/62 SHA | 新建或安全迁移带 key-map/metadata 的 SF10 reopen store，1700-query gate |
+| TuGraph | final 4.5.2 worker SHA `8a845f078a3460c3a6120f511916b35a007bb9ee545a92fd4f9e83be41a3df88`；tiny 2/2 | 旧 4.0 store 与 4.5.2 不兼容且已 fail-closed；正在 fresh rebuild 4.5.2 SF10 store |
+| Neo4j | `neo4j:5.26.24` RepoDigest `f66304b9...96435`；real Bolt 4/4；runtime evidence SHA256SUMS 已固化 | 对历史 SF10 store 做独立 clone、manifest、P31 correctness gate |
+| NebulaGraph | v3.8.0 三镜像 digest 3/3 与历史一致；real nGQL 5/5；runtime manifest SHA `66497ff04cfdde7532efb7eb2a00fbbf1fb0f03c25967d02ea446cdc2aa787f6` | 对历史 44 GB store 做独立 clone、manifest、三容器 P31 correctness gate |
+
+六系统最终主分支回归为 P10 `33/33` 加 TuGraph 独立 `2/2`，全部使用真实 tiny API 且 0 skip。上述 build/fixture/兼容性数字均为 `performance_eligible=false`；正式性能数据点仍为 0。
 
 状态枚举：`DONE`、`PREPARING`、`READY`、`RUNNING`、`VALIDATING`、`PASS`、`FAIL`、`BLOCKED_LOAD`。进程退出码为 0 不等于 `PASS`；正式完成还必须有 raw、manifest、hash、正确性 gate 和规定的独立重复。
 
