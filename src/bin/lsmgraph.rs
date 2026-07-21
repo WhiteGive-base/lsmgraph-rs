@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use lsmgraph::base_graph::{build_from_snb, BuildConfig, IoConfig};
 use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig, QueryControlStage};
@@ -13,7 +13,8 @@ use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
 use lsmgraph::metrics::process_cpu_time_ns;
 use lsmgraph::shared_truth::{
-    build_storage_sample_plan, read_truth_tsv, verify_engine_truth, SharedIdMap,
+    build_storage_sample_plan, read_truth_tsv, verify_engine_truth, DenseDigest, SharedIdMap,
+    TruthRow,
 };
 use lsmgraph::snb::{
     import_snb_full, import_snb_full_multi, import_snb_updates, rebuild_snb_edge_props,
@@ -406,6 +407,21 @@ enum Command {
         sample_plan_in: Option<PathBuf>,
         #[arg(long)]
         sample_plan_out: Option<PathBuf>,
+        /// Enable the strict P10 adapter path and publish raw per-query
+        /// observations into this directory.  This mode requires
+        /// --sample-plan-in, --p10-truth-tsv, and --p10-id-map-dir.
+        #[arg(long)]
+        p10_raw_output_dir: Option<PathBuf>,
+        /// P01/P02B dense-ID typed-neighbor truth consumed by P10 raw mode.
+        #[arg(long)]
+        p10_truth_tsv: Option<PathBuf>,
+        /// P01 bidirectional dense/original ID map consumed by P10 raw mode.
+        #[arg(long)]
+        p10_id_map_dir: Option<PathBuf>,
+        /// Fail-closed deadline for each typed-neighbor call plus result
+        /// materialization and dense digest in P10 raw mode.
+        #[arg(long)]
+        p10_per_query_timeout_ms: Option<u64>,
         #[arg(long, default_value_t = true)]
         scan: bool,
         #[arg(long, default_value_t = false)]
@@ -1329,6 +1345,10 @@ async fn main() -> Result<()> {
             sample_plan_degree_hint,
             sample_plan_in,
             sample_plan_out,
+            p10_raw_output_dir,
+            p10_truth_tsv,
+            p10_id_map_dir,
+            p10_per_query_timeout_ms,
             scan,
             auto_compact,
             automatic_maintenance,
@@ -1369,6 +1389,57 @@ async fn main() -> Result<()> {
                     "--training-feedback-compactions and measured --auto-compact are mutually exclusive"
                 );
             }
+            let p10_option_count = [
+                p10_raw_output_dir.is_some(),
+                p10_truth_tsv.is_some(),
+                p10_id_map_dir.is_some(),
+                p10_per_query_timeout_ms.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if p10_option_count != 0 && p10_option_count != 4 {
+                bail!(
+                    "P10 raw mode requires all of --p10-raw-output-dir, --p10-truth-tsv, --p10-id-map-dir, and --p10-per-query-timeout-ms"
+                );
+            }
+            if p10_option_count == 4 {
+                if sample_plan_in.is_none() {
+                    bail!("P10 raw mode requires --sample-plan-in");
+                }
+                if warmup_runs == 0 || repeats == 0 {
+                    bail!("P10 raw mode requires --warmup-runs > 0 and --repeats > 0");
+                }
+                if p10_per_query_timeout_ms == Some(0) {
+                    bail!("P10 raw mode requires --p10-per-query-timeout-ms > 0");
+                }
+                if training_runs != 0
+                    || training_feedback_compactions != 0
+                    || auto_compact
+                    || automatic_maintenance
+                    || query_cpu_phases
+                {
+                    bail!(
+                        "P10 raw mode forbids training, compaction, automatic maintenance, and query CPU instrumentation"
+                    );
+                }
+                if workload_mode != StorageBenchWorkloadMode::OneHop
+                    || property_predicate_mode != StorageBenchPropertyPredicateMode::None
+                    || src_label.is_some()
+                    || dst_label.is_some()
+                    || edge_type.is_some()
+                    || !edge_types.is_empty()
+                {
+                    bail!(
+                        "P10 raw mode is frozen to plan-driven one-hop typed-neighbor queries without labels or properties"
+                    );
+                }
+                if emit_result_digests || sample_plan_degree_hint || sample_plan_out.is_some() {
+                    bail!(
+                        "P10 raw mode owns dense result digests and forbids legacy digest/plan-output options"
+                    );
+                }
+            }
             let repeats = repeats.max(1);
             let mut config = LsmGraphConfig::new(&data_dir)
                 .with_io_backend(io_backend)
@@ -1383,6 +1454,43 @@ async fn main() -> Result<()> {
             config.l0_ra_min_score = ra_min_score;
             config.l0_ra_min_l0_segments = ra_min_l0_segments;
             let engine = Engine::open(config).await?;
+            if let (
+                Some(raw_output_dir),
+                Some(truth_tsv),
+                Some(id_map_dir),
+                Some(per_query_timeout_ms),
+            ) = (
+                p10_raw_output_dir.as_ref(),
+                p10_truth_tsv.as_ref(),
+                p10_id_map_dir.as_ref(),
+                p10_per_query_timeout_ms,
+            ) {
+                let sample_plan_path = sample_plan_in
+                    .as_ref()
+                    .expect("P10 option validation requires a sample plan");
+                let sample_plan: StorageBenchSamplePlan = serde_json::from_slice(
+                    &fs::read(sample_plan_path)
+                        .with_context(|| format!("read {}", sample_plan_path.display()))?,
+                )
+                .with_context(|| format!("parse {}", sample_plan_path.display()))?;
+                let truth_rows = read_truth_tsv(truth_tsv)?;
+                let ids = SharedIdMap::load(id_map_dir)?;
+                let summary = run_p10_storage_bench(
+                    &engine,
+                    &sample_plan,
+                    &truth_rows,
+                    &ids,
+                    semantic_degree_hint,
+                    force_signature,
+                    warmup_runs,
+                    repeats,
+                    per_query_timeout_ms,
+                    raw_output_dir,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+                return Ok(());
+            }
             let oracle_index_stats = if matches!(l0_layout, Some(L0LayoutPolicy::OracleSemantic)) {
                 Some(engine.build_oracle_index().await?)
             } else {
@@ -2018,6 +2126,400 @@ fn edge_preview(edges: &[EdgeRecord]) -> Vec<Value> {
         .collect()
 }
 
+const P10_RAW_SCHEMA_VERSION: &str = "p10-seml0-storage-bench-raw-v1";
+const P10_RAW_TIMING_BOUNDARY: &str =
+    "typed-neighbor-call-plus-result-materialization-and-digest-v1";
+
+#[derive(Debug, Clone)]
+struct P10PlanQuery {
+    truth: TruthRow,
+    original_src: u64,
+    degree: u64,
+}
+
+#[derive(Debug, Clone)]
+struct P10RawObservation {
+    phase: &'static str,
+    pass_index: usize,
+    truth: TruthRow,
+    actual: Option<DenseDigest>,
+    status: &'static str,
+    latency_ns: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct P10RawPhaseSummary {
+    passes: usize,
+    requested_queries: usize,
+    completed_queries: usize,
+    timeout_queries: usize,
+    mismatch_queries: usize,
+    started_monotonic_ns: u64,
+    ended_monotonic_ns: u64,
+    elapsed_ns: u64,
+}
+
+fn p10_validate_plan(
+    plan: &StorageBenchSamplePlan,
+    truth_rows: &[TruthRow],
+    ids: &SharedIdMap,
+) -> Result<Vec<P10PlanQuery>> {
+    if plan.version != 1 || plan.source != "shared-truth-tsv" {
+        bail!(
+            "P10 sample plan must be version 1 from shared-truth-tsv, found version={} source={:?}",
+            plan.version,
+            plan.source
+        );
+    }
+    if plan.src_label.is_some() || plan.dst_label.is_some() {
+        bail!("P10 sample plan must not carry source/destination label filters");
+    }
+    let sample_count: usize = plan.entries.iter().map(|entry| entry.samples.len()).sum();
+    if sample_count != truth_rows.len() {
+        bail!(
+            "P10 sample plan query count {} differs from truth count {}",
+            sample_count,
+            truth_rows.len()
+        );
+    }
+
+    let mut queries = Vec::with_capacity(truth_rows.len());
+    for entry in &plan.entries {
+        if entry.src_label.is_some() || entry.dst_label.is_some() {
+            bail!("P10 sample-plan entries must not carry label filters");
+        }
+        let edge_type = entry
+            .edge_type
+            .context("P10 sample-plan entry is missing a typed edge_type")?;
+        for sample in &entry.samples {
+            let truth = truth_rows
+                .get(queries.len())
+                .context("P10 sample plan contains more queries than truth")?;
+            if edge_type != truth.edge_type {
+                bail!(
+                    "P10 plan/truth order mismatch at query {}: edge_type {} != {}",
+                    truth.query_index,
+                    edge_type,
+                    truth.edge_type
+                );
+            }
+            let original_src = ids.original_for_dense(truth.src).with_context(|| {
+                format!(
+                    "P10 truth query {} references unmapped dense source {}",
+                    truth.query_index, truth.src
+                )
+            })?;
+            if sample.src != original_src {
+                bail!(
+                    "P10 plan/truth order mismatch at query {}: original src {} != {}",
+                    truth.query_index,
+                    sample.src,
+                    original_src
+                );
+            }
+            if sample.degree != truth.count {
+                bail!(
+                    "P10 plan/truth degree mismatch at query {}: {} != {}",
+                    truth.query_index,
+                    sample.degree,
+                    truth.count
+                );
+            }
+            queries.push(P10PlanQuery {
+                truth: truth.clone(),
+                original_src,
+                degree: sample.degree,
+            });
+        }
+    }
+    if queries.len() != truth_rows.len() {
+        bail!("P10 sample plan omitted one or more truth queries");
+    }
+    Ok(queries)
+}
+
+fn p10_monotonic_ns() -> Result<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: value points to writable timespec storage for the duration of
+    // the libc call, and CLOCK_MONOTONIC is supported on the Linux runner.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) };
+    if rc != 0 || value.tv_sec < 0 || value.tv_nsec < 0 {
+        bail!("clock_gettime(CLOCK_MONOTONIC) failed: {}", std::io::Error::last_os_error());
+    }
+    let seconds = u64::try_from(value.tv_sec).context("CLOCK_MONOTONIC seconds overflow")?;
+    let nanos = u64::try_from(value.tv_nsec).context("CLOCK_MONOTONIC nanos overflow")?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|base| base.checked_add(nanos))
+        .context("CLOCK_MONOTONIC nanoseconds overflow")
+}
+
+async fn run_p10_phase(
+    engine: &Engine,
+    snapshot: u64,
+    queries: &[P10PlanQuery],
+    ids: &SharedIdMap,
+    phase: &'static str,
+    passes: usize,
+    semantic_degree_hint: bool,
+    force_signature: bool,
+    timeout_ms: u64,
+) -> Result<(Vec<P10RawObservation>, P10RawPhaseSummary)> {
+    let timeout_ns = timeout_ms
+        .checked_mul(1_000_000)
+        .context("P10 timeout nanoseconds overflow")?;
+    let deadline = Duration::from_millis(timeout_ms);
+    let phase_started = p10_monotonic_ns()?;
+    let mut observations = Vec::with_capacity(queries.len() * passes);
+    let mut completed = 0usize;
+    let mut timeouts = 0usize;
+    let mut mismatches = 0usize;
+
+    for pass_index in 0..passes {
+        for query in queries {
+            let query_started = p10_monotonic_ns()?;
+            let outcome = tokio::time::timeout(
+                deadline,
+                run_storage_bench_query(
+                    engine,
+                    snapshot,
+                    query.original_src,
+                    Some(query.truth.edge_type),
+                    semantic_degree_hint,
+                    force_signature,
+                    query.degree,
+                    None,
+                    StorageBenchPropertyPredicateMode::None,
+                    0,
+                    0,
+                    0,
+                ),
+            )
+            .await;
+
+            let mut actual = None;
+            let mut status = "timeout";
+            match outcome {
+                Ok(result) => {
+                    let edges = result.with_context(|| {
+                        format!(
+                            "P10 typed-neighbor query {} failed",
+                            query.truth.query_index
+                        )
+                    })?;
+                    let mut digest = DenseDigest::default();
+                    for edge in edges {
+                        let dense_dst = ids.dense_for_original(edge.dst).with_context(|| {
+                            format!(
+                                "P10 query {} returned unmapped original destination {}",
+                                query.truth.query_index, edge.dst
+                            )
+                        })?;
+                        digest.add(dense_dst);
+                    }
+                    actual = Some(digest);
+                    status = "ok";
+                }
+                Err(_) => {}
+            }
+            let query_ended = p10_monotonic_ns()?;
+            let mut latency_ns = query_ended.saturating_sub(query_started);
+            if latency_ns > timeout_ns {
+                actual = None;
+                status = "timeout";
+            }
+            if status == "timeout" {
+                latency_ns = latency_ns.max(timeout_ns);
+                timeouts += 1;
+            } else {
+                completed += 1;
+                if actual != Some(query.truth.digest()) {
+                    mismatches += 1;
+                }
+            }
+            observations.push(P10RawObservation {
+                phase,
+                pass_index,
+                truth: query.truth.clone(),
+                actual,
+                status,
+                latency_ns,
+            });
+        }
+    }
+    let phase_ended = p10_monotonic_ns()?;
+    Ok((
+        observations,
+        P10RawPhaseSummary {
+            passes,
+            requested_queries: passes * queries.len(),
+            completed_queries: completed,
+            timeout_queries: timeouts,
+            mismatch_queries: mismatches,
+            started_monotonic_ns: phase_started,
+            ended_monotonic_ns: phase_ended,
+            elapsed_ns: phase_ended.saturating_sub(phase_started),
+        },
+    ))
+}
+
+fn p10_write_raw_artifacts(
+    output_dir: &Path,
+    observations: &[P10RawObservation],
+    warmup: &P10RawPhaseSummary,
+    measured: &P10RawPhaseSummary,
+    result: &Value,
+) -> Result<()> {
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create P10 raw output directory {}", output_dir.display()))?;
+    let observation_path = output_dir.join("p10-raw-observations.tsv");
+    let event_path = output_dir.join("p10-raw-phase-events.jsonl");
+    let result_path = output_dir.join("p10-raw-result.json");
+    for path in [&observation_path, &event_path, &result_path] {
+        if path.exists() {
+            bail!("P10 raw output refuses to overwrite {}", path.display());
+        }
+    }
+    let suffix = format!(".tmp.{}", std::process::id());
+    let observation_tmp = observation_path.with_file_name(format!(
+        "{}{}",
+        observation_path.file_name().unwrap().to_string_lossy(),
+        suffix
+    ));
+    let event_tmp = event_path.with_file_name(format!(
+        "{}{}",
+        event_path.file_name().unwrap().to_string_lossy(),
+        suffix
+    ));
+    let result_tmp = result_path.with_file_name(format!(
+        "{}{}",
+        result_path.file_name().unwrap().to_string_lossy(),
+        suffix
+    ));
+
+    {
+        let mut writer = BufWriter::new(fs::File::create(&observation_tmp)?);
+        writeln!(
+            writer,
+            "phase\tpass_index\tquery_index\tedge_type\tsrc\texpected_count\tactual_count\texpected_sum_hash\tactual_sum_hash\texpected_xor_hash\tactual_xor_hash\tstatus\tlatency_ns"
+        )?;
+        for row in observations {
+            let (actual_count, actual_sum, actual_xor) = row
+                .actual
+                .map(|digest| {
+                    (
+                        digest.count.to_string(),
+                        digest.sum_hash.to_string(),
+                        digest.xor_hash.to_string(),
+                    )
+                })
+                .unwrap_or_else(|| (String::new(), String::new(), String::new()));
+            writeln!(
+                writer,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                row.phase,
+                row.pass_index,
+                row.truth.query_index,
+                row.truth.edge_type,
+                row.truth.src,
+                row.truth.count,
+                actual_count,
+                row.truth.sum_hash,
+                actual_sum,
+                row.truth.xor_hash,
+                actual_xor,
+                row.status,
+                row.latency_ns,
+            )?;
+        }
+        writer.flush()?;
+    }
+    {
+        let mut writer = BufWriter::new(fs::File::create(&event_tmp)?);
+        for (phase, event, timestamp) in [
+            ("warmup", "start", warmup.started_monotonic_ns),
+            ("warmup", "end", warmup.ended_monotonic_ns),
+            ("measured", "start", measured.started_monotonic_ns),
+            ("measured", "end", measured.ended_monotonic_ns),
+        ] {
+            serde_json::to_writer(
+                &mut writer,
+                &json!({"phase": phase, "event": event, "monotonic_ns": timestamp}),
+            )?;
+            writeln!(writer)?;
+        }
+        writer.flush()?;
+    }
+    fs::write(&result_tmp, serde_json::to_vec_pretty(result)?)?;
+    fs::rename(&observation_tmp, &observation_path)?;
+    fs::rename(&event_tmp, &event_path)?;
+    // The result is the completion marker and is deliberately published last.
+    fs::rename(&result_tmp, &result_path)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_p10_storage_bench(
+    engine: &Engine,
+    plan: &StorageBenchSamplePlan,
+    truth_rows: &[TruthRow],
+    ids: &SharedIdMap,
+    semantic_degree_hint: bool,
+    force_signature: bool,
+    warmup_passes: usize,
+    measured_passes: usize,
+    timeout_ms: u64,
+    output_dir: &Path,
+) -> Result<Value> {
+    let queries = p10_validate_plan(plan, truth_rows, ids)?;
+    let snapshot = engine.current_snapshot();
+    let effective_force_signature = force_signature || plan.force_signature;
+    let (mut observations, warmup) = run_p10_phase(
+        engine,
+        snapshot,
+        &queries,
+        ids,
+        "warmup",
+        warmup_passes,
+        semantic_degree_hint,
+        effective_force_signature,
+        timeout_ms,
+    )
+    .await?;
+    let (measured_observations, measured) = run_p10_phase(
+        engine,
+        snapshot,
+        &queries,
+        ids,
+        "measured",
+        measured_passes,
+        semantic_degree_hint,
+        effective_force_signature,
+        timeout_ms,
+    )
+    .await?;
+    observations.extend(measured_observations);
+    let result = json!({
+        "schema_version": P10_RAW_SCHEMA_VERSION,
+        "clock": "CLOCK_MONOTONIC",
+        "timing_boundary": P10_RAW_TIMING_BOUNDARY,
+        "snapshot": snapshot,
+        "query_count": truth_rows.len(),
+        "semantic_degree_hint": semantic_degree_hint,
+        "force_signature": effective_force_signature,
+        "per_query_timeout_ms": timeout_ms,
+        "mapping_hash": ids.mapping_hash(),
+        "id_map_vertex_count": ids.vertex_count(),
+        "warmup": warmup,
+        "measured": measured,
+    });
+    p10_write_raw_artifacts(output_dir, &observations, &warmup, &measured, &result)?;
+    Ok(result)
+}
+
 struct StorageBenchRoundResult {
     neighbor_edges: usize,
     one_hop_edges: usize,
@@ -2638,6 +3140,60 @@ mod tests {
         assert_eq!(parsed.entries[0].edge_type, Some(-7));
         assert_eq!(parsed.entries[0].samples[0].src, 400);
         assert_eq!(parsed.entries[0].samples[0].degree, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn p10_plan_contract_rejects_truth_reordering() -> Result<()> {
+        let ids = SharedIdMap::from_dense_to_original(vec![100, 400])?;
+        let rows = vec![lsmgraph::shared_truth::TruthRow {
+            query_index: 0,
+            edge_type: 7,
+            src: 1,
+            count: 0,
+            sum_hash: 0,
+            xor_hash: 0,
+        }];
+        let shared = build_storage_sample_plan(&rows, &ids, false, false)?;
+        let encoded = serde_json::to_string(&shared)?;
+        let mut parsed: StorageBenchSamplePlan = serde_json::from_str(&encoded)?;
+        parsed.entries[0].samples[0].src = 100;
+        let error = p10_validate_plan(&parsed, &rows, &ids).unwrap_err();
+        assert!(error.to_string().contains("plan/truth order mismatch"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn p10_raw_mode_runs_whole_trace_warmup_then_measured() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let engine = Engine::create(LsmGraphConfig::new(temp.path().join("store"))).await?;
+        engine.insert_edge(100, 200, 7).await?;
+        engine.insert_edge(100, 300, 7).await?;
+        let ids = SharedIdMap::from_dense_to_original(vec![100, 200, 300])?;
+        let mut digest = DenseDigest::default();
+        digest.add(1);
+        digest.add(2);
+        let rows = vec![TruthRow {
+            query_index: 0,
+            edge_type: 7,
+            src: 0,
+            count: digest.count,
+            sum_hash: digest.sum_hash,
+            xor_hash: digest.xor_hash,
+        }];
+        let shared = build_storage_sample_plan(&rows, &ids, false, false)?;
+        let plan: StorageBenchSamplePlan =
+            serde_json::from_str(&serde_json::to_string(&shared)?)?;
+        let output = temp.path().join("raw");
+        let summary = run_p10_storage_bench(
+            &engine, &plan, &rows, &ids, false, false, 1, 1, 1_000, &output,
+        )
+        .await?;
+        assert_eq!(summary["warmup"]["mismatch_queries"], 0);
+        assert_eq!(summary["measured"]["mismatch_queries"], 0);
+        assert!(output.join("p10-raw-observations.tsv").is_file());
+        assert!(output.join("p10-raw-phase-events.jsonl").is_file());
+        assert!(output.join("p10-raw-result.json").is_file());
         Ok(())
     }
 
