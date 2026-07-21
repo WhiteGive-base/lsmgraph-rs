@@ -96,10 +96,14 @@ measured 边界；import wall/CPU/store bytes 单独报告，不得混入 query 
 | LiveGraph | `adapters/livegraph_adapter.py`；原生 worker 同进程 fresh import→warmup→measured | 每个 repeat 使用全新的 store/temp；冻结 dense dataset、worker 和 `liblivegraph.so` SHA |
 | Aster | `adapters/aster_adapter.py` + 原生 RocksGraph worker | clean/pinned source、冻结 binary/dataset/logical-store SHA、reopen DB、P02B PASS |
 | TuGraph | typed-neighbor adapter | 冻结 runtime/image/binary；正式运行期间独占服务或 in-process 入口 |
-| Neo4j | Bolt typed-neighbor client adapter | 精确 image digest、固定 client；外部预启动且容器名写入 manifest |
+| Neo4j | `adapters/neo4j_adapter.py`；真实 Bolt/Cypher typed-neighbor、逐查询 monotonic latency/digest/timeout | 精确 image digest、固定 Python driver；只读外部预启动容器与独立 runtime-store copy |
 | NebulaGraph | nGQL typed-neighbor client adapter | graphd/metad/storaged 精确 digest；三个外部预启动容器均写入 manifest |
 
 正式 manifest 的 adapter、binary、truth、file dataset 必须给出精确 SHA-256；目录 dataset 使用冻结 lineage SHA-256。client-server 还必须声明全部 image digest 和可由 P31 解析的 container/PID，运行器不会代替用户管理服务生命周期。
+
+client-server request 还会携带 `external_service`，把 suite manifest 的
+`service_lifecycle/containers/extra_pids/image_digests` 原样交给真实 adapter。这样 adapter
+复验的容器和 P31 采集的容器不能由两套互不相干的参数指定。
 
 每个系统必须显式填写 `process_lifetime` 和 `runtime_libraries`。LiveGraph 的
 正式值只能是 `fresh-import-and-query-process-lifetime-v1`，不能标成 prebuilt、
@@ -148,6 +152,21 @@ LD_LIBRARY_PATH=/abs/path/to/LiveGraph/build \
 LIVEGRAPH_P10_BINARY=$PWD/baseline/external-drivers/livegraph_p10_driver \
 python3 -B -m unittest -v \
   cidr-experiments/runners/p10/tests/test_livegraph_adapter.py
+```
+
+### Neo4j adapter 的当前边界
+
+Neo4j 使用 `external-prestarted-query-process-lifetime-v1`。真实 adapter 不管理服务；它在查询前
+复验 manifest 中的唯一容器、`neo4j:5.26.24` RepoDigest、localhost Bolt 端口、`/data`
+mount、`restart=no`、只读默认数据库、Python driver `5.28.3`、dataset/truth/store manifest
+和 canonical P02B admission。详细的安全 runtime-copy 与 store 冻结流程见
+`adapters/NEO4J-ADAPTER-CN.md`。
+
+真实 tiny fixture 自测（明确不是论文性能数据）：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
+  cidr-experiments/runners/p10/tests/test_neo4j_adapter.py
 ```
 
 ## Fixture 自测
