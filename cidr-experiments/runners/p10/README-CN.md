@@ -43,6 +43,11 @@ readiness_gate=PASS
 adapter [manifest args...] --request adapter-request.json --output-dir DIR
 ```
 
+request 会把 `execution_mode`、system binary、dataset 以及每个 store root
+的 lineage SHA-256 一并传给 adapter；正式模式中这些 SHA 均不能为空。这样
+adapter 实际打开的 binary/data/store 与 P31 manifest 是同一组冻结输入，
+不能通过 adapter 参数悄悄换成另一份数据。
+
 adapter 必须在一次进程生命周期内依次生成：
 
 1. `phase-events.jsonl`：严格四行，依次为 warmup start/end、measured start/end；时间来自 Linux `CLOCK_MONOTONIC`。
@@ -84,13 +89,44 @@ P31 当前覆盖整个 warmup+measured adapter 进程，资源列因此是 repea
 | 系统 | adapter 必须提供 | 运行前外部条件 |
 |---|---|---|
 | SemL0 | 共享 truth 消费、同进程 warmup/measured、逐查询观测 | integration release binary；四个变体各自 store；共享 sample plan |
-| LiveGraph | query-only adapter，不得每个 repeat 重载图 | 重编译含 `--truth-tsv` 的 driver；兼容 block/WAL store |
+| LiveGraph | `adapters/livegraph_adapter.py`；原生 worker 同进程 warmup→measured | 需要可重开的 query-only block/WAL store；当前 vendored revision 尚不支持，formal 会 fail closed |
 | Aster | RocksGraph typed-neighbor bridge | clean/pinned source 与重建 driver；兼容 DB |
 | TuGraph | typed-neighbor adapter | 冻结 runtime/image/binary；正式运行期间独占服务或 in-process 入口 |
 | Neo4j | Bolt typed-neighbor client adapter | 精确 image digest、固定 client；外部预启动且容器名写入 manifest |
 | NebulaGraph | nGQL typed-neighbor client adapter | graphd/metad/storaged 精确 digest；三个外部预启动容器均写入 manifest |
 
 正式 manifest 的 adapter、binary、truth、file dataset 必须给出精确 SHA-256；目录 dataset 使用冻结 lineage SHA-256。client-server 还必须声明全部 image digest 和可由 P31 解析的 container/PID，运行器不会代替用户管理服务生命周期。
+
+每个正式 `store_roots[]` 还必须提供 `sha256`。它是已发布 store manifest
+的 lineage SHA-256，不是临时对目录遍历顺序做出的散列；该值会进入 resolved
+suite config、adapter request 和 P31 config provenance。
+
+### LiveGraph adapter 的当前边界
+
+构建真实 LiveGraph query worker：
+
+```bash
+make -C baseline/external-drivers livegraph_p10 \
+  LG=/abs/path/to/LiveGraph
+```
+
+`livegraph_p10_driver --capabilities` 会声明 store capability。当前仓库固定的
+LiveGraph 源码在 `Graph` 构造时以 `O_TRUNC` 打开 block/WAL，且 vertex/edge
+metadata 只存在于当前进程；所以历史 block/WAL 文件不能被另一个 repeat
+重新打开。adapter 只允许在 `execution_mode=fixture` 时从小型 dense edge
+list 导入一次，并在同一个原生 worker 中完成完整 warmup 后再 measured。
+`execution_mode=formal` 要求 worker 声明 `reopenable-query-store-v1`，否则在
+任何 store 写入或计时前退出。这些 fixture 结果只用于 correctness，不得进入
+Figure 1。
+
+真实 LiveGraph 小 fixture 自测（不产生性能数据）：
+
+```bash
+LD_LIBRARY_PATH=/abs/path/to/LiveGraph/build \
+LIVEGRAPH_P10_BINARY=$PWD/baseline/external-drivers/livegraph_p10_driver \
+python3 -B -m unittest -v \
+  cidr-experiments/runners/p10/tests/test_livegraph_adapter.py
+```
 
 ## Fixture 自测
 

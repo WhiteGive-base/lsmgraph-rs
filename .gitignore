@@ -17,6 +17,7 @@ __pycache__/
 # Benchmark raw data and DB artifacts
 /baseline/external-drivers/livegraph_driver_stream
 /baseline/external-drivers/livegraph_digest_driver
+/baseline/external-drivers/livegraph_p10_driver
 /baseline/external-baselines-20260624/**/edges-raw.tsv
 /baseline/external-baselines-20260624/**/edges-dense.txt
 /baseline/external-baselines-20260624/**/livegraph-block
