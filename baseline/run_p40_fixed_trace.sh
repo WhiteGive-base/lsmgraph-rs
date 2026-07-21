@@ -28,9 +28,15 @@ NICE_LEVEL="${NICE_LEVEL:-15}"
 BUILD="${BUILD:-1}"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
-# Optional P31 wrapper contract:
-#   collector --run-id ID --repeat N --arm NAME --raw-dir DIR -- COMMAND...
+# Optional P31 wrapper. This must be the actual P31 run_with_resources.sh;
+# every arm receives an independent P31 run directory and store root.
 P31_COLLECTOR="${P31_COLLECTOR:-}"
+P31_DEVICE="${P31_DEVICE:-nvme1n1}"
+P31_DATA_MOUNT="${P31_DATA_MOUNT:-/data}"
+P31_INTERVAL="${P31_INTERVAL:-1}"
+P31_DISK_INTERVAL="${P31_DISK_INTERVAL:-15}"
+P31_MIN_SAMPLES="${P31_MIN_SAMPLES:-2}"
+P31_ALLOW_MISSING_AUX_TOOLS="${P31_ALLOW_MISSING_AUX_TOOLS:-0}"
 CLEAN_READY_FILE="${CLEAN_READY_FILE:-}"
 
 die() {
@@ -43,6 +49,8 @@ die() {
 [[ -f "$SOURCE_CSV" || -n "$TRACE_IN" ]] || die "missing source CSV: $SOURCE_CSV"
 [[ -z "$TRACE_IN" || -f "$TRACE_IN" ]] || die "TRACE_IN does not exist: $TRACE_IN"
 [[ -z "$P31_COLLECTOR" || -x "$P31_COLLECTOR" ]] || die "P31_COLLECTOR is not executable: $P31_COLLECTOR"
+[[ "$P31_ALLOW_MISSING_AUX_TOOLS" == "0" || "$P31_ALLOW_MISSING_AUX_TOOLS" == "1" ]] \
+  || die 'P31_ALLOW_MISSING_AUX_TOOLS must be 0 or 1'
 
 case "$MODE" in
   fixture)
@@ -54,6 +62,8 @@ case "$MODE" in
     [[ -f "$CLEAN_READY_FILE" ]] || die 'formal mode requires CLEAN_READY_FILE'
     grep -q '^readiness_gate=PASS$' "$CLEAN_READY_FILE" || die 'clean-window readiness gate is not PASS'
     [[ "${PERFORMANCE_ELIGIBLE:-0}" == "1" ]] || die 'formal mode requires PERFORMANCE_ELIGIBLE=1'
+    [[ "$P31_ALLOW_MISSING_AUX_TOOLS" == "0" ]] \
+      || die 'formal mode forbids P31_ALLOW_MISSING_AUX_TOOLS=1'
     PERFORMANCE_ELIGIBLE=true
     ;;
   *) die "unknown MODE=$MODE; use fixture or formal" ;;
@@ -106,6 +116,11 @@ GIT_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
   printf 'repeats=%s\n' "$REPEATS"
   printf 'arms=%s\n' "${ARMS[*]}"
   printf 'p31_collector=%s\n' "${P31_COLLECTOR:-none}"
+  printf 'p31_device=%s\n' "$P31_DEVICE"
+  printf 'p31_data_mount=%s\n' "$P31_DATA_MOUNT"
+  printf 'p31_interval=%s\n' "$P31_INTERVAL"
+  printf 'p31_disk_interval=%s\n' "$P31_DISK_INTERVAL"
+  printf 'p31_min_samples=%s\n' "$P31_MIN_SAMPLES"
 } >> "$LOG_ROOT/classification.env"
 
 for repeat in $(seq 1 "$REPEATS"); do
@@ -129,9 +144,35 @@ for repeat in $(seq 1 "$REPEATS"); do
     printf '\n' >> "$repeat_dir/$arm.command.txt"
 
     if [[ -n "$P31_COLLECTOR" ]]; then
-      timeout "$ARM_TIMEOUT" nice -n "$NICE_LEVEL" "$P31_COLLECTOR" \
-        --run-id "$RUN_ID" --repeat "$repeat" --arm "$arm" --raw-dir "$repeat_dir" -- \
-        "${command[@]}" \
+      repeat_label="$(printf '%02d' "$repeat")"
+      p31_run_dir="$repeat_dir/$arm.p31"
+      arm_config="$repeat_dir/$arm.config.json"
+      printf '{"schema_version":"p40-arm-config-v1","policy":"%s","capacity_l0_files":%s,"static_range_bucket_size":%s,"store_mode":"create","trace_sha256":"%s"}\n' \
+        "$arm" "$CAPACITY_L0_FILES" "$STATIC_RANGE_BUCKET_SIZE" "$TRACE_SHA256" \
+        > "$arm_config"
+      p31_command=(
+        "$P31_COLLECTOR"
+        --run-dir "$p31_run_dir"
+        --run-id "${RUN_ID}-r${repeat_label}-${arm}"
+        --task-id "P40-${RUN_ID}-r${repeat_label}-${arm}"
+        --performance-eligible "$PERFORMANCE_ELIGIBLE"
+        --repo-root "$ROOT"
+        --device "$P31_DEVICE"
+        --data-mount "$P31_DATA_MOUNT"
+        --interval "$P31_INTERVAL"
+        --disk-interval "$P31_DISK_INTERVAL"
+        --min-samples "$P31_MIN_SAMPLES"
+        --store "lsm=$store_dir"
+        --binary "$BIN"
+        --dataset "$TRACE_FILE"
+        --query-or-trace "$TRACE_FILE"
+        --config "$arm_config"
+      )
+      if [[ "$P31_ALLOW_MISSING_AUX_TOOLS" == "1" ]]; then
+        p31_command+=(--allow-missing-aux-tools)
+      fi
+      p31_command+=(-- "${command[@]}")
+      timeout "$ARM_TIMEOUT" nice -n "$NICE_LEVEL" "${p31_command[@]}" \
         > "$repeat_dir/$arm.stdout.log" 2> "$repeat_dir/$arm.stderr.log"
     else
       timeout "$ARM_TIMEOUT" nice -n "$NICE_LEVEL" "${command[@]}" \
