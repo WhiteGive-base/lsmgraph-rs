@@ -700,6 +700,14 @@ def validate_adapter_outputs(
     for path in (result_path, observations_path, events_path):
         if not path.is_file():
             raise ContractError(f"adapter omitted required artifact: {path.name}")
+    process_lifetime = request.get("process_lifetime")
+    legacy_fixture_lifetime = process_lifetime is None
+    if legacy_fixture_lifetime:
+        if request.get("execution_mode") != "fixture" or not system.get("fixture_only", False):
+            raise ContractError("adapter request omitted process_lifetime outside a fixture-only validation")
+        process_lifetime = FIXTURE_PROCESS_LIFETIME
+    elif process_lifetime not in PROCESS_LIFETIME_POLICIES:
+        raise ContractError("adapter request.process_lifetime is outside the frozen vocabulary")
     result_keys = (
         "schema_version",
         "contract_version",
@@ -720,7 +728,9 @@ def validate_adapter_outputs(
     )
     result = require_keys(
         read_json(result_path, "adapter result"),
-        required=result_keys,
+        required=tuple(
+            key for key in result_keys if not (legacy_fixture_lifetime and key == "process_lifetime")
+        ),
         allowed=(*result_keys, "setup"),
         context="adapter result",
     )
@@ -732,7 +742,6 @@ def validate_adapter_outputs(
         "system_version": system["system_version"],
         "interface_scope": INTERFACE_SCOPE,
         "repeat_index": request["repeat_index"],
-        "process_lifetime": request["process_lifetime"],
         "truth_sha256": request["truth"]["sha256"],
         "sequence_digest_algorithm": SEQUENCE_DIGEST_ALGORITHM,
         "timing_boundary": TIMING_BOUNDARY,
@@ -743,6 +752,10 @@ def validate_adapter_outputs(
     for key, expected in exact_top.items():
         if result.get(key) != expected:
             raise ContractError(f"adapter result.{key}: {result.get(key)!r} != {expected!r}")
+    if not legacy_fixture_lifetime and result.get("process_lifetime") != process_lifetime:
+        raise ContractError(
+            f"adapter result.process_lifetime: {result.get('process_lifetime')!r} != {process_lifetime!r}"
+        )
 
     observations = _read_observations(observations_path)
     phase_passes = {
@@ -886,7 +899,7 @@ def validate_adapter_outputs(
         "import_store_logical_bytes": "",
         "import_store_allocated_bytes": "",
     }
-    if request["process_lifetime"] == FRESH_IMPORT_PROCESS_LIFETIME:
+    if process_lifetime == FRESH_IMPORT_PROCESS_LIFETIME:
         if "setup" not in result:
             raise ContractError("fresh-import adapter result omitted setup metrics")
         setup_keys = (
@@ -944,14 +957,13 @@ def validate_adapter_outputs(
         }
     elif "setup" in result:
         raise ContractError("non-fresh adapter result must not publish fresh-import setup metrics")
-    return {
+    validated = {
         "schema_version": "cidr-p10-validated-repeat-v1",
         "system_id": system["id"],
         "display_name": system["display_name"],
         "group": system["group"],
         "system_version": system["system_version"],
         "interface_scope": INTERFACE_SCOPE,
-        "process_lifetime": request["process_lifetime"],
         "repeat_index": request["repeat_index"],
         "query_count": len(truth_rows),
         "warmup_passes": phase_passes["warmup"],
@@ -978,6 +990,9 @@ def validate_adapter_outputs(
         },
         "adapter_provenance": adapter_provenance,
     }
+    if not legacy_fixture_lifetime:
+        validated["process_lifetime"] = process_lifetime
+    return validated
 
 
 def read_p31_summary(run_dir: Path, *, performance_eligible: bool) -> dict[str, Any]:
