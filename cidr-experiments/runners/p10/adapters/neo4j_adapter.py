@@ -57,10 +57,18 @@ P31_DIR = P10_DIR.parent / "p31"
 sys.path.insert(0, str(P31_DIR))
 from run_manifest import host_facts as p31_host_facts  # noqa: E402
 
-PROVENANCE_SCHEMA_VERSION = "p10-neo4j-adapter-provenance-v1"
-STORE_MANIFEST_SCHEMA_VERSION = "p10-neo4j-store-manifest-v1"
+PROVENANCE_SCHEMA_VERSION = "p10-neo4j-adapter-provenance-v2"
+STORE_MANIFEST_SCHEMA_VERSION = "p10-neo4j-store-manifest-v2"
 TREE_HASH_METHOD = "sha256-tree-v1(relative-path,size,file-sha256)"
 RELATIONSHIP_MODEL = "dense-edge-type-as-outgoing-relationship-type-v1"
+SNAPSHOT_PHASE = "offline-prestart-v1"
+DATABASE_NAME = "neo4j"
+INDEX_NAME = "v_id"
+NODE_LABEL = "V"
+ID_PROPERTY = "id"
+EXPECTED_IMAGE_REF = "neo4j:5.26.24"
+EXPECTED_DRIVER_VERSION = "5.28.3"
+EXPECTED_SERVER_AGENT = "Neo4j/5.26.24"
 MASK = (1 << 64) - 1
 SHA256_CHARS = frozenset("0123456789abcdef")
 
@@ -77,9 +85,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("fixture", "formal"), required=True)
     parser.add_argument("--uri", required=True)
     parser.add_argument("--database", default="neo4j")
-    parser.add_argument("--expected-image-ref", default="neo4j:5.26.24")
+    parser.add_argument("--readiness-timeout-s", type=int, default=180)
+    parser.add_argument("--expected-image-ref", default=EXPECTED_IMAGE_REF)
     parser.add_argument("--expected-driver-version", required=True)
-    parser.add_argument("--expected-server-agent", default="Neo4j/5.26.24")
+    parser.add_argument("--expected-server-agent", default=EXPECTED_SERVER_AGENT)
     parser.add_argument("--store-label", default="neo4j-runtime")
     parser.add_argument("--dataset-manifest", required=True, type=Path)
     parser.add_argument("--dataset-manifest-sha256", required=True)
@@ -369,9 +378,10 @@ def validate_request(
         "Neo4j requires exactly one P31-visible container",
     )
     pids = external["extra_pids"]
-    require(isinstance(pids, list), "request.external_service.extra_pids must be an array")
-    for index, pid in enumerate(pids):
-        integer(pid, f"request.external_service.extra_pids[{index}]", 1)
+    require(
+        isinstance(pids, list) and not pids,
+        "Neo4j requires an empty extra_pids array; P31 must observe the one container",
+    )
     image_digests = external["image_digests"]
     require(
         isinstance(image_digests, list) and len(image_digests) == 1,
@@ -422,7 +432,9 @@ def validate_store_manifest(
     dataset: dict[str, Any],
     request: dict[str, Any],
     image_digest: str,
+    expected_image_ref: str,
     expected_server_version: str,
+    formal: bool,
 ) -> dict[str, Any]:
     reference = resolve_file(path, expected_sha, "Neo4j store manifest")
     required = (
@@ -432,8 +444,11 @@ def validate_store_manifest(
         "hash_method",
         "file_count",
         "total_bytes",
-        "neo4j_version",
-        "image_digest",
+        "snapshot_phase",
+        "mutable_runtime_paths",
+        "runtime_compatibility",
+        "import_image_identity",
+        "database_contract",
         "dataset_manifest_sha256",
         "dataset_sha256",
         "truth_sha256",
@@ -450,8 +465,7 @@ def validate_store_manifest(
         "schema_version": STORE_MANIFEST_SCHEMA_VERSION,
         "store_sha256": store_lineage,
         "hash_method": TREE_HASH_METHOD,
-        "neo4j_version": expected_server_version,
-        "image_digest": image_digest,
+        "snapshot_phase": SNAPSHOT_PHASE,
         "dataset_manifest_sha256": dataset["reference"]["sha256"],
         "dataset_sha256": request["dataset"]["sha256"],
         "truth_sha256": request["truth"]["sha256"],
@@ -462,6 +476,64 @@ def validate_store_manifest(
     same_path(manifest["store_root"], store, "Neo4j store manifest.store_root")
     integer(manifest["file_count"], "Neo4j store manifest.file_count", 1)
     integer(manifest["total_bytes"], "Neo4j store manifest.total_bytes", 1)
+    mutable_paths = manifest["mutable_runtime_paths"]
+    require(
+        mutable_paths == ["logs/**", "server_id", "transactions/**"],
+        "Neo4j store manifest.mutable_runtime_paths mismatch",
+    )
+    runtime = require_keys(
+        manifest["runtime_compatibility"],
+        required=("neo4j_version", "image_ref", "image_digest"),
+        allowed=("neo4j_version", "image_ref", "image_digest"),
+        context="Neo4j store manifest.runtime_compatibility",
+    )
+    require(runtime["neo4j_version"] == expected_server_version, "Neo4j runtime version mismatch")
+    require(runtime["image_ref"] == expected_image_ref, "Neo4j runtime image ref mismatch")
+    require(runtime["image_digest"] == image_digest, "Neo4j runtime image digest mismatch")
+    import_identity = require_keys(
+        manifest["import_image_identity"],
+        required=("status", "image_ref", "image_digest"),
+        allowed=("status", "image_ref", "image_digest"),
+        context="Neo4j store manifest.import_image_identity",
+    )
+    require(import_identity["image_ref"] == expected_image_ref, "Neo4j import image ref mismatch")
+    require(
+        import_identity["status"] in {"verified-repodigest", "unverified-tag-only"},
+        "Neo4j import image identity has unknown status",
+    )
+    if import_identity["status"] == "verified-repodigest":
+        require(
+            import_identity["image_digest"] == image_digest,
+            "Neo4j verified import image digest differs from runtime digest",
+        )
+    else:
+        require(
+            import_identity["image_digest"] is None,
+            "Neo4j unverified import identity must not claim a digest",
+        )
+        require(
+            not formal,
+            "formal Neo4j runs require a verified import image RepoDigest",
+        )
+    database = require_keys(
+        manifest["database_contract"],
+        required=("database_name", "node_label", "id_property", "required_index"),
+        allowed=("database_name", "node_label", "id_property", "required_index"),
+        context="Neo4j store manifest.database_contract",
+    )
+    require(database["database_name"] == DATABASE_NAME, "Neo4j database name mismatch")
+    require(database["node_label"] == NODE_LABEL, "Neo4j node label mismatch")
+    require(database["id_property"] == ID_PROPERTY, "Neo4j ID property mismatch")
+    required_index = require_keys(
+        database["required_index"],
+        required=("name", "type", "state"),
+        allowed=("name", "type", "state"),
+        context="Neo4j store manifest.database_contract.required_index",
+    )
+    require(
+        required_index == {"name": INDEX_NAME, "type": "RANGE", "state": "ONLINE"},
+        "Neo4j required index contract mismatch",
+    )
     sentinels = manifest["sentinel_files"]
     require(isinstance(sentinels, list) and sentinels, "Neo4j store manifest requires sentinel_files")
     validated: list[dict[str, Any]] = []
@@ -484,7 +556,14 @@ def validate_store_manifest(
         reference_item = resolve_file(target, item["sha256"], context)
         expected_size = integer(item["size_bytes"], f"{context}.size_bytes", 1)
         require(reference_item["size_bytes"] == expected_size, f"{context}.size_bytes mismatch")
-        validated.append({"path": relative_text, **reference_item})
+        validated.append(
+            {
+                "path": relative_text,
+                "absolute_path": reference_item["path"],
+                "sha256": reference_item["sha256"],
+                "size_bytes": reference_item["size_bytes"],
+            }
+        )
     return {"reference": reference, "lineage": manifest, "validated_sentinels": validated}
 
 
@@ -525,6 +604,10 @@ def validate_container(
     require(container.get("Name") == f"/{name}", "Docker container name mismatch")
     state = container.get("State", {})
     require(state.get("Running") is True, "Neo4j container is not running")
+    pid = integer(state.get("Pid"), "Neo4j container PID", 1)
+    started_at = nonempty_string(state.get("StartedAt"), "Neo4j container StartedAt")
+    restart_count = integer(container.get("RestartCount"), "Neo4j container RestartCount", 0)
+    require(restart_count == 0, "Neo4j container must have RestartCount=0")
     require(container.get("HostConfig", {}).get("RestartPolicy", {}).get("Name") == "no", "Neo4j container restart policy must be 'no'")
     require(container.get("Config", {}).get("Image") == expected_image_ref, "Neo4j container image tag mismatch")
     image_id = exact_image_digest(container.get("Image"), "Docker container image ID")
@@ -563,14 +646,16 @@ def validate_container(
 
     environment = container.get("Config", {}).get("Env") or []
     require("NEO4J_AUTH=none" in environment, "Neo4j adapter currently requires NEO4J_AUTH=none")
-    if formal:
-        require(
-            "NEO4J_server_databases_default__to__read__only=true" in environment,
-            "formal Neo4j service must default databases to read-only",
-        )
+    require(
+        "NEO4J_server_databases_default__to__read__only=true" in environment,
+        "Neo4j service must default databases to read-only",
+    )
     return {
         "name": name,
-        "id": nonempty_string(container.get("Id"), "Docker container ID"),
+        "container_id": nonempty_string(container.get("Id"), "Docker container ID"),
+        "pid": pid,
+        "started_at": started_at,
+        "restart_count": restart_count,
         "image_id": image_id,
         "configured_image": expected_image_ref,
         "repo_digests": repo_digests,
@@ -579,8 +664,33 @@ def validate_container(
         "bolt_host": "127.0.0.1",
         "bolt_port": parsed.port,
         "restart_policy": "no",
-        "read_only_default": "NEO4J_server_databases_default__to__read__only=true" in environment,
+        "read_only_default": True,
     }
+
+
+def validate_container_stability(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    stable_keys = (
+        "name",
+        "container_id",
+        "pid",
+        "started_at",
+        "restart_count",
+        "image_id",
+        "configured_image",
+        "expected_repo_digest",
+        "data_mount",
+        "bolt_host",
+        "bolt_port",
+        "restart_policy",
+        "read_only_default",
+    )
+    for key in stable_keys:
+        require(before.get(key) == after.get(key), f"Neo4j container {key} changed during the repeat")
+    require(before.get("restart_count") == 0, "Neo4j container restarted before the repeat")
+    require(after.get("restart_count") == 0, "Neo4j container restarted during the repeat")
+    return {"stable": True, "before": before, "after": after}
 
 
 def driver_binding(expected_version: str) -> dict[str, Any]:
@@ -823,68 +933,145 @@ def observation_row(
     }
 
 
+def open_ready_driver(
+    uri: str,
+    expected_agent: str,
+    timeout_s: int,
+) -> tuple[Any, str, dict[str, Any]]:
+    require(1 <= timeout_s <= 900, "Neo4j readiness timeout must be in [1, 900] seconds")
+    started = clock_ns()
+    deadline = time.monotonic() + timeout_s
+    attempts = 0
+    last_error = "not attempted"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ContractError(
+                f"Neo4j readiness timed out after {attempts} attempts: {last_error}"
+            )
+        attempts += 1
+        driver = None
+        try:
+            driver = GraphDatabase.driver(
+                uri,
+                auth=None,
+                max_connection_pool_size=1,
+                connection_timeout=max(0.001, min(30.0, remaining)),
+            )
+            driver.verify_connectivity()
+            server_agent = driver.get_server_info().agent
+        except Exception as exc:  # Neo4j exposes several transient startup errors.
+            if driver is not None:
+                driver.close()
+            last_error = f"{exc.__class__.__name__}: {exc}"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ContractError(
+                    f"Neo4j readiness timed out after {attempts} attempts: {last_error}"
+                ) from exc
+            time.sleep(min(1.0, remaining))
+            continue
+        if server_agent != expected_agent:
+            driver.close()
+            raise ContractError(
+                f"Neo4j server agent {server_agent!r} != {expected_agent!r}"
+            )
+        elapsed_ns = clock_ns() - started
+        if time.monotonic() > deadline or elapsed_ns > timeout_s * 1_000_000_000:
+            driver.close()
+            raise ContractError(
+                f"Neo4j readiness exceeded its {timeout_s}-second deadline"
+            )
+        return (
+            driver,
+            server_agent,
+            {
+                "timeout_s": timeout_s,
+                "attempts": attempts,
+                "elapsed_ns": elapsed_ns,
+            },
+        )
+
+
+def verify_database_contract(driver: Any, database: str) -> dict[str, Any]:
+    require(database == DATABASE_NAME, f"Neo4j database must be {DATABASE_NAME!r}")
+    statement = (
+        "SHOW INDEXES YIELD name, state, type, entityType, labelsOrTypes, properties "
+        "WHERE name = $name "
+        "RETURN name, state, type, entityType, labelsOrTypes, properties"
+    )
+    with driver.session(database=database, default_access_mode=neo4j.READ_ACCESS) as session:
+        records = [record.data() for record in session.run(statement, name=INDEX_NAME)]
+    require(len(records) == 1, f"Neo4j requires exactly one {INDEX_NAME!r} index")
+    index = records[0]
+    expected = {
+        "name": INDEX_NAME,
+        "state": "ONLINE",
+        "type": "RANGE",
+        "entityType": "NODE",
+        "labelsOrTypes": [NODE_LABEL],
+        "properties": [ID_PROPERTY],
+    }
+    for key, value in expected.items():
+        require(index.get(key) == value, f"Neo4j index {INDEX_NAME!r} {key} mismatch")
+    return {
+        "database_name": database,
+        "node_label": NODE_LABEL,
+        "id_property": ID_PROPERTY,
+        "required_index": expected,
+    }
+
+
 def execute_queries(
-    request: dict[str, Any], truth_rows: list[dict[str, int]], uri: str, database: str, expected_agent: str
-) -> tuple[list[dict[str, str]], dict[str, Any], str]:
+    request: dict[str, Any], truth_rows: list[dict[str, int]], driver: Any, database: str
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
     timing = request["timing"]
     observations: list[dict[str, str]] = []
     phases: dict[str, Any] = {}
-    driver = GraphDatabase.driver(
-        uri,
-        auth=None,
-        max_connection_pool_size=1,
-        connection_timeout=30.0,
-    )
-    try:
-        driver.verify_connectivity()
-        server_agent = driver.get_server_info().agent
-        require(server_agent == expected_agent, f"Neo4j server agent {server_agent!r} != {expected_agent!r}")
-        with driver.session(database=database, default_access_mode=neo4j.READ_ACCESS) as session:
-            for phase in ("warmup", "measured"):
-                passes = timing[f"{phase}_passes"]
-                started = clock_ns()
-                for pass_index in range(passes):
-                    for truth in truth_rows:
-                        status, latency_ns, digest = run_query(
-                            session, truth, timing["per_query_timeout_ms"]
+    with driver.session(database=database, default_access_mode=neo4j.READ_ACCESS) as session:
+        for phase in ("warmup", "measured"):
+            passes = timing[f"{phase}_passes"]
+            started = clock_ns()
+            for pass_index in range(passes):
+                for truth in truth_rows:
+                    status, latency_ns, digest = run_query(
+                        session, truth, timing["per_query_timeout_ms"]
+                    )
+                    observations.append(
+                        observation_row(
+                            request,
+                            truth,
+                            phase,
+                            pass_index,
+                            status,
+                            latency_ns,
+                            digest,
                         )
-                        observations.append(
-                            observation_row(
-                                request,
-                                truth,
-                                phase,
-                                pass_index,
-                                status,
-                                latency_ns,
-                                digest,
-                            )
-                        )
-                ended = clock_ns()
-                phase_rows = [row for row in observations if row["phase"] == phase]
-                timeouts = sum(row["status"] == "timeout" for row in phase_rows)
-                mismatches = 0
-                for row in phase_rows:
-                    if row["status"] == "ok" and (
-                        row["actual_count"] != row["expected_count"]
-                        or row["actual_sum_hash"] != row["expected_sum_hash"]
-                        or row["actual_xor_hash"] != row["expected_xor_hash"]
-                    ):
-                        mismatches += 1
-                phases[phase] = {
-                    "passes": passes,
-                    "requested_queries": passes * len(truth_rows),
-                    "completed_queries": len(phase_rows) - timeouts,
-                    "timeout_queries": timeouts,
-                    "mismatch_queries": mismatches,
-                    "started_monotonic_ns": started,
-                    "ended_monotonic_ns": ended,
-                    "elapsed_ns": ended - started,
-                    "expected_digest_sha256": phase_digest(phase, passes, truth_rows),
-                    "actual_digest_sha256": phase_digest(phase, passes, truth_rows, phase_rows),
-                }
-    finally:
-        driver.close()
-    return observations, phases, server_agent
+                    )
+            ended = clock_ns()
+            phase_rows = [row for row in observations if row["phase"] == phase]
+            timeouts = sum(row["status"] == "timeout" for row in phase_rows)
+            mismatches = 0
+            for row in phase_rows:
+                if row["status"] == "ok" and (
+                    row["actual_count"] != row["expected_count"]
+                    or row["actual_sum_hash"] != row["expected_sum_hash"]
+                    or row["actual_xor_hash"] != row["expected_xor_hash"]
+                ):
+                    mismatches += 1
+            phases[phase] = {
+                "passes": passes,
+                "requested_queries": passes * len(truth_rows),
+                "completed_queries": len(phase_rows) - timeouts,
+                "timeout_queries": timeouts,
+                "mismatch_queries": mismatches,
+                "started_monotonic_ns": started,
+                "ended_monotonic_ns": ended,
+                "elapsed_ns": ended - started,
+                "expected_digest_sha256": phase_digest(phase, passes, truth_rows),
+                "actual_digest_sha256": phase_digest(phase, passes, truth_rows, phase_rows),
+            }
+    return observations, phases
 
 
 def write_observations(path: Path, rows: list[dict[str, str]]) -> None:
@@ -928,6 +1115,24 @@ def write_phase_events(path: Path, phases: dict[str, Any]) -> None:
 
 def run(args: argparse.Namespace) -> None:
     formal = args.mode == "formal"
+    require(args.database == DATABASE_NAME, f"Neo4j database must be {DATABASE_NAME!r}")
+    require(
+        1 <= args.readiness_timeout_s <= 900,
+        "Neo4j readiness timeout must be in [1, 900] seconds",
+    )
+    if formal:
+        require(
+            args.expected_image_ref == EXPECTED_IMAGE_REF,
+            f"formal Neo4j image must be {EXPECTED_IMAGE_REF!r}",
+        )
+        require(
+            args.expected_driver_version == EXPECTED_DRIVER_VERSION,
+            f"formal Neo4j Python driver must be {EXPECTED_DRIVER_VERSION!r}",
+        )
+        require(
+            args.expected_server_agent == EXPECTED_SERVER_AGENT,
+            f"formal Neo4j server agent must be {EXPECTED_SERVER_AGENT!r}",
+        )
     request_path = args.request.resolve()
     request_ref = artifact_ref(request_path)
     request, truth_rows, store, store_lineage, image_digest = validate_request(
@@ -964,11 +1169,13 @@ def run(args: argparse.Namespace) -> None:
         dataset,
         request,
         image_digest,
+        args.expected_image_ref,
         server_version,
+        formal,
     )
     driver = driver_binding(args.expected_driver_version)
     external = request["external_service"]
-    container = validate_container(
+    container_before = validate_container(
         external["containers"][0],
         args.expected_image_ref,
         image_digest,
@@ -985,9 +1192,29 @@ def run(args: argparse.Namespace) -> None:
         require(git["clean"], "formal Neo4j adapter requires a clean Git worktree")
         p02b = validate_p02b(args, git, request, dataset)
 
-    observations, phases, server_agent = execute_queries(
-        request, truth_rows, args.uri, args.database, args.expected_server_agent
+    query_driver = None
+    try:
+        query_driver, server_agent, readiness = open_ready_driver(
+            args.uri,
+            args.expected_server_agent,
+            args.readiness_timeout_s,
+        )
+        database_contract = verify_database_contract(query_driver, args.database)
+        observations, phases = execute_queries(
+            request, truth_rows, query_driver, args.database
+        )
+    finally:
+        if query_driver is not None:
+            query_driver.close()
+    container_after = validate_container(
+        external["containers"][0],
+        args.expected_image_ref,
+        image_digest,
+        store,
+        args.uri,
+        formal,
     )
+    container_lifecycle = validate_container_stability(container_before, container_after)
     write_observations(output_dir / "query-observations.tsv", observations)
     write_phase_events(output_dir / "phase-events.jsonl", phases)
     result = {
@@ -1012,20 +1239,28 @@ def run(args: argparse.Namespace) -> None:
     provenance = {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
         "performance_eligible": formal,
-        "mode": args.mode,
+        "execution_mode": args.mode,
+        "group": "client-server",
+        "system_version": request["system_version"],
+        "process_lifetime": EXTERNAL_PROCESS_LIFETIME,
         "request": request_ref,
         "repo": git,
         "p02b": p02b,
         "python_binary": request["binary"],
         "python_driver": driver,
         "server_agent": server_agent,
-        "container": container,
+        "container_lifecycle": container_lifecycle,
+        "readiness": readiness,
+        "database_contract": database_contract,
+        "dataset_input": request["dataset"],
         "dataset": dataset,
         "truth": artifact_ref(Path(request["truth"]["path"])),
         "store": store_manifest,
         "query_contract": {
             "cypher_shape": "MATCH (s:V {id: $src})-[:E_{P|N}<type>]->(d:V) RETURN d.id AS dst",
             "relationship_model": RELATIONSHIP_MODEL,
+            "database_name": DATABASE_NAME,
+            "required_index": database_contract["required_index"],
             "clock": CLOCK_NAME,
             "timing_boundary": TIMING_BOUNDARY,
             "warmup_before_measured": True,
