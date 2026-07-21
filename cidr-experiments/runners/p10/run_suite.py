@@ -38,6 +38,7 @@ from p10_contract import (
     sha256_file,
     validate_adapter_outputs,
     validate_adapter_p31_binding,
+    validate_neo4j_p31_binding,
     validate_nebulagraph_p31_binding,
 )
 
@@ -429,6 +430,8 @@ def execute_repeat(
             p31,
             system_id=system["id"],
         )
+    elif mode == "formal" and system["id"] == "neo4j":
+        validate_neo4j_p31_binding(validated.get("adapter_provenance"), p31)
     elif mode == "formal" and system["id"] == "nebulagraph":
         validate_nebulagraph_p31_binding(validated.get("adapter_provenance"), p31)
     validated["p31"] = p31

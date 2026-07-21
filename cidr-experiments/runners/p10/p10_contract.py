@@ -686,6 +686,339 @@ def _validate_events(path: Path, result: dict[str, Any]) -> None:
         raise ContractError("warmup and measured intervals overlap or are reversed")
 
 
+def _neo4j_artifact_ref(value: object, context: str, *, verify_file: bool) -> dict[str, Any]:
+    ref = require_keys(
+        value,
+        required=("path", "sha256"),
+        allowed=("path", "sha256", "size_bytes"),
+        context=context,
+    )
+    path = Path(nonempty_string(ref["path"], f"{context}.path")).resolve()
+    sha = normalize_sha(ref["sha256"], f"{context}.sha256", required=True)
+    if verify_file:
+        if not path.is_file() or sha256_file(path) != sha:
+            raise ContractError(f"{context}: file path/SHA-256 is invalid")
+    return {"path": str(path), "sha256": sha}
+
+
+def _neo4j_same_ref(observed: object, expected: object, context: str) -> None:
+    if not isinstance(expected, dict):
+        raise ContractError(f"{context}: expected reference is malformed")
+    ref = _neo4j_artifact_ref(observed, context, verify_file=False)
+    if ref["path"] != str(Path(str(expected.get("path", ""))).resolve()):
+        raise ContractError(f"{context}: path differs from request")
+    if ref["sha256"] != expected.get("sha256"):
+        raise ContractError(f"{context}: SHA-256 differs from request")
+
+
+def _validate_neo4j_provenance(
+    provenance: dict[str, Any],
+    request: dict[str, Any],
+    system: dict[str, Any],
+    process_lifetime: str,
+) -> None:
+    keys = (
+        "schema_version",
+        "performance_eligible",
+        "execution_mode",
+        "group",
+        "system_version",
+        "process_lifetime",
+        "request",
+        "repo",
+        "p02b",
+        "python_binary",
+        "python_driver",
+        "server_agent",
+        "container_lifecycle",
+        "readiness",
+        "database_contract",
+        "dataset_input",
+        "dataset",
+        "truth",
+        "store",
+        "query_contract",
+    )
+    provenance = require_keys(
+        provenance, required=keys, allowed=keys, context="Neo4j adapter provenance"
+    )
+    formal = request.get("execution_mode") == "formal"
+    exact = {
+        "schema_version": "p10-neo4j-adapter-provenance-v2",
+        "performance_eligible": formal,
+        "execution_mode": request.get("execution_mode"),
+        "group": "client-server",
+        "system_version": system["system_version"],
+        "process_lifetime": process_lifetime,
+        "server_agent": "Neo4j/5.26.24",
+    }
+    for key, expected in exact.items():
+        if provenance.get(key) != expected:
+            raise ContractError(f"Neo4j provenance {key} differs from request")
+
+    request_ref = _neo4j_artifact_ref(provenance["request"], "Neo4j request", verify_file=True)
+    if read_json(Path(request_ref["path"]), "Neo4j provenance request") != request:
+        raise ContractError("Neo4j provenance request content differs from orchestrator request")
+    _neo4j_same_ref(provenance["python_binary"], request.get("binary"), "Neo4j Python binary")
+    _neo4j_same_ref(provenance["dataset_input"], request.get("dataset"), "Neo4j dataset input")
+    _neo4j_same_ref(provenance["truth"], request.get("truth"), "Neo4j truth")
+
+    driver = require_keys(
+        provenance["python_driver"],
+        required=("version", "package_tree_sha256", "hash_method", "file_count", "total_bytes", "module"),
+        allowed=("version", "package_tree_sha256", "hash_method", "file_count", "total_bytes", "module"),
+        context="Neo4j Python driver",
+    )
+    if driver["version"] != "5.28.3":
+        raise ContractError("Neo4j Python driver version is not frozen at 5.28.3")
+    if driver["hash_method"] != "sha256-tree-v1(relative-path,size,file-sha256)":
+        raise ContractError("Neo4j Python driver tree hash method mismatch")
+    normalize_sha(driver["package_tree_sha256"], "Neo4j Python driver tree SHA", required=True)
+    integer(driver["file_count"], "Neo4j Python driver file_count", 1)
+    integer(driver["total_bytes"], "Neo4j Python driver total_bytes", 1)
+    _neo4j_artifact_ref(driver["module"], "Neo4j Python driver module", verify_file=True)
+
+    stores = request.get("store_roots")
+    selected = next(
+        (
+            item
+            for item in stores
+            if isinstance(item, dict) and item.get("label") == "neo4j-runtime"
+        ),
+        None,
+    ) if isinstance(stores, list) else None
+    if not isinstance(selected, dict):
+        raise ContractError("Neo4j request lacks neo4j-runtime store root")
+
+    lifecycle = require_keys(
+        provenance["container_lifecycle"],
+        required=("stable", "before", "after"),
+        allowed=("stable", "before", "after"),
+        context="Neo4j container lifecycle",
+    )
+    if lifecycle["stable"] is not True:
+        raise ContractError("Neo4j container lifecycle is not stable")
+    container_keys = (
+        "name",
+        "container_id",
+        "pid",
+        "started_at",
+        "restart_count",
+        "image_id",
+        "configured_image",
+        "repo_digests",
+        "expected_repo_digest",
+        "data_mount",
+        "bolt_host",
+        "bolt_port",
+        "restart_policy",
+        "read_only_default",
+    )
+    containers = request.get("external_service", {}).get("containers", [])
+    image_digests = request.get("external_service", {}).get("image_digests", [])
+    if len(containers) != 1 or len(image_digests) != 1:
+        raise ContractError("Neo4j request lacks one exact container/image digest")
+    normalized_containers: list[dict[str, Any]] = []
+    for phase in ("before", "after"):
+        item = require_keys(
+            lifecycle[phase],
+            required=container_keys,
+            allowed=container_keys,
+            context=f"Neo4j container lifecycle.{phase}",
+        )
+        if item["name"] != containers[0]:
+            raise ContractError("Neo4j container name differs from request")
+        if not isinstance(item["container_id"], str) or not item["container_id"]:
+            raise ContractError("Neo4j container ID is missing")
+        integer(item["pid"], f"Neo4j container {phase} PID", 1)
+        nonempty_string(item["started_at"], f"Neo4j container {phase} StartedAt")
+        if integer(item["restart_count"], f"Neo4j container {phase} RestartCount", 0) != 0:
+            raise ContractError("Neo4j container restarted during the repeat")
+        if not IMAGE_DIGEST_RE.fullmatch(str(item["image_id"])):
+            raise ContractError("Neo4j container image ID is malformed")
+        if item["expected_repo_digest"] != image_digests[0]:
+            raise ContractError("Neo4j container RepoDigest differs from request")
+        repo_digests = item["repo_digests"]
+        resolved_repo_digests = {
+            value.split("@", 1)[1]
+            for value in repo_digests
+            if isinstance(value, str) and "@" in value
+        } if isinstance(repo_digests, list) else set()
+        if image_digests[0] not in resolved_repo_digests:
+            raise ContractError("Neo4j container RepoDigest is absent from image metadata")
+        if Path(str(item["data_mount"])).resolve() != Path(str(selected["path"])).resolve():
+            raise ContractError("Neo4j container data mount differs from request store")
+        if (
+            item["configured_image"] != "neo4j:5.26.24"
+            or item["bolt_host"] != "127.0.0.1"
+            or not isinstance(item["bolt_port"], int)
+            or item["bolt_port"] <= 0
+            or item["restart_policy"] != "no"
+            or item["read_only_default"] is not True
+        ):
+            raise ContractError("Neo4j container isolation contract is invalid")
+        normalized_containers.append(item)
+    stable_fields = (
+        "name", "container_id", "pid", "started_at", "restart_count", "image_id",
+        "configured_image", "expected_repo_digest", "data_mount", "bolt_host", "bolt_port",
+        "restart_policy", "read_only_default",
+    )
+    for key in stable_fields:
+        if normalized_containers[0][key] != normalized_containers[1][key]:
+            raise ContractError(f"Neo4j container {key} changed during the repeat")
+
+    readiness = require_keys(
+        provenance["readiness"],
+        required=("timeout_s", "attempts", "elapsed_ns"),
+        allowed=("timeout_s", "attempts", "elapsed_ns"),
+        context="Neo4j readiness",
+    )
+    timeout_s = integer(readiness["timeout_s"], "Neo4j readiness timeout_s", 1)
+    if timeout_s > 900:
+        raise ContractError("Neo4j readiness timeout exceeds the frozen maximum")
+    integer(readiness["attempts"], "Neo4j readiness attempts", 1)
+    elapsed_ns = integer(readiness["elapsed_ns"], "Neo4j readiness elapsed_ns", 1)
+    if elapsed_ns > timeout_s * 1_000_000_000:
+        raise ContractError("Neo4j readiness elapsed time exceeds its deadline")
+
+    database_expected = {
+        "database_name": "neo4j",
+        "node_label": "V",
+        "id_property": "id",
+        "required_index": {
+            "name": "v_id",
+            "state": "ONLINE",
+            "type": "RANGE",
+            "entityType": "NODE",
+            "labelsOrTypes": ["V"],
+            "properties": ["id"],
+        },
+    }
+    if provenance["database_contract"] != database_expected:
+        raise ContractError("Neo4j live database/index contract mismatch")
+
+    dataset = require_keys(
+        provenance["dataset"],
+        required=("reference", "lineage"),
+        allowed=("reference", "lineage"),
+        context="Neo4j dataset provenance",
+    )
+    _neo4j_artifact_ref(dataset["reference"], "Neo4j dataset manifest", verify_file=True)
+    lineage = dataset["lineage"]
+    if not isinstance(lineage, dict):
+        raise ContractError("Neo4j dataset lineage is malformed")
+    if (
+        Path(str(lineage.get("dataset_root", ""))).resolve()
+        != Path(str(request["dataset"]["path"])).resolve()
+        or lineage.get("dataset_sha256") != request["dataset"]["sha256"]
+    ):
+        raise ContractError("Neo4j dataset lineage differs from request")
+
+    store = require_keys(
+        provenance["store"],
+        required=("reference", "lineage", "validated_sentinels"),
+        allowed=("reference", "lineage", "validated_sentinels"),
+        context="Neo4j store provenance",
+    )
+    _neo4j_artifact_ref(store["reference"], "Neo4j store manifest", verify_file=True)
+    store_lineage = store["lineage"]
+    if not isinstance(store_lineage, dict):
+        raise ContractError("Neo4j store lineage is malformed")
+    if (
+        store_lineage.get("schema_version") != "p10-neo4j-store-manifest-v2"
+        or store_lineage.get("snapshot_phase") != "offline-prestart-v1"
+        or Path(str(store_lineage.get("store_root", ""))).resolve()
+        != Path(str(selected["path"])).resolve()
+        or store_lineage.get("store_sha256") != selected.get("sha256")
+        or store_lineage.get("truth_sha256") != request["truth"]["sha256"]
+        or store_lineage.get("dataset_sha256") != request["dataset"]["sha256"]
+    ):
+        raise ContractError("Neo4j store lineage differs from request")
+    runtime = store_lineage.get("runtime_compatibility")
+    if (
+        not isinstance(runtime, dict)
+        or runtime.get("neo4j_version") != "5.26.24"
+        or runtime.get("image_ref") != "neo4j:5.26.24"
+        or runtime.get("image_digest") != image_digests[0]
+    ):
+        raise ContractError("Neo4j store runtime compatibility is invalid")
+    import_identity = store_lineage.get("import_image_identity")
+    if not isinstance(import_identity, dict):
+        raise ContractError("Neo4j store import image identity is missing")
+    if (
+        import_identity.get("status") not in {"verified-repodigest", "unverified-tag-only"}
+        or import_identity.get("image_ref") != "neo4j:5.26.24"
+    ):
+        raise ContractError("Neo4j store import image identity is invalid")
+    if formal and (
+        import_identity.get("status") != "verified-repodigest"
+        or import_identity.get("image_digest") != image_digests[0]
+    ):
+        raise ContractError("formal Neo4j store lacks verified import RepoDigest lineage")
+    if not formal and import_identity.get("status") == "unverified-tag-only" and import_identity.get("image_digest") is not None:
+        raise ContractError("unverified Neo4j import identity falsely claims a digest")
+    if store_lineage.get("mutable_runtime_paths") != ["logs/**", "server_id", "transactions/**"]:
+        raise ContractError("Neo4j offline store mutable-runtime contract is invalid")
+    if store_lineage.get("database_contract") != {
+        "database_name": "neo4j",
+        "node_label": "V",
+        "id_property": "id",
+        "required_index": {"name": "v_id", "type": "RANGE", "state": "ONLINE"},
+    }:
+        raise ContractError("Neo4j offline store database contract is invalid")
+    expected_sentinels = store_lineage.get("sentinel_files")
+    validated_sentinels = store["validated_sentinels"]
+    if not isinstance(expected_sentinels, list) or not isinstance(validated_sentinels, list):
+        raise ContractError("Neo4j store sentinel lineage is malformed")
+    expected_by_path = {
+        item.get("path"): (item.get("size_bytes"), item.get("sha256"))
+        for item in expected_sentinels
+        if isinstance(item, dict)
+    }
+    observed_by_path = {
+        item.get("path"): (item.get("size_bytes"), item.get("sha256"))
+        for item in validated_sentinels
+        if isinstance(item, dict)
+    }
+    if not expected_by_path or observed_by_path != expected_by_path:
+        raise ContractError("Neo4j validated sentinels differ from offline manifest")
+
+    query_keys = (
+        "cypher_shape", "relationship_model", "database_name", "required_index",
+        "clock", "timing_boundary", "warmup_before_measured",
+        "process_reuse_between_phases", "concurrency",
+    )
+    query = require_keys(
+        provenance["query_contract"],
+        required=query_keys,
+        allowed=query_keys,
+        context="Neo4j query contract",
+    )
+    if (
+        query["cypher_shape"]
+        != "MATCH (s:V {id: $src})-[:E_{P|N}<type>]->(d:V) RETURN d.id AS dst"
+        or query["relationship_model"] != "dense-edge-type-as-outgoing-relationship-type-v1"
+        or query["database_name"] != "neo4j"
+        or query["required_index"] != database_expected["required_index"]
+        or query["clock"] != CLOCK_NAME
+        or query["timing_boundary"] != TIMING_BOUNDARY
+        or query["warmup_before_measured"] is not True
+        or query["process_reuse_between_phases"] is not True
+        or query["concurrency"] != 1
+    ):
+        raise ContractError("Neo4j query contract provenance is invalid")
+
+    if formal:
+        repo = provenance["repo"]
+        admission = provenance["p02b"].get("admission") if isinstance(provenance["p02b"], dict) else None
+        if not isinstance(repo, dict) or repo.get("clean") is not True:
+            raise ContractError("formal Neo4j provenance lacks a clean Git state")
+        if not isinstance(admission, dict) or admission.get("state") != "PASS" or admission.get("formal_required") is not True:
+            raise ContractError("formal Neo4j provenance lacks a formal P02B PASS admission")
+    elif provenance["repo"] is not None or provenance["p02b"] is not None:
+        raise ContractError("fixture Neo4j provenance must not carry formal Git/P02B admission")
+
+
 def validate_adapter_outputs(
     *,
     output_dir: Path,
@@ -947,6 +1280,13 @@ def validate_adapter_outputs(
                 p02b = adapter_provenance.get("p02b_release")
                 if not isinstance(p02b, dict) or p02b.get("require_formal") is not True:
                     raise ContractError("formal TuGraph provenance lacks a formal P02B release")
+        elif system["id"] == "neo4j":
+            _validate_neo4j_provenance(
+                adapter_provenance,
+                request,
+                system,
+                process_lifetime,
+            )
         elif system["id"] == "nebulagraph":
             if adapter_provenance.get("schema_version") != "p10-nebulagraph-adapter-provenance-v1":
                 raise ContractError("NebulaGraph adapter provenance has wrong schema_version")
@@ -1065,6 +1405,8 @@ def validate_adapter_outputs(
         raise ContractError("formal Aster adapter omitted adapter-provenance.json")
     elif system["id"] == "tugraph" and not system.get("fixture_only", False):
         raise ContractError("formal TuGraph adapter omitted adapter-provenance.json")
+    elif system["id"] == "neo4j" and not system.get("fixture_only", False):
+        raise ContractError("formal Neo4j adapter omitted adapter-provenance.json")
     elif system["id"] == "nebulagraph" and not system.get("fixture_only", False):
         raise ContractError("formal NebulaGraph adapter omitted adapter-provenance.json")
     artifact_paths = [result_path, observations_path, events_path]
@@ -1287,6 +1629,79 @@ def validate_seml0_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
     """Backward-compatible SemL0-specific entry point."""
 
     validate_adapter_p31_binding(provenance, p31, system_id="seml0")
+
+
+def validate_neo4j_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
+    """Cross-bind one stable external Neo4j container and its store to P31."""
+
+    if not isinstance(provenance, dict) or provenance.get("schema_version") != "p10-neo4j-adapter-provenance-v2":
+        raise ContractError("formal Neo4j result lacks v2 adapter provenance")
+    collector = p31.get("collector")
+    inputs = p31.get("inputs")
+    disk_roots = p31.get("disk_roots")
+    repo = p31.get("repo")
+    if not all(isinstance(value, expected) for value, expected in (
+        (collector, dict),
+        (inputs, dict),
+        (disk_roots, list),
+        (repo, dict),
+    )):
+        raise ContractError("P31 manifest lacks Neo4j collector/input/disk/repo lineage")
+
+    lifecycle = provenance.get("container_lifecycle")
+    before = lifecycle.get("before") if isinstance(lifecycle, dict) else None
+    after = lifecycle.get("after") if isinstance(lifecycle, dict) else None
+    if (
+        not isinstance(before, dict)
+        or not isinstance(after, dict)
+        or lifecycle.get("stable") is not True
+        or before.get("name") != after.get("name")
+    ):
+        raise ContractError("Neo4j provenance lacks one stable container lifecycle")
+    container_name = before["name"]
+    stable_fields = ("name", "container_id", "pid", "started_at", "restart_count")
+    if any(before.get(key) != after.get(key) for key in stable_fields):
+        raise ContractError("Neo4j provenance container identity changed during P31 collection")
+    if before.get("restart_count") != 0:
+        raise ContractError("Neo4j provenance container restarted during P31 collection")
+    if collector.get("containers") != [container_name] or collector.get("extra_pids") != []:
+        raise ContractError("P31 container coverage differs from Neo4j provenance")
+
+    def same_ref(observed: object, expected: object, label: str) -> None:
+        if not isinstance(observed, dict) or not isinstance(expected, dict):
+            raise ContractError(f"P31 lacks Neo4j {label} artifact reference")
+        if Path(str(observed.get("path", ""))).resolve() != Path(str(expected.get("path", ""))).resolve():
+            raise ContractError(f"P31 {label} path differs from Neo4j provenance")
+        if observed.get("sha256") != expected.get("sha256"):
+            raise ContractError(f"P31 {label} SHA-256 differs from Neo4j provenance")
+
+    same_ref(inputs.get("binary"), provenance.get("python_binary"), "binary")
+    same_ref(inputs.get("dataset"), provenance.get("dataset_input"), "dataset")
+    same_ref(inputs.get("truth"), provenance.get("truth"), "truth")
+    same_ref(inputs.get("query_or_trace"), provenance.get("truth"), "query_or_trace")
+
+    store = provenance.get("store")
+    lineage = store.get("lineage") if isinstance(store, dict) else None
+    store_root = lineage.get("store_root") if isinstance(lineage, dict) else None
+    if not isinstance(store_root, str):
+        raise ContractError("Neo4j provenance lacks the runtime store root")
+    matching = [
+        root
+        for root in disk_roots
+        if isinstance(root, dict)
+        and root.get("role") == "store"
+        and Path(str(root.get("path", ""))).resolve() == Path(store_root).resolve()
+    ]
+    if len(matching) != 1:
+        raise ContractError("P31 does not monitor exactly the Neo4j runtime store")
+
+    provenance_repo = provenance.get("repo")
+    if (
+        not isinstance(provenance_repo, dict)
+        or repo.get("git_sha") != provenance_repo.get("head")
+        or repo.get("dirty") is not False
+    ):
+        raise ContractError("P31 Git state differs from Neo4j provenance")
 
 
 def validate_nebulagraph_p31_binding(provenance: object, p31: dict[str, Any]) -> None:
