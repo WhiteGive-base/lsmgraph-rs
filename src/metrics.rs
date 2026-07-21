@@ -9,6 +9,68 @@ use serde_json::{json, Value};
 
 use crate::types::{EdgeType, VertexId};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryCpuPhase {
+    QuerySetup,
+    MetadataAdmission,
+    RoutingIndex,
+    BodyDecodeFilter,
+    MvccResult,
+}
+
+/// Process-CPU timer used only for mutually exclusive query-path regions.
+///
+/// We deliberately use `CLOCK_PROCESS_CPUTIME_ID` instead of wall time: an
+/// async body read may resume on another Tokio worker, while the process clock
+/// remains continuous. Formal runners execute one query stream per process and
+/// validate the phase sum against independently collected process CPU time.
+#[must_use]
+pub struct QueryCpuPhaseTimer<'a> {
+    metrics: &'a Metrics,
+    phase: QueryCpuPhase,
+    started_ns: Option<u64>,
+}
+
+impl Drop for QueryCpuPhaseTimer<'_> {
+    fn drop(&mut self) {
+        let Some(started_ns) = self.started_ns else {
+            return;
+        };
+        let Some(finished_ns) = process_cpu_time_ns() else {
+            self.metrics
+                .query_cpu_clock_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        self.metrics
+            .record_query_cpu_ns(self.phase, finished_ns.saturating_sub(started_ns));
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_cpu_time_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid writable timespec and the clock id requires no
+    // additional lifetime or ownership guarantees.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    if rc != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 {
+        return None;
+    }
+    Some(
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_cpu_time_ns() -> Option<u64> {
+    None
+}
+
 const LATENCY_BUCKET_US: [u64; 32] = [
     25,
     50,
@@ -119,11 +181,20 @@ pub struct Metrics {
     pub csr_header_bytes: AtomicU64,
     pub csr_offset_bytes: AtomicU64,
     pub csr_body_bytes: AtomicU64,
+    /// L0 entries returned by the routing structure (or full L0 fallback)
+    /// before exact-evidence admission is applied.
+    pub routed_l0_segments: AtomicU64,
     pub candidate_l0_segments: AtomicU64,
     pub range_filtered_segments: AtomicU64,
     pub bloom_filtered_segments: AtomicU64,
     pub filter_passed_segments: AtomicU64,
     pub matched_l0_segments: AtomicU64,
+    pub query_cpu_query_setup_ns: AtomicU64,
+    pub query_cpu_metadata_admission_ns: AtomicU64,
+    pub query_cpu_routing_index_ns: AtomicU64,
+    pub query_cpu_body_decode_filter_ns: AtomicU64,
+    pub query_cpu_mvcc_result_ns: AtomicU64,
+    pub query_cpu_clock_failures: AtomicU64,
     pub csr_offset_cache_hits: AtomicU64,
     pub csr_offset_cache_misses: AtomicU64,
     pub csr_probe_bloom_negative: AtomicU64,
@@ -213,11 +284,18 @@ impl Default for Metrics {
             csr_header_bytes: AtomicU64::new(0),
             csr_offset_bytes: AtomicU64::new(0),
             csr_body_bytes: AtomicU64::new(0),
+            routed_l0_segments: AtomicU64::new(0),
             candidate_l0_segments: AtomicU64::new(0),
             range_filtered_segments: AtomicU64::new(0),
             bloom_filtered_segments: AtomicU64::new(0),
             filter_passed_segments: AtomicU64::new(0),
             matched_l0_segments: AtomicU64::new(0),
+            query_cpu_query_setup_ns: AtomicU64::new(0),
+            query_cpu_metadata_admission_ns: AtomicU64::new(0),
+            query_cpu_routing_index_ns: AtomicU64::new(0),
+            query_cpu_body_decode_filter_ns: AtomicU64::new(0),
+            query_cpu_mvcc_result_ns: AtomicU64::new(0),
+            query_cpu_clock_failures: AtomicU64::new(0),
             csr_offset_cache_hits: AtomicU64::new(0),
             csr_offset_cache_misses: AtomicU64::new(0),
             csr_probe_bloom_negative: AtomicU64::new(0),
@@ -238,6 +316,37 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    pub fn query_cpu_timer(&self, enabled: bool, phase: QueryCpuPhase) -> QueryCpuPhaseTimer<'_> {
+        if !enabled {
+            return QueryCpuPhaseTimer {
+                metrics: self,
+                phase,
+                started_ns: None,
+            };
+        }
+        let started_ns = process_cpu_time_ns();
+        if started_ns.is_none() {
+            self.query_cpu_clock_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        QueryCpuPhaseTimer {
+            metrics: self,
+            phase,
+            started_ns,
+        }
+    }
+
+    fn record_query_cpu_ns(&self, phase: QueryCpuPhase, elapsed_ns: u64) {
+        let counter = match phase {
+            QueryCpuPhase::QuerySetup => &self.query_cpu_query_setup_ns,
+            QueryCpuPhase::MetadataAdmission => &self.query_cpu_metadata_admission_ns,
+            QueryCpuPhase::RoutingIndex => &self.query_cpu_routing_index_ns,
+            QueryCpuPhase::BodyDecodeFilter => &self.query_cpu_body_decode_filter_ns,
+            QueryCpuPhase::MvccResult => &self.query_cpu_mvcc_result_ns,
+        };
+        counter.fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
     pub fn add_read(&self, bytes: u64) {
         self.read_syscalls.fetch_add(1, Ordering::Relaxed);
         self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -322,14 +431,23 @@ impl Metrics {
         snapshots
     }
 
-    pub fn reset(&self) {
+    /// Reset observable per-interval counters without erasing the feedback
+    /// controller's accumulated partition state. Storage-bench uses this at
+    /// warmup/measurement boundaries so A4/A6 do not silently cold-start on
+    /// every repeat.
+    pub fn reset_observations_preserve_controller(&self) {
         self.reset_counters();
         self.reset_latencies();
         for metric in self.endpoint_metrics.lock().values() {
             metric.reset();
         }
-        self.l0_partition_metrics.lock().clear();
         self.pruning_reason_metrics.lock().clear();
+    }
+
+    /// Full reset for a genuinely independent controller run.
+    pub fn reset(&self) {
+        self.reset_observations_preserve_controller();
+        self.l0_partition_metrics.lock().clear();
     }
 
     pub fn snapshot_json(&self) -> Value {
@@ -364,6 +482,15 @@ impl Metrics {
                 "compaction_output_bytes": self.load(&self.compaction_output_bytes),
                 "degree_directory_sidecar_persists": self.load(&self.degree_directory_sidecar_persists),
                 "rebuild_index_latency": self.storage_rebuild_index_latency.snapshot(),
+                "query_cpu_ns": {
+                    "clock": "CLOCK_PROCESS_CPUTIME_ID",
+                    "query_setup": self.load(&self.query_cpu_query_setup_ns),
+                    "metadata_admission": self.load(&self.query_cpu_metadata_admission_ns),
+                    "routing_index": self.load(&self.query_cpu_routing_index_ns),
+                    "body_decode_filter": self.load(&self.query_cpu_body_decode_filter_ns),
+                    "mvcc_result": self.load(&self.query_cpu_mvcc_result_ns),
+                    "clock_failures": self.load(&self.query_cpu_clock_failures),
+                },
             },
             "io": {
                 "read_syscalls": self.load(&self.read_syscalls),
@@ -393,6 +520,7 @@ impl Metrics {
                 "header_bytes": self.load(&self.csr_header_bytes),
                 "offset_bytes": self.load(&self.csr_offset_bytes),
                 "body_bytes": self.load(&self.csr_body_bytes),
+                "routed_l0_segments": self.load(&self.routed_l0_segments),
                 "candidate_l0_segments": self.load(&self.candidate_l0_segments),
                 "range_filtered_segments": self.load(&self.range_filtered_segments),
                 "bloom_filtered_segments": self.load(&self.bloom_filtered_segments),
@@ -509,11 +637,18 @@ impl Metrics {
             &self.csr_header_bytes,
             &self.csr_offset_bytes,
             &self.csr_body_bytes,
+            &self.routed_l0_segments,
             &self.candidate_l0_segments,
             &self.range_filtered_segments,
             &self.bloom_filtered_segments,
             &self.filter_passed_segments,
             &self.matched_l0_segments,
+            &self.query_cpu_query_setup_ns,
+            &self.query_cpu_metadata_admission_ns,
+            &self.query_cpu_routing_index_ns,
+            &self.query_cpu_body_decode_filter_ns,
+            &self.query_cpu_mvcc_result_ns,
+            &self.query_cpu_clock_failures,
             &self.csr_offset_cache_hits,
             &self.csr_offset_cache_misses,
             &self.csr_probe_bloom_negative,
@@ -909,5 +1044,53 @@ mod tests {
             after["http"]["endpoints"]["/query/interactive_complex_1"]["count"],
             0
         );
+    }
+
+    #[test]
+    fn observation_reset_preserves_feedback_controller_state() {
+        let metrics = Metrics::default();
+        let key = L0PartitionKey {
+            src_label: 1,
+            edge_type: 7,
+            range_start: 0,
+            range_end: 255,
+        };
+        metrics.record_l0_partition_query(key);
+        metrics.add_read(128);
+
+        metrics.reset_observations_preserve_controller();
+        assert_eq!(metrics.snapshot_json()["io"]["read_bytes"], 0);
+        let snapshots = metrics.l0_partition_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].query_count, 1);
+
+        metrics.reset();
+        assert!(metrics.l0_partition_snapshots().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn query_phase_timer_records_process_cpu_and_resets() {
+        let metrics = Metrics::default();
+        {
+            let _timer = metrics.query_cpu_timer(true, QueryCpuPhase::QuerySetup);
+            let mut value = 0u64;
+            for item in 0..100_000u64 {
+                value = value.wrapping_add(item.rotate_left((item % 63) as u32));
+            }
+            std::hint::black_box(value);
+        }
+        let before = metrics.snapshot_json();
+        assert_eq!(before["storage"]["query_cpu_ns"]["clock_failures"], 0);
+        assert!(
+            before["storage"]["query_cpu_ns"]["query_setup"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+
+        metrics.reset();
+        let after = metrics.snapshot_json();
+        assert_eq!(after["storage"]["query_cpu_ns"]["query_setup"], 0);
     }
 }

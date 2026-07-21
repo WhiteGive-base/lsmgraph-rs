@@ -7,13 +7,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use lsmgraph::base_graph::{build_from_snb, BuildConfig, IoConfig};
-use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig};
+use lsmgraph::config::{IoBackendKind, L0LayoutPolicy, LsmGraphConfig, QueryControlStage};
 use lsmgraph::csr::CsrPropertyValuePredicate;
 use lsmgraph::graph::Engine;
 use lsmgraph::loader::{import_person_knows, import_snb_topology, validate_person_knows};
 use lsmgraph::shared_truth::{
     build_storage_sample_plan, read_truth_tsv, verify_engine_truth, SharedIdMap,
 };
+use lsmgraph::metrics::process_cpu_time_ns;
 use lsmgraph::snb::{
     import_snb_full, import_snb_full_multi, import_snb_updates, rebuild_snb_edge_props,
     start_dgs_compatible_server, validate_ic1_ic14_dynamic, validate_ic_batch_dynamic,
@@ -68,6 +69,8 @@ enum Command {
         graph_aware_l0: bool,
         #[arg(long, default_value = "naive")]
         l0_layout: L0LayoutPolicy,
+        #[arg(long, default_value = "a6")]
+        query_control_stage: QueryControlStage,
         #[arg(long, default_value_t = 4 * 1024 * 1024)]
         semantic_budget_min_edge_type_bytes: usize,
         #[arg(long, default_value_t = 1.0e308)]
@@ -112,6 +115,8 @@ enum Command {
         schema_epoch: u64,
         #[arg(long, default_value_t = false)]
         auto_compact: bool,
+        #[arg(long, default_value = "a6")]
+        query_control_stage: QueryControlStage,
         #[arg(long, default_value_t = 4 * 1024 * 1024)]
         semantic_budget_min_edge_type_bytes: usize,
         #[arg(long, default_value_t = 1.0e308)]
@@ -278,6 +283,9 @@ enum Command {
     Compact {
         #[arg(long, default_value = DEFAULT_STORE)]
         data_dir: PathBuf,
+        /// Defaults to A0 to preserve the legacy single-output compaction CLI.
+        #[arg(long, default_value = "a0")]
+        query_control_stage: QueryControlStage,
         #[arg(long, default_value_t = false)]
         auto_pick: bool,
         #[arg(long)]
@@ -365,6 +373,16 @@ enum Command {
         warmup_runs: usize,
         #[arg(long, default_value_t = 1)]
         repeats: usize,
+        /// Replay the complete frozen sample plan this many times before
+        /// warmup/measurement. These queries stay in the same Engine process
+        /// so feedback state can drive the A4/A5 pre-measurement compaction.
+        #[arg(long, default_value_t = 0)]
+        training_runs: usize,
+        /// Number of feedback-selected L0 partitions to compact after the
+        /// training trace and before measurement. Valid only for A4/A5 with
+        /// automatic maintenance disabled.
+        #[arg(long, default_value_t = 0)]
+        training_feedback_compactions: usize,
         #[arg(long)]
         edge_type: Option<i32>,
         #[arg(long, value_delimiter = ',')]
@@ -392,8 +410,18 @@ enum Command {
         scan: bool,
         #[arg(long, default_value_t = false)]
         auto_compact: bool,
+        /// Enable the engine's asynchronous/closed-loop maintenance. This is
+        /// distinct from `--auto-compact`, the legacy post-round manual pick.
+        #[arg(long, default_value_t = false)]
+        automatic_maintenance: bool,
+        /// Collect mutually-exclusive process-CPU phase counters. Use only in
+        /// a single-stream diagnostic run with automatic maintenance disabled.
+        #[arg(long, default_value_t = false)]
+        query_cpu_phases: bool,
         #[arg(long)]
         l0_layout: Option<L0LayoutPolicy>,
+        #[arg(long, default_value = "a6")]
+        query_control_stage: QueryControlStage,
         #[arg(long, value_enum, default_value = "one-hop")]
         workload_mode: StorageBenchWorkloadMode,
         #[arg(long, value_enum, default_value = "none")]
@@ -532,9 +560,7 @@ struct ImportManyLayoutStore {
 
 fn parse_import_many_layout_store(raw: &str) -> Result<ImportManyLayoutStore> {
     let Some((layout_raw, data_dir_raw)) = raw.split_once(':') else {
-        anyhow::bail!(
-            "invalid --layout-store {raw:?}; expected layout:/absolute/store/path"
-        );
+        anyhow::bail!("invalid --layout-store {raw:?}; expected layout:/absolute/store/path");
     };
     if data_dir_raw.is_empty() {
         anyhow::bail!("invalid --layout-store {raw:?}; empty store path");
@@ -563,6 +589,7 @@ async fn main() -> Result<()> {
             schema_epoch,
             graph_aware_l0,
             l0_layout,
+            query_control_stage,
             semantic_budget_min_edge_type_bytes,
             semantic_budget_min_edge_type_score,
             semantic_budget_core_edge_weight,
@@ -595,6 +622,7 @@ async fn main() -> Result<()> {
                 .with_auto_compaction(auto_compact)
                 .with_schema_epoch(schema_epoch)
                 .with_l0_layout(l0_layout)
+                .with_query_control_stage(query_control_stage)
                 .with_semantic_budget_min_edge_type_bytes(semantic_budget_min_edge_type_bytes)
                 .with_semantic_budget_min_edge_type_score(semantic_budget_min_edge_type_score)
                 .with_semantic_budget_core_edge_weight(semantic_budget_core_edge_weight)
@@ -643,10 +671,12 @@ async fn main() -> Result<()> {
                 sidecar_start.elapsed().as_secs_f64()
             );
             println!(
-                "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{}}}",
+                "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{},\"l0_layout\":\"{:?}\",\"query_control_stage\":\"{:?}\"}}",
                 stats.input_rows,
                 stats.directed_edges,
-                engine.current_snapshot()
+                engine.current_snapshot(),
+                l0_layout,
+                query_control_stage
             );
         }
         Command::ImportMany {
@@ -656,6 +686,7 @@ async fn main() -> Result<()> {
             memgraph_bytes,
             schema_epoch,
             auto_compact,
+            query_control_stage,
             semantic_budget_min_edge_type_bytes,
             semantic_budget_min_edge_type_score,
             semantic_budget_core_edge_weight,
@@ -688,6 +719,7 @@ async fn main() -> Result<()> {
                     .with_auto_compaction(auto_compact)
                     .with_schema_epoch(schema_epoch)
                     .with_l0_layout(spec.layout)
+                    .with_query_control_stage(query_control_stage)
                     .with_semantic_budget_min_edge_type_bytes(semantic_budget_min_edge_type_bytes)
                     .with_semantic_budget_min_edge_type_score(semantic_budget_min_edge_type_score)
                     .with_semantic_budget_core_edge_weight(semantic_budget_core_edge_weight)
@@ -718,9 +750,15 @@ async fn main() -> Result<()> {
                 sidecar_start.elapsed().as_secs_f64()
             );
             for (idx, engine) in engines.iter().enumerate() {
-                eprintln!("[import-many] persist semantic sidecars engine_index={} start", idx);
+                eprintln!(
+                    "[import-many] persist semantic sidecars engine_index={} start",
+                    idx
+                );
                 engine.persist_semantic_sidecars()?;
-                eprintln!("[import-many] persist semantic sidecars engine_index={} complete", idx);
+                eprintln!(
+                    "[import-many] persist semantic sidecars engine_index={} complete",
+                    idx
+                );
             }
             eprintln!(
                 "[import-many] persist semantic sidecars complete elapsed_s={:.1}",
@@ -732,6 +770,7 @@ async fn main() -> Result<()> {
                 .map(|(spec, engine)| {
                     json!({
                         "layout": format!("{:?}", spec.layout),
+                        "query_control_stage": format!("{:?}", query_control_stage),
                         "data_dir": spec.data_dir.display().to_string(),
                         "snapshot": engine.current_snapshot(),
                     })
@@ -742,6 +781,7 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&json!({
                     "input_rows": stats.input_rows,
                     "directed_edges": stats.directed_edges,
+                    "query_control_stage": format!("{:?}", query_control_stage),
                     "stores": stores,
                 }))?
             );
@@ -1081,6 +1121,7 @@ async fn main() -> Result<()> {
         }
         Command::Compact {
             data_dir,
+            query_control_stage,
             auto_pick,
             src_label,
             edge_type,
@@ -1090,7 +1131,8 @@ async fn main() -> Result<()> {
             let engine = Engine::open(
                 LsmGraphConfig::new(data_dir)
                     .with_io_backend(io_backend)
-                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+                    .with_metadata_cache_entries(csr_metadata_cache_entries)
+                    .with_query_control_stage(query_control_stage),
             )
             .await?;
             if auto_pick {
@@ -1123,8 +1165,21 @@ async fn main() -> Result<()> {
                     }))?
                 );
             } else {
-                let meta = engine.compact_l0_to_l1().await?;
-                println!("{}", serde_json::to_string_pretty(&meta)?);
+                if query_control_stage.semantic_compaction_enabled() {
+                    let outputs = engine.compact_l0_to_l1_partitioned().await?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "query_control_stage": format!("{:?}", query_control_stage),
+                            "semantic_partition_outputs": true,
+                            "output_count": outputs.len(),
+                            "outputs": outputs,
+                        }))?
+                    );
+                } else {
+                    let meta = engine.compact_l0_to_l1().await?;
+                    println!("{}", serde_json::to_string_pretty(&meta)?);
+                }
             }
         }
         Command::ValidateKnows {
@@ -1262,6 +1317,8 @@ async fn main() -> Result<()> {
             samples,
             warmup_runs,
             repeats,
+            training_runs,
+            training_feedback_compactions,
             edge_type,
             edge_types,
             src_label,
@@ -1274,7 +1331,10 @@ async fn main() -> Result<()> {
             sample_plan_out,
             scan,
             auto_compact,
+            automatic_maintenance,
+            query_cpu_phases,
             l0_layout,
+            query_control_stage,
             workload_mode,
             property_predicate_mode,
             property_id,
@@ -1285,10 +1345,37 @@ async fn main() -> Result<()> {
             ra_min_score,
             ra_min_l0_segments,
         } => {
+            if query_cpu_phases && automatic_maintenance {
+                anyhow::bail!(
+                    "--query-cpu-phases requires --automatic-maintenance=false; run closed-loop maintenance as a separate resource trial"
+                );
+            }
+            if training_feedback_compactions > 0 && training_runs == 0 {
+                anyhow::bail!("--training-feedback-compactions requires --training-runs > 0");
+            }
+            if training_feedback_compactions > 0 && !query_control_stage.feedback_priority_enabled()
+            {
+                anyhow::bail!(
+                    "--training-feedback-compactions requires query-control stage A4 or A5"
+                );
+            }
+            if training_feedback_compactions > 0 && automatic_maintenance {
+                anyhow::bail!(
+                    "manual training compaction and --automatic-maintenance are mutually exclusive"
+                );
+            }
+            if training_feedback_compactions > 0 && auto_compact {
+                anyhow::bail!(
+                    "--training-feedback-compactions and measured --auto-compact are mutually exclusive"
+                );
+            }
             let repeats = repeats.max(1);
             let mut config = LsmGraphConfig::new(&data_dir)
                 .with_io_backend(io_backend)
-                .with_metadata_cache_entries(csr_metadata_cache_entries);
+                .with_metadata_cache_entries(csr_metadata_cache_entries)
+                .with_query_control_stage(query_control_stage)
+                .with_auto_compaction(automatic_maintenance)
+                .with_query_cpu_phase_instrumentation(query_cpu_phases);
             if let Some(l0_layout) = l0_layout {
                 config.l0_layout = l0_layout;
             }
@@ -1346,6 +1433,64 @@ async fn main() -> Result<()> {
                 }
                 fs::write(path, serde_json::to_vec_pretty(&sample_plan)?)?;
             }
+
+            // A4/A5 feedback is process-local. Replay the whole frozen trace
+            // before measurement and compact in this same Engine instance;
+            // a separate `compact` process would silently lose the feedback
+            // map and invalidate the staircase.
+            let levels_before_training = engine.live_file_count_by_level();
+            let mut training_rounds = Vec::new();
+            if training_runs > 0 {
+                metrics.reset();
+                let mut first_training_entry = true;
+                for training_round in 0..training_runs {
+                    for (entry_index, entry) in sample_plan.entries.iter().enumerate() {
+                        let result = run_storage_bench_round(
+                            &engine,
+                            snapshot,
+                            entry,
+                            semantic_degree_hint,
+                            effective_force_signature,
+                            workload_mode,
+                            property_predicate_mode,
+                            property_id,
+                            property_value_i64,
+                            property_default_i64,
+                            two_hop_fanout,
+                            first_training_entry,
+                            false,
+                            false,
+                        )
+                        .await?;
+                        first_training_entry = false;
+                        training_rounds.push(json!({
+                            "training_round": training_round + 1,
+                            "entry_index": entry_index,
+                            "edge_type": entry.edge_type,
+                            "result": storage_bench_round_json(
+                                "training",
+                                training_round + 1,
+                                result,
+                            ),
+                        }));
+                    }
+                }
+            }
+            let mut training_feedback_compaction_results = Vec::new();
+            for compaction_index in 0..training_feedback_compactions {
+                let decision = engine
+                    .compact_best_l0_partition_by_score()
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "training feedback compaction {} found no eligible L0 partition",
+                            compaction_index + 1
+                        )
+                    })?;
+                training_feedback_compaction_results.push(decision);
+            }
+            let levels_after_training = engine.live_file_count_by_level();
+            metrics.reset_observations_preserve_controller();
             let mut benchmarks = Vec::new();
             for entry in &sample_plan.entries {
                 let requested_edge_type = entry.edge_type;
@@ -1364,6 +1509,9 @@ async fn main() -> Result<()> {
                         property_value_i64,
                         property_default_i64,
                         two_hop_fanout,
+                        true,
+                        false,
+                        false,
                     )
                     .await?;
                     warmup_rounds.push(storage_bench_round_json("warmup", round + 1, result));
@@ -1382,6 +1530,9 @@ async fn main() -> Result<()> {
                         property_value_i64,
                         property_default_i64,
                         two_hop_fanout,
+                        true,
+                        emit_result_digests,
+                        query_cpu_phases,
                     )
                     .await?;
                     measured_rounds.push(storage_bench_round_json("measured", round + 1, result));
@@ -1403,65 +1554,24 @@ async fn main() -> Result<()> {
                     .get("neighbor_metrics")
                     .cloned()
                     .unwrap_or(Value::Null);
-                let auto_compaction = if auto_compact {
+                let post_round_feedback_compaction = if auto_compact {
                     engine.compact_best_l0_partition_by_score().await?
                 } else {
                     None
                 };
-                let post_auto_compaction_metrics = if auto_compact {
+                let post_round_feedback_compaction_metrics = if auto_compact {
                     Some(metrics.snapshot_json())
                 } else {
                     None
                 };
-                // Optional correctness piggyback: re-run each sample's measured query path once
-                // (deterministic, single pass) and emit a stable digest over the sorted visible
-                // EdgeRecords. The schema baseline and each variant produce comparable digests,
-                // so W14 correctness can be checked from the bench JSON instead of re-opening two
-                // engines through `neighbor-compare`.
-                let (result_digests, entry_result_digest) = if emit_result_digests {
-                    let degree_by_src: HashMap<u64, u64> = entry
-                        .samples
-                        .iter()
-                        .map(|sample| (sample.src, sample.degree))
-                        .collect();
-                    let mut digests = Vec::with_capacity(entry.samples.len());
-                    let mut folded: Vec<(u64, u64)> = Vec::with_capacity(entry.samples.len());
-                    for sample in &entry.samples {
-                        let mut edges = run_storage_bench_query(
-                            &engine,
-                            snapshot,
-                            sample.src,
-                            requested_edge_type,
-                            semantic_degree_hint,
-                            effective_force_signature,
-                            degree_by_src.get(&sample.src).copied().unwrap_or(0),
-                            entry.dst_label,
-                            property_predicate_mode,
-                            property_id,
-                            property_value_i64,
-                            property_default_i64,
-                        )
-                        .await?;
-                        let digest = storage_bench_result_digest(&mut edges);
-                        folded.push((sample.src, digest));
-                        digests.push(json!({
-                            "src": sample.src,
-                            "degree": sample.degree,
-                            "edge_type": requested_edge_type,
-                            "dst_label": entry.dst_label,
-                            "property_predicate_mode": property_predicate_mode,
-                            "result_count": edges.len(),
-                            "result_digest": format!("{:016x}", digest),
-                        }));
-                    }
-                    let aggregate = storage_bench_entry_digest(&folded);
-                    (
-                        Some(Value::Array(digests)),
-                        Some(format!("{:016x}", aggregate)),
-                    )
-                } else {
-                    (None, None)
-                };
+                // Digests are generated inside the final measured round. A
+                // second replay would double the query trace, mutate A6's
+                // controller after measurement, and pollute P31 process totals.
+                let result_digests = last_round.get("result_digests").cloned();
+                let entry_result_digest = last_round
+                    .get("entry_result_digest")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 benchmarks.push(json!({
                     "edge_type": requested_edge_type,
                     "src_label": entry.src_label,
@@ -1486,12 +1596,12 @@ async fn main() -> Result<()> {
                     "warmup_rounds": warmup_rounds,
                     "rounds": measured_rounds,
                     "repeat_summary": storage_bench_repeat_summary(&measured_rounds),
-                    "auto_compaction": auto_compaction,
-                    "auto_compaction_metrics_source": if auto_compact { Some("last_measured_repeat") } else { None },
+                    "post_round_feedback_compaction": post_round_feedback_compaction,
+                    "post_round_feedback_compaction_metrics_source": if auto_compact { Some("last_measured_repeat") } else { None },
                     "levels_after_run": engine.live_file_count_by_level(),
                     "neighbor_summary": neighbor_summary,
                     "neighbor_metrics": neighbor_metrics,
-                    "post_auto_compaction_metrics": post_auto_compaction_metrics,
+                    "post_round_feedback_compaction_metrics": post_round_feedback_compaction_metrics,
                     "emit_result_digests": emit_result_digests,
                     "entry_result_digest": entry_result_digest,
                     "result_digests": result_digests,
@@ -1518,9 +1628,26 @@ async fn main() -> Result<()> {
                     "two_hop_fanout": two_hop_fanout,
                     "warmup_runs": warmup_runs,
                     "repeats": repeats,
+                    "training_runs": training_runs,
+                    "training_feedback_compactions": training_feedback_compactions,
+                    "training_rounds": training_rounds,
+                    "training_feedback_compaction_results": training_feedback_compaction_results,
+                    "levels_before_training": levels_before_training,
+                    "levels_after_training": levels_after_training,
                     "sample_plan_in": sample_plan_in,
                     "sample_plan_out": sample_plan_out,
                     "l0_layout": l0_layout.map(|layout| format!("{:?}", layout)),
+                    "query_control_stage": format!("{:?}", query_control_stage),
+                    "feature_switches": {
+                        "exact_evidence_admission": query_control_stage.admission_enabled(),
+                        "semantic_routing": query_control_stage.semantic_routing_enabled(),
+                        "budgeted_degree_promotion": query_control_stage.degree_promotion_enabled(),
+                        "feedback_priority": query_control_stage.feedback_priority_enabled(),
+                        "semantic_compaction": query_control_stage.semantic_compaction_enabled(),
+                        "automatic_maintenance": automatic_maintenance,
+                        "query_cpu_phase_instrumentation": query_cpu_phases,
+                        "post_round_feedback_compact": auto_compact,
+                    },
                     "oracle_index_stats": oracle_index_stats,
                     "sample_plan_version": sample_plan.version,
                     "scan_requested": scan && sample_plan.source == "scan",
@@ -1897,8 +2024,11 @@ struct StorageBenchRoundResult {
     property_value_i64: i64,
     property_default_i64: i64,
     two_hop_fanout: usize,
+    query_cpu_total_ns: Option<u64>,
     neighbor_summary: Value,
     neighbor_metrics: Value,
+    entry_result_digest: Option<String>,
+    result_digests: Option<Value>,
 }
 
 async fn run_storage_bench_round(
@@ -1913,9 +2043,15 @@ async fn run_storage_bench_round(
     property_value_i64: i64,
     property_default_i64: i64,
     two_hop_fanout: usize,
+    reset_metrics: bool,
+    emit_result_digests: bool,
+    measure_process_cpu: bool,
 ) -> Result<StorageBenchRoundResult> {
     let metrics = engine.metrics();
-    metrics.reset();
+    if reset_metrics {
+        metrics.reset_observations_preserve_controller();
+    }
+    let process_cpu_started_ns = measure_process_cpu.then(process_cpu_time_ns).flatten();
     let requested_edge_type = entry.edge_type;
     let degree_by_src: HashMap<u64, u64> = entry
         .samples
@@ -1926,9 +2062,11 @@ async fn run_storage_bench_round(
     let mut one_hop_edges = 0usize;
     let mut two_hop_edges = 0usize;
     let mut two_hop_sources = 0usize;
+    let mut per_sample_digests = Vec::new();
+    let mut folded_digests = Vec::new();
     let neighbor_started = Instant::now();
     for sample in &entry.samples {
-        let first_hop = run_storage_bench_query(
+        let mut first_hop = run_storage_bench_query(
             engine,
             snapshot,
             sample.src,
@@ -1943,6 +2081,19 @@ async fn run_storage_bench_round(
             property_default_i64,
         )
         .await?;
+        if emit_result_digests {
+            let digest = storage_bench_result_digest(&mut first_hop);
+            folded_digests.push((sample.src, digest));
+            per_sample_digests.push(json!({
+                "src": sample.src,
+                "degree": sample.degree,
+                "edge_type": requested_edge_type,
+                "dst_label": entry.dst_label,
+                "property_predicate_mode": property_predicate_mode,
+                "result_count": first_hop.len(),
+                "result_digest": format!("{:016x}", digest),
+            }));
+        }
         one_hop_edges += first_hop.len();
         neighbor_edges += first_hop.len();
 
@@ -1971,8 +2122,14 @@ async fn run_storage_bench_round(
         }
     }
     let get_neighbors_elapsed_ms = neighbor_started.elapsed().as_millis() as u64;
+    let query_cpu_total_ns = process_cpu_started_ns
+        .zip(process_cpu_time_ns())
+        .map(|(start, finish)| finish.saturating_sub(start));
     let neighbor_metrics = metrics.snapshot_json();
     let neighbor_summary = storage_bench_metric_summary(&neighbor_metrics);
+    let entry_result_digest = emit_result_digests
+        .then(|| format!("{:016x}", storage_bench_entry_digest(&folded_digests)));
+    let result_digests = emit_result_digests.then(|| Value::Array(per_sample_digests));
     Ok(StorageBenchRoundResult {
         neighbor_edges,
         one_hop_edges,
@@ -1985,8 +2142,11 @@ async fn run_storage_bench_round(
         property_value_i64,
         property_default_i64,
         two_hop_fanout,
+        query_cpu_total_ns,
         neighbor_summary,
         neighbor_metrics,
+        entry_result_digest,
+        result_digests,
     })
 }
 
@@ -2008,35 +2168,43 @@ async fn run_storage_bench_query(
         StorageBenchPropertyPredicateMode::None => {
             if let Some(edge_type) = requested_edge_type {
                 if force_signature || semantic_degree_hint || dst_label.is_some() {
-                    let signature = storage_bench_signature(
-                        src,
-                        Some(edge_type),
-                        semantic_degree_hint,
-                        degree,
-                        dst_label,
-                    );
-                    engine.get_neighbors_by_signature(signature, snapshot).await
+                    engine
+                        .get_neighbors_by_signature_builder(snapshot, || {
+                            storage_bench_signature(
+                                src,
+                                Some(edge_type),
+                                semantic_degree_hint,
+                                degree,
+                                dst_label,
+                            )
+                        })
+                        .await
                 } else {
                     engine.get_neighbors_typed(src, edge_type, snapshot).await
                 }
             } else if force_signature || dst_label.is_some() {
-                let signature =
-                    storage_bench_signature(src, None, semantic_degree_hint, degree, dst_label);
-                engine.get_neighbors_by_signature(signature, snapshot).await
+                engine
+                    .get_neighbors_by_signature_builder(snapshot, || {
+                        storage_bench_signature(src, None, semantic_degree_hint, degree, dst_label)
+                    })
+                    .await
             } else {
                 engine.get_neighbors(src, snapshot).await
             }
         }
         StorageBenchPropertyPredicateMode::RequiredProperty => {
-            let signature = storage_bench_signature(
-                src,
-                requested_edge_type,
-                semantic_degree_hint,
-                degree,
-                dst_label,
-            )
-            .with_required_property(property_id);
-            engine.get_neighbors_by_signature(signature, snapshot).await
+            engine
+                .get_neighbors_by_signature_builder(snapshot, || {
+                    storage_bench_signature(
+                        src,
+                        requested_edge_type,
+                        semantic_degree_hint,
+                        degree,
+                        dst_label,
+                    )
+                    .with_required_property(property_id)
+                })
+                .await
         }
         StorageBenchPropertyPredicateMode::Presence => {
             let edges = engine
@@ -2133,10 +2301,20 @@ fn storage_bench_round_json(kind: &str, round: usize, result: StorageBenchRoundR
         "two_hop_edges": result.two_hop_edges,
         "two_hop_sources": result.two_hop_sources,
         "get_neighbors_elapsed_ms": result.get_neighbors_elapsed_ms,
+        "query_cpu_total_ns": result.query_cpu_total_ns,
+        "routed_l0_segments": result.neighbor_summary["routed_l0_segments"].clone(),
         "candidate_l0_segments": result.neighbor_summary["candidate_l0_segments"].clone(),
         "body_reads": result.neighbor_summary["body_reads"].clone(),
         "body_bytes": result.neighbor_summary["body_bytes"].clone(),
+        "query_cpu_query_setup_ns": result.neighbor_summary["query_cpu_query_setup_ns"].clone(),
+        "query_cpu_metadata_admission_ns": result.neighbor_summary["query_cpu_metadata_admission_ns"].clone(),
+        "query_cpu_routing_index_ns": result.neighbor_summary["query_cpu_routing_index_ns"].clone(),
+        "query_cpu_body_decode_filter_ns": result.neighbor_summary["query_cpu_body_decode_filter_ns"].clone(),
+        "query_cpu_mvcc_result_ns": result.neighbor_summary["query_cpu_mvcc_result_ns"].clone(),
+        "query_cpu_clock_failures": result.neighbor_summary["query_cpu_clock_failures"].clone(),
         "get_neighbors_latency_sum_us": result.neighbor_metrics["storage"]["get_neighbors_latency"]["sum_us"].clone(),
+        "entry_result_digest": result.entry_result_digest,
+        "result_digests": result.result_digests,
         "neighbor_summary": result.neighbor_summary,
         "neighbor_metrics": result.neighbor_metrics,
     })
@@ -2266,6 +2444,7 @@ fn parse_query_list(raw: &str) -> Vec<String> {
 
 fn storage_bench_metric_summary(metrics: &Value) -> Value {
     json!({
+        "routed_l0_segments": metric_u64(metrics, &["csr", "routed_l0_segments"]),
         "candidate_l0_segments": metric_u64(metrics, &["csr", "candidate_l0_segments"]),
         "range_filtered_segments": metric_u64(metrics, &["csr", "range_filtered_segments"]),
         "bloom_filtered_segments": metric_u64(metrics, &["csr", "bloom_filtered_segments"]),
@@ -2278,6 +2457,12 @@ fn storage_bench_metric_summary(metrics: &Value) -> Value {
         "read_syscalls": metric_u64(metrics, &["io", "read_syscalls"]),
         "read_bytes": metric_u64(metrics, &["io", "read_bytes"]),
         "get_neighbors_ops": metric_u64(metrics, &["storage", "get_neighbors_ops"]),
+        "query_cpu_query_setup_ns": metric_u64(metrics, &["storage", "query_cpu_ns", "query_setup"]),
+        "query_cpu_metadata_admission_ns": metric_u64(metrics, &["storage", "query_cpu_ns", "metadata_admission"]),
+        "query_cpu_routing_index_ns": metric_u64(metrics, &["storage", "query_cpu_ns", "routing_index"]),
+        "query_cpu_body_decode_filter_ns": metric_u64(metrics, &["storage", "query_cpu_ns", "body_decode_filter"]),
+        "query_cpu_mvcc_result_ns": metric_u64(metrics, &["storage", "query_cpu_ns", "mvcc_result"]),
+        "query_cpu_clock_failures": metric_u64(metrics, &["storage", "query_cpu_ns", "clock_failures"]),
         "get_neighbors_avg_us": metric_u64(metrics, &["storage", "get_neighbors_latency", "avg_us"]),
         "get_neighbors_p50_us": metric_u64(metrics, &["storage", "get_neighbors_latency", "p50_us"]),
         "get_neighbors_p90_us": metric_u64(metrics, &["storage", "get_neighbors_latency", "p90_us"]),
@@ -2297,10 +2482,18 @@ fn storage_bench_repeat_summary(rounds: &[Value]) -> Value {
         "one_hop_edges": series_stats(&round_field_series(rounds, "one_hop_edges")),
         "two_hop_edges": series_stats(&round_field_series(rounds, "two_hop_edges")),
         "two_hop_sources": series_stats(&round_field_series(rounds, "two_hop_sources")),
+        "routed_l0_segments": series_stats(&round_summary_series(rounds, "routed_l0_segments")),
         "candidate_l0_segments": series_stats(&round_summary_series(rounds, "candidate_l0_segments")),
         "read_bytes": series_stats(&round_summary_series(rounds, "read_bytes")),
         "body_reads": series_stats(&round_summary_series(rounds, "body_reads")),
         "body_bytes": series_stats(&round_summary_series(rounds, "body_bytes")),
+        "query_cpu_query_setup_ns": series_stats(&round_summary_series(rounds, "query_cpu_query_setup_ns")),
+        "query_cpu_metadata_admission_ns": series_stats(&round_summary_series(rounds, "query_cpu_metadata_admission_ns")),
+        "query_cpu_routing_index_ns": series_stats(&round_summary_series(rounds, "query_cpu_routing_index_ns")),
+        "query_cpu_body_decode_filter_ns": series_stats(&round_summary_series(rounds, "query_cpu_body_decode_filter_ns")),
+        "query_cpu_mvcc_result_ns": series_stats(&round_summary_series(rounds, "query_cpu_mvcc_result_ns")),
+        "query_cpu_total_ns": series_stats(&round_field_series(rounds, "query_cpu_total_ns")),
+        "query_cpu_clock_failures": series_stats(&round_summary_series(rounds, "query_cpu_clock_failures")),
         "get_neighbors_latency_sum_us": series_stats(&round_metric_latency_series(rounds, "sum_us")),
         "get_neighbors_avg_us": series_stats(&round_summary_series(rounds, "get_neighbors_avg_us")),
         "get_neighbors_p50_us": series_stats(&round_summary_series(rounds, "get_neighbors_p50_us")),
@@ -2485,11 +2678,20 @@ mod tests {
 
     #[test]
     fn result_digest_detects_edge_set_changes() {
-        let mut base = vec![EdgeRecord::insert(1, 10, 1, 2), EdgeRecord::insert(1, 20, 1, 3)];
+        let mut base = vec![
+            EdgeRecord::insert(1, 10, 1, 2),
+            EdgeRecord::insert(1, 20, 1, 3),
+        ];
         let mut extra = base.clone();
         extra.push(EdgeRecord::insert(1, 30, 1, 4));
-        let mut dst_changed = vec![EdgeRecord::insert(1, 11, 1, 2), EdgeRecord::insert(1, 20, 1, 3)];
-        let mut marker_changed = vec![EdgeRecord::delete(1, 10, 1, 2), EdgeRecord::insert(1, 20, 1, 3)];
+        let mut dst_changed = vec![
+            EdgeRecord::insert(1, 11, 1, 2),
+            EdgeRecord::insert(1, 20, 1, 3),
+        ];
+        let mut marker_changed = vec![
+            EdgeRecord::delete(1, 10, 1, 2),
+            EdgeRecord::insert(1, 20, 1, 3),
+        ];
         let baseline = storage_bench_result_digest(&mut base);
         assert_ne!(baseline, storage_bench_result_digest(&mut extra));
         assert_ne!(baseline, storage_bench_result_digest(&mut dst_changed));
@@ -2501,7 +2703,10 @@ mod tests {
 
     #[test]
     fn entry_digest_folds_per_sample_digests() {
-        let samples = vec![(1u64, 0xaaaa_aaaa_aaaa_aaaau64), (2u64, 0xbbbb_bbbb_bbbb_bbbbu64)];
+        let samples = vec![
+            (1u64, 0xaaaa_aaaa_aaaa_aaaau64),
+            (2u64, 0xbbbb_bbbb_bbbb_bbbbu64),
+        ];
         let folded = storage_bench_entry_digest(&samples);
         // Stable and sensitive to per-sample order (each src is keyed in).
         assert_eq!(folded, storage_bench_entry_digest(&samples));

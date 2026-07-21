@@ -45,6 +45,71 @@ pub enum L0LayoutPolicy {
     RocksDbStyle,
 }
 
+/// Pre-registered query-control staircase used by the CIDR component
+/// ablation.  The ordering is intentional: every stage enables exactly one
+/// additional control-plane mechanism while preserving the safety-first read
+/// path.  `A6` is the production/full-control working point and therefore the
+/// default for existing callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QueryControlStage {
+    A0,
+    A1,
+    A2,
+    A3,
+    A4,
+    A5,
+    A6,
+}
+
+impl Default for QueryControlStage {
+    fn default() -> Self {
+        Self::A6
+    }
+}
+
+impl QueryControlStage {
+    pub fn admission_enabled(self) -> bool {
+        self >= Self::A1
+    }
+
+    pub fn semantic_routing_enabled(self) -> bool {
+        self >= Self::A2
+    }
+
+    pub fn degree_promotion_enabled(self) -> bool {
+        self >= Self::A3
+    }
+
+    pub fn feedback_priority_enabled(self) -> bool {
+        self >= Self::A4
+    }
+
+    pub fn semantic_compaction_enabled(self) -> bool {
+        self >= Self::A5
+    }
+
+    pub fn full_control_enabled(self) -> bool {
+        self >= Self::A6
+    }
+}
+
+impl FromStr for QueryControlStage {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "a0" | "0" | "naive" => Ok(Self::A0),
+            "a1" | "1" | "admission" => Ok(Self::A1),
+            "a2" | "2" | "routing" => Ok(Self::A2),
+            "a3" | "3" | "degree" => Ok(Self::A3),
+            "a4" | "4" | "feedback" => Ok(Self::A4),
+            "a5" | "5" | "semantic-compaction" | "semantic_compaction" => Ok(Self::A5),
+            "a6" | "6" | "full" => Ok(Self::A6),
+            _ => anyhow::bail!("unknown query-control stage: {s}; expected A0..A6"),
+        }
+    }
+}
+
 impl FromStr for L0LayoutPolicy {
     type Err = anyhow::Error;
 
@@ -100,6 +165,13 @@ pub struct LsmGraphConfig {
     pub auto_compaction: bool,
     pub schema_epoch: SchemaEpoch,
     pub l0_layout: L0LayoutPolicy,
+    /// Orthogonal CIDR component-ablation stage.  This is deliberately
+    /// independent of `l0_layout`: layout controls physical organization,
+    /// while the stage controls which query-control mechanisms may use it.
+    pub query_control_stage: QueryControlStage,
+    /// Enables process-CPU phase instrumentation for single-stream diagnostic
+    /// runs. Formal latency runs keep this disabled and calibrate it separately.
+    pub query_cpu_phase_instrumentation: bool,
     pub semantic_budget_min_edge_type_bytes: usize,
     pub semantic_budget_min_edge_type_score: f64,
     pub semantic_budget_core_edge_weight: f64,
@@ -140,6 +212,8 @@ impl LsmGraphConfig {
             auto_compaction: false,
             schema_epoch: 0,
             l0_layout: L0LayoutPolicy::Naive,
+            query_control_stage: QueryControlStage::default(),
+            query_cpu_phase_instrumentation: false,
             semantic_budget_min_edge_type_bytes: 4 * 1024 * 1024,
             semantic_budget_min_edge_type_score: 1.0e308,
             semantic_budget_core_edge_weight: 4.0,
@@ -200,6 +274,16 @@ impl LsmGraphConfig {
 
     pub fn with_l0_layout(mut self, policy: L0LayoutPolicy) -> Self {
         self.l0_layout = policy;
+        self
+    }
+
+    pub fn with_query_control_stage(mut self, stage: QueryControlStage) -> Self {
+        self.query_control_stage = stage;
+        self
+    }
+
+    pub fn with_query_cpu_phase_instrumentation(mut self, enabled: bool) -> Self {
+        self.query_cpu_phase_instrumentation = enabled;
         self
     }
 
@@ -269,12 +353,75 @@ impl LsmGraphConfig {
     }
 
     pub fn supports_feedback_compaction(&self) -> bool {
-        !matches!(
-            self.l0_layout,
-            L0LayoutPolicy::LsmGraphStyle
-                | L0LayoutPolicy::FullCompact
-                | L0LayoutPolicy::OracleSemantic
-                | L0LayoutPolicy::RocksDbStyle
-        )
+        self.query_control_stage.feedback_priority_enabled()
+            && !matches!(
+                self.l0_layout,
+                L0LayoutPolicy::LsmGraphStyle
+                    | L0LayoutPolicy::FullCompact
+                    | L0LayoutPolicy::OracleSemantic
+                    | L0LayoutPolicy::RocksDbStyle
+            )
+    }
+
+    /// Automatic lifecycle control is the final A6 component. Earlier
+    /// staircase stages may still invoke the corresponding maintenance
+    /// operation explicitly, which keeps A5 (semantic compaction) isolated
+    /// from A6 (the full closed loop).
+    pub fn automatic_maintenance_enabled(&self) -> bool {
+        self.auto_compaction && self.query_control_stage.full_control_enabled()
+    }
+}
+
+#[cfg(test)]
+mod query_control_stage_tests {
+    use super::QueryControlStage;
+    use std::str::FromStr;
+
+    #[test]
+    fn staircase_enables_one_mechanism_at_a_time() {
+        let stages = [
+            QueryControlStage::A0,
+            QueryControlStage::A1,
+            QueryControlStage::A2,
+            QueryControlStage::A3,
+            QueryControlStage::A4,
+            QueryControlStage::A5,
+            QueryControlStage::A6,
+        ];
+        let expected = [
+            (false, false, false, false, false, false),
+            (true, false, false, false, false, false),
+            (true, true, false, false, false, false),
+            (true, true, true, false, false, false),
+            (true, true, true, true, false, false),
+            (true, true, true, true, true, false),
+            (true, true, true, true, true, true),
+        ];
+        for (stage, expected) in stages.into_iter().zip(expected) {
+            assert_eq!(
+                (
+                    stage.admission_enabled(),
+                    stage.semantic_routing_enabled(),
+                    stage.degree_promotion_enabled(),
+                    stage.feedback_priority_enabled(),
+                    stage.semantic_compaction_enabled(),
+                    stage.full_control_enabled(),
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn stage_parser_is_stable_for_manifest_values() {
+        for (raw, expected) in [
+            ("A0", QueryControlStage::A0),
+            ("a3", QueryControlStage::A3),
+            ("semantic-compaction", QueryControlStage::A5),
+            ("full", QueryControlStage::A6),
+        ] {
+            assert_eq!(QueryControlStage::from_str(raw).unwrap(), expected);
+        }
+        assert!(QueryControlStage::from_str("A7").is_err());
     }
 }

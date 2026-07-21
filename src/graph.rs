@@ -23,7 +23,10 @@ use crate::index::{MultiLevelIndex, VertexLockTable};
 use crate::io::AnyIoBackend;
 use crate::levels::{split_levels, L0, L1};
 use crate::memgraph::MemGraph;
-use crate::metrics::{L0PartitionKey, L0PartitionProbe, L0PartitionSnapshot, Metrics};
+use crate::metrics::{
+    L0PartitionKey, L0PartitionProbe, L0PartitionSnapshot, Metrics, QueryCpuPhase,
+    QueryCpuPhaseTimer,
+};
 use crate::property_encoding::{
     encode_with_encoding, parse_default_or_null_rule, PropertyEncodingRegistry,
     PropertyPhysicalEncoding, PropertyValue,
@@ -146,7 +149,10 @@ impl SemanticL0Index {
                         if meta.min_src > signature.src {
                             break;
                         }
-                        if signature.src <= meta.max_src && meta.may_contain_signature(signature) {
+                        // Routing is intentionally limited to index-key and source-range
+                        // selection. Exactness/proof checks belong to the single admission
+                        // gate in the read path so A1->A2 can isolate routing cost.
+                        if signature.src <= meta.max_src {
                             out.push(*meta);
                         }
                     }
@@ -680,7 +686,7 @@ impl LevelMergePolicy {
             fanout: config.level_fanout.max(2),
             min_input_segments: 2,
             max_output_level: config.max_levels.saturating_sub(1).max(1) as LevelId,
-            semantic_partition_outputs: true,
+            semantic_partition_outputs: config.query_control_stage.semantic_compaction_enabled(),
         }
     }
 }
@@ -719,7 +725,7 @@ pub struct MaintenanceReport {
     pub l0_segments_after: usize,
     pub l1_segments_after: usize,
     pub feedback_compaction: Option<L0CompactionDecision>,
-    pub threshold_l0_compaction: Option<CsrSegmentMeta>,
+    pub threshold_l0_compaction: Vec<CsrSegmentMeta>,
     pub level_compactions: Vec<LevelCompactionDecision>,
     pub compaction_count_delta: u64,
 }
@@ -924,11 +930,18 @@ impl Engine {
         // avoid OOM when scan_edges + the index build would otherwise coexist. Real measurement
         // reads (--sample-plan-in, no scan) leave it unset so pruning stays correct.
         let semantic_index_started = Instant::now();
-        let semantic_index_skipped = std::env::var("SNB_SKIP_SEM_INDEX")
+        let semantic_index_skipped_by_env = std::env::var("SNB_SKIP_SEM_INDEX")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let semantic_index_skipped_by_stage =
+            !engine.config.query_control_stage.semantic_routing_enabled();
+        let semantic_index_skipped =
+            semantic_index_skipped_by_env || semantic_index_skipped_by_stage;
         if semantic_index_skipped {
-            eprintln!("[engine] SKIP rebuild_semantic_indexes (SNB_SKIP_SEM_INDEX set)");
+            eprintln!(
+                "[engine] SKIP rebuild_semantic_indexes env_skip={} stage={:?}",
+                semantic_index_skipped_by_env, engine.config.query_control_stage
+            );
         } else {
             engine.load_or_rebuild_semantic_indexes().await?;
         }
@@ -957,7 +970,15 @@ impl Engine {
         self.metrics.clone()
     }
 
+    fn query_cpu_timer(&self, phase: QueryCpuPhase) -> QueryCpuPhaseTimer<'_> {
+        self.metrics
+            .query_cpu_timer(self.config.query_cpu_phase_instrumentation, phase)
+    }
+
     pub fn persist_semantic_sidecars(&self) -> Result<()> {
+        if !self.config.query_control_stage.degree_promotion_enabled() {
+            return Ok(());
+        }
         self.persist_degree_directory_sidecar_for_current_version()
     }
 
@@ -972,7 +993,7 @@ impl Engine {
         &self,
         trigger: MaintenanceTrigger,
     ) -> Result<Option<MaintenanceReport>> {
-        if !self.config.auto_compaction {
+        if !self.config.automatic_maintenance_enabled() {
             return Ok(None);
         }
         self.run_maintenance_inner(trigger, false).await
@@ -993,13 +1014,24 @@ impl Engine {
         let feedback_compaction = self.compact_best_l0_partition_by_score().await?;
         let threshold_l0_compaction =
             if feedback_compaction.is_none() && self.l0_count_exceeds_auto_threshold() {
-                self.compact_l0_to_l1_inner(false).await?
+                if self
+                    .config
+                    .query_control_stage
+                    .semantic_compaction_enabled()
+                {
+                    self.compact_l0_to_l1_partitioned().await?
+                } else {
+                    self.compact_l0_to_l1_inner(false)
+                        .await?
+                        .into_iter()
+                        .collect()
+                }
             } else {
-                None
+                Vec::new()
             };
         let level_compactions = self.compact_levels().await?;
         if feedback_compaction.is_some()
-            || threshold_l0_compaction.is_some()
+            || !threshold_l0_compaction.is_empty()
             || !level_compactions.is_empty()
         {
             self.persist_semantic_sidecars()?;
@@ -1007,7 +1039,7 @@ impl Engine {
         let after_levels = self.live_file_count_by_level();
         let after_compactions = self.metrics.compaction_count.load(Ordering::Relaxed);
         let skipped_reason = if feedback_compaction.is_none()
-            && threshold_l0_compaction.is_none()
+            && threshold_l0_compaction.is_empty()
             && level_compactions.is_empty()
         {
             Some("no eligible maintenance work".to_string())
@@ -1029,7 +1061,7 @@ impl Engine {
     }
 
     fn spawn_maintenance_after_flush(self: &Arc<Self>) {
-        if !self.config.auto_compaction {
+        if !self.config.automatic_maintenance_enabled() {
             return;
         }
         let engine = self.clone();
@@ -1714,7 +1746,7 @@ impl Engine {
             self.enqueue_flush(memgraph).await?;
         }
         self.wait_for_flushes().await?;
-        if self.config.auto_compaction {
+        if self.config.automatic_maintenance_enabled() {
             self.maybe_run_maintenance(MaintenanceTrigger::Flush)
                 .await?;
         }
@@ -2129,7 +2161,9 @@ impl Engine {
             BTreeMap::new();
         let mut needs_sort: BTreeSet<(i32, EdgeType, DegreeClass)> = BTreeSet::new();
         let mut candidates = Vec::new();
-        let feedback_edge_type_weights = if self.config.semantic_budget_disable_feedback {
+        let feedback_edge_type_weights = if self.config.semantic_budget_disable_feedback
+            || !self.config.query_control_stage.feedback_priority_enabled()
+        {
             HashMap::new()
         } else {
             semantic_budget_feedback_edge_type_weights(&self.metrics.l0_partition_snapshots())
@@ -2226,6 +2260,17 @@ impl Engine {
                 // edge-type pruning schema already provides, pushing intermediate
                 // budgets *below* the schema baseline (read-amp cliff). See
                 // baseline/progress-note: budgeted now stays <= schema at all budgets.
+                let key = (src_label, edge_type, DegreeClass::Mixed);
+                needs_sort.insert(key);
+                partitions.entry(key).or_default().extend_from_slice(group);
+                continue;
+            }
+
+            if !self.config.query_control_stage.degree_promotion_enabled() {
+                // A0--A2 must not pay the A3 degree-statistics cost. Preserve
+                // the exact edge type but merge all degree classes, yielding
+                // the same physical evidence store for A0/A1 while keeping
+                // A3 as the only stage that computes/promotes degree bins.
                 let key = (src_label, edge_type, DegreeClass::Mixed);
                 needs_sort.insert(key);
                 partitions.entry(key).or_default().extend_from_slice(group);
@@ -2394,6 +2439,22 @@ impl Engine {
             .await
     }
 
+    /// Build a signature inside the Engine's QuerySetup and end-to-end query
+    /// timing boundary. Benchmark callers that derive degree/destination
+    /// predicates per source must use this entry point; passing an already
+    /// built signature would otherwise omit that client-side CPU and latency.
+    pub async fn get_neighbors_by_signature_builder<F>(
+        &self,
+        snapshot: SnapshotId,
+        build_signature: F,
+    ) -> Result<Vec<EdgeRecord>>
+    where
+        F: FnOnce() -> GraphAccessSignature,
+    {
+        self.get_neighbors_signature_builder_internal(build_signature, snapshot)
+            .await
+    }
+
     pub async fn get_neighbors_matching_property_value(
         &self,
         src: VertexId,
@@ -2419,6 +2480,141 @@ impl Engine {
     /// signature remains a compact topology/presence descriptor. Topology-only
     /// rows still participate as snapshot blockers, and they can match only
     /// when the predicate carries an explicit schema-default absent policy.
+    fn property_read_candidates(
+        &self,
+        guard: &VersionGuard,
+        reader: &CsrReader<AnyIoBackend>,
+        signature: &GraphAccessSignature,
+    ) -> Vec<CsrSegmentMeta> {
+        let src = signature.src;
+        let mut selected = Vec::new();
+        if let Some(l0) = guard.version().levels.get(L0 as usize) {
+            let routing_cpu = self.query_cpu_timer(QueryCpuPhase::RoutingIndex);
+            let use_semantic_l0_index = self.config.query_control_stage.semantic_routing_enabled()
+                && signature.edge_type.is_some()
+                && signature.src_label != UNKNOWN_SOURCE_LABEL;
+            let routed = if use_semantic_l0_index {
+                self.semantic_l0_index
+                    .read()
+                    .candidates_with_degree_classes(signature, None)
+            } else {
+                l0.clone()
+            };
+            drop(routing_cpu);
+
+            let collect_feedback = self.config.query_control_stage.feedback_priority_enabled();
+            let mut touched_partitions = HashSet::new();
+            for meta in routed {
+                self.metrics
+                    .routed_l0_segments
+                    .fetch_add(1, Ordering::Relaxed);
+                let admission_cpu = self.query_cpu_timer(QueryCpuPhase::MetadataAdmission);
+                if self.config.query_control_stage.admission_enabled() {
+                    let decision = meta.signature_pruning_decision(signature);
+                    self.metrics.record_signature_pruning_decision(
+                        decision.reason,
+                        decision.pruned,
+                        meta.segment_bytes,
+                    );
+                    if decision.pruned {
+                        continue;
+                    }
+                }
+                let partition_key = self.l0_partition_key(src, signature.edge_type, &meta);
+                if collect_feedback && touched_partitions.insert(partition_key) {
+                    self.metrics.record_l0_partition_query(partition_key);
+                }
+                let mut partition_probe = L0PartitionProbe {
+                    candidate_segments: 1,
+                    ..L0PartitionProbe::default()
+                };
+                self.metrics
+                    .candidate_l0_segments
+                    .fetch_add(1, Ordering::Relaxed);
+                if src < meta.min_src || src > meta.max_src {
+                    self.metrics
+                        .range_filtered_segments
+                        .fetch_add(1, Ordering::Relaxed);
+                    partition_probe.range_filtered_segments = 1;
+                    if collect_feedback {
+                        self.metrics
+                            .record_l0_partition_probe(partition_key, partition_probe);
+                    }
+                    continue;
+                }
+                match reader.cached_may_contain_src(&meta, src) {
+                    Some(false) => {
+                        self.metrics
+                            .bloom_filtered_segments
+                            .fetch_add(1, Ordering::Relaxed);
+                        partition_probe.bloom_filtered_segments = 1;
+                        partition_probe.offset_cache_hits = 1;
+                        if collect_feedback {
+                            self.metrics
+                                .record_l0_partition_probe(partition_key, partition_probe);
+                        }
+                        continue;
+                    }
+                    Some(true) => partition_probe.offset_cache_hits = 1,
+                    None => partition_probe.offset_cache_misses = 1,
+                }
+                self.metrics
+                    .filter_passed_segments
+                    .fetch_add(1, Ordering::Relaxed);
+                partition_probe.filter_passed_segments = 1;
+                if collect_feedback {
+                    self.metrics
+                        .record_l0_partition_probe(partition_key, partition_probe);
+                }
+                drop(admission_cpu);
+                selected.push(meta);
+            }
+        }
+
+        let higher = {
+            let _routing_cpu = self.query_cpu_timer(QueryCpuPhase::RoutingIndex);
+            self.index.get_positions(src)
+        };
+        for meta in higher {
+            let admission_cpu = self.query_cpu_timer(QueryCpuPhase::MetadataAdmission);
+            if self.config.query_control_stage.admission_enabled() {
+                let decision = meta.signature_pruning_decision(signature);
+                self.metrics.record_signature_pruning_decision(
+                    decision.reason,
+                    decision.pruned,
+                    meta.segment_bytes,
+                );
+                if decision.pruned {
+                    continue;
+                }
+            }
+            drop(admission_cpu);
+            selected.push(meta);
+        }
+        selected
+    }
+
+    fn record_property_body_feedback(
+        &self,
+        src: VertexId,
+        edge_type: Option<EdgeType>,
+        meta: &CsrSegmentMeta,
+        body_hit: bool,
+    ) {
+        if meta.level != L0 || !self.config.query_control_stage.feedback_priority_enabled() {
+            return;
+        }
+        let partition_key = self.l0_partition_key(src, edge_type, meta);
+        self.metrics.record_l0_partition_probe(
+            partition_key,
+            L0PartitionProbe {
+                matched_segments: u64::from(body_hit),
+                body_reads: 1,
+                ..L0PartitionProbe::default()
+            },
+        );
+    }
+
     pub async fn get_neighbors_matching_csr_property_value_prototype(
         &self,
         src: VertexId,
@@ -2426,6 +2622,7 @@ impl Engine {
         snapshot: SnapshotId,
         predicate: CsrPropertyValuePredicate,
     ) -> Result<Vec<EdgeRecord>> {
+        let query_setup_cpu = self.query_cpu_timer(QueryCpuPhase::QuerySetup);
         let started = Instant::now();
         self.metrics
             .get_neighbors_ops
@@ -2435,28 +2632,35 @@ impl Engine {
         let mut candidates = Vec::new();
         let registry =
             PropertyEncodingRegistry::from_schema_catalog(&self.schema_catalog_snapshot())?;
+        drop(query_setup_cpu);
 
-        for memgraph in &guard.version().memgraphs {
-            for record in memgraph.get_edges_with_properties_for_src(src) {
-                if edge_type
-                    .map(|ty| record.edge.edge_type != ty)
-                    .unwrap_or(false)
-                {
-                    continue;
+        {
+            let _body_cpu = self.query_cpu_timer(QueryCpuPhase::BodyDecodeFilter);
+            for memgraph in &guard.version().memgraphs {
+                for record in memgraph.get_edges_with_properties_for_src(src) {
+                    if edge_type
+                        .map(|ty| record.edge.edge_type != ty)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let matches_predicate = edge_properties_match_value_predicate(
+                        &record.properties,
+                        &registry,
+                        &predicate,
+                    )?;
+                    candidates.push(PropertyValueCandidateEdge {
+                        edge: record.edge,
+                        matches_predicate,
+                    });
                 }
-                let matches_predicate = edge_properties_match_value_predicate(
-                    &record.properties,
-                    &registry,
-                    &predicate,
-                )?;
-                candidates.push(PropertyValueCandidateEdge {
-                    edge: record.edge,
-                    matches_predicate,
-                });
             }
         }
 
-        let signature = GraphAccessSignature::neighbor_scan(src, edge_type);
+        let mut signature = GraphAccessSignature::neighbor_scan(src, edge_type);
+        if !predicate.absent_property_matches() {
+            signature = signature.with_required_property(predicate.property_id);
+        }
         let reader = CsrReader::with_metrics_and_cache(
             self.backend.clone(),
             self.config.store_dir.clone(),
@@ -2464,51 +2668,42 @@ impl Engine {
             self.metadata_cache.clone(),
         );
 
-        for (level_id, level) in guard.version().levels.iter().enumerate() {
-            for meta in level {
-                if !meta.may_contain_signature(&signature)
-                    || src < meta.min_src
-                    || src > meta.max_src
-                {
-                    continue;
-                }
-                if matches!(reader.cached_may_contain_src(meta, src), Some(false)) {
-                    continue;
-                }
-                if level_id == L0 as usize {
-                    self.metrics
-                        .candidate_l0_segments
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                if meta.has_property_value_section()
-                    && !meta.definitely_lacks_property(predicate.property_id)
-                {
-                    let rows = reader
-                        .get_neighbors_with_decoded_properties(meta, src, &registry)
-                        .await?;
-                    candidates.extend(rows.into_iter().map(|row| {
-                        let matches_predicate =
-                            predicate.matches_decoded_properties(&row.properties);
-                        PropertyValueCandidateEdge {
-                            edge: row.edge,
-                            matches_predicate,
-                        }
-                    }));
-                } else {
-                    candidates.extend(reader.get_neighbors(meta, src).await?.into_iter().map(
-                        |edge| PropertyValueCandidateEdge {
-                            edge,
-                            matches_predicate: predicate.absent_property_matches(),
-                        },
-                    ));
-                }
+        for meta in self.property_read_candidates(&guard, &reader, &signature) {
+            let _body_cpu = self.query_cpu_timer(QueryCpuPhase::BodyDecodeFilter);
+            if meta.has_property_value_section()
+                && !meta.definitely_lacks_property(predicate.property_id)
+            {
+                let rows = reader
+                    .get_neighbors_with_decoded_properties(&meta, src, &registry)
+                    .await?;
+                self.record_property_body_feedback(src, edge_type, &meta, !rows.is_empty());
+                candidates.extend(rows.into_iter().map(|row| {
+                    let matches_predicate = predicate.matches_decoded_properties(&row.properties);
+                    PropertyValueCandidateEdge {
+                        edge: row.edge,
+                        matches_predicate,
+                    }
+                }));
+            } else {
+                let edges = reader.get_neighbors(&meta, src).await?;
+                self.record_property_body_feedback(src, edge_type, &meta, !edges.is_empty());
+                candidates.extend(edges.into_iter().map(|edge| PropertyValueCandidateEdge {
+                    edge,
+                    matches_predicate: predicate.absent_property_matches(),
+                }));
             }
         }
 
+        let result_cpu = self.query_cpu_timer(QueryCpuPhase::MvccResult);
         let mut out = merge_visible_property_value_candidates(candidates, snapshot);
         if let Some(edge_type) = edge_type {
             out.retain(|edge| edge.edge_type == edge_type);
         }
+        drop(result_cpu);
+        drop(guard);
+        drop(_lock);
+        self.maybe_run_maintenance(MaintenanceTrigger::ReadFeedback)
+            .await?;
         self.metrics
             .storage_get_neighbors_latency
             .record_since(started);
@@ -2528,6 +2723,7 @@ impl Engine {
         snapshot: SnapshotId,
         property_id: PropertyId,
     ) -> Result<Vec<EdgeRecord>> {
+        let query_setup_cpu = self.query_cpu_timer(QueryCpuPhase::QuerySetup);
         let started = Instant::now();
         self.metrics
             .get_neighbors_ops
@@ -2535,27 +2731,32 @@ impl Engine {
         let _lock = self.vertex_locks.read_lock(src);
         let guard = self.version_manager.pin_current();
         let mut candidates = Vec::new();
+        drop(query_setup_cpu);
 
-        for memgraph in &guard.version().memgraphs {
-            for record in memgraph.get_edges_with_properties_for_src(src) {
-                if edge_type
-                    .map(|ty| record.edge.edge_type != ty)
-                    .unwrap_or(false)
-                {
-                    continue;
+        {
+            let _body_cpu = self.query_cpu_timer(QueryCpuPhase::BodyDecodeFilter);
+            for memgraph in &guard.version().memgraphs {
+                for record in memgraph.get_edges_with_properties_for_src(src) {
+                    if edge_type
+                        .map(|ty| record.edge.edge_type != ty)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let matches_predicate = record
+                        .properties
+                        .iter()
+                        .any(|property| property.property_id == property_id);
+                    candidates.push(PropertyValueCandidateEdge {
+                        edge: record.edge,
+                        matches_predicate,
+                    });
                 }
-                let matches_predicate = record
-                    .properties
-                    .iter()
-                    .any(|property| property.property_id == property_id);
-                candidates.push(PropertyValueCandidateEdge {
-                    edge: record.edge,
-                    matches_predicate,
-                });
             }
         }
 
-        let signature = GraphAccessSignature::neighbor_scan(src, edge_type);
+        let signature =
+            GraphAccessSignature::neighbor_scan(src, edge_type).with_required_property(property_id);
         let reader = CsrReader::with_metrics_and_cache(
             self.backend.clone(),
             self.config.store_dir.clone(),
@@ -2563,50 +2764,41 @@ impl Engine {
             self.metadata_cache.clone(),
         );
 
-        for (level_id, level) in guard.version().levels.iter().enumerate() {
-            for meta in level {
-                if !meta.may_contain_signature(&signature)
-                    || src < meta.min_src
-                    || src > meta.max_src
-                {
-                    continue;
-                }
-                if matches!(reader.cached_may_contain_src(meta, src), Some(false)) {
-                    continue;
-                }
-                if level_id == L0 as usize {
-                    self.metrics
-                        .candidate_l0_segments
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                if meta.has_property_value_section() && !meta.definitely_lacks_property(property_id)
-                {
-                    let rows = reader.get_neighbors_with_properties(meta, src).await?;
-                    candidates.extend(rows.into_iter().map(|row| {
-                        let matches_predicate = row
-                            .properties
-                            .iter()
-                            .any(|property| property.property_id == property_id);
-                        PropertyValueCandidateEdge {
-                            edge: row.edge,
-                            matches_predicate,
-                        }
-                    }));
-                } else {
-                    candidates.extend(reader.get_neighbors(meta, src).await?.into_iter().map(
-                        |edge| PropertyValueCandidateEdge {
-                            edge,
-                            matches_predicate: false,
-                        },
-                    ));
-                }
+        for meta in self.property_read_candidates(&guard, &reader, &signature) {
+            let _body_cpu = self.query_cpu_timer(QueryCpuPhase::BodyDecodeFilter);
+            if meta.has_property_value_section() && !meta.definitely_lacks_property(property_id) {
+                let rows = reader.get_neighbors_with_properties(&meta, src).await?;
+                self.record_property_body_feedback(src, edge_type, &meta, !rows.is_empty());
+                candidates.extend(rows.into_iter().map(|row| {
+                    let matches_predicate = row
+                        .properties
+                        .iter()
+                        .any(|property| property.property_id == property_id);
+                    PropertyValueCandidateEdge {
+                        edge: row.edge,
+                        matches_predicate,
+                    }
+                }));
+            } else {
+                let edges = reader.get_neighbors(&meta, src).await?;
+                self.record_property_body_feedback(src, edge_type, &meta, !edges.is_empty());
+                candidates.extend(edges.into_iter().map(|edge| PropertyValueCandidateEdge {
+                    edge,
+                    matches_predicate: false,
+                }));
             }
         }
 
+        let result_cpu = self.query_cpu_timer(QueryCpuPhase::MvccResult);
         let mut out = merge_visible_property_value_candidates(candidates, snapshot);
         if let Some(edge_type) = edge_type {
             out.retain(|edge| edge.edge_type == edge_type);
         }
+        drop(result_cpu);
+        drop(guard);
+        drop(_lock);
+        self.maybe_run_maintenance(MaintenanceTrigger::ReadFeedback)
+            .await?;
         self.metrics
             .storage_get_neighbors_latency
             .record_since(started);
@@ -2709,13 +2901,21 @@ impl Engine {
         edge_type: Option<EdgeType>,
         snapshot: SnapshotId,
     ) -> Result<Vec<EdgeRecord>> {
+        let started = Instant::now();
+        let query_setup_cpu = self.query_cpu_timer(QueryCpuPhase::QuerySetup);
         let signature = GraphAccessSignature::neighbor_scan(src, edge_type);
-        let degree_classes = edge_type
-            .and_then(|edge_type| self.degree_directory.read().get(&(src, edge_type)).copied());
+        let degree_classes = if self.config.query_control_stage.degree_promotion_enabled() {
+            edge_type
+                .and_then(|edge_type| self.degree_directory.read().get(&(src, edge_type)).copied())
+        } else {
+            None
+        };
+        drop(query_setup_cpu);
         self.get_neighbors_signature_internal_with_l0_degree_classes(
             signature,
             snapshot,
             degree_classes,
+            started,
         )
         .await
     }
@@ -2725,12 +2925,33 @@ impl Engine {
         signature: GraphAccessSignature,
         snapshot: SnapshotId,
     ) -> Result<Vec<EdgeRecord>> {
-        let degree_classes = signature.edge_type.and_then(|edge_type| {
-            self.degree_directory
-                .read()
-                .get(&(signature.src, edge_type))
-                .copied()
-        });
+        self.get_neighbors_signature_builder_internal(|| signature, snapshot)
+            .await
+    }
+
+    async fn get_neighbors_signature_builder_internal<F>(
+        &self,
+        build_signature: F,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<EdgeRecord>>
+    where
+        F: FnOnce() -> GraphAccessSignature,
+    {
+        let started = Instant::now();
+        let query_setup_cpu = self.query_cpu_timer(QueryCpuPhase::QuerySetup);
+        let mut signature = build_signature();
+        let degree_enabled = self.config.query_control_stage.degree_promotion_enabled();
+        let degree_classes = if degree_enabled {
+            signature.edge_type.and_then(|edge_type| {
+                self.degree_directory
+                    .read()
+                    .get(&(signature.src, edge_type))
+                    .copied()
+            })
+        } else {
+            signature = signature.without_degree_class();
+            None
+        };
         let signature = if signature.degree_class.is_some()
             && degree_classes
                 .map(|mask| degree_class_mask_count(mask) > 1)
@@ -2740,10 +2961,12 @@ impl Engine {
         } else {
             signature
         };
+        drop(query_setup_cpu);
         self.get_neighbors_signature_internal_with_l0_degree_classes(
             signature,
             snapshot,
             degree_classes,
+            started,
         )
         .await
     }
@@ -2753,18 +2976,21 @@ impl Engine {
         signature: GraphAccessSignature,
         snapshot: SnapshotId,
         l0_degree_classes: Option<DegreeClassMask>,
+        started: Instant,
     ) -> Result<Vec<EdgeRecord>> {
         let src = signature.src;
         let edge_type = signature.edge_type;
-        let started = Instant::now();
         self.metrics
             .get_neighbors_ops
             .fetch_add(1, Ordering::Relaxed);
         let _lock = self.vertex_locks.read_lock(src);
         let guard = self.version_manager.pin_current();
         let mut updates = Vec::new();
-        for memgraph in &guard.version().memgraphs {
-            updates.extend(memgraph.get_edges_for_src(src));
+        {
+            let _body_cpu = self.query_cpu_timer(QueryCpuPhase::BodyDecodeFilter);
+            for memgraph in &guard.version().memgraphs {
+                updates.extend(memgraph.get_edges_for_src(src));
+            }
         }
 
         let reader = CsrReader::with_metrics_and_cache(
@@ -2775,18 +3001,22 @@ impl Engine {
         );
         if matches!(self.config.l0_layout, L0LayoutPolicy::LsmGraphStyle) {
             if let Some(l0) = guard.version().levels.get(L0 as usize) {
+                let _body_cpu = self.query_cpu_timer(QueryCpuPhase::BodyDecodeFilter);
                 updates.extend(self.get_neighbors_lsmgraph_style(l0, src).await?);
             }
         } else if matches!(self.config.l0_layout, L0LayoutPolicy::OracleSemantic) {
             if let Some(l0) = guard.version().levels.get(L0 as usize) {
+                let _body_cpu = self.query_cpu_timer(QueryCpuPhase::BodyDecodeFilter);
                 updates.extend(
                     self.get_neighbors_oracle_semantic(l0, &reader, &signature, src)
                         .await?,
                 );
             }
         } else if let Some(l0) = guard.version().levels.get(L0 as usize) {
-            let use_semantic_l0_index =
-                signature.edge_type.is_some() && signature.src_label != UNKNOWN_SOURCE_LABEL;
+            let routing_cpu = self.query_cpu_timer(QueryCpuPhase::RoutingIndex);
+            let use_semantic_l0_index = self.config.query_control_stage.semantic_routing_enabled()
+                && signature.edge_type.is_some()
+                && signature.src_label != UNKNOWN_SOURCE_LABEL;
             let indexed_l0 = if use_semantic_l0_index {
                 self.semantic_l0_index
                     .read()
@@ -2794,6 +3024,7 @@ impl Engine {
             } else {
                 Vec::new()
             };
+            let collect_feedback = self.config.query_control_stage.feedback_priority_enabled();
             let mut touched_partitions = HashSet::new();
             let fallback_l0;
             let candidate_l0: &[CsrSegmentMeta] = if use_semantic_l0_index {
@@ -2802,18 +3033,25 @@ impl Engine {
                 fallback_l0 = l0.clone();
                 &fallback_l0
             };
+            drop(routing_cpu);
             for meta in candidate_l0 {
-                let decision = meta.signature_pruning_decision(&signature);
-                self.metrics.record_signature_pruning_decision(
-                    decision.reason,
-                    decision.pruned,
-                    meta.segment_bytes,
-                );
-                if decision.pruned {
-                    continue;
+                self.metrics
+                    .routed_l0_segments
+                    .fetch_add(1, Ordering::Relaxed);
+                let admission_cpu = self.query_cpu_timer(QueryCpuPhase::MetadataAdmission);
+                if self.config.query_control_stage.admission_enabled() {
+                    let decision = meta.signature_pruning_decision(&signature);
+                    self.metrics.record_signature_pruning_decision(
+                        decision.reason,
+                        decision.pruned,
+                        meta.segment_bytes,
+                    );
+                    if decision.pruned {
+                        continue;
+                    }
                 }
                 let partition_key = self.l0_partition_key(src, edge_type, meta);
-                if touched_partitions.insert(partition_key) {
+                if collect_feedback && touched_partitions.insert(partition_key) {
                     self.metrics.record_l0_partition_query(partition_key);
                 }
                 let mut partition_probe = L0PartitionProbe {
@@ -2828,8 +3066,10 @@ impl Engine {
                         .range_filtered_segments
                         .fetch_add(1, Ordering::Relaxed);
                     partition_probe.range_filtered_segments = 1;
-                    self.metrics
-                        .record_l0_partition_probe(partition_key, partition_probe);
+                    if collect_feedback {
+                        self.metrics
+                            .record_l0_partition_probe(partition_key, partition_probe);
+                    }
                     continue;
                 }
                 let cached_may_contain = reader.cached_may_contain_src(meta, src);
@@ -2840,8 +3080,10 @@ impl Engine {
                             .fetch_add(1, Ordering::Relaxed);
                         partition_probe.bloom_filtered_segments = 1;
                         partition_probe.offset_cache_hits = 1;
-                        self.metrics
-                            .record_l0_partition_probe(partition_key, partition_probe);
+                        if collect_feedback {
+                            self.metrics
+                                .record_l0_partition_probe(partition_key, partition_probe);
+                        }
                         continue;
                     }
                     Some(true) => {
@@ -2855,6 +3097,8 @@ impl Engine {
                     .filter_passed_segments
                     .fetch_add(1, Ordering::Relaxed);
                 partition_probe.filter_passed_segments = 1;
+                drop(admission_cpu);
+                let _body_cpu = self.query_cpu_timer(QueryCpuPhase::BodyDecodeFilter);
                 let edges = retain_edges_for_signature(
                     meta,
                     &signature,
@@ -2869,21 +3113,32 @@ impl Engine {
                 } else if matches!(cached_may_contain, Some(true)) {
                     partition_probe.bloom_false_positive_probes = 1;
                 }
-                self.metrics
-                    .record_l0_partition_probe(partition_key, partition_probe);
+                if collect_feedback {
+                    self.metrics
+                        .record_l0_partition_probe(partition_key, partition_probe);
+                }
                 updates.extend(edges);
             }
         }
-        for meta in self.index.get_positions(src) {
-            let decision = meta.signature_pruning_decision(&signature);
-            self.metrics.record_signature_pruning_decision(
-                decision.reason,
-                decision.pruned,
-                meta.segment_bytes,
-            );
-            if decision.pruned {
-                continue;
+        let higher_level_positions = {
+            let _routing_cpu = self.query_cpu_timer(QueryCpuPhase::RoutingIndex);
+            self.index.get_positions(src)
+        };
+        for meta in higher_level_positions {
+            let admission_cpu = self.query_cpu_timer(QueryCpuPhase::MetadataAdmission);
+            if self.config.query_control_stage.admission_enabled() {
+                let decision = meta.signature_pruning_decision(&signature);
+                self.metrics.record_signature_pruning_decision(
+                    decision.reason,
+                    decision.pruned,
+                    meta.segment_bytes,
+                );
+                if decision.pruned {
+                    continue;
+                }
             }
+            drop(admission_cpu);
+            let _body_cpu = self.query_cpu_timer(QueryCpuPhase::BodyDecodeFilter);
             updates.extend(retain_edges_for_signature(
                 &meta,
                 &signature,
@@ -2891,18 +3146,23 @@ impl Engine {
             ));
         }
 
+        let result_cpu = self.query_cpu_timer(QueryCpuPhase::MvccResult);
         if let Some(edge_type) = edge_type {
             updates.retain(|edge| edge.edge_type == edge_type);
         }
         updates = retain_edges_for_dst_label(&signature, updates);
         let out = merge_visible(updates, snapshot);
-        self.metrics
-            .storage_get_neighbors_latency
-            .record_since(started);
+        drop(result_cpu);
         drop(guard);
         drop(_lock);
         self.maybe_run_maintenance(MaintenanceTrigger::ReadFeedback)
             .await?;
+        // A6 maintenance is awaited by the public query API, so it is part of
+        // the client-visible latency. Recording before this await would make
+        // histogram p99 disagree with the storage-bench wall-clock/QPS.
+        self.metrics
+            .storage_get_neighbors_latency
+            .record_since(started);
         Ok(out)
     }
 
@@ -3000,6 +3260,19 @@ impl Engine {
 
     pub async fn compact_l0_to_l1(&self) -> Result<Option<CsrSegmentMeta>> {
         self.compact_l0_to_l1_inner(true).await
+    }
+
+    /// Compact the complete L0 overlap into semantically partitioned L1
+    /// outputs. This is the A5/A6 lifecycle path; the legacy single-output
+    /// `compact_l0_to_l1` API remains available for compatibility.
+    pub async fn compact_l0_to_l1_partitioned(&self) -> Result<Vec<CsrSegmentMeta>> {
+        self.compact_l0_target_to_l1(L0CompactionTarget {
+            src_label: UNKNOWN_SOURCE_LABEL,
+            edge_type: None,
+            min_src: None,
+            max_src: None,
+        })
+        .await
     }
 
     pub async fn build_oracle_index(&self) -> Result<OracleIndexStats> {
@@ -3260,10 +3533,17 @@ impl Engine {
             self.config.store_dir.clone(),
             self.current_schema_epoch(),
         );
-        let mut outputs = Vec::new();
-        for segment_edges in
-            split_property_compaction_segments(compacted, self.config.segment_target_bytes)
+        let output_segments = if self
+            .config
+            .query_control_stage
+            .semantic_compaction_enabled()
         {
+            split_semantic_compaction_segments(compacted, self.config.segment_target_bytes)
+        } else {
+            split_property_compaction_segments(compacted, self.config.segment_target_bytes)
+        };
+        let mut outputs = Vec::new();
+        for segment_edges in output_segments {
             let file_id = self.alloc_file_id();
             let output = writer
                 .write_segment_with_properties(L1, file_id, segment_edges)
@@ -3577,6 +3857,11 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         let expected_file_ids = degree_directory_sidecar_file_ids(&guard.version().levels);
+        if !self.config.query_control_stage.degree_promotion_enabled() {
+            self.degree_directory.write().clear();
+            *self.semantic_l0_index.write() = SemanticL0Index::rebuild(&l0_files);
+            return Ok(());
+        }
         if let Some(degree_directory) =
             read_degree_directory_sidecar(&self.config.store_dir, &expected_file_ids)?
         {
@@ -3607,6 +3892,11 @@ impl Engine {
     }
 
     async fn rebuild_semantic_indexes(&self) -> Result<()> {
+        if !self.config.query_control_stage.semantic_routing_enabled() {
+            self.degree_directory.write().clear();
+            *self.semantic_l0_index.write() = SemanticL0Index::default();
+            return Ok(());
+        }
         let guard = self.version_manager.pin_current();
         let reader = CsrReader::with_metrics_and_cache(
             self.backend.clone(),
@@ -3614,25 +3904,28 @@ impl Engine {
             self.metrics.clone(),
             self.metadata_cache.clone(),
         );
+        let degree_enabled = self.config.query_control_stage.degree_promotion_enabled();
         let mut degree_directory: HashMap<(VertexId, EdgeType), DegreeClassMask> = HashMap::new();
-        if let Some(l0_files) = guard.version().levels.get(L0 as usize) {
-            for meta in l0_files {
-                let Some(degree_class) = degree_directory_class_for_l0(meta) else {
-                    continue;
-                };
-                // A partially built degree directory must be a hard error: degree-hint
-                // routing prunes against it, so silently skipping a tracked exact
-                // segment here could turn an IO error into a missed-edge read (false
-                // negative). Non-exact/Mixed-degree segments deliberately have no
-                // directory entry; the semantic index still reads them conservatively.
-                let offsets = reader.read_offsets(meta).await?;
-                for offset in offsets.iter() {
-                    insert_degree_class_mask(
-                        degree_directory
-                            .entry((offset.src, meta.edge_type_partition))
-                            .or_default(),
-                        degree_class,
-                    );
+        if degree_enabled {
+            if let Some(l0_files) = guard.version().levels.get(L0 as usize) {
+                for meta in l0_files {
+                    let Some(degree_class) = degree_directory_class_for_l0(meta) else {
+                        continue;
+                    };
+                    // A partially built degree directory must be a hard error: degree-hint
+                    // routing prunes against it, so silently skipping a tracked exact
+                    // segment here could turn an IO error into a missed-edge read (false
+                    // negative). Non-exact/Mixed-degree segments deliberately have no
+                    // directory entry; the semantic index still reads them conservatively.
+                    let offsets = reader.read_offsets(meta).await?;
+                    for offset in offsets.iter() {
+                        insert_degree_class_mask(
+                            degree_directory
+                                .entry((offset.src, meta.edge_type_partition))
+                                .or_default(),
+                            degree_class,
+                        );
+                    }
                 }
             }
         }
@@ -3645,32 +3938,40 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         *self.semantic_l0_index.write() = SemanticL0Index::rebuild(&l0_files);
-        self.persist_degree_directory_sidecar_best_effort();
+        if degree_enabled {
+            self.persist_degree_directory_sidecar_best_effort();
+        }
         Ok(())
     }
 
     async fn update_semantic_indexes_with_l0_metas(&self, metas: &[CsrSegmentMeta]) -> Result<()> {
+        if !self.config.query_control_stage.semantic_routing_enabled() {
+            return Ok(());
+        }
         let reader = CsrReader::with_metrics_and_cache(
             self.backend.clone(),
             self.config.store_dir.clone(),
             self.metrics.clone(),
             self.metadata_cache.clone(),
         );
+        let degree_enabled = self.config.query_control_stage.degree_promotion_enabled();
         let mut updates: HashMap<(VertexId, EdgeType), DegreeClassMask> = HashMap::new();
-        for meta in metas {
-            let Some(degree_class) = degree_directory_class_for_l0(meta) else {
-                continue;
-            };
-            // Same contract as rebuild_semantic_indexes: never leave the degree
-            // directory silently incomplete for tracked exact segments.
-            let offsets = reader.read_offsets(meta).await?;
-            for offset in offsets.iter() {
-                insert_degree_class_mask(
-                    updates
-                        .entry((offset.src, meta.edge_type_partition))
-                        .or_default(),
-                    degree_class,
-                );
+        if degree_enabled {
+            for meta in metas {
+                let Some(degree_class) = degree_directory_class_for_l0(meta) else {
+                    continue;
+                };
+                // Same contract as rebuild_semantic_indexes: never leave the degree
+                // directory silently incomplete for tracked exact segments.
+                let offsets = reader.read_offsets(meta).await?;
+                for offset in offsets.iter() {
+                    insert_degree_class_mask(
+                        updates
+                            .entry((offset.src, meta.edge_type_partition))
+                            .or_default(),
+                        degree_class,
+                    );
+                }
             }
         }
 
