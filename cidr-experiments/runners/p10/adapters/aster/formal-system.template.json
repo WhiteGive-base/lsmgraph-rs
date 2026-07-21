@@ -1,0 +1,72 @@
+{
+  "id": "aster",
+  "display_name": "Aster",
+  "group": "embedded",
+  "interface_scope": "typed-neighbor-dense-id-v1",
+  "system_version": "aster-rocksgraph@6abb258e577c479325092a8ac0e7691fdfd154c2",
+  "fixture_only": false,
+  "service_lifecycle": "in-process",
+  "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+  "adapter": {
+    "path": "__ABSOLUTE_REPO__/cidr-experiments/runners/p10/adapters/aster_adapter.py",
+    "sha256": "__ADAPTER_SHA256__",
+    "args": [
+      "--mode",
+      "formal",
+      "--lifecycle",
+      "reopen",
+      "--source-root",
+      "__ABSOLUTE_ASTER_SOURCE_ROOT__",
+      "--source-commit",
+      "6abb258e577c479325092a8ac0e7691fdfd154c2",
+      "--repo-root",
+      "__ABSOLUTE_REPO__",
+      "--binary",
+      "__ABSOLUTE_ASTER_WORKER__",
+      "--binary-sha256",
+      "__WORKER_SHA256__",
+      "--dataset",
+      "__ABSOLUTE_SF10_DENSE_DATASET__",
+      "--dataset-sha256",
+      "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+      "--store-label",
+      "aster",
+      "--store-manifest",
+      "__ABSOLUTE_ASTER_ARTIFACTS__/aster-store-manifest.json",
+      "--store-manifest-sha256",
+      "__STORE_MANIFEST_SHA256__",
+      "--p02b-result",
+      "__ABSOLUTE_P02B__/sentinel-result.json",
+      "--p02b-result-sha256",
+      "__P02B_RESULT_SHA256__",
+      "--p02b-validator",
+      "__ABSOLUTE_REPO__/cidr-experiments/runners/p02b/validate_sentinel_result.py",
+      "--p02b-validator-sha256",
+      "__P02B_VALIDATOR_SHA256__",
+      "--p02b-max-age-seconds",
+      "3600",
+      "--p31-wrapper",
+      "__ABSOLUTE_REPO__/cidr-experiments/runners/p31/run_with_resources.sh",
+      "--p31-wrapper-sha256",
+      "__P31_WRAPPER_SHA256__",
+      "--block-cache-bytes",
+      "268435456"
+    ]
+  },
+  "binary": {
+    "path": "__ABSOLUTE_ASTER_WORKER__",
+    "sha256": "__WORKER_SHA256__"
+  },
+  "runtime_libraries": [],
+  "store_roots": [
+    {
+      "label": "aster",
+      "path": "__ABSOLUTE_ASTER_SF10_STORE__",
+      "sha256": "__ASTER_LOGICAL_STORE_SHA256__"
+    }
+  ],
+  "temp_roots": [],
+  "containers": [],
+  "extra_pids": [],
+  "image_digests": []
+}

@@ -113,6 +113,14 @@ manifest、P02B result/validator 与 P31 wrapper 的 SHA-256 均必须在 suite 
 P31 统计覆盖整个 adapter 生命周期；论文 QPS/P50/P95/P99 只取 measured phase。
 二者不能混用。`fresh` 结果始终是 correctness fixture，不能进入 Figure 1。
 
+## Formal suite 模板
+
+`aster/formal-system.template.json` 给出 P10 suite 中 Aster system 项的冻结结构。
+使用前必须替换所有 `__...__` 占位符，并保证 adapter args 中的 worker、dataset、
+store manifest、P02B result/validator 和 P31 wrapper 路径/SHA 与 system/request 侧完全
+一致。Aster worker 静态链接 RocksGraph，因此模板的 `runtime_libraries` 为空；
+`store_roots[aster].sha256` 填逻辑 query-store SHA，而不是物理 tree SHA。
+
 ## 当前正式运行前仍需准备
 
 - 已建立 detached clean source view

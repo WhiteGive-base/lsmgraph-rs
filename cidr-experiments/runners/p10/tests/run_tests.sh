@@ -7,6 +7,7 @@ P10_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 bash -n "$P10_DIR/run_adapter_with_p31.sh" "$SCRIPT_DIR/fixture_p31.sh"
 for json_file in \
   "$SCRIPT_DIR/fixture-suite.json" \
+  "$P10_DIR/adapters/aster/formal-system.template.json" \
   "$P10_DIR/schemas/suite-manifest.schema.json" \
   "$P10_DIR/schemas/adapter-request.schema.json" \
   "$P10_DIR/schemas/adapter-result.schema.json" \
