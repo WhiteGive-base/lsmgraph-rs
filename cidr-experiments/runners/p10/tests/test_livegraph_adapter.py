@@ -385,6 +385,17 @@ class LiveGraphAdapterTest(unittest.TestCase):
             self.assertIn("canonical SF10 dense dataset", completed.stderr)
             self.assertEqual(list(store.iterdir()), [])
 
+    def test_formal_contract_accepts_1700_query_synthetic_truth(self) -> None:
+        """Retain the historical test ID under the stronger pinned-truth contract.
+
+        The earlier assertion accepted any 1700-row synthetic truth.  Formal
+        LiveGraph now requires the canonical SF10 dense truth, so preserving the
+        old test must assert the fail-closed replacement rather than re-open the
+        retired acceptance path.
+        """
+
+        self.test_formal_contract_rejects_noncanonical_1700_query_synthetic_truth()
+
     def test_formal_protocol_rejects_noncanonical_pass_count_before_store_mutation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="p10-livegraph-formal-passes-negative-") as raw:
             root = Path(raw)

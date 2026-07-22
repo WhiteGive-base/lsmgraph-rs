@@ -34,6 +34,8 @@ CANONICAL_STAGES = {
 P02B_MAX_AGE_SECONDS = 6 * 60 * 60
 P02B_SENTINEL_SCHEMA = "p02b-sf10-sentinel-result-v1"
 P02B_ADMISSION_SCHEMA = "p20-p02b-admission-v1"
+BATCH_ADMISSION_SCHEMA = "p20-batch-lease-admission-v2"
+BATCH_PROTOCOL = "short-clean-window-v2"
 
 
 class RunnerError(ValueError):
@@ -101,6 +103,19 @@ def artifact_row(name, path, expected_sha, require_file=False, require_dir=False
         "kind": kind,
         "sha256": expected_sha,
         "verification": verification,
+    }
+
+
+def computed_file_row(name, path):
+    path = require_absolute(path, name)
+    if not path.is_file():
+        raise RunnerError("{} must be an existing file: {}".format(name, path))
+    return {
+        "name": name,
+        "path": str(path),
+        "kind": "file",
+        "sha256": sha256_file(path),
+        "verification": "computed-file",
     }
 
 
@@ -232,6 +247,130 @@ def git_head(repo_root):
     if result.returncode != 0 or not result.stdout.strip():
         raise RunnerError("cannot resolve current Git HEAD: {}".format(result.stderr.strip()))
     return result.stdout.strip()
+
+
+def resolve_admission_mode(args, repo_root):
+    legacy_selected = bool(args.legacy_v1_admission)
+    batch_values = (args.batch_lease, args.batch_gate_tool)
+    batch_selected = any(value is not None for value in batch_values)
+    if legacy_selected == batch_selected:
+        raise RunnerError(
+            "select exactly one admission protocol: --legacy-v1-admission with "
+            "--p02b-sentinel-result and --p02b-sentinel-result-sha256, or "
+            "--batch-lease plus --batch-gate-tool"
+        )
+    if legacy_selected:
+        if args.p02b_sentinel_result is None or args.p02b_sentinel_result_sha256 is None:
+            raise RunnerError(
+                "legacy v1 admission requires --p02b-sentinel-result and its SHA-256"
+            )
+        return {"protocol_version": "legacy-p02b-admission-v1"}
+    if any(value is None for value in batch_values):
+        raise RunnerError("v2 admission requires both --batch-lease and --batch-gate-tool")
+    if args.p02b_sentinel_result is not None or args.p02b_sentinel_result_sha256 is not None:
+        raise RunnerError("v2 admission may not mix legacy P02B result options")
+    expected_gate = (repo_root / "cidr-experiments/runners/batch_gate_v2.py").resolve()
+    selected_gate = require_absolute(args.batch_gate_tool, "batch gate tool")
+    if selected_gate != expected_gate or not selected_gate.is_file():
+        raise RunnerError("batch gate tool must be canonical repository copy: {}".format(expected_gate))
+    lease = require_absolute(args.batch_lease, "batch lease")
+    if not lease.is_file():
+        raise RunnerError("batch lease must be an existing file: {}".format(lease))
+    return {
+        "protocol_version": BATCH_PROTOCOL,
+        "gate_tool": selected_gate,
+        "lease": lease,
+    }
+
+
+def validate_batch_lease(gate_tool, lease, repo_root, binary_path):
+    command = [
+        sys.executable,
+        str(gate_tool),
+        "validate-lease",
+        "--lease",
+        str(lease),
+        "--consumer",
+        "P20",
+        "--repo-root",
+        str(repo_root),
+        "--binary",
+        str(binary_path),
+    ]
+    completed = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if completed.returncode != 0:
+        raise RunnerError("batch lease validator failed: {}".format(completed.stderr.strip()))
+    try:
+        receipt = json.loads(completed.stdout, object_pairs_hook=_unique_object)
+    except (json.JSONDecodeError, RunnerError) as exc:
+        raise RunnerError("batch lease validator emitted invalid JSON: {}".format(exc))
+    if not isinstance(receipt, dict):
+        raise RunnerError("batch lease validator receipt must be an object")
+    expected = {
+        "schema_version": "cidr-batch-lease-admission-v2",
+        "state": "PASS",
+        "consumer": "P20",
+        "lease": str(Path(lease).resolve()),
+        "lease_sha256": sha256_file(lease),
+        "repo_head": git_head(repo_root),
+        "binary_sha256": sha256_file(binary_path),
+    }
+    for name, value in expected.items():
+        if receipt.get(name) != value:
+            raise RunnerError("batch lease receipt drift: {}".format(name))
+    if not isinstance(receipt.get("host"), dict):
+        raise RunnerError("batch lease receipt omitted host identity")
+    normalize_sha(
+        receipt["host"].get("fingerprint_sha256", ""), "batch lease host fingerprint"
+    )
+    if not isinstance(receipt.get("remaining_seconds"), (int, float)) or isinstance(
+        receipt.get("remaining_seconds"), bool
+    ) or receipt["remaining_seconds"] <= 0:
+        raise RunnerError("batch lease receipt has no positive remaining lifetime")
+    return receipt, command
+
+
+def validate_p31_integrity_guard(p31_run_root, lease_row, gate_row, binary_row):
+    validation_path = Path(p31_run_root) / "validation.json"
+    validation = read_json(validation_path, "P31 validation")
+    guard = validation.get("integrity_guard")
+    if (
+        validation.get("state") != "PASS"
+        or not isinstance(guard, dict)
+        or guard.get("schema_version") != "cidr-p31-batch-integrity-v2"
+        or guard.get("state") != "PASS"
+        or guard.get("consumer") != "P20"
+        or guard.get("lease_sha256") != lease_row["sha256"]
+        or guard.get("gate_tool_sha256") != gate_row["sha256"]
+        or guard.get("anchor_binary_sha256") != binary_row["sha256"]
+    ):
+        raise RunnerError("P31 batch integrity guard binding is not a clean P20 PASS")
+    evidence = guard.get("evidence")
+    required = {
+        "release": "p31_command_release",
+        "ready": "p31_integrity_guard_ready",
+        "status": "p31_integrity_guard_status",
+        "samples": "p31_integrity_guard_samples",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != set(required):
+        raise RunnerError("P31 integrity guard evidence set drift")
+    rows = []
+    for evidence_name, row_name in required.items():
+        reference = evidence[evidence_name]
+        if not isinstance(reference, dict):
+            raise RunnerError("P31 integrity guard evidence reference drift")
+        row = artifact_row(
+            row_name,
+            reference.get("path"),
+            reference.get("sha256", ""),
+            require_file=True,
+        )
+        if reference.get("size_bytes") != Path(row["path"]).stat().st_size:
+            raise RunnerError("P31 integrity guard evidence size drift: {}".format(evidence_name))
+        rows.append(row)
+    return guard, rows
 
 
 def validate_p02b_sentinel(validator, result_row, repo_root, repo_head, binary_sha256):
@@ -638,12 +777,15 @@ def run(args):
     profiles = require_absolute(args.profiles, "profiles")
     profile_validator = require_absolute(args.profile_validator, "profile validator")
     summarizer = require_absolute(args.summarizer, "summarizer")
-    p02b_validator = require_absolute(
-        HERE.parent / "p02b" / "validate_sentinel_result.py",
-        "P02B sentinel validator",
-    )
     p31_wrapper = require_absolute(args.p31_wrapper, "P31 wrapper")
     data_mount = require_absolute(args.data_mount, "data mount")
+    admission_mode = resolve_admission_mode(args, repo_root)
+    p02b_validator = None
+    if admission_mode["protocol_version"] == "legacy-p02b-admission-v1":
+        p02b_validator = require_absolute(
+            HERE.parent / "p02b" / "validate_sentinel_result.py",
+            "P02B sentinel validator",
+        )
     if args.mode == "correctness":
         raise RunnerError(
             "mode=correctness is not runnable here; this measured runner consumes an external correctness PASS"
@@ -662,13 +804,15 @@ def run(args):
     for path, label in ((repo_root, "repo root"), (data_mount, "data mount")):
         if not path.is_dir():
             raise RunnerError("{} must be an existing directory: {}".format(label, path))
-    for path, label in (
+    required_files = [
         (profiles, "profiles"),
         (profile_validator, "profile validator"),
         (summarizer, "summarizer"),
-        (p02b_validator, "P02B sentinel validator"),
         (p31_wrapper, "P31 wrapper"),
-    ):
+    ]
+    if p02b_validator is not None:
+        required_files.append((p02b_validator, "P02B sentinel validator"))
+    for path, label in required_files:
         if not path.is_file():
             raise RunnerError("{} must be an existing file: {}".format(label, path))
     if (
@@ -748,7 +892,7 @@ def run(args):
     profiles_sha = sha256_file(profiles)
     validator_sha = sha256_file(profile_validator)
     summarizer_sha = sha256_file(summarizer)
-    p02b_validator_sha = sha256_file(p02b_validator)
+    p02b_validator_sha = sha256_file(p02b_validator) if p02b_validator is not None else None
     runner_sha = sha256_file(Path(__file__).resolve())
     p31_sha = sha256_file(p31_wrapper)
     expected_queries = validate_sample_plan(sample_row["path"])
@@ -769,32 +913,53 @@ def run(args):
         "sample_plan": sample_row["sha256"],
         "truth": truth_row["sha256"],
     }
-    p02b_result_row = artifact_row(
-        "p02b_sentinel_result",
-        args.p02b_sentinel_result,
-        args.p02b_sentinel_result_sha256,
-        require_file=True,
-    )
     current_git_head = git_head(repo_root)
-    p02b_receipt, p02b_validator_command = validate_p02b_sentinel(
-        p02b_validator,
-        p02b_result_row,
-        repo_root,
-        current_git_head,
-        binary_row["sha256"],
-    )
-    p02b_marker_row = artifact_row(
-        "p02b_pass_marker",
-        p02b_receipt["pass_marker"],
-        p02b_receipt["pass_marker_sha256"],
-        require_file=True,
-    )
-    p02b_provenance_row = artifact_row(
-        "p02b_provenance",
-        p02b_receipt["provenance"],
-        p02b_receipt["provenance_sha256"],
-        require_file=True,
-    )
+    p02b_result_row = None
+    p02b_receipt = None
+    p02b_validator_command = None
+    p02b_marker_row = None
+    p02b_provenance_row = None
+    batch_lease_row = None
+    batch_gate_row = None
+    batch_receipt = None
+    batch_validator_command = None
+    if admission_mode["protocol_version"] == "legacy-p02b-admission-v1":
+        if p02b_validator is None:
+            raise RunnerError("legacy P02B validator resolution failed")
+        p02b_result_row = artifact_row(
+            "p02b_sentinel_result",
+            args.p02b_sentinel_result,
+            args.p02b_sentinel_result_sha256,
+            require_file=True,
+        )
+        p02b_receipt, p02b_validator_command = validate_p02b_sentinel(
+            p02b_validator,
+            p02b_result_row,
+            repo_root,
+            current_git_head,
+            binary_row["sha256"],
+        )
+        p02b_marker_row = artifact_row(
+            "p02b_pass_marker",
+            p02b_receipt["pass_marker"],
+            p02b_receipt["pass_marker_sha256"],
+            require_file=True,
+        )
+        p02b_provenance_row = artifact_row(
+            "p02b_provenance",
+            p02b_receipt["provenance"],
+            p02b_receipt["provenance_sha256"],
+            require_file=True,
+        )
+    else:
+        batch_lease_row = computed_file_row("batch_lease", admission_mode["lease"])
+        batch_gate_row = computed_file_row("batch_gate_tool", admission_mode["gate_tool"])
+        batch_receipt, batch_validator_command = validate_batch_lease(
+            admission_mode["gate_tool"],
+            admission_mode["lease"],
+            repo_root,
+            Path(binary_row["path"]),
+        )
     validate_correctness_evidence(
         correctness_row["path"], expected, args.scale, args.stage, args.workload, expected_queries
     )
@@ -843,66 +1008,91 @@ def run(args):
         }
         shutil.copy2(correctness_row["path"], str(output_root / "correctness-pass.json"))
         resolved_profile_sha = sha256_file(output_root / "resolved-profile.json")
-        p02b_admission = {
-            "schema_version": P02B_ADMISSION_SCHEMA,
-            "state": "PASS",
-            "scope": "host-global",
-            "admitted_at_utc": utc_now(),
-            "policy": {
-                "consumer": "P20",
-                "formal_pass_required": True,
-                "fixture_forbidden": True,
-                "maximum_age_seconds": P02B_MAX_AGE_SECONDS,
-                "same_host_fingerprint_required": True,
-                "release_is_scale_store_workload_independent": True,
+        p20_binding = {
+            "task_id": args.task_id,
+            "run_id": run_id,
+            "repeat_index": args.repeat_index,
+            "scale": args.scale,
+            "stage": args.stage,
+            "mode": args.mode,
+            "workload": args.workload,
+            "property_id": property_id,
+            "repo_root": str(repo_root),
+            "repo_head": current_git_head,
+            "input_sha256": expected,
+            "correctness_pass_sha256": correctness_row["sha256"],
+            "pristine_store_sha256": pristine_row["sha256"],
+            "pristine_store_manifest_sha256": pristine_manifest_row["sha256"],
+            "profiles_sha256": profiles_sha,
+            "resolved_profile_sha256": resolved_profile_sha,
+            "cpu_isolation": {
+                "benchmark_cpuset": cpuset,
+                "collector_cpuset": housekeeping_cpuset,
+                "disjoint": True,
+                "worker_threads": args.worker_threads,
             },
-            "p02b": {
-                "validator_command": p02b_validator_command,
-                "validator_sha256": p02b_validator_sha,
-                "receipt": p02b_receipt,
-            },
-            "p20": {
-                "task_id": args.task_id,
-                "run_id": run_id,
-                "repeat_index": args.repeat_index,
-                "scale": args.scale,
-                "stage": args.stage,
-                "mode": args.mode,
-                "workload": args.workload,
-                "property_id": property_id,
-                "repo_root": str(repo_root),
-                "repo_head": current_git_head,
-                "input_sha256": expected,
-                "correctness_pass_sha256": correctness_row["sha256"],
-                "pristine_store_sha256": pristine_row["sha256"],
-                "pristine_store_manifest_sha256": pristine_manifest_row["sha256"],
-                "profiles_sha256": profiles_sha,
-                "resolved_profile_sha256": resolved_profile_sha,
-                "cpu_isolation": {
-                    "benchmark_cpuset": cpuset,
-                    "collector_cpuset": housekeeping_cpuset,
-                    "disjoint": True,
-                    "worker_threads": args.worker_threads,
-                },
-                "p31": {
-                    "wrapper_sha256": p31_sha,
-                    "device": args.device,
-                    "data_mount": str(data_mount),
-                    "interval_seconds": args.interval,
-                    "disk_interval_seconds": args.disk_interval,
-                    "min_samples": args.min_samples,
-                    "require_aux_tools": True,
-                },
+            "p31": {
+                "wrapper_sha256": p31_sha,
+                "device": args.device,
+                "data_mount": str(data_mount),
+                "interval_seconds": args.interval,
+                "disk_interval_seconds": args.disk_interval,
+                "min_samples": args.min_samples,
+                "require_aux_tools": True,
             },
         }
-        atomic_json(output_root / "p02b-admission.json", p02b_admission)
-        p02b_admission_row = {
-            "name": "p02b_admission",
-            "path": str(output_root / "p02b-admission.json"),
-            "kind": "file",
-            "sha256": sha256_file(output_root / "p02b-admission.json"),
-            "verification": "computed-file",
-        }
+        if admission_mode["protocol_version"] == "legacy-p02b-admission-v1":
+            p02b_admission = {
+                "schema_version": P02B_ADMISSION_SCHEMA,
+                "state": "PASS",
+                "scope": "host-global",
+                "admitted_at_utc": utc_now(),
+                "policy": {
+                    "consumer": "P20",
+                    "formal_pass_required": True,
+                    "fixture_forbidden": True,
+                    "maximum_age_seconds": P02B_MAX_AGE_SECONDS,
+                    "same_host_fingerprint_required": True,
+                    "release_is_scale_store_workload_independent": True,
+                },
+                "p02b": {
+                    "validator_command": p02b_validator_command,
+                    "validator_sha256": p02b_validator_sha,
+                    "receipt": p02b_receipt,
+                },
+                "p20": p20_binding,
+            }
+            atomic_json(output_root / "p02b-admission.json", p02b_admission)
+            admission_row = computed_file_row(
+                "p02b_admission", output_root / "p02b-admission.json"
+            )
+        else:
+            if batch_receipt is None or batch_validator_command is None:
+                raise RunnerError("batch lease admission receipt is missing")
+            batch_admission = {
+                "schema_version": BATCH_ADMISSION_SCHEMA,
+                "state": "PASS",
+                "scope": "single-host-single-head-formal-batch",
+                "protocol_version": BATCH_PROTOCOL,
+                "admitted_at_utc": utc_now(),
+                "policy": {
+                    "consumer": "P20",
+                    "valid_lease_required_at_admission_and_pre_p31": True,
+                    "integrity_guard_required": True,
+                    "legacy_six_hour_freshness_used": False,
+                },
+                "batch_gate": {
+                    "validator_command": batch_validator_command,
+                    "gate_tool_sha256": batch_gate_row["sha256"],
+                    "lease_sha256": batch_lease_row["sha256"],
+                    "receipt": batch_receipt,
+                },
+                "p20": p20_binding,
+            }
+            atomic_json(output_root / "batch-lease-admission.json", batch_admission)
+            admission_row = computed_file_row(
+                "batch_lease_admission", output_root / "batch-lease-admission.json"
+            )
         invocation_config = {
             "schema_version": 1,
             "experiment_id": resolved["experiment_id"],
@@ -928,20 +1118,41 @@ def run(args):
             "frozen_environment": recorded_environment,
             "input_sha256": expected,
             "correctness_pass_sha256": correctness_row["sha256"],
-            "p02b_validator_sha256": p02b_validator_sha,
-            "p02b_sentinel_result_sha256": p02b_result_row["sha256"],
-            "p02b_pass_marker_sha256": p02b_marker_row["sha256"],
-            "p02b_provenance_sha256": p02b_provenance_row["sha256"],
-            "p02b_admission_sha256": p02b_admission_row["sha256"],
-            "p02b_run_id": p02b_receipt["run_id"],
-            "p02b_completed_at_utc": p02b_receipt["completed_at_utc"],
-            "p02b_host_fingerprint_sha256": p02b_receipt["host"]["fingerprint_sha256"],
+            "admission_protocol": admission_mode["protocol_version"],
             "pristine_store_sha256": pristine_row["sha256"],
             "pristine_store_manifest_sha256": pristine_manifest_row["sha256"],
             "stage_store_provenance_sha256": stage_provenance_row["sha256"],
             "profiles_sha256": profiles_sha,
             "resolved_profile_sha256": resolved_profile_sha,
         }
+        if admission_mode["protocol_version"] == "legacy-p02b-admission-v1":
+            invocation_config.update(
+                {
+                    "p02b_validator_sha256": p02b_validator_sha,
+                    "p02b_sentinel_result_sha256": p02b_result_row["sha256"],
+                    "p02b_pass_marker_sha256": p02b_marker_row["sha256"],
+                    "p02b_provenance_sha256": p02b_provenance_row["sha256"],
+                    "p02b_admission_sha256": admission_row["sha256"],
+                    "p02b_run_id": p02b_receipt["run_id"],
+                    "p02b_completed_at_utc": p02b_receipt["completed_at_utc"],
+                    "p02b_host_fingerprint_sha256": p02b_receipt["host"][
+                        "fingerprint_sha256"
+                    ],
+                }
+            )
+        else:
+            invocation_config.update(
+                {
+                    "batch_lease_sha256": batch_lease_row["sha256"],
+                    "batch_gate_tool_sha256": batch_gate_row["sha256"],
+                    "batch_lease_admission_sha256": admission_row["sha256"],
+                    "batch_lease_issued_at_utc": batch_receipt["issued_at_utc"],
+                    "batch_lease_expires_at_utc": batch_receipt["expires_at_utc"],
+                    "batch_host_fingerprint_sha256": batch_receipt["host"][
+                        "fingerprint_sha256"
+                    ],
+                }
+            )
         atomic_json(output_root / "invocation-config.json", invocation_config)
         invocation_config_sha = sha256_file(output_root / "invocation-config.json")
         storage_argv = [
@@ -969,6 +1180,41 @@ def run(args):
         benchmark_argv = list(storage_argv)
         if cpuset is not None:
             benchmark_argv = ["taskset", "-c", cpuset] + benchmark_argv
+
+        batch_pre_p31_row = None
+        batch_pre_p31_receipt = None
+        if admission_mode["protocol_version"] == BATCH_PROTOCOL:
+            batch_pre_p31_receipt, pre_p31_validator_command = validate_batch_lease(
+                admission_mode["gate_tool"],
+                admission_mode["lease"],
+                repo_root,
+                Path(binary_row["path"]),
+            )
+            for key in (
+                "state",
+                "consumer",
+                "lease",
+                "lease_sha256",
+                "host",
+                "repo_head",
+                "binary_sha256",
+                "issued_at_utc",
+                "expires_at_utc",
+            ):
+                if batch_pre_p31_receipt.get(key) != batch_receipt.get(key):
+                    raise RunnerError("batch lease identity changed before P31: {}".format(key))
+            pre_p31_document = {
+                "schema_version": "p20-batch-lease-pre-p31-v2",
+                "state": "PASS",
+                "validated_at_utc": utc_now(),
+                "validator_command": pre_p31_validator_command,
+                "receipt": batch_pre_p31_receipt,
+                "initial_admission_sha256": admission_row["sha256"],
+            }
+            atomic_json(output_root / "batch-lease-pre-p31.json", pre_p31_document)
+            batch_pre_p31_row = computed_file_row(
+                "batch_lease_pre_p31", output_root / "batch-lease-pre-p31.json"
+            )
 
         p31_argv = [
             "taskset",
@@ -1018,6 +1264,19 @@ def run(args):
             "--config-sha256",
             invocation_config_sha,
         ]
+        if admission_mode["protocol_version"] == BATCH_PROTOCOL:
+            p31_argv.extend(
+                [
+                    "--batch-lease",
+                    str(admission_mode["lease"]),
+                    "--batch-gate-tool",
+                    str(admission_mode["gate_tool"]),
+                    "--batch-consumer",
+                    "P20",
+                    "--batch-anchor-binary",
+                    binary_row["path"],
+                ]
+            )
         if args.allow_missing_aux_tools:
             p31_argv.append("--allow-missing-aux-tools")
         p31_argv.extend(["--"] + benchmark_argv)
@@ -1032,7 +1291,7 @@ def run(args):
             "worker_threads": args.worker_threads,
             "frozen_environment": recorded_environment,
             "runtime_overrides": runtime,
-            "p02b_validator_argv": p02b_validator_command,
+            "admission_protocol": admission_mode["protocol_version"],
             "storage_bench_argv": storage_argv,
             "benchmark_argv": benchmark_argv,
             "p31_argv": p31_argv,
@@ -1040,6 +1299,15 @@ def run(args):
             "stage_store": str(stage_store),
             "pristine_store": str(pristine_store),
         }
+        if admission_mode["protocol_version"] == "legacy-p02b-admission-v1":
+            command_doc["p02b_validator_argv"] = p02b_validator_command
+        else:
+            command_doc.update(
+                {
+                    "batch_lease_validator_argv": batch_validator_command,
+                    "batch_lease_pre_p31_sha256": batch_pre_p31_row["sha256"],
+                }
+            )
         atomic_json(output_root / "command.json", command_doc)
         rows = [
             binary_row,
@@ -1050,20 +1318,40 @@ def run(args):
             pristine_row,
             pristine_manifest_row,
             stage_provenance_row,
-            p02b_result_row,
-            p02b_marker_row,
-            p02b_provenance_row,
-            p02b_admission_row,
             {"name": "profiles", "path": str(profiles), "kind": "file", "sha256": profiles_sha, "verification": "computed-file"},
             {"name": "invocation_config", "path": str(output_root / "invocation-config.json"), "kind": "file", "sha256": invocation_config_sha, "verification": "computed-file"},
             {"name": "profile_validator", "path": str(profile_validator), "kind": "file", "sha256": validator_sha, "verification": "computed-file"},
-            {"name": "p02b_validator", "path": str(p02b_validator), "kind": "file", "sha256": p02b_validator_sha, "verification": "computed-file"},
             {"name": "p20_runner", "path": str(Path(__file__).resolve()), "kind": "file", "sha256": runner_sha, "verification": "computed-file"},
             {"name": "p20_summarizer", "path": str(summarizer), "kind": "file", "sha256": summarizer_sha, "verification": "computed-file"},
             {"name": "p31_wrapper", "path": str(p31_wrapper), "kind": "file", "sha256": p31_sha, "verification": "computed-file"},
             {"name": "resolved_profile", "path": str(output_root / "resolved-profile.json"), "kind": "file", "sha256": sha256_file(output_root / "resolved-profile.json"), "verification": "computed-file"},
             {"name": "command", "path": str(output_root / "command.json"), "kind": "file", "sha256": sha256_file(output_root / "command.json"), "verification": "computed-file"},
         ]
+        if admission_mode["protocol_version"] == "legacy-p02b-admission-v1":
+            rows.extend(
+                [
+                    p02b_result_row,
+                    p02b_marker_row,
+                    p02b_provenance_row,
+                    admission_row,
+                    {
+                        "name": "p02b_validator",
+                        "path": str(p02b_validator),
+                        "kind": "file",
+                        "sha256": p02b_validator_sha,
+                        "verification": "computed-file",
+                    },
+                ]
+            )
+        else:
+            rows.extend(
+                [
+                    batch_lease_row,
+                    batch_gate_row,
+                    admission_row,
+                    batch_pre_p31_row,
+                ]
+            )
         write_input_tsv(output_root / "inputs.sha256.tsv", rows)
 
         p31_returncode = run_with_signal_forwarding(
@@ -1078,6 +1366,14 @@ def run(args):
             )
             write_p20_failure(output_root, message, p31_returncode)
             raise RunnerError(message)
+
+        integrity_guard = None
+        integrity_rows = []
+        if admission_mode["protocol_version"] == BATCH_PROTOCOL:
+            integrity_guard, integrity_rows = validate_p31_integrity_guard(
+                p31_run_root, batch_lease_row, batch_gate_row, binary_row
+            )
+            rows.extend(integrity_rows)
 
         post_state = {
             "schema_version": 1,
@@ -1119,12 +1415,40 @@ def run(args):
             "stage_store_provenance_sha256": stage_provenance_row["sha256"],
             "stage_store_post_state_sha256": post_state_row["sha256"],
             "input_manifest_sha256": sha256_file(output_root / "inputs.sha256.tsv"),
-            "p02b_admission_sha256": p02b_admission_row["sha256"],
-            "p02b_sentinel_result_sha256": p02b_result_row["sha256"],
-            "p02b_pass_marker_sha256": p02b_marker_row["sha256"],
-            "p02b_provenance_sha256": p02b_provenance_row["sha256"],
+            "admission_protocol": admission_mode["protocol_version"],
             "summary_sha256": sha256_file(output_root / "summary.tsv"),
         }
+        if admission_mode["protocol_version"] == "legacy-p02b-admission-v1":
+            pass_doc.update(
+                {
+                    "p02b_admission_sha256": admission_row["sha256"],
+                    "p02b_sentinel_result_sha256": p02b_result_row["sha256"],
+                    "p02b_pass_marker_sha256": p02b_marker_row["sha256"],
+                    "p02b_provenance_sha256": p02b_provenance_row["sha256"],
+                }
+            )
+        else:
+            integrity_by_name = {row["name"]: row["sha256"] for row in integrity_rows}
+            pass_doc.update(
+                {
+                    "batch_lease_sha256": batch_lease_row["sha256"],
+                    "batch_gate_tool_sha256": batch_gate_row["sha256"],
+                    "batch_lease_admission_sha256": admission_row["sha256"],
+                    "batch_lease_pre_p31_sha256": batch_pre_p31_row["sha256"],
+                    "p31_integrity_guard_status_sha256": integrity_by_name[
+                        "p31_integrity_guard_status"
+                    ],
+                    "p31_integrity_guard_samples_sha256": integrity_by_name[
+                        "p31_integrity_guard_samples"
+                    ],
+                    "p31_integrity_guard_ready_sha256": integrity_by_name[
+                        "p31_integrity_guard_ready"
+                    ],
+                    "p31_command_release_sha256": integrity_by_name[
+                        "p31_command_release"
+                    ],
+                }
+            )
         atomic_json(output_root / "P20-PASS.json", pass_doc)
         print(str(output_root / "summary.tsv"))
         return 0
@@ -1165,8 +1489,11 @@ def build_parser():
     parser.add_argument("--truth-sha256", required=True)
     parser.add_argument("--correctness-pass", required=True, type=Path)
     parser.add_argument("--correctness-pass-sha256", required=True)
-    parser.add_argument("--p02b-sentinel-result", required=True, type=Path)
-    parser.add_argument("--p02b-sentinel-result-sha256", required=True)
+    parser.add_argument("--legacy-v1-admission", action="store_true")
+    parser.add_argument("--p02b-sentinel-result", type=Path)
+    parser.add_argument("--p02b-sentinel-result-sha256")
+    parser.add_argument("--batch-lease", type=Path)
+    parser.add_argument("--batch-gate-tool", type=Path)
     parser.add_argument("--scale", required=True, choices=("sf10", "sf30"))
     parser.add_argument("--stage", required=True, choices=tuple("A{}".format(i) for i in range(7)))
     parser.add_argument(

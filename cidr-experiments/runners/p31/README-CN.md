@@ -92,3 +92,18 @@ tests/smoke_resource_collector.sh
 唯一集合及 ready/status artifact 的 SHA-256，供 P10 做端到端交叉绑定。
 
 smoke 只运行数秒的小型 Python fixture，不启动任何正式 benchmark。
+
+### Short clean-window v2 integrity guard
+
+传入 `--batch-lease`、`--batch-gate-tool`、`--batch-consumer` 和
+`--batch-anchor-binary` 时四项必须同时存在。wrapper 并行启动 resource collector 与
+batch integrity guard；只有两者都写 READY，benchmark 命令才被释放。释放边界写入
+`command-release.json`，命令结束后先记录 `command_ended_at_utc`，再让 guard 采集并
+封存最后状态。
+
+validator 要求 collector/guard READY ≤ command release ≤ command end ≤ guard end，
+并调用 canonical gate tool 离线重验 guard samples。lease、gate、anchor binary、READY、
+status、samples 与 release 的 SHA-256 全部进入 `validation.json`、manifest summary 与
+`DONE` hash 链。任一 gap、污染、HEAD/dirty/binary/expiry 漂移，或缺少首尾覆盖，都会
+删除 `DONE` 并 fail closed。没有四项 batch 参数时保持 legacy P31 行为，且拒绝出现未声明
+的 guard/release evidence。

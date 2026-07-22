@@ -26,10 +26,14 @@ python3 -B cidr-experiments/runners/p10/run_suite.py run \
   --manifest /abs/path/p10-p11-sf10.json \
   --run-root /abs/path/results/P10-P11-run01 \
   --mode formal \
-  --clean-ready-file /abs/path/CLEAN-READY
+  --batch-lease /abs/path/batch-lease.json \
+  --batch-gate-tool "$PWD/cidr-experiments/runners/batch_gate_v2.py"
 ```
 
-正式 `run-root` 必须位于 Git worktree 之外，否则创建运行产物会让 P31 的 clean-tree gate 失败。正式模式不允许覆盖真实 P31 路径，不允许 `fixture_only`，且 readiness 文件必须含独立一行：
+正式 `run-root` 必须位于 Git worktree 之外，否则创建运行产物会让 P31 的 clean-tree gate 失败。正式模式不允许覆盖真实 P31 路径，不允许 `fixture_only`。v2 会在 suite admission 和每个 repeat 开始前重验 lease，并要求每个 P31 validation 含完整 integrity guard PASS；lease、repeat admission、guard READY/status/samples/release 的 hash 都进入 suite provenance。
+
+旧协议只可显式使用 `--legacy-v1-clean-ready /abs/path/CLEAN-READY`；
+`--clean-ready-file` 仅保留为兼容别名。legacy readiness 文件必须含独立一行：
 
 ```text
 readiness_gate=PASS

@@ -30,6 +30,12 @@ Core options:
   --extra-pid PID          Add an external process tree (repeatable).
   --allow-missing-aux-tools  Permit smoke without pidstat/iostat; never use formally.
 
+Short clean-window v2 (all four options are required together):
+  --batch-lease PATH
+  --batch-gate-tool PATH
+  --batch-consumer P10|P20
+  --batch-anchor-binary PATH
+
 Provenance inputs (paths and optional precomputed directory hashes):
   --binary PATH [--binary-sha256 HEX]
   --dataset PATH [--dataset-sha256 HEX]
@@ -60,6 +66,11 @@ declare -a STORES=()
 declare -a TEMPS=()
 declare -a CONTAINERS=()
 declare -a EXTRA_PIDS=()
+BATCH_LEASE=""
+BATCH_GATE_TOOL=""
+BATCH_CONSUMER=""
+BATCH_ANCHOR_BINARY=""
+BATCH_MODE=0
 declare -a INPUTS=()
 BINARY=""
 BINARY_SHA256=""
@@ -91,6 +102,10 @@ while [[ $# -gt 0 ]]; do
     --temp) TEMPS+=("${2:?}"); shift 2 ;;
     --container) CONTAINERS+=("${2:?}"); shift 2 ;;
     --extra-pid) EXTRA_PIDS+=("${2:?}"); shift 2 ;;
+    --batch-lease) BATCH_LEASE="${2:?}"; shift 2 ;;
+    --batch-gate-tool) BATCH_GATE_TOOL="${2:?}"; shift 2 ;;
+    --batch-consumer) BATCH_CONSUMER="${2:?}"; shift 2 ;;
+    --batch-anchor-binary) BATCH_ANCHOR_BINARY="${2:?}"; shift 2 ;;
     --allow-missing-aux-tools) REQUIRE_AUX_TOOLS="false"; shift ;;
     --binary) BINARY="${2:?}"; shift 2 ;;
     --binary-sha256) BINARY_SHA256="${2:?}"; shift 2 ;;
@@ -118,6 +133,9 @@ done
 [[ "$PERFORMANCE_ELIGIBLE" == "true" || "$PERFORMANCE_ELIGIBLE" == "false" ]] || {
   echo "--performance-eligible must be true or false" >&2; exit 64;
 }
+[[ "$COLLECTOR_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+  echo "--collector-ready-timeout must be a positive integer" >&2; exit 64;
+}
 [[ "$DATASET_SHA256_MODE" == "verify" || "$DATASET_SHA256_MODE" == "declared-no-read-v1" ]] || {
   echo "--dataset-sha256-mode is invalid" >&2; exit 64;
 }
@@ -125,9 +143,29 @@ if [[ "$DATASET_SHA256_MODE" == "declared-no-read-v1" && "$PERFORMANCE_ELIGIBLE"
   echo "declared-no-read dataset SHA mode is formal-only" >&2
   exit 64
 fi
-[[ "$COLLECTOR_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
-  echo "--collector-ready-timeout must be a positive integer" >&2; exit 64;
-}
+batch_option_count=0
+for value in "$BATCH_LEASE" "$BATCH_GATE_TOOL" "$BATCH_CONSUMER" "$BATCH_ANCHOR_BINARY"; do
+  [[ -n "$value" ]] && batch_option_count=$((batch_option_count + 1))
+done
+if [[ "$batch_option_count" -ne 0 && "$batch_option_count" -ne 4 ]]; then
+  echo "all short-clean-window v2 batch options are required together" >&2
+  exit 64
+fi
+if [[ "$batch_option_count" -eq 4 ]]; then
+  BATCH_MODE=1
+  [[ "$BATCH_LEASE" == /* && -f "$BATCH_LEASE" ]] || {
+    echo "--batch-lease must be an absolute existing file" >&2; exit 66;
+  }
+  [[ "$BATCH_GATE_TOOL" == /* && -f "$BATCH_GATE_TOOL" ]] || {
+    echo "--batch-gate-tool must be an absolute existing file" >&2; exit 66;
+  }
+  [[ "$BATCH_ANCHOR_BINARY" == /* && -x "$BATCH_ANCHOR_BINARY" ]] || {
+    echo "--batch-anchor-binary must be an absolute executable file" >&2; exit 66;
+  }
+  [[ "$BATCH_CONSUMER" == "P10" || "$BATCH_CONSUMER" == "P20" ]] || {
+    echo "--batch-consumer must be P10 or P20" >&2; exit 64;
+  }
+fi
 if [[ -e "$RUN_DIR" && -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
   echo "refusing non-empty run directory: $RUN_DIR" >&2
   exit 73
@@ -141,6 +179,10 @@ STOP_FILE="${RUN_DIR}/COLLECTOR_STOP"
 READY_FILE="${RUN_DIR}/collector-ready.json"
 COLLECTOR_STATUS_FILE="${RUN_DIR}/collector-status.json"
 COMMAND_FILE="${RUN_DIR}/command.txt"
+GUARD_DIR="${RUN_DIR}/integrity-guard"
+GUARD_READY_FILE="${GUARD_DIR}/READY.json"
+GUARD_STATUS_FILE="${GUARD_DIR}/status.json"
+COMMAND_RELEASE_FILE="${RUN_DIR}/command-release.json"
 printf '%q ' "${COMMAND[@]}" > "$COMMAND_FILE"
 printf '\n' >> "$COMMAND_FILE"
 
@@ -180,6 +222,14 @@ MANIFEST_ARGS+=(--dataset-sha256-mode "$DATASET_SHA256_MODE")
 [[ -n "$QUERY_OR_TRACE_SHA256" ]] && MANIFEST_ARGS+=(--query-or-trace-sha256 "$QUERY_OR_TRACE_SHA256")
 [[ -n "$CONFIG" ]] && MANIFEST_ARGS+=(--config "$CONFIG")
 [[ -n "$CONFIG_SHA256" ]] && MANIFEST_ARGS+=(--config-sha256 "$CONFIG_SHA256")
+if [[ "$BATCH_MODE" == "1" ]]; then
+  MANIFEST_ARGS+=(
+    --batch-lease "$BATCH_LEASE"
+    --batch-gate-tool "$BATCH_GATE_TOOL"
+    --batch-consumer "$BATCH_CONSUMER"
+    --batch-anchor-binary "$BATCH_ANCHOR_BINARY"
+  )
+fi
 set +e
 "${MANIFEST_ARGS[@]}"
 MANIFEST_RC=$?
@@ -192,9 +242,13 @@ fi
 
 COMMAND_PID=""
 COLLECTOR_PID=""
+GUARD_PID=""
 COMMAND_RC=255
 COLLECTOR_RC=255
+GUARD_RC=255
 WRAPPER_SIGNAL=""
+COMMAND_RELEASE_AT_UTC=""
+COMMAND_ENDED_AT_UTC=""
 FINALIZED=0
 
 terminate_command_group() {
@@ -225,6 +279,10 @@ cleanup() {
       kill -TERM "$COLLECTOR_PID" 2>/dev/null || true
       wait "$COLLECTOR_PID" 2>/dev/null || true
     fi
+    if [[ -n "$GUARD_PID" ]] && kill -0 "$GUARD_PID" 2>/dev/null; then
+      kill -TERM "$GUARD_PID" 2>/dev/null || true
+      wait "$GUARD_PID" 2>/dev/null || true
+    fi
     python3 -B "$MANIFEST_TOOL" abort --run-dir "$RUN_DIR" \
       --reason "wrapper exited before validation (rc=${prior_rc}, signal=${WRAPPER_SIGNAL:-none})" || true
   fi
@@ -236,26 +294,60 @@ trap 'on_signal 2' INT
 trap 'on_signal 15' TERM
 
 STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
-setsid -- bash -c '
-  ready_file="$1"
-  status_file="$2"
-  timeout_s="$3"
-  shift 3
-  deadline=$((SECONDS + timeout_s))
-  while [[ ! -f "$ready_file" ]]; do
-    if [[ -f "$status_file" ]]; then
-      echo "collector exited before readiness; adapter command was not released" >&2
+if [[ "$BATCH_MODE" == "1" ]]; then
+  setsid -- bash -c '
+    collector_ready="$1"
+    collector_status="$2"
+    guard_ready="$3"
+    guard_status="$4"
+    release_file="$5"
+    timeout_s="$6"
+    shift 6
+    deadline=$((SECONDS + timeout_s))
+    while [[ ! -f "$collector_ready" || ! -f "$guard_ready" ]]; do
+      if [[ -f "$collector_status" || -f "$guard_status" ]]; then
+        echo "collector/guard exited before dual readiness; command was not released" >&2
+        exit 125
+      fi
+      if (( SECONDS >= deadline )); then
+        echo "collector/guard readiness timed out after ${timeout_s}s; command was not released" >&2
+        exit 125
+      fi
+      sleep 0.05
+    done
+    if [[ -f "$collector_status" || -f "$guard_status" ]]; then
+      echo "collector/guard failed at the release boundary" >&2
       exit 125
     fi
-    if (( SECONDS >= deadline )); then
-      echo "collector readiness timed out after ${timeout_s}s; adapter command was not released" >&2
-      exit 125
-    fi
-    sleep 0.05
-  done
-  exec "$@"
-' cidr-collector-gate "$READY_FILE" "$COLLECTOR_STATUS_FILE" "$COLLECTOR_READY_TIMEOUT" "${COMMAND[@]}" \
-  > "${RUN_DIR}/command.stdout.log" 2> "${RUN_DIR}/command.stderr.log" &
+    released_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    temporary="${release_file}.tmp.$$"
+    printf "{\"schema_version\":\"cidr-command-release-v2\",\"state\":\"RELEASED\",\"released_at_utc\":\"%s\"}\n" "$released_at" > "$temporary"
+    mv "$temporary" "$release_file"
+    exec "$@"
+  ' cidr-dual-ready-gate "$READY_FILE" "$COLLECTOR_STATUS_FILE" "$GUARD_READY_FILE" "$GUARD_STATUS_FILE" "$COMMAND_RELEASE_FILE" "$COLLECTOR_READY_TIMEOUT" "${COMMAND[@]}" \
+    > "${RUN_DIR}/command.stdout.log" 2> "${RUN_DIR}/command.stderr.log" &
+else
+  setsid -- bash -c '
+    ready_file="$1"
+    status_file="$2"
+    timeout_s="$3"
+    shift 3
+    deadline=$((SECONDS + timeout_s))
+    while [[ ! -f "$ready_file" ]]; do
+      if [[ -f "$status_file" ]]; then
+        echo "collector exited before readiness; adapter command was not released" >&2
+        exit 125
+      fi
+      if (( SECONDS >= deadline )); then
+        echo "collector readiness timed out after ${timeout_s}s; adapter command was not released" >&2
+        exit 125
+      fi
+      sleep 0.05
+    done
+    exec "$@"
+  ' cidr-collector-gate "$READY_FILE" "$COLLECTOR_STATUS_FILE" "$COLLECTOR_READY_TIMEOUT" "${COMMAND[@]}" \
+    > "${RUN_DIR}/command.stdout.log" 2> "${RUN_DIR}/command.stderr.log" &
+fi
 COMMAND_PID=$!
 
 declare -a COLLECTOR_ARGS=(
@@ -277,16 +369,48 @@ for value in "${EXTRA_PIDS[@]}"; do COLLECTOR_ARGS+=(--extra-pid "$value"); done
 "${COLLECTOR_ARGS[@]}" > "${RUN_DIR}/collector.stdout.log" 2> "${RUN_DIR}/collector.stderr.log" &
 COLLECTOR_PID=$!
 
+if [[ "$BATCH_MODE" == "1" ]]; then
+  declare -a GUARD_ARGS=(
+    python3 -B "$BATCH_GATE_TOOL" guard
+    --lease "$BATCH_LEASE"
+    --consumer "$BATCH_CONSUMER"
+    --repo-root "$REPO_ROOT"
+    --binary "$BATCH_ANCHOR_BINARY"
+    --root-pid "$COMMAND_PID"
+    --stop-file "$STOP_FILE"
+    --output-dir "$GUARD_DIR"
+    --interval-seconds 1
+    --max-gap-seconds 3
+    --terminate-pgid-on-failure
+  )
+  for value in "${EXTRA_PIDS[@]}"; do GUARD_ARGS+=(--allowed-pid "$value"); done
+  for value in "${CONTAINERS[@]}"; do GUARD_ARGS+=(--allowed-container "$value"); done
+  "${GUARD_ARGS[@]}" > "${RUN_DIR}/integrity-guard.stdout.log" 2> "${RUN_DIR}/integrity-guard.stderr.log" &
+  GUARD_PID=$!
+fi
+
 set +e
 wait "$COMMAND_PID"
 COMMAND_RC=$?
 set -e
+COMMAND_ENDED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 terminate_command_group
 : > "$STOP_FILE"
 set +e
 wait "$COLLECTOR_PID"
 COLLECTOR_RC=$?
 set -e
+if [[ "$BATCH_MODE" == "1" ]]; then
+  set +e
+  wait "$GUARD_PID"
+  GUARD_RC=$?
+  set -e
+  if [[ -f "$COMMAND_RELEASE_FILE" ]]; then
+    COMMAND_RELEASE_AT_UTC="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["released_at_utc"])' "$COMMAND_RELEASE_FILE")"
+  else
+    COMMAND_RELEASE_AT_UTC="NOT_RELEASED"
+  fi
+fi
 ENDED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 
 declare -a EXECUTION_ARGS=(
@@ -299,6 +423,13 @@ declare -a EXECUTION_ARGS=(
   --collector-exit-code "$COLLECTOR_RC"
 )
 [[ -n "$WRAPPER_SIGNAL" ]] && EXECUTION_ARGS+=(--wrapper-signal "$WRAPPER_SIGNAL")
+if [[ "$BATCH_MODE" == "1" ]]; then
+  EXECUTION_ARGS+=(
+    --command-release-at-utc "$COMMAND_RELEASE_AT_UTC"
+    --command-ended-at-utc "$COMMAND_ENDED_AT_UTC"
+    --guard-exit-code "$GUARD_RC"
+  )
+fi
 "${EXECUTION_ARGS[@]}"
 
 set +e
@@ -317,6 +448,9 @@ if [[ "$COMMAND_RC" -ne 0 ]]; then
 fi
 if [[ "$COLLECTOR_RC" -ne 0 ]]; then
   exit 90
+fi
+if [[ "$BATCH_MODE" == "1" && "$GUARD_RC" -ne 0 ]]; then
+  exit 92
 fi
 if [[ "$VALIDATOR_RC" -ne 0 ]]; then
   exit 91

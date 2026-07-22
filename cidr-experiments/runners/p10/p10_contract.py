@@ -3263,14 +3263,24 @@ def read_p31_summary(run_dir: Path, *, performance_eligible: bool) -> dict[str, 
         raise ContractError("P31 DONE state is not PASS")
     manifest = read_json(manifest_path, "P31 run manifest")
     manifest_sha = sha256_file(manifest_path)
-    validation_sha: str | None = None
+    validation = read_json(validation_path, "P31 validation")
+    validation_sha = sha256_file(validation_path)
     if manifest.get("state") != "PASS":
         raise ContractError("P31 run manifest state is not PASS")
+    if validation.get("state") != "PASS":
+        raise ContractError("P31 validation state is not PASS")
+    if (
+        done_value.get("manifest_sha256") != manifest_sha
+        or done_value.get("validation_sha256") != validation_sha
+    ):
+        raise ContractError("P31 DONE does not bind manifest/validation")
     if manifest.get("performance_eligible_declared") is not performance_eligible:
         raise ContractError("P31 performance_eligible_declared differs from orchestrator mode")
     summary = manifest.get("summary")
     if not isinstance(summary, dict) or not isinstance(summary.get("resources"), dict) or not isinstance(summary.get("disk"), dict):
         raise ContractError("P31 run manifest lacks resource/disk summary objects")
+    if summary.get("integrity_guard") != validation.get("integrity_guard"):
+        raise ContractError("P31 summary integrity guard differs from validation.json")
     required_resources = (
         "peak_rss_bytes",
         "peak_pss_bytes",
@@ -3295,13 +3305,12 @@ def read_p31_summary(run_dir: Path, *, performance_eligible: bool) -> dict[str, 
             allowed=("state", "validated_at_utc", "manifest_sha256", "validation_sha256"),
             context="P31 DONE",
         )
-        validation_sha = sha256_file(validation_path)
         if normalize_sha(done_value["manifest_sha256"], "P31 DONE manifest SHA", required=True) != manifest_sha:
             raise ContractError("P31 DONE manifest_sha256 differs from run-manifest.json")
         if normalize_sha(done_value["validation_sha256"], "P31 DONE validation SHA", required=True) != validation_sha:
             raise ContractError("P31 DONE validation_sha256 differs from validation.json")
         validation = require_keys(
-            read_json(validation_path, "P31 validation"),
+            validation,
             required=(
                 "schema_version",
                 "state",
@@ -3321,6 +3330,7 @@ def read_p31_summary(run_dir: Path, *, performance_eligible: bool) -> dict[str, 
                 "resource_summary",
                 "disk_summary",
                 "iostat_samples",
+                "integrity_guard",
             ),
             context="P31 validation",
         )
@@ -3442,6 +3452,7 @@ def read_p31_summary(run_dir: Path, *, performance_eligible: bool) -> dict[str, 
         "collector_result": collector_result,
         "inputs": manifest.get("inputs"),
         "disk_roots": manifest.get("disk_roots"),
+        "integrity_guard": summary.get("integrity_guard"),
     }
 
 

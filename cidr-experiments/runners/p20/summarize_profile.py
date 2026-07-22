@@ -105,11 +105,20 @@ SUMMARY_COLUMNS = [
     "sample_plan_sha256",
     "truth_sha256",
     "correctness_pass_sha256",
+    "admission_protocol",
     "p02b_sentinel_result_sha256",
     "p02b_pass_marker_sha256",
     "p02b_provenance_sha256",
     "p02b_validator_sha256",
     "p02b_admission_sha256",
+    "batch_lease_sha256",
+    "batch_gate_tool_sha256",
+    "batch_lease_admission_sha256",
+    "batch_lease_pre_p31_sha256",
+    "p31_integrity_guard_status_sha256",
+    "p31_integrity_guard_samples_sha256",
+    "p31_integrity_guard_ready_sha256",
+    "p31_command_release_sha256",
     "profiles_sha256",
     "invocation_config_sha256",
     "resolved_profile_sha256",
@@ -265,11 +274,6 @@ def read_input_manifest(path):
         "sample_plan",
         "truth",
         "correctness_pass",
-        "p02b_sentinel_result",
-        "p02b_pass_marker",
-        "p02b_provenance",
-        "p02b_validator",
-        "p02b_admission",
         "pristine_store",
         "pristine_store_manifest",
         "stage_store_provenance",
@@ -283,6 +287,27 @@ def read_input_manifest(path):
         "resolved_profile",
         "command",
     }
+    legacy = {
+        "p02b_sentinel_result",
+        "p02b_pass_marker",
+        "p02b_provenance",
+        "p02b_validator",
+        "p02b_admission",
+    }
+    batch = {
+        "batch_lease",
+        "batch_gate_tool",
+        "batch_lease_admission",
+        "batch_lease_pre_p31",
+        "p31_command_release",
+        "p31_integrity_guard_ready",
+        "p31_integrity_guard_status",
+        "p31_integrity_guard_samples",
+    }
+    has_legacy = bool(legacy & set(rows))
+    has_batch = bool(batch & set(rows))
+    require(has_legacy != has_batch, "input manifest must select exactly one admission protocol")
+    required |= legacy if has_legacy else batch
     missing = sorted(required - set(rows))
     require(not missing, "input manifest missing: {}".format(", ".join(missing)))
     for name, row in rows.items():
@@ -405,6 +430,57 @@ def validate_p31(run_root, command, inputs, invocation):
             manifest_inputs.get(name, {}).get("sha256") == expected_sha,
             "P31 input hash drift: {}".format(name),
         )
+    protocol = invocation.get("admission_protocol")
+    require(command.get("admission_protocol") == protocol, "P31 admission protocol drift")
+    if protocol == "legacy-p02b-admission-v1":
+        require(manifest.get("batch_gate") is None, "legacy P31 declared a batch gate")
+        require(
+            validation.get("integrity_guard") is None,
+            "legacy P31 contains undeclared integrity guard",
+        )
+    elif protocol == "short-clean-window-v2":
+        batch_gate = manifest.get("batch_gate")
+        guard = validation.get("integrity_guard")
+        require(
+            isinstance(batch_gate, dict)
+            and batch_gate.get("protocol_version") == "short-clean-window-v2"
+            and batch_gate.get("consumer") == "P20"
+            and batch_gate.get("integrity_guard_required") is True,
+            "P31 batch gate declaration drift",
+        )
+        require(
+            isinstance(guard, dict)
+            and guard.get("schema_version") == "cidr-p31-batch-integrity-v2"
+            and guard.get("state") == "PASS"
+            and guard.get("consumer") == "P20",
+            "P31 integrity guard is not a P20 PASS",
+        )
+        expected_guard_hashes = {
+            "lease_sha256": inputs["batch_lease"]["sha256"],
+            "gate_tool_sha256": inputs["batch_gate_tool"]["sha256"],
+            "anchor_binary_sha256": inputs["binary"]["sha256"],
+        }
+        for name, value in expected_guard_hashes.items():
+            require(guard.get(name) == value, "P31 integrity guard hash drift: {}".format(name))
+        evidence_names = {
+            "release": "p31_command_release",
+            "ready": "p31_integrity_guard_ready",
+            "status": "p31_integrity_guard_status",
+            "samples": "p31_integrity_guard_samples",
+        }
+        evidence = guard.get("evidence")
+        require(isinstance(evidence, dict) and set(evidence) == set(evidence_names), "P31 guard evidence set drift")
+        for evidence_name, input_name in evidence_names.items():
+            reference = evidence[evidence_name]
+            require(
+                isinstance(reference, dict)
+                and Path(reference.get("path", "")).resolve()
+                == Path(inputs[input_name]["path"]).resolve()
+                and reference.get("sha256") == inputs[input_name]["sha256"],
+                "P31 guard evidence binding drift: {}".format(evidence_name),
+            )
+    else:
+        raise SummaryError("unsupported admission protocol")
     resources = manifest.get("summary", {}).get("resources", {})
     disk = manifest.get("summary", {}).get("disk", {})
     required_resources = {
@@ -422,6 +498,7 @@ def validate_p31(run_root, command, inputs, invocation):
     return {
         "root": p31_root,
         "manifest": manifest,
+        "validation": validation,
         "resources": resources,
         "disk": disk,
         "manifest_sha": manifest_sha,
@@ -764,6 +841,148 @@ def validate_p02b_admission(admission, receipt, resolved, invocation, command, i
     )
 
 
+def validate_batch_admission(admission, pre_p31, resolved, invocation, command, inputs, p31):
+    require(
+        admission.get("schema_version") == "p20-batch-lease-admission-v2"
+        and admission.get("state") == "PASS"
+        and admission.get("scope") == "single-host-single-head-formal-batch"
+        and admission.get("protocol_version") == "short-clean-window-v2",
+        "batch lease admission schema/state/scope drift",
+    )
+    policy = admission.get("policy")
+    require(
+        isinstance(policy, dict)
+        and policy.get("consumer") == "P20"
+        and policy.get("valid_lease_required_at_admission_and_pre_p31") is True
+        and policy.get("integrity_guard_required") is True
+        and policy.get("legacy_six_hour_freshness_used") is False,
+        "batch lease admission policy drift",
+    )
+    gate_path = inputs["batch_gate_tool"]["path"]
+    lease_path = inputs["batch_lease"]["path"]
+    repo_root = option_value(command["p31_argv"], "--repo-root")
+    validator_argv = [
+        sys.executable,
+        gate_path,
+        "validate-lease",
+        "--lease",
+        lease_path,
+        "--consumer",
+        "P20",
+        "--repo-root",
+        repo_root,
+        "--binary",
+        inputs["binary"]["path"],
+    ]
+    batch_gate = admission.get("batch_gate")
+    require(isinstance(batch_gate, dict), "batch lease admission gate binding missing")
+    require(
+        batch_gate.get("validator_command") == validator_argv
+        and command.get("batch_lease_validator_argv") == validator_argv
+        and pre_p31.get("validator_command") == validator_argv,
+        "batch lease validator argv drift",
+    )
+    require(
+        batch_gate.get("gate_tool_sha256") == inputs["batch_gate_tool"]["sha256"]
+        and batch_gate.get("lease_sha256") == inputs["batch_lease"]["sha256"]
+        and pre_p31.get("initial_admission_sha256")
+        == inputs["batch_lease_admission"]["sha256"]
+        and command.get("batch_lease_pre_p31_sha256")
+        == inputs["batch_lease_pre_p31"]["sha256"],
+        "batch lease admission/pre-P31 hash drift",
+    )
+    completed = subprocess.run(
+        validator_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    require(
+        completed.returncode == 0,
+        "batch lease expired or changed before summary: {}".format(completed.stderr.strip()),
+    )
+    try:
+        current_receipt = json.loads(completed.stdout, object_pairs_hook=_unique_object)
+    except (json.JSONDecodeError, SummaryError) as exc:
+        raise SummaryError("batch lease validator emitted invalid JSON: {}".format(exc))
+    initial_receipt = batch_gate.get("receipt")
+    pre_receipt = pre_p31.get("receipt")
+    require(
+        isinstance(current_receipt, dict)
+        and isinstance(initial_receipt, dict)
+        and isinstance(pre_receipt, dict),
+        "batch lease receipt chain is incomplete",
+    )
+    stable_keys = {
+        "schema_version",
+        "state",
+        "consumer",
+        "lease",
+        "lease_sha256",
+        "issued_at_utc",
+        "expires_at_utc",
+        "host",
+        "repo_head",
+        "binary_sha256",
+    }
+    for key in stable_keys:
+        require(
+            initial_receipt.get(key) == pre_receipt.get(key) == current_receipt.get(key),
+            "batch lease receipt chain drift: {}".format(key),
+        )
+    expected_invocation = {
+        "batch_lease_sha256": inputs["batch_lease"]["sha256"],
+        "batch_gate_tool_sha256": inputs["batch_gate_tool"]["sha256"],
+        "batch_lease_admission_sha256": inputs["batch_lease_admission"]["sha256"],
+        "batch_lease_issued_at_utc": initial_receipt.get("issued_at_utc"),
+        "batch_lease_expires_at_utc": initial_receipt.get("expires_at_utc"),
+        "batch_host_fingerprint_sha256": initial_receipt.get("host", {}).get(
+            "fingerprint_sha256"
+        ),
+    }
+    for name, value in expected_invocation.items():
+        require(invocation.get(name) == value, "batch lease invocation drift: {}".format(name))
+    p20 = admission.get("p20")
+    require(isinstance(p20, dict), "batch lease admission P20 binding missing")
+    identity = {
+        "task_id": invocation.get("task_id"),
+        "run_id": invocation.get("run_id"),
+        "repeat_index": invocation.get("repeat_index"),
+        "scale": invocation.get("scale"),
+        "stage": invocation.get("stage"),
+        "mode": invocation.get("mode"),
+        "workload": invocation.get("workload"),
+        "property_id": invocation.get("property_id"),
+        "repo_head": current_receipt.get("repo_head"),
+    }
+    for name, value in identity.items():
+        require(p20.get(name) == value, "batch lease P20 identity drift: {}".format(name))
+    require(Path(p20.get("repo_root", "")).resolve() == Path(repo_root).resolve(), "batch lease P20 repo-root drift")
+    expected_inputs = {
+        "binary": inputs["binary"]["sha256"],
+        "dataset": inputs["dataset"]["sha256"],
+        "sample_plan": inputs["sample_plan"]["sha256"],
+        "truth": inputs["truth"]["sha256"],
+    }
+    require(p20.get("input_sha256") == expected_inputs, "batch lease P20 input drift")
+    p31_argv = command["p31_argv"]
+    require(
+        option_value(p31_argv, "--batch-lease") == lease_path
+        and option_value(p31_argv, "--batch-gate-tool") == gate_path
+        and option_value(p31_argv, "--batch-consumer") == "P20"
+        and option_value(p31_argv, "--batch-anchor-binary") == inputs["binary"]["path"],
+        "P31 batch lease CLI binding drift",
+    )
+    guard = p31["validation"].get("integrity_guard", {})
+    require(
+        guard.get("lease_sha256") == inputs["batch_lease"]["sha256"]
+        and guard.get("gate_tool_sha256") == inputs["batch_gate_tool"]["sha256"],
+        "P31 integrity guard admission drift",
+    )
+    require(
+        resolved.get("scale") == p20.get("scale")
+        and resolved.get("stage", {}).get("id") == p20.get("stage"),
+        "batch lease admission resolved profile drift",
+    )
+
+
 def build_rows(run_root):
     run_root = Path(run_root).resolve()
     require(run_root.is_dir(), "run root is not a directory")
@@ -780,7 +999,24 @@ def build_rows(run_root):
     stage_post_state = load_json(
         inputs["stage_store_post_state"]["path"], "stage-store post state"
     )
-    p02b_admission = load_json(inputs["p02b_admission"]["path"], "P02B admission")
+    admission_protocol = invocation.get("admission_protocol")
+    require(
+        admission_protocol in {"legacy-p02b-admission-v1", "short-clean-window-v2"}
+        and command.get("admission_protocol") == admission_protocol,
+        "admission protocol declaration drift",
+    )
+    p02b_admission = None
+    batch_admission = None
+    batch_pre_p31 = None
+    if admission_protocol == "legacy-p02b-admission-v1":
+        p02b_admission = load_json(inputs["p02b_admission"]["path"], "P02B admission")
+    else:
+        batch_admission = load_json(
+            inputs["batch_lease_admission"]["path"], "batch lease admission"
+        )
+        batch_pre_p31 = load_json(
+            inputs["batch_lease_pre_p31"]["path"], "batch lease pre-P31 admission"
+        )
     require(
         sha256_file(run_root / "correctness-pass.json") == inputs["correctness_pass"]["sha256"],
         "copied correctness PASS hash mismatch",
@@ -875,19 +1111,30 @@ def build_rows(run_root):
     require("--" in p31_argv, "P31 argv separator is missing")
     require(p31_argv[p31_argv.index("--") + 1 :] == benchmark_argv, "P31 command tail drift")
     p31 = validate_p31(run_root, command, inputs, invocation)
-    expected_p02b_hashes = {
-        "p02b_sentinel_result_sha256": inputs["p02b_sentinel_result"]["sha256"],
-        "p02b_pass_marker_sha256": inputs["p02b_pass_marker"]["sha256"],
-        "p02b_provenance_sha256": inputs["p02b_provenance"]["sha256"],
-        "p02b_validator_sha256": inputs["p02b_validator"]["sha256"],
-        "p02b_admission_sha256": inputs["p02b_admission"]["sha256"],
-    }
-    for name, value in expected_p02b_hashes.items():
-        require(invocation.get(name) == value, "P02B invocation hash drift: {}".format(name))
-    p02b_receipt = validate_p02b_receipt(inputs, invocation, command, p31)
-    validate_p02b_admission(
-        p02b_admission, p02b_receipt, resolved, invocation, command, inputs
-    )
+    if admission_protocol == "legacy-p02b-admission-v1":
+        expected_p02b_hashes = {
+            "p02b_sentinel_result_sha256": inputs["p02b_sentinel_result"]["sha256"],
+            "p02b_pass_marker_sha256": inputs["p02b_pass_marker"]["sha256"],
+            "p02b_provenance_sha256": inputs["p02b_provenance"]["sha256"],
+            "p02b_validator_sha256": inputs["p02b_validator"]["sha256"],
+            "p02b_admission_sha256": inputs["p02b_admission"]["sha256"],
+        }
+        for name, value in expected_p02b_hashes.items():
+            require(invocation.get(name) == value, "P02B invocation hash drift: {}".format(name))
+        p02b_receipt = validate_p02b_receipt(inputs, invocation, command, p31)
+        validate_p02b_admission(
+            p02b_admission, p02b_receipt, resolved, invocation, command, inputs
+        )
+    else:
+        validate_batch_admission(
+            batch_admission,
+            batch_pre_p31,
+            resolved,
+            invocation,
+            command,
+            inputs,
+            p31,
+        )
 
     raw_path = p31["root"] / "command.stdout.log"
     raw = load_json(raw_path, "storage-bench stdout")
@@ -946,11 +1193,20 @@ def build_rows(run_root):
         "sample_plan_sha256": inputs["sample_plan"]["sha256"],
         "truth_sha256": inputs["truth"]["sha256"],
         "correctness_pass_sha256": inputs["correctness_pass"]["sha256"],
-        "p02b_sentinel_result_sha256": inputs["p02b_sentinel_result"]["sha256"],
-        "p02b_pass_marker_sha256": inputs["p02b_pass_marker"]["sha256"],
-        "p02b_provenance_sha256": inputs["p02b_provenance"]["sha256"],
-        "p02b_validator_sha256": inputs["p02b_validator"]["sha256"],
-        "p02b_admission_sha256": inputs["p02b_admission"]["sha256"],
+        "admission_protocol": admission_protocol,
+        "p02b_sentinel_result_sha256": inputs.get("p02b_sentinel_result", {}).get("sha256", ""),
+        "p02b_pass_marker_sha256": inputs.get("p02b_pass_marker", {}).get("sha256", ""),
+        "p02b_provenance_sha256": inputs.get("p02b_provenance", {}).get("sha256", ""),
+        "p02b_validator_sha256": inputs.get("p02b_validator", {}).get("sha256", ""),
+        "p02b_admission_sha256": inputs.get("p02b_admission", {}).get("sha256", ""),
+        "batch_lease_sha256": inputs.get("batch_lease", {}).get("sha256", ""),
+        "batch_gate_tool_sha256": inputs.get("batch_gate_tool", {}).get("sha256", ""),
+        "batch_lease_admission_sha256": inputs.get("batch_lease_admission", {}).get("sha256", ""),
+        "batch_lease_pre_p31_sha256": inputs.get("batch_lease_pre_p31", {}).get("sha256", ""),
+        "p31_integrity_guard_status_sha256": inputs.get("p31_integrity_guard_status", {}).get("sha256", ""),
+        "p31_integrity_guard_samples_sha256": inputs.get("p31_integrity_guard_samples", {}).get("sha256", ""),
+        "p31_integrity_guard_ready_sha256": inputs.get("p31_integrity_guard_ready", {}).get("sha256", ""),
+        "p31_command_release_sha256": inputs.get("p31_command_release", {}).get("sha256", ""),
         "profiles_sha256": inputs["profiles"]["sha256"],
         "invocation_config_sha256": inputs["invocation_config"]["sha256"],
         "resolved_profile_sha256": inputs["resolved_profile"]["sha256"],

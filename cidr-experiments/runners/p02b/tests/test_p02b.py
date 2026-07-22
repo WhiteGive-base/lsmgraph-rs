@@ -8,13 +8,15 @@ import statistics
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from build_lineage_manifest import build_tree_manifest
 from calculate_cv import calculate_cv
 from p02b_common import GateError, sha256_file
-from run_sf10_sentinel import validate_lineage_manifest
+from run_sf10_sentinel import validate_config, validate_lineage_manifest
 from validate_clean_ready import validate_clean_ready
 from validate_sentinel_result import validate_result
+import run_sf10_sentinel as sentinel_runner
 
 
 class CvTests(unittest.TestCase):
@@ -105,6 +107,89 @@ class LineageManifestTests(unittest.TestCase):
 
             dataset = build_tree_manifest(root, "dataset")
             self.assertEqual(dataset["dataset_root"], str(root.resolve()))
+
+
+class ConfigTests(unittest.TestCase):
+    def test_legacy_and_short_v2_configs_are_both_accepted(self) -> None:
+        config_dir = Path(__file__).resolve().parents[1] / "configs"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            validated = []
+            for name in ("sf10-seml0.json", "sf10-seml0-short-gate-v2.json"):
+                value = json.loads((config_dir / name).read_text(encoding="utf-8"))
+                value["p31"]["data_mount"] = str(root)
+                path = root / name
+                path.write_text(json.dumps(value), encoding="utf-8")
+                validated.append(validate_config(path))
+            legacy, short = validated
+            self.assertNotIn("protocol_version", legacy["clean_ready"])
+            self.assertEqual(short["clean_ready"]["protocol_version"], "short-clean-window-v2")
+            self.assertEqual(short["clean_ready"]["minimum_consecutive_samples"], 5)
+            self.assertEqual(short["clean_ready"]["sample_interval_seconds"], 60)
+
+    def test_short_v2_config_rejects_timing_drift(self) -> None:
+        source = Path(__file__).resolve().parents[1] / "configs" / "sf10-seml0-short-gate-v2.json"
+        value = json.loads(source.read_text(encoding="utf-8"))
+        value["clean_ready"]["sample_interval_seconds"] = 30
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaises(GateError):
+                validate_config(path)
+
+
+class LeaseIssuanceStateMachineTests(unittest.TestCase):
+    def test_lease_failure_preserves_p02b_pass_but_returns_three(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            pass_path = run_dir / "PASS"
+            pass_path.write_text('{"state":"PASS"}\n', encoding="utf-8")
+            result = {
+                "state": "PASS",
+                "fixture_only": False,
+                "clean_ready": {"protocol_version": "short-clean-window-v2"},
+            }
+            argv = [
+                "run_sf10_sentinel.py",
+                "--run-dir",
+                str(run_dir),
+                "--clean-ready",
+                str(run_dir / "READY"),
+                "--repo-root",
+                str(run_dir),
+                "--binary",
+                str(run_dir / "binary"),
+                "--dataset-manifest",
+                str(run_dir / "dataset.json"),
+                "--store",
+                str(run_dir),
+                "--store-manifest",
+                str(run_dir / "store.json"),
+                "--truth",
+                str(run_dir / "truth.tsv"),
+                "--query-plan",
+                str(run_dir / "plan.json"),
+                "--id-map-dir",
+                str(run_dir),
+                "--config",
+                str(run_dir / "config.json"),
+                "--batch-lease-output",
+                str(run_dir / "lease.json"),
+            ]
+            with mock.patch.object(sentinel_runner, "run", return_value=result), mock.patch.object(
+                sentinel_runner,
+                "issue_batch_lease",
+                side_effect=GateError("fixture lease failure"),
+            ), mock.patch.object(sentinel_runner.sys, "argv", argv):
+                return_code = sentinel_runner.main()
+            self.assertEqual(return_code, 3)
+            self.assertTrue(pass_path.is_file())
+            self.assertFalse((run_dir / "FAILED").exists())
+            failure = json.loads(
+                (run_dir / "BATCH-LEASE-FAILED.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(failure["state"], "FAILED")
+            self.assertIs(failure["p02b_pass_preserved"], True)
 
 
 class CleanReadyTests(unittest.TestCase):
@@ -546,6 +631,59 @@ class SentinelResultTests(unittest.TestCase):
         self.write_json(self.result_path, value)
         self._resign_marker()
 
+    def _install_v2_clean_ready(self) -> dict:
+        artifact_names = (
+            "READY",
+            "COMPLETE",
+            "classification.env",
+            "STATE",
+            "samples.tsv",
+            "latest.tsv",
+            "monitor_clean_window.sh",
+        )
+        artifact_dir = self.root / "v2-clean"
+        artifact_dir.mkdir()
+        artifacts = {}
+        for name in artifact_names:
+            path = artifact_dir / name
+            path.write_text("{} fixture\n".format(name), encoding="utf-8")
+            artifacts[name] = self.file_ref(path)
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        clean_ready = {
+            "schema_version": "p02b-clean-ready-binding-v2",
+            "state": "PASS",
+            "protocol_version": "short-clean-window-v2",
+            "run_id": "fixture-clean-v2",
+            "ready_time": now,
+            "age_seconds_at_binding": 0.0,
+            "required_consecutive_samples": 5,
+            "observed_consecutive_samples": 5,
+            "source_v1_history_preserved": False,
+            "git_head": self.repo_head,
+            "host": self.host["hostname"],
+            "timing": {
+                "expected_interval_seconds": 60,
+                "gap_tolerance_seconds": 15.0,
+                "observed_gap_seconds": [60.0, 60.0, 60.0, 60.0],
+                "maximum_observed_gap_seconds": 60.0,
+                "gap_check_pass": True,
+            },
+            "artifacts": artifacts,
+        }
+        self._replace_clean_ready(clean_ready)
+        return clean_ready
+
+    def _replace_clean_ready(self, clean_ready: dict) -> None:
+        binding = self.run_dir / "clean-ready-binding.json"
+        self.write_json(binding, clean_ready)
+        provenance = json.loads(self.provenance_path.read_text(encoding="utf-8"))
+        provenance["clean_ready_binding_sha256"] = sha256_file(binding)
+        self.write_json(self.provenance_path, provenance)
+        result = json.loads(self.result_path.read_text(encoding="utf-8"))
+        result["clean_ready"] = clean_ready
+        result["provenance"]["sha256"] = sha256_file(self.provenance_path)
+        self._rewrite_result(result)
+
     def test_complete_fixture_releases_p20_nonformal_consumer(self) -> None:
         receipt = validate_result(
             self.result_path,
@@ -561,6 +699,27 @@ class SentinelResultTests(unittest.TestCase):
         self.assertEqual(receipt["host"], self.host)
         self.assertEqual(receipt["pass_marker_sha256"], sha256_file(self.marker_path))
         self.assertEqual(receipt["provenance_sha256"], sha256_file(self.provenance_path))
+
+    def test_complete_short_v2_binding_is_accepted(self) -> None:
+        self._install_v2_clean_ready()
+        receipt = validate_result(
+            self.result_path,
+            "P20",
+            False,
+            expected_repo_root=self.repo,
+            expected_repo_head=self.repo_head,
+            expected_binary_sha256=self.binary_sha,
+            max_age_seconds=3600,
+        )
+        self.assertEqual(receipt["state"], "PASS")
+
+    def test_short_v2_gap_tamper_is_rejected_after_chain_resign(self) -> None:
+        clean_ready = self._install_v2_clean_ready()
+        clean_ready["timing"]["observed_gap_seconds"][2] = 12.0
+        clean_ready["timing"]["maximum_observed_gap_seconds"] = 60.0
+        self._replace_clean_ready(clean_ready)
+        with self.assertRaises(GateError):
+            validate_result(self.result_path, "P20", False)
 
     def test_fixture_cannot_release_formal_p20(self) -> None:
         with self.assertRaises(GateError):

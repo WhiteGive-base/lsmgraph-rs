@@ -69,6 +69,7 @@ from adapters.launch_neo4j_runtime import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 DEFAULT_P31 = REPO_ROOT / "cidr-experiments/runners/p31/run_with_resources.sh"
+DEFAULT_BATCH_GATE = REPO_ROOT / "cidr-experiments/runners/batch_gate_v2.py"
 P31_ADAPTER_WRAPPER = SCRIPT_DIR / "run_adapter_with_p31.sh"
 NEO4J_LIFECYCLE = SCRIPT_DIR / "adapters" / "launch_neo4j_runtime.py"
 NEBULAGRAPH_LIFECYCLE = (
@@ -173,12 +174,109 @@ def verify_clean_ready(path: Path) -> None:
         raise ContractError("clean-ready file lacks an exact readiness_gate=PASS line")
 
 
-def verify_formal_preflight(run_root: Path, p31_wrapper: Path, clean_ready_file: Path | None) -> None:
+def artifact_ref(path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    return {
+        "path": str(resolved),
+        "size_bytes": resolved.stat().st_size,
+        "sha256": sha256_file(resolved),
+    }
+
+
+def batch_anchor_from_lease(lease_path: Path) -> Path:
+    lease = read_json(lease_path.resolve(), "batch lease")
+    raw = lease.get("identity", {}).get("binary", {}).get("path")
+    if not isinstance(raw, str) or not Path(raw).is_absolute():
+        raise ContractError("batch lease omits an absolute anchor binary path")
+    binary = Path(raw).resolve()
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise ContractError("batch lease anchor binary is missing or not executable")
+    return binary
+
+
+def validate_batch_lease(
+    lease_path: Path, gate_tool: Path, anchor_binary: Path
+) -> tuple[dict[str, Any], list[str]]:
+    command = [
+        sys.executable,
+        "-B",
+        str(gate_tool),
+        "validate-lease",
+        "--lease",
+        str(lease_path),
+        "--consumer",
+        "P10",
+        "--repo-root",
+        str(REPO_ROOT),
+        "--binary",
+        str(anchor_binary),
+    ]
+    completed = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False
+    )
+    if completed.returncode != 0:
+        raise ContractError(
+            "batch lease validation failed: {}".format(completed.stderr.strip())
+        )
+    try:
+        receipt = json.loads(completed.stdout)
+    except ValueError as exc:
+        raise ContractError("batch gate emitted invalid JSON") from exc
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema_version") != "cidr-batch-lease-admission-v2"
+        or receipt.get("state") != "PASS"
+        or receipt.get("consumer") != "P10"
+        or Path(str(receipt.get("lease", ""))).resolve() != lease_path.resolve()
+        or receipt.get("lease_sha256") != sha256_file(lease_path)
+        or receipt.get("binary_sha256") != sha256_file(anchor_binary)
+    ):
+        raise ContractError("batch lease admission receipt drift")
+    host = receipt.get("host")
+    fingerprint = host.get("fingerprint_sha256") if isinstance(host, dict) else None
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+        or not isinstance(receipt.get("repo_head"), str)
+        or len(receipt["repo_head"]) not in (40, 64)
+        or not isinstance(receipt.get("issued_at_utc"), str)
+        or not isinstance(receipt.get("expires_at_utc"), str)
+        or isinstance(receipt.get("remaining_seconds"), bool)
+        or not isinstance(receipt.get("remaining_seconds"), (int, float))
+        or receipt["remaining_seconds"] <= 0
+    ):
+        raise ContractError("batch lease admission identity/lifetime drift")
+    return receipt, command
+
+
+def verify_formal_preflight(
+    run_root: Path,
+    p31_wrapper: Path,
+    *,
+    batch_lease: Path | None,
+    batch_gate_tool: Path | None,
+    legacy_v1_clean_ready: Path | None,
+    compatibility_clean_ready: Path | None,
+) -> dict[str, Any]:
     if p31_wrapper.resolve() != DEFAULT_P31.resolve():
         raise ContractError("formal mode forbids overriding the real P31 wrapper")
-    if clean_ready_file is None:
-        raise ContractError("formal mode requires --clean-ready-file")
-    verify_clean_ready(clean_ready_file.resolve())
+    legacy_candidates = [
+        path
+        for path in (legacy_v1_clean_ready, compatibility_clean_ready)
+        if path is not None
+    ]
+    if len(legacy_candidates) > 1:
+        raise ContractError("legacy clean-ready aliases are mutually exclusive")
+    batch_count = int(batch_lease is not None) + int(batch_gate_tool is not None)
+    if batch_count == 1:
+        raise ContractError("--batch-lease and --batch-gate-tool are required together")
+    if batch_count and legacy_candidates:
+        raise ContractError("formal mode forbids mixing v2 lease and legacy v1 admission")
+    if not batch_count and not legacy_candidates:
+        raise ContractError(
+            "formal mode requires a v2 batch lease or explicit legacy v1 clean-ready"
+        )
     if run_root == REPO_ROOT or REPO_ROOT in run_root.parents:
         raise ContractError("formal run-root must be outside the Git worktree so P31 sees a clean repository")
     try:
@@ -192,6 +290,28 @@ def verify_formal_preflight(run_root: Path, p31_wrapper: Path, clean_ready_file:
         raise ContractError(f"formal mode could not audit Git status: {exc}") from exc
     if status:
         raise ContractError("formal mode requires a clean Git worktree")
+    if batch_count:
+        assert batch_lease is not None
+        assert batch_gate_tool is not None
+        lease_path = batch_lease.resolve()
+        gate_tool = batch_gate_tool.resolve()
+        if gate_tool != DEFAULT_BATCH_GATE.resolve():
+            raise ContractError("formal v2 mode forbids overriding the canonical batch gate tool")
+        if not lease_path.is_file() or not gate_tool.is_file():
+            raise ContractError("formal v2 batch lease/gate tool is missing")
+        anchor_binary = batch_anchor_from_lease(lease_path)
+        receipt, command = validate_batch_lease(lease_path, gate_tool, anchor_binary)
+        return {
+            "protocol": "batch-lease-v2",
+            "lease": lease_path,
+            "gate_tool": gate_tool,
+            "anchor_binary": anchor_binary,
+            "suite_receipt": receipt,
+            "suite_validator_argv": command,
+        }
+    legacy_path = legacy_candidates[0].resolve()
+    verify_clean_ready(legacy_path)
+    return {"protocol": "legacy-clean-ready-v1", "clean_ready": legacy_path}
 
 
 def select_systems(suite: dict[str, Any], ids: list[str], group: str | None) -> list[dict[str, Any]]:
@@ -311,6 +431,7 @@ def p31_command(
     mode: str,
     extra_adapter_args: list[str] | None = None,
     named_inputs: list[str] | None = None,
+    admission: dict[str, Any] | None = None,
 ) -> list[str]:
     performance_eligible = mode == "formal"
     p31_dir = repeat_dir / "p31"
@@ -350,6 +471,19 @@ def p31_command(
         command.extend(("--extra-pid", str(pid)))
     for value in named_inputs or []:
         command.extend(("--input", value))
+    if admission is not None and admission.get("protocol") == "batch-lease-v2":
+        command.extend(
+            (
+                "--batch-lease",
+                str(admission["lease"]),
+                "--batch-gate-tool",
+                str(admission["gate_tool"]),
+                "--batch-consumer",
+                "P10",
+                "--batch-anchor-binary",
+                str(admission["anchor_binary"]),
+            )
+        )
     command.extend(
         (
             "--binary",
@@ -1527,9 +1661,30 @@ def _execute_repeat_impl(
     resolved_manifest: Path,
     p31_wrapper: Path,
     mode: str,
+    admission: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    repeat_admission: dict[str, Any] | None = None
+    if admission is not None and admission.get("protocol") == "batch-lease-v2":
+        receipt, validator_argv = validate_batch_lease(
+            admission["lease"], admission["gate_tool"], admission["anchor_binary"]
+        )
+        repeat_admission = {
+            "schema_version": "cidr-p10-repeat-batch-admission-v2",
+            "state": "PASS",
+            "protocol": "batch-lease-v2",
+            "consumer": "P10",
+            "receipt": receipt,
+            "validator_argv": validator_argv,
+            "lease": artifact_ref(admission["lease"]),
+            "gate_tool": artifact_ref(admission["gate_tool"]),
+            "anchor_binary": artifact_ref(admission["anchor_binary"]),
+        }
     repeat_dir = run_root / "systems" / system["id"] / f"repeat-{repeat_index:02d}"
     repeat_dir.mkdir(parents=True, exist_ok=False)
+    repeat_admission_path: Path | None = None
+    if repeat_admission is not None:
+        repeat_admission_path = repeat_dir / "batch-lease-admission.json"
+        atomic_json(repeat_admission_path, repeat_admission)
     adapter_output = repeat_dir / "adapter-output"
     adapter_output.mkdir()
     effective_system = materialize_fresh_repeat_roots(system, run_root, repeat_index)
@@ -1655,6 +1810,7 @@ def _execute_repeat_impl(
             mode=mode,
             extra_adapter_args=dynamic_adapter_args,
             named_inputs=named_inputs,
+            admission=admission,
         )
         (repeat_dir / "orchestrator-command.json").write_text(
             json.dumps(command, indent=2) + "\n", encoding="utf-8"
@@ -1747,6 +1903,18 @@ def _execute_repeat_impl(
     if completed is None:
         raise ContractError(f"{system['id']} repeat {repeat_index}: P31/adapter did not start")
     p31 = read_p31_summary(repeat_dir / "p31", performance_eligible=mode == "formal")
+    if repeat_admission is not None:
+        integrity = p31.get("integrity_guard")
+        if (
+            not isinstance(integrity, dict)
+            or integrity.get("state") != "PASS"
+            or integrity.get("consumer") != "P10"
+            or integrity.get("lease_sha256")
+            != repeat_admission["receipt"]["lease_sha256"]
+        ):
+            raise ContractError(
+                f"{system['id']} repeat {repeat_index}: P31 integrity guard binding drift"
+            )
     validated = validate_adapter_outputs(
         output_dir=adapter_output,
         request=request,
@@ -1828,6 +1996,13 @@ def _execute_repeat_impl(
         "path": str(request_path.resolve()),
         "sha256": sha256_file(request_path),
     }
+    if repeat_admission is not None and repeat_admission_path is not None:
+        validated["batch_admission"] = {
+            "protocol": "batch-lease-v2",
+            "artifact": artifact_ref(repeat_admission_path),
+            "receipt": repeat_admission["receipt"],
+            "integrity_guard": p31["integrity_guard"],
+        }
     atomic_json(repeat_dir / "validated-result.json", validated)
     return validated
 
@@ -1892,6 +2067,7 @@ def execute_repeat(
     resolved_manifest: Path,
     p31_wrapper: Path,
     mode: str,
+    admission: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute one repeat and fail-closed cleanup every launched Neo4j failure."""
 
@@ -1905,6 +2081,7 @@ def execute_repeat(
             resolved_manifest=resolved_manifest,
             p31_wrapper=p31_wrapper,
             mode=mode,
+            admission=admission,
         )
     except BaseException as failure:
         if mode == "formal" and system.get("id") == "neo4j":
@@ -2189,10 +2366,26 @@ def run(args: argparse.Namespace) -> int:
     for required_executable in (p31_wrapper, P31_ADAPTER_WRAPPER):
         if not required_executable.is_file() or not os.access(required_executable, os.X_OK):
             raise ContractError(f"required wrapper is missing or not executable: {required_executable}")
+    admission: dict[str, Any] | None = None
     if args.mode == "formal":
-        verify_formal_preflight(run_root, p31_wrapper, args.clean_ready_file)
-    elif args.clean_ready_file is not None:
-        raise ContractError("--clean-ready-file is only valid in formal mode")
+        admission = verify_formal_preflight(
+            run_root,
+            p31_wrapper,
+            batch_lease=args.batch_lease,
+            batch_gate_tool=args.batch_gate_tool,
+            legacy_v1_clean_ready=args.legacy_v1_clean_ready,
+            compatibility_clean_ready=args.clean_ready_file,
+        )
+    elif any(
+        value is not None
+        for value in (
+            args.clean_ready_file,
+            args.legacy_v1_clean_ready,
+            args.batch_lease,
+            args.batch_gate_tool,
+        )
+    ):
+        raise ContractError("admission options are only valid in formal mode")
 
     claim_empty_directory(
         run_root,
@@ -2213,6 +2406,8 @@ def run(args: argparse.Namespace) -> int:
     running_path = run_root / "RUNNING"
     resolved_manifest = run_root / "resolved-suite-manifest.json"
     repeat_results: list[dict[str, Any]] = []
+    suite_admission_path: Path | None = None
+    repeat_integrity_path: Path | None = None
     try:
         atomic_json(
             running_path,
@@ -2225,6 +2420,22 @@ def run(args: argparse.Namespace) -> int:
             },
         )
         atomic_json(resolved_manifest, suite)
+        if admission is not None and admission.get("protocol") == "batch-lease-v2":
+            suite_admission_path = run_root / "batch-lease-admission.json"
+            atomic_json(
+                suite_admission_path,
+                {
+                    "schema_version": "cidr-p10-suite-batch-admission-v2",
+                    "state": "PASS",
+                    "protocol": "batch-lease-v2",
+                    "consumer": "P10",
+                    "receipt": admission["suite_receipt"],
+                    "validator_argv": admission["suite_validator_argv"],
+                    "lease": artifact_ref(admission["lease"]),
+                    "gate_tool": artifact_ref(admission["gate_tool"]),
+                    "anchor_binary": artifact_ref(admission["anchor_binary"]),
+                },
+            )
         for system in selected:
             for repeat_index in repeat_indices:
                 repeat_results.append(
@@ -2237,6 +2448,7 @@ def run(args: argparse.Namespace) -> int:
                         resolved_manifest=resolved_manifest,
                         p31_wrapper=p31_wrapper,
                         mode=args.mode,
+                        admission=admission,
                     )
                 )
         if args.mode == "formal":
@@ -2250,6 +2462,34 @@ def run(args: argparse.Namespace) -> int:
         system_rows = aggregate_systems(repeat_rows)
         system_path = run_root / "system-results.tsv"
         write_tsv(system_path, SYSTEM_COLUMNS, system_rows)
+        if admission is not None and admission.get("protocol") == "batch-lease-v2":
+            repeat_integrity_path = run_root / "repeat-integrity.json"
+            atomic_json(
+                repeat_integrity_path,
+                {
+                    "schema_version": "cidr-p10-repeat-integrity-index-v2",
+                    "state": "PASS",
+                    "lease_sha256": admission["suite_receipt"]["lease_sha256"],
+                    "repeats": [
+                        {
+                            "system_id": result["system_id"],
+                            "repeat_index": result["repeat_index"],
+                            "admission_sha256": result["batch_admission"]["artifact"]["sha256"],
+                            "guard_status_sha256": result["batch_admission"]["integrity_guard"]
+                            ["evidence"]["status"]["sha256"],
+                            "guard_samples_sha256": result["batch_admission"]["integrity_guard"]
+                            ["evidence"]["samples"]["sha256"],
+                            "guard_ready_sha256": result["batch_admission"]["integrity_guard"]
+                            ["evidence"]["ready"]["sha256"],
+                            "command_release_sha256": result["batch_admission"]
+                            ["integrity_guard"]["evidence"]["release"]["sha256"],
+                            "p31_validation_sha256": result["p31"]["validation_sha256"],
+                            "p31_done_sha256": result["p31"]["done_sha256"],
+                        }
+                        for result in repeat_results
+                    ],
+                },
+            )
         repeat_evidence: list[dict[str, Any]] = []
         if args.mode == "formal":
             for result in repeat_results:
@@ -2314,19 +2554,29 @@ def run(args: argparse.Namespace) -> int:
             "repeat_evidence": repeat_evidence,
             "completed_at_utc": utc_now(),
         }
+        if admission is not None:
+            summary["admission_protocol"] = admission["protocol"]
+        if suite_admission_path is not None and repeat_integrity_path is not None:
+            summary["batch_lease"] = artifact_ref(admission["lease"])
+            summary["suite_batch_admission"] = artifact_ref(suite_admission_path)
+            summary["repeat_integrity"] = artifact_ref(repeat_integrity_path)
         summary_path = run_root / "suite-summary.json"
         atomic_json(summary_path, summary)
         marker_name = "DONE" if complete_suite else "PARTIAL-DONE"
-        atomic_json(
-            run_root / marker_name,
-            {
-                "state": "PASS",
-                "complete_frozen_suite": complete_suite,
-                "performance_eligible": args.mode == "formal",
-                "summary_sha256": sha256_file(summary_path),
-                "resolved_manifest_sha256": sha256_file(resolved_manifest),
-            },
-        )
+        marker = {
+            "state": "PASS",
+            "complete_frozen_suite": complete_suite,
+            "performance_eligible": args.mode == "formal",
+            "summary_sha256": sha256_file(summary_path),
+            "resolved_manifest_sha256": sha256_file(resolved_manifest),
+        }
+        if admission is not None:
+            marker["admission_protocol"] = admission["protocol"]
+        if suite_admission_path is not None and repeat_integrity_path is not None:
+            marker["batch_lease_sha256"] = sha256_file(admission["lease"])
+            marker["suite_batch_admission_sha256"] = sha256_file(suite_admission_path)
+            marker["repeat_integrity_sha256"] = sha256_file(repeat_integrity_path)
+        atomic_json(run_root / marker_name, marker)
         running_path.unlink()
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
@@ -2384,6 +2634,9 @@ def build_parser() -> argparse.ArgumentParser:
         if action == "run":
             command.add_argument("--p31-wrapper", type=Path)
             command.add_argument("--clean-ready-file", type=Path)
+            command.add_argument("--legacy-v1-clean-ready", type=Path)
+            command.add_argument("--batch-lease", type=Path)
+            command.add_argument("--batch-gate-tool", type=Path)
             command.add_argument("--system", action="append", default=[])
             command.add_argument("--group", choices=("embedded", "client-server"))
             command.add_argument("--repeat-index", action="append", type=int, default=[])

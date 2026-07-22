@@ -26,6 +26,8 @@ Required scalar options:
   --truth PATH --truth-sha256 HEX
   --query-or-trace PATH --query-or-trace-sha256 HEX
   --config PATH --config-sha256 HEX
+  [--batch-lease PATH --batch-gate-tool PATH --batch-consumer P10|P20
+   --batch-anchor-binary PATH]
 
 Repeatable:
   --store LABEL=PATH (at least one), --temp LABEL=PATH,
@@ -59,6 +61,10 @@ QUERY_OR_TRACE=""
 QUERY_OR_TRACE_SHA256=""
 CONFIG=""
 CONFIG_SHA256=""
+BATCH_LEASE=""
+BATCH_GATE_TOOL=""
+BATCH_CONSUMER=""
+BATCH_ANCHOR_BINARY=""
 ALLOW_MISSING_AUX=0
 declare -a STORES=()
 declare -a TEMPS=()
@@ -96,6 +102,10 @@ while [[ $# -gt 0 ]]; do
     --query-or-trace-sha256) QUERY_OR_TRACE_SHA256="${2:?}"; shift 2 ;;
     --config) CONFIG="${2:?}"; shift 2 ;;
     --config-sha256) CONFIG_SHA256="${2:?}"; shift 2 ;;
+    --batch-lease) BATCH_LEASE="${2:?}"; shift 2 ;;
+    --batch-gate-tool) BATCH_GATE_TOOL="${2:?}"; shift 2 ;;
+    --batch-consumer) BATCH_CONSUMER="${2:?}"; shift 2 ;;
+    --batch-anchor-binary) BATCH_ANCHOR_BINARY="${2:?}"; shift 2 ;;
     --allow-missing-aux-tools) ALLOW_MISSING_AUX=1; shift ;;
     --) shift; COMMAND=("$@"); break ;;
     --help|-h) usage; exit 0 ;;
@@ -141,6 +151,20 @@ fi
 [[ ${#STORES[@]} -gt 0 ]] || { echo 'at least one --store is required' >&2; exit 64; }
 [[ ${#COMMAND[@]} -gt 0 ]] || { echo 'adapter command after -- is required' >&2; exit 64; }
 [[ -x "$P31" ]] || { echo "P31 wrapper is not executable: $P31" >&2; exit 66; }
+batch_option_count=0
+for value in "$BATCH_LEASE" "$BATCH_GATE_TOOL" "$BATCH_CONSUMER" "$BATCH_ANCHOR_BINARY"; do
+  [[ -n "$value" ]] && batch_option_count=$((batch_option_count + 1))
+done
+if [[ "$batch_option_count" -ne 0 && "$batch_option_count" -ne 4 ]]; then
+  echo 'batch gate options must be supplied together' >&2
+  exit 64
+fi
+if [[ "$batch_option_count" -eq 4 ]]; then
+  [[ "$BATCH_LEASE" == /* && -f "$BATCH_LEASE" ]] || { echo 'invalid batch lease' >&2; exit 66; }
+  [[ "$BATCH_GATE_TOOL" == /* && -f "$BATCH_GATE_TOOL" ]] || { echo 'invalid batch gate tool' >&2; exit 66; }
+  [[ "$BATCH_ANCHOR_BINARY" == /* && -x "$BATCH_ANCHOR_BINARY" ]] || { echo 'invalid batch anchor binary' >&2; exit 66; }
+  [[ "$BATCH_CONSUMER" == "P10" || "$BATCH_CONSUMER" == "P20" ]] || { echo 'invalid batch consumer' >&2; exit 64; }
+fi
 if [[ "$PERFORMANCE_ELIGIBLE" == "true" && "$ALLOW_MISSING_AUX" == "1" ]]; then
   echo 'formal mode forbids --allow-missing-aux-tools' >&2
   exit 64
@@ -164,6 +188,14 @@ for value in "${TEMPS[@]}"; do P31_ARGS+=(--temp "$value"); done
 for value in "${CONTAINERS[@]}"; do P31_ARGS+=(--container "$value"); done
 for value in "${EXTRA_PIDS[@]}"; do P31_ARGS+=(--extra-pid "$value"); done
 for value in "${INPUTS[@]}"; do P31_ARGS+=(--input "$value"); done
+if [[ "$batch_option_count" -eq 4 ]]; then
+  P31_ARGS+=(
+    --batch-lease "$BATCH_LEASE"
+    --batch-gate-tool "$BATCH_GATE_TOOL"
+    --batch-consumer "$BATCH_CONSUMER"
+    --batch-anchor-binary "$BATCH_ANCHOR_BINARY"
+  )
+fi
 P31_ARGS+=(
   --binary "$BINARY" --binary-sha256 "$BINARY_SHA256"
   --dataset "$DATASET" --dataset-sha256 "$DATASET_SHA256"

@@ -9,8 +9,9 @@ SF10 试跑和 P31 资源采集绑定成一个 fail-closed 放行门。它本身
 只有以下条件全部成立，runner 才写 `PASS` 和 `sentinel-result.json`：
 
 1. P03 `READY`、`COMPLETE`、`STATE`、`samples.tsv`、`latest.tsv`、
-   `classification.env` 和 monitor 脚本相互一致，monitor 脚本 SHA-256 未变，最后至少
-   15 个样本连续通过，且 `READY` 不超过 300 秒；
+   `classification.env` 和 monitor 脚本相互一致，monitor 脚本 SHA-256 未变；legacy
+   v1 要求原 15-sample 证据，short v2 要求恰好配置 `5 × 60 s` 且逐 gap 校验，二者的
+   `READY` 均不得超过 300 秒；
 2. Git worktree clean；binary、truth、query plan、config、dataset/store manifest、
    P31 wrapper 和 ID-map manifest 的 SHA-256 在开始与结束时一致；
 3. `shared-truth-verify` 检查 1,700 个查询、0 mismatch，并重新生成 query plan；
@@ -24,10 +25,18 @@ SF10 试跑和 P31 资源采集绑定成一个 fail-closed 放行门。它本身
 任一命令、truth、P31、hash、schema、运行时长或 CV gate 失败，只写 `FAILED`，不会留下
 `PASS`。runner 只会在超时时终止自己创建的进程组，不检查、停止或修改其他用户进程。
 
+短窗口 v2 把“P02B 本体是否通过”和“批次租约是否成功发行”定义为两个连续但不同的
+状态机：P02B 完整通过后先原子写 `PASS`；随后发行 24 小时 batch lease。若发行失败，
+runner 保留已经成立的 P02B `PASS`，另写 `BATCH-LEASE-FAILED.json` 并以退出码 `3`
+结束。这个状态不表示 P02B 失败，但 P10/P20 必须 fail closed：没有有效 lease 及其
+`.PASS.json` marker 时，任何正式下游运行都不得启动。发行成功时写
+`BATCH-LEASE-ISSUED.json`，并由 lease 文件及 marker 共同提供下游 admission。
+
 ## 正式准备
 
 正式运行必须使用已经 commit 的 clean `codex/cidr-sentinel` worktree，并在该 commit 上
-构建 release binary。当前配置在 `configs/sf10-seml0.json`，冻结：
+构建 release binary。legacy 配置保留在 `configs/sf10-seml0.json`；短窗口正式批次使用
+`configs/sf10-seml0-short-gate-v2.json`，冻结：
 
 - housekeeping CPU：`0-15,64-79`；formal CPU：跨两个 NUMA 节点的 48 个物理核；
 - `RAYON_NUM_THREADS=48`，blocking I/O，schema sentinel store；
@@ -78,10 +87,16 @@ python3 cidr-experiments/runners/p02b/run_sf10_sentinel.py \
   --truth /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/neo4j/sf10-main/workload/truth-s50-seed42.tsv \
   --query-plan /data/WorkSpace/results/P02B/sf10-shared-truth-plan.json \
   --id-map-dir /data/WorkSpace/lsmgraph-rs/cidr-experiments/artifacts/id-maps/P01-IDMAP-20260721T171325Z-187e851 \
-  --config "$PWD/cidr-experiments/runners/p02b/configs/sf10-seml0.json"
+  --config "$PWD/cidr-experiments/runners/p02b/configs/sf10-seml0-short-gate-v2.json" \
+  --batch-gate-tool "$PWD/cidr-experiments/runners/batch_gate_v2.py" \
+  --batch-lease-output "/ABS/BATCH/batch-lease.json"
 ```
 
-P10/P20 在启动前必须显式消费并校验结果：
+上述命令仅在 P02B `PASS` 与 batch lease 都成功时返回 `0`。退出码 `3` 表示 P02B
+仍为 `PASS`、但 lease 发行失败；此时必须修复发行问题，不能把 P02B `PASS` 直接交给
+v2 下游。旧协议仍可显式使用 legacy 配置并由 P10/P20 的 legacy CLI 消费。
+
+legacy P10/P20 在启动前显式消费并校验 P02B 结果：
 
 ```bash
 python3 cidr-experiments/runners/p02b/validate_sentinel_result.py \
@@ -92,10 +107,11 @@ fixture 会生成 `FIXTURE-PASS`，永远不能通过 `--require-formal`。
 
 ## 预计时间
 
-- P03 从第一个干净样本到 `READY`：约 15 分钟（15 个、60 秒间隔）；
+- short-window v2 的 P03 从第一个干净样本到 `READY`：约 5 分钟（5 个、60 秒间隔；
+  首尾时间跨度约 4 分钟并预留采集开销）。legacy v1 的 15-sample 路径仍约 15 分钟；
 - P02B SemL0 sentinel：协议下限为 3×30 秒 measured query time，加 shared-truth、warmup、
   P31 收尾和目录扫描，预计约 8–20 分钟；
-- 因此清场后的最短放行链约 23–35 分钟。首次真实 run 若 10 repeats 未达到每 run 30 秒，
+- 因此 v2 清场后的放行链约 13–25 分钟。首次真实 run 若 10 repeats 未达到每 run 30 秒，
   会 fail closed；应在非正式 pilot 后冻结更高 repeat 数并重新 commit，而不是运行时放宽。
 
 ## 测试

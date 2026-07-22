@@ -59,3 +59,15 @@ python3 cidr-experiments/runners/p20/validate_profiles.py \
 ```
 
 解析结果只包含 canonical feature 参数；路径、样本数、warmup、repeat、binary/truth/dataset SHA 等由上层 runner 添加并写入 manifest。正式任务必须由 P31 `run_with_resources.sh` 包裹，且先通过 shared-truth correctness gate 与 clean-window sentinel。
+
+## v2 batch admission
+
+新正式批次向 `run_single_profile.py` 同时传入 `--batch-lease` 与 canonical
+`--batch-gate-tool`。runner 在创建 stage store 前和释放 P31 命令前各重验一次 lease；
+P31 必须返回 consumer=`P20` 的 integrity guard PASS。lease、两次 admission、guard
+READY/status/samples 及 command release 的 SHA-256 均写入 input manifest、summary 与
+`P20-PASS.json`。Figure 2 聚合器禁止在同一批次混用 v1/v2 admission。
+
+旧 6 小时 P02B freshness 路径仅在显式 `--legacy-v1-admission` 时启用，并同时要求
+`--p02b-sentinel-result` 与 `--p02b-sentinel-result-sha256`；v2 与 legacy 参数混用会在
+克隆 stage store 前 fail closed。

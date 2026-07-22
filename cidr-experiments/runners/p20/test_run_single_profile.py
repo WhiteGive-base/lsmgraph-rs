@@ -2,6 +2,7 @@
 
 import csv
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -13,12 +14,17 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 
 HERE = Path(__file__).resolve().parent
 RUNNER = HERE / "run_single_profile.py"
 SUMMARIZER = HERE / "summarize_profile.py"
 FIXTURES = HERE / "tests"
+SPEC = importlib.util.spec_from_file_location("run_single_profile", RUNNER)
+assert SPEC and SPEC.loader
+RUNNER_MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(RUNNER_MODULE)
 
 
 def sha256(path):
@@ -597,6 +603,7 @@ class SingleProfileRunnerTest(unittest.TestCase):
         if include_sentinel:
             command.extend(
                 [
+                    "--legacy-v1-admission",
                     "--p02b-sentinel-result",
                     str(self.sentinel),
                     "--p02b-sentinel-result-sha256",
@@ -955,6 +962,85 @@ class SingleProfileRunnerTest(unittest.TestCase):
         )
         self.assertNotEqual(summary.returncode, 0)
         self.assertIn("p02b_pass_marker", summary.stderr)
+
+
+class AdmissionProtocolUnitTest(unittest.TestCase):
+    def test_explicit_legacy_and_complete_v2_are_accepted_but_mixing_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            gate = repo / "cidr-experiments" / "runners" / "batch_gate_v2.py"
+            gate.parent.mkdir(parents=True)
+            gate.write_text("# fixture\n", encoding="utf-8")
+            lease = repo / "lease.json"
+            lease.write_text("{}\n", encoding="utf-8")
+            legacy = SimpleNamespace(
+                legacy_v1_admission=True,
+                batch_lease=None,
+                batch_gate_tool=None,
+                p02b_sentinel_result=repo / "result.json",
+                p02b_sentinel_result_sha256="a" * 64,
+            )
+            self.assertEqual(
+                RUNNER_MODULE.resolve_admission_mode(legacy, repo)["protocol_version"],
+                "legacy-p02b-admission-v1",
+            )
+            v2 = SimpleNamespace(
+                legacy_v1_admission=False,
+                batch_lease=lease,
+                batch_gate_tool=gate,
+                p02b_sentinel_result=None,
+                p02b_sentinel_result_sha256=None,
+            )
+            self.assertEqual(
+                RUNNER_MODULE.resolve_admission_mode(v2, repo)["protocol_version"],
+                "short-clean-window-v2",
+            )
+            v2.p02b_sentinel_result = repo / "result.json"
+            with self.assertRaises(RUNNER_MODULE.RunnerError):
+                RUNNER_MODULE.resolve_admission_mode(v2, repo)
+
+    def test_p31_guard_evidence_tamper_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            evidence = {}
+            mapping = {
+                "release": "command-release.json",
+                "ready": "READY.json",
+                "status": "status.json",
+                "samples": "integrity-samples.tsv",
+            }
+            for name, filename in mapping.items():
+                path = root / filename
+                path.write_text(name + "\n", encoding="utf-8")
+                evidence[name] = file_ref(path)
+            lease_row = {"sha256": "1" * 64}
+            gate_row = {"sha256": "2" * 64}
+            binary_row = {"sha256": "3" * 64}
+            validation = {
+                "state": "PASS",
+                "integrity_guard": {
+                    "schema_version": "cidr-p31-batch-integrity-v2",
+                    "state": "PASS",
+                    "consumer": "P20",
+                    "lease_sha256": lease_row["sha256"],
+                    "gate_tool_sha256": gate_row["sha256"],
+                    "anchor_binary_sha256": binary_row["sha256"],
+                    "evidence": evidence,
+                },
+            }
+            (root / "validation.json").write_text(
+                json.dumps(validation), encoding="utf-8"
+            )
+            guard, rows = RUNNER_MODULE.validate_p31_integrity_guard(
+                root, lease_row, gate_row, binary_row
+            )
+            self.assertEqual(guard["state"], "PASS")
+            self.assertEqual(len(rows), 4)
+            (root / "status.json").write_text("tampered\n", encoding="utf-8")
+            with self.assertRaises(RUNNER_MODULE.RunnerError):
+                RUNNER_MODULE.validate_p31_integrity_guard(
+                    root, lease_row, gate_row, binary_row
+                )
 
 
 if __name__ == "__main__":

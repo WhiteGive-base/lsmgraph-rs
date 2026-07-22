@@ -446,23 +446,30 @@ def validate_id_map(value: Any, files: Dict[str, Any]) -> None:
 def validate_clean_ready(run_dir: Path, value: Any, provenance: Dict[str, Any]) -> None:
     if not isinstance(value, dict):
         raise GateError("clean_ready is not an object")
-    require_exact_keys(
-        value,
-        {
-            "schema_version",
-            "state",
-            "run_id",
-            "ready_time",
-            "age_seconds_at_binding",
-            "required_consecutive_samples",
-            "observed_consecutive_samples",
-            "git_head",
-            "host",
-            "artifacts",
-        },
-        "clean_ready",
-    )
-    if value["schema_version"] != "p02b-clean-ready-binding-v1" or value["state"] != "PASS":
+    common_keys = {
+        "schema_version",
+        "state",
+        "run_id",
+        "ready_time",
+        "age_seconds_at_binding",
+        "required_consecutive_samples",
+        "observed_consecutive_samples",
+        "git_head",
+        "host",
+        "artifacts",
+    }
+    schema = value.get("schema_version")
+    if schema == "p02b-clean-ready-binding-v1":
+        require_exact_keys(value, common_keys, "clean_ready")
+    elif schema == "p02b-clean-ready-binding-v2":
+        require_exact_keys(
+            value,
+            common_keys | {"protocol_version", "source_v1_history_preserved", "timing"},
+            "clean_ready v2",
+        )
+    else:
+        raise GateError("clean_ready schema is unsupported")
+    if value["state"] != "PASS":
         raise GateError("clean_ready schema/state drift")
     if not isinstance(value["run_id"], str) or not value["run_id"]:
         raise GateError("clean_ready run_id is invalid")
@@ -472,11 +479,60 @@ def validate_clean_ready(run_dir: Path, value: Any, provenance: Dict[str, Any]) 
     observed = require_int(value["observed_consecutive_samples"], "clean_ready observed samples", 1)
     if observed < required:
         raise GateError("clean_ready observed samples are insufficient")
+    if schema == "p02b-clean-ready-binding-v2":
+        if value["protocol_version"] != "short-clean-window-v2" or required < 5:
+            raise GateError("clean_ready v2 protocol/sample count drift")
+        if not isinstance(value["source_v1_history_preserved"], bool):
+            raise GateError("clean_ready v2 history flag must be boolean")
+        timing = value["timing"]
+        if not isinstance(timing, dict):
+            raise GateError("clean_ready v2 timing must be an object")
+        require_exact_keys(
+            timing,
+            {
+                "expected_interval_seconds",
+                "gap_tolerance_seconds",
+                "observed_gap_seconds",
+                "maximum_observed_gap_seconds",
+                "gap_check_pass",
+            },
+            "clean_ready v2 timing",
+        )
+        if timing["expected_interval_seconds"] != 60 or timing["gap_check_pass"] is not True:
+            raise GateError("clean_ready v2 interval/gap classification drift")
+        tolerance = require_number(timing["gap_tolerance_seconds"], "clean_ready v2 tolerance")
+        if tolerance < 0 or tolerance > 15:
+            raise GateError("clean_ready v2 gap tolerance drift")
+        gaps = timing["observed_gap_seconds"]
+        if not isinstance(gaps, list) or len(gaps) != required - 1:
+            raise GateError("clean_ready v2 gap evidence count drift")
+        observed_gaps = [
+            require_number(gap, "clean_ready v2 observed gap", positive=True) for gap in gaps
+        ]
+        lower = 60.0 - tolerance
+        upper = 60.0 + tolerance
+        if any(gap < lower or gap > upper for gap in observed_gaps):
+            raise GateError("clean_ready v2 observed gap is outside tolerance")
+        recorded_maximum = require_number(
+            timing["maximum_observed_gap_seconds"], "clean_ready v2 maximum gap", positive=True
+        )
+        if not math.isclose(recorded_maximum, max(observed_gaps), rel_tol=1e-9, abs_tol=1e-9):
+            raise GateError("clean_ready v2 maximum gap summary drift")
     if not isinstance(value["git_head"], str) or not isinstance(value["host"], str) or not value["host"]:
         raise GateError("clean_ready git/host identity is invalid")
     artifacts = value["artifacts"]
     if not isinstance(artifacts, dict) or not artifacts:
         raise GateError("clean_ready artifacts are missing")
+    if schema == "p02b-clean-ready-binding-v2" and set(artifacts) != {
+        "READY",
+        "COMPLETE",
+        "classification.env",
+        "STATE",
+        "samples.tsv",
+        "latest.tsv",
+        "monitor_clean_window.sh",
+    }:
+        raise GateError("clean_ready v2 artifact set drift")
     for name, reference in artifacts.items():
         if not isinstance(name, str) or not name:
             raise GateError("clean_ready artifact name is invalid")

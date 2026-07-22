@@ -3,9 +3,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main() -> int:
@@ -30,11 +39,35 @@ def main() -> int:
             },
         },
     }
-    (run_dir / "run-manifest.json").write_text(
+    manifest_path = run_dir / "run-manifest.json"
+    validation_path = run_dir / "validation.json"
+    manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    validation_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "fixture-p31-validation-v1",
+                "state": "PASS",
+                "fixture_only": True,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (run_dir / "DONE").write_text(
-        json.dumps({"state": "PASS", "fixture_only": True}, sort_keys=True) + "\n",
+        json.dumps(
+            {
+                "state": "PASS",
+                "fixture_only": True,
+                "manifest_sha256": sha256_file(manifest_path),
+                "validation_sha256": sha256_file(validation_path),
+            },
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return 0

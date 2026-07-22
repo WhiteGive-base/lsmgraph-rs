@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -939,6 +940,412 @@ def validate_container_tracking(
                     errors.append(f"collector-ready.json: {name} PID lacks a zero-baseline readiness sample")
 
 
+def _legacy_short_container_identity_tuple(
+    value: object,
+    context: str,
+    errors: list[str],
+) -> tuple[str, int, str, int] | None:
+    if not isinstance(value, dict):
+        errors.append(f"{context}: identity is not an object")
+        return None
+    container_id = value.get("container_id")
+    pid = value.get("pid")
+    started_at = value.get("started_at")
+    restart_count = value.get("restart_count")
+    if not isinstance(container_id, str) or _CONTAINER_ID.fullmatch(container_id) is None:
+        errors.append(f"{context}: container_id is not a full Docker ID")
+        return None
+    if type(pid) is not int or pid <= 0:
+        errors.append(f"{context}: pid is not a positive integer")
+        return None
+    if not isinstance(started_at, str) or not started_at:
+        errors.append(f"{context}: started_at is empty or malformed")
+        return None
+    if type(restart_count) is not int or restart_count < 0:
+        errors.append(f"{context}: restart_count is not a non-negative integer")
+        return None
+    return container_id, pid, started_at, restart_count
+
+
+def _legacy_short_validate_container_tracking(
+    collector_config: dict[str, Any],
+    collector: dict[str, Any],
+    ready: dict[str, Any],
+    resources: list[dict[str, str]],
+    expected_root_pid: object,
+    errors: list[str],
+) -> None:
+    """Fail closed on unresolved, unsampled, or changing external identities."""
+
+    requested = collector_config.get("containers")
+    configured_extra = collector_config.get("extra_pids")
+    if not isinstance(requested, list) or any(not isinstance(name, str) or not name for name in requested):
+        errors.append("run-manifest.json: collector containers are malformed")
+        requested = []
+    if len(requested) != len(set(requested)):
+        errors.append("run-manifest.json: collector containers contain duplicates")
+    if (
+        not isinstance(configured_extra, list)
+        or any(type(pid) is not int or pid <= 0 for pid in configured_extra)
+        or len(configured_extra) != len(set(configured_extra))
+    ):
+        errors.append("run-manifest.json: extra_pids are not unique positive integers")
+        configured_extra = []
+
+    sample_pids_by_index: dict[int, set[int]] = {}
+    all_sample_pids: set[int] = set()
+    for row in resources:
+        try:
+            index = int(row["sample_index"])
+            pids = {int(raw) for raw in row.get("pids", "").split(",") if raw}
+        except (KeyError, TypeError, ValueError):
+            continue
+        sample_pids_by_index[index] = pids
+        all_sample_pids.update(pids)
+
+    seen = collector.get("containers_seen")
+    history = collector.get("container_identity_history")
+    unique = collector.get("container_identity_unique_set")
+    expected_names = set(requested)
+    for label, value in (
+        ("containers_seen", seen),
+        ("container_identity_history", history),
+        ("container_identity_unique_set", unique),
+    ):
+        if not isinstance(value, dict) or set(value) != expected_names:
+            errors.append(f"collector-status.json: {label} keys differ from requested containers")
+    if not isinstance(seen, dict) or not isinstance(history, dict) or not isinstance(unique, dict):
+        return
+    if collector.get("container_identity_schema_version") != CONTAINER_IDENTITY_SCHEMA_VERSION:
+        errors.append("collector-status.json: wrong container identity schema version")
+
+    normalized_unique: dict[str, tuple[str, int, str, int]] = {}
+    for name in requested:
+        seen_pid = seen.get(name)
+        if type(seen_pid) is not int or seen_pid <= 0:
+            errors.append(f"collector-status.json: containers_seen[{name!r}] is not a positive integer")
+        elif seen_pid not in all_sample_pids:
+            errors.append(f"collector-status.json: containers_seen[{name!r}] PID was never sampled")
+
+        observations = history.get(name)
+        identities = unique.get(name)
+        if not isinstance(observations, list) or not observations:
+            errors.append(f"collector-status.json: no identity history for container {name!r}")
+            observations = []
+        if not isinstance(identities, list) or not identities:
+            errors.append(f"collector-status.json: no unique identity for container {name!r}")
+            identities = []
+
+        derived: list[tuple[str, int, str, int]] = []
+        for index, observation in enumerate(observations):
+            identity = container_identity_tuple(
+                observation,
+                f"collector-status.json: {name} history[{index}]",
+                errors,
+            )
+            if identity is not None and identity not in derived:
+                derived.append(identity)
+            before_sample = observation.get("before_sample_index") if isinstance(observation, dict) else None
+            observed_at = observation.get("observed_at_utc") if isinstance(observation, dict) else None
+            if type(before_sample) is not int or before_sample not in sample_pids_by_index:
+                errors.append(f"collector-status.json: {name} history[{index}] has no matching sample")
+            elif identity is not None and identity[1] not in sample_pids_by_index[before_sample]:
+                errors.append(f"collector-status.json: {name} history[{index}] PID is absent from its sample")
+            if not isinstance(observed_at, str) or not observed_at:
+                errors.append(f"collector-status.json: {name} history[{index}] lacks observed_at_utc")
+
+        declared: list[tuple[str, int, str, int]] = []
+        for index, value in enumerate(identities):
+            identity = container_identity_tuple(
+                value,
+                f"collector-status.json: {name} unique[{index}]",
+                errors,
+            )
+            if identity is not None:
+                declared.append(identity)
+        if declared != derived:
+            errors.append(f"collector-status.json: {name} unique set is not derived from identity history")
+        if len(declared) != 1:
+            errors.append(f"collector-status.json: {name} did not retain exactly one stable identity")
+        else:
+            normalized_unique[name] = declared[0]
+            if declared[0][1] != seen_pid:
+                errors.append(f"collector-status.json: {name} containers_seen PID differs from identity")
+            if declared[0][1] not in all_sample_pids:
+                errors.append(f"collector-status.json: {name} identity PID was never sampled")
+
+    if ready.get("schema_version") != CONTAINER_IDENTITY_SCHEMA_VERSION or ready.get("state") != "READY":
+        errors.append("collector-ready.json: missing clean READY identity gate")
+    if collector.get("collector_ready") != ready:
+        errors.append("collector-status.json: collector_ready differs from collector-ready.json")
+    if ready.get("root_pid") != expected_root_pid:
+        errors.append("collector-ready.json: root_pid differs from execution.json")
+    if ready.get("external_zero_baseline") is not True:
+        errors.append("collector-ready.json: external zero baseline was not established")
+    ready_index = ready.get("resource_sample_index")
+    if type(ready_index) is not int or ready_index not in sample_pids_by_index:
+        errors.append("collector-ready.json: resource_sample_index has no matching sample")
+        ready_sample_pids: set[int] = set()
+    else:
+        ready_sample_pids = sample_pids_by_index[ready_index]
+        if ready_index != 0:
+            errors.append("collector-ready.json: adapter was not released from the first resource sample")
+    if not isinstance(ready.get("ready_at_utc"), str) or not ready.get("ready_at_utc"):
+        errors.append("collector-ready.json: ready_at_utc is missing")
+    declared_sample_pids = ready.get("sample_pids")
+    if (
+        not isinstance(declared_sample_pids, list)
+        or any(type(pid) is not int or pid <= 0 for pid in declared_sample_pids)
+        or declared_sample_pids != sorted(ready_sample_pids)
+    ):
+        errors.append("collector-ready.json: sample_pids differ from the readiness resource sample")
+    baseline_pids = ready.get("external_zero_baseline_pids")
+    if (
+        not isinstance(baseline_pids, list)
+        or any(type(pid) is not int or pid <= 0 for pid in baseline_pids)
+        or baseline_pids != sorted(set(baseline_pids))
+        or not set(baseline_pids).issubset(ready_sample_pids)
+    ):
+        errors.append("collector-ready.json: external_zero_baseline_pids are malformed or unsampled")
+        baseline_pid_set: set[int] = set()
+    else:
+        baseline_pid_set = set(baseline_pids)
+    if ready.get("extra_pids") != configured_extra or not set(configured_extra).issubset(baseline_pid_set):
+        errors.append("collector-ready.json: extra PID baseline differs from the manifest")
+    ready_containers = ready.get("containers")
+    if not isinstance(ready_containers, dict) or set(ready_containers) != expected_names:
+        errors.append("collector-ready.json: container keys differ from the manifest")
+    else:
+        for name in requested:
+            identity = container_identity_tuple(
+                ready_containers.get(name),
+                f"collector-ready.json: containers[{name!r}]",
+                errors,
+            )
+            if identity is not None:
+                if normalized_unique.get(name) != identity:
+                    errors.append(f"collector-ready.json: {name} identity differs from final unique identity")
+                if identity[1] not in ready_sample_pids or identity[1] not in baseline_pid_set:
+                    errors.append(f"collector-ready.json: {name} PID lacks a zero-baseline readiness sample")
+
+
+def parse_utc_timestamp(value: object, context: str, errors: list[str]) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        errors.append(f"{context}: timestamp is missing")
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        errors.append(f"{context}: timestamp is malformed")
+        return None
+    if parsed.tzinfo is None:
+        errors.append(f"{context}: timestamp lacks a timezone")
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def verify_batch_file_ref(reference: object, context: str, errors: list[str]) -> Path | None:
+    if not isinstance(reference, dict):
+        errors.append(f"{context}: file reference is missing")
+        return None
+    raw_path = reference.get("path")
+    if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+        errors.append(f"{context}: path is not absolute")
+        return None
+    path = Path(raw_path).resolve()
+    if not path.is_file():
+        errors.append(f"{context}: file is missing")
+        return None
+    if reference.get("kind") != "file" or reference.get("exists") is not True:
+        errors.append(f"{context}: manifest file classification drift")
+    if reference.get("size_bytes") != path.stat().st_size:
+        errors.append(f"{context}: size changed")
+    digest = sha256_file(path)
+    if reference.get("sha256") != digest:
+        errors.append(f"{context}: SHA-256 changed")
+    return path
+
+
+def evidence_file_ref(path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    return {
+        "path": str(resolved),
+        "size_bytes": resolved.stat().st_size,
+        "sha256": sha256_file(resolved),
+    }
+
+
+def validate_batch_integrity_guard(
+    run_dir: Path,
+    manifest: dict[str, Any],
+    execution: dict[str, Any],
+    collector_ready: dict[str, Any],
+    errors: list[str],
+) -> dict[str, Any] | None:
+    batch = manifest.get("batch_gate")
+    guard_dir = run_dir / "integrity-guard"
+    release_path = run_dir / "command-release.json"
+    batch_execution_fields = {
+        "command_release_at_utc",
+        "command_ended_at_utc",
+        "guard_exit_code",
+    }
+    if batch is None:
+        if guard_dir.exists() or release_path.exists() or any(
+            field in execution for field in batch_execution_fields
+        ):
+            errors.append("legacy P31 run contains undeclared batch-guard evidence")
+        return None
+    if not isinstance(batch, dict) or set(batch) != {
+        "protocol_version",
+        "consumer",
+        "lease",
+        "gate_tool",
+        "anchor_binary",
+        "integrity_guard_required",
+    }:
+        errors.append("run-manifest.json: batch_gate schema drift")
+        return {}
+    if (
+        batch.get("protocol_version") != "short-clean-window-v2"
+        or batch.get("consumer") not in {"P10", "P20"}
+        or batch.get("integrity_guard_required") is not True
+    ):
+        errors.append("run-manifest.json: batch_gate policy drift")
+    lease_path = verify_batch_file_ref(batch.get("lease"), "batch lease", errors)
+    gate_tool = verify_batch_file_ref(batch.get("gate_tool"), "batch gate tool", errors)
+    anchor_binary = verify_batch_file_ref(
+        batch.get("anchor_binary"), "batch anchor binary", errors
+    )
+    if execution.get("guard_exit_code") != 0:
+        errors.append(
+            f"integrity guard exit code is {execution.get('guard_exit_code')!r}, expected 0"
+        )
+    admission: dict[str, Any] = {}
+    if lease_path is not None and gate_tool is not None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(gate_tool),
+                "validate-guard",
+                "--guard-dir",
+                str(guard_dir),
+                "--lease",
+                str(lease_path),
+                "--expected-repo-head",
+                str(manifest.get("repo", {}).get("git_sha", "")),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            errors.append(
+                "batch gate rejected integrity guard: {}".format(completed.stderr.strip())
+            )
+        else:
+            try:
+                parsed = json.loads(completed.stdout)
+                if not isinstance(parsed, dict) or parsed.get("state") != "PASS":
+                    raise ValueError("admission is not a PASS object")
+                admission = parsed
+            except (ValueError, json.JSONDecodeError) as exc:
+                errors.append(f"batch gate emitted invalid guard admission: {exc}")
+    release = read_json(release_path, errors)
+    guard_ready = read_json(guard_dir / "READY.json", errors)
+    guard_status = read_json(guard_dir / "status.json", errors)
+    if (
+        release.get("schema_version") != "cidr-command-release-v2"
+        or release.get("state") != "RELEASED"
+    ):
+        errors.append("command-release.json: schema/state drift")
+    if lease_path is not None and admission.get("lease_sha256") != sha256_file(lease_path):
+        errors.append("integrity guard admission lease SHA differs from batch lease")
+    if admission.get("guard_dir") and Path(str(admission["guard_dir"])).resolve() != guard_dir.resolve():
+        errors.append("integrity guard admission points to another directory")
+    if anchor_binary is not None and guard_status.get("binary_sha256") != sha256_file(anchor_binary):
+        errors.append("integrity guard anchor binary SHA drift")
+
+    release_raw = release.get("released_at_utc")
+    if execution.get("command_release_at_utc") != release_raw:
+        errors.append("execution command release timestamp differs from release artifact")
+    started = parse_utc_timestamp(execution.get("started_at_utc"), "execution start", errors)
+    collector_ready_at = parse_utc_timestamp(
+        collector_ready.get("ready_at_utc"), "collector READY", errors
+    )
+    guard_ready_at = parse_utc_timestamp(
+        guard_ready.get("ready_at_utc"), "integrity guard READY", errors
+    )
+    released_at = parse_utc_timestamp(release_raw, "command release", errors)
+    command_ended_at = parse_utc_timestamp(
+        execution.get("command_ended_at_utc"), "command end", errors
+    )
+    guard_ended_at = parse_utc_timestamp(
+        guard_status.get("ended_at_utc"), "integrity guard end", errors
+    )
+    if all(
+        value is not None
+        for value in (
+            started,
+            collector_ready_at,
+            guard_ready_at,
+            released_at,
+            command_ended_at,
+            guard_ended_at,
+        )
+    ):
+        assert started is not None
+        assert collector_ready_at is not None
+        assert guard_ready_at is not None
+        assert released_at is not None
+        assert command_ended_at is not None
+        assert guard_ended_at is not None
+        if not (
+            started <= collector_ready_at <= released_at
+            and started <= guard_ready_at <= released_at
+            and released_at <= command_ended_at <= guard_ended_at
+        ):
+            errors.append(
+                "dual READY/command/guard boundary coverage is incomplete"
+            )
+
+    evidence_paths = {
+        "release": release_path,
+        "ready": guard_dir / "READY.json",
+        "status": guard_dir / "status.json",
+        "samples": guard_dir / "integrity-samples.tsv",
+    }
+    evidence: dict[str, Any] = {}
+    for name, path in evidence_paths.items():
+        if path.is_file():
+            evidence[name] = evidence_file_ref(path)
+    lease_reference = batch.get("lease") if isinstance(batch.get("lease"), dict) else {}
+    tool_reference = batch.get("gate_tool") if isinstance(batch.get("gate_tool"), dict) else {}
+    anchor_reference = (
+        batch.get("anchor_binary") if isinstance(batch.get("anchor_binary"), dict) else {}
+    )
+    return {
+        "schema_version": "cidr-p31-batch-integrity-v2",
+        "state": "PASS" if not errors else "FAILED",
+        "consumer": batch.get("consumer"),
+        "lease_sha256": lease_reference.get("sha256"),
+        "gate_tool_sha256": tool_reference.get("sha256"),
+        "anchor_binary_sha256": anchor_reference.get("sha256"),
+        "admission": admission,
+        "evidence": evidence,
+        "coverage": {
+            "collector_ready_at_utc": collector_ready.get("ready_at_utc"),
+            "guard_ready_at_utc": guard_ready.get("ready_at_utc"),
+            "command_release_at_utc": release_raw,
+            "command_ended_at_utc": execution.get("command_ended_at_utc"),
+            "guard_ended_at_utc": guard_status.get("ended_at_utc"),
+        },
+    }
+
+
 def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tuple[bool, dict[str, Any]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -1065,6 +1472,9 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
         if not path.is_file() or sha256_file(path) != ref.get("sha256"):
             errors.append(f"{name} script missing or SHA-256 mismatch")
     validate_formal_provenance(manifest, errors)
+    integrity_guard = validate_batch_integrity_guard(
+        run_dir, manifest, execution, ready, errors
+    )
 
     resource_summary = {
         "samples": len(resources),
@@ -1132,10 +1542,15 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
         "disk_summary": disk_summary,
         "iostat_samples": len(iostat_rows),
     }
+    if integrity_guard is not None:
+        integrity_guard["state"] = "PASS" if not errors else "FAILED"
+        validation["integrity_guard"] = integrity_guard
     atomic_json(run_dir / "validation.json", validation)
     manifest["state"] = "PASS" if passed else "FAILED_VALIDATION"
     manifest["artifacts"] = artifacts
     manifest["summary"] = {"resources": resource_summary, "disk": disk_summary}
+    if integrity_guard is not None:
+        manifest["summary"]["integrity_guard"] = integrity_guard
     manifest["validation"] = validation
     atomic_json(manifest_path, manifest)
 

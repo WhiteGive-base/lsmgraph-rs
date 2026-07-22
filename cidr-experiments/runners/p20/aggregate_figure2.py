@@ -66,10 +66,20 @@ RUN_CONSTANTS = (
     "p31_wrapper_sha256",
     "pristine_store_sha256",
     "pristine_store_manifest_sha256",
+    "admission_protocol",
     "p02b_sentinel_result_sha256",
     "p02b_pass_marker_sha256",
     "p02b_provenance_sha256",
     "p02b_validator_sha256",
+    "p02b_admission_sha256",
+    "batch_lease_sha256",
+    "batch_gate_tool_sha256",
+    "batch_lease_admission_sha256",
+    "batch_lease_pre_p31_sha256",
+    "p31_integrity_guard_status_sha256",
+    "p31_integrity_guard_samples_sha256",
+    "p31_integrity_guard_ready_sha256",
+    "p31_command_release_sha256",
     "current_digest_pass",
     "current_digest_mismatches",
 )
@@ -117,10 +127,20 @@ PAIR_SHARED = (
     "p31_wrapper_sha256",
     "pristine_store_sha256",
     "pristine_store_manifest_sha256",
+    "admission_protocol",
     "p02b_sentinel_result_sha256",
     "p02b_pass_marker_sha256",
     "p02b_provenance_sha256",
     "p02b_validator_sha256",
+    "p02b_admission_sha256",
+    "batch_lease_sha256",
+    "batch_gate_tool_sha256",
+    "batch_lease_admission_sha256",
+    "batch_lease_pre_p31_sha256",
+    "p31_integrity_guard_status_sha256",
+    "p31_integrity_guard_samples_sha256",
+    "p31_integrity_guard_ready_sha256",
+    "p31_command_release_sha256",
 )
 RUN_COLUMNS = [
     "figure2_schema_version",
@@ -155,10 +175,20 @@ RUN_COLUMNS = [
     "profiles_sha256",
     "pristine_store_sha256",
     "pristine_store_manifest_sha256",
+    "admission_protocol",
     "p02b_sentinel_result_sha256",
     "p02b_pass_marker_sha256",
     "p02b_provenance_sha256",
     "p02b_validator_sha256",
+    "p02b_admission_sha256",
+    "batch_lease_sha256",
+    "batch_gate_tool_sha256",
+    "batch_lease_admission_sha256",
+    "batch_lease_pre_p31_sha256",
+    "p31_integrity_guard_status_sha256",
+    "p31_integrity_guard_samples_sha256",
+    "p31_integrity_guard_ready_sha256",
+    "p31_command_release_sha256",
     "latency_summary_sha256",
     "cpu_phase_summary_sha256",
 ]
@@ -223,7 +253,7 @@ def load_rows(path):
         "benchmark_entry_index",
         "get_neighbors_latency_histogram_json",
         "query_cpu_total_ns",
-        "p02b_sentinel_result_sha256",
+        "admission_protocol",
     }
     require(required <= set(reader.fieldnames or []), "summary schema is missing Figure 2 fields")
     return path, rows
@@ -356,7 +386,41 @@ def validate_adaptation_pair(rows_by_key):
         )
 
 
+def require_admission_fields(row, label):
+    protocol = row.get("admission_protocol")
+    legacy_fields = (
+        "p02b_sentinel_result_sha256",
+        "p02b_pass_marker_sha256",
+        "p02b_provenance_sha256",
+        "p02b_validator_sha256",
+        "p02b_admission_sha256",
+    )
+    batch_fields = (
+        "batch_lease_sha256",
+        "batch_gate_tool_sha256",
+        "batch_lease_admission_sha256",
+        "batch_lease_pre_p31_sha256",
+        "p31_integrity_guard_status_sha256",
+        "p31_integrity_guard_samples_sha256",
+        "p31_integrity_guard_ready_sha256",
+        "p31_command_release_sha256",
+    )
+    if protocol == "legacy-p02b-admission-v1":
+        require(all(row.get(field) for field in legacy_fields), "{} lacks legacy P02B admission".format(label))
+        require(not any(row.get(field) for field in batch_fields), "{} mixes v2 batch evidence into legacy admission".format(label))
+    elif protocol == "short-clean-window-v2":
+        require(all(row.get(field) for field in batch_fields), "{} lacks v2 batch/guard admission".format(label))
+        require(not any(row.get(field) for field in legacy_fields), "{} mixes legacy P02B evidence into v2 admission".format(label))
+    else:
+        raise AggregateError("{} has unsupported admission protocol".format(label))
+
+
 def build_run_rows(collapsed, expected_repeats):
+    protocols = {item.get("admission_protocol") for item in collapsed}
+    require(
+        len(protocols) == 1,
+        "one Figure 2 aggregation batch may not mix admission protocols",
+    )
     by_pair = {}
     for item in collapsed:
         key = tuple(item[field] for field in PAIR_KEY)
@@ -374,11 +438,11 @@ def build_run_rows(collapsed, expected_repeats):
         latency = modes["latency"]
         cpu = modes.get("cpu-phase")
         require(latency["performance_eligible"] == "true", "latency half is not formal")
-        require(latency["p02b_sentinel_result_sha256"], "latency half lacks P02B admission")
+        require_admission_fields(latency, "latency half")
         require(latency["current_digest_pass"] == "1", "latency digest gate failed")
         if cpu is not None:
             require(cpu["performance_eligible"] == "false", "CPU half must remain diagnostic")
-            require(cpu["p02b_sentinel_result_sha256"], "CPU half lacks P02B admission")
+            require_admission_fields(cpu, "CPU half")
             require(cpu["current_digest_pass"] == "1", "CPU digest gate failed")
             for field in PAIR_SHARED:
                 require(latency[field] == cpu[field], "paired-mode {} drift".format(field))
@@ -419,10 +483,20 @@ def build_run_rows(collapsed, expected_repeats):
             "profiles_sha256": latency["profiles_sha256"],
             "pristine_store_sha256": latency["pristine_store_sha256"],
             "pristine_store_manifest_sha256": latency["pristine_store_manifest_sha256"],
+            "admission_protocol": latency["admission_protocol"],
             "p02b_sentinel_result_sha256": latency["p02b_sentinel_result_sha256"],
             "p02b_pass_marker_sha256": latency["p02b_pass_marker_sha256"],
             "p02b_provenance_sha256": latency["p02b_provenance_sha256"],
             "p02b_validator_sha256": latency["p02b_validator_sha256"],
+            "p02b_admission_sha256": latency["p02b_admission_sha256"],
+            "batch_lease_sha256": latency["batch_lease_sha256"],
+            "batch_gate_tool_sha256": latency["batch_gate_tool_sha256"],
+            "batch_lease_admission_sha256": latency["batch_lease_admission_sha256"],
+            "batch_lease_pre_p31_sha256": latency["batch_lease_pre_p31_sha256"],
+            "p31_integrity_guard_status_sha256": latency["p31_integrity_guard_status_sha256"],
+            "p31_integrity_guard_samples_sha256": latency["p31_integrity_guard_samples_sha256"],
+            "p31_integrity_guard_ready_sha256": latency["p31_integrity_guard_ready_sha256"],
+            "p31_command_release_sha256": latency["p31_command_release_sha256"],
             "latency_summary_sha256": latency["summary_sha256"],
             "cpu_phase_summary_sha256": "" if cpu is None else cpu["summary_sha256"],
         }

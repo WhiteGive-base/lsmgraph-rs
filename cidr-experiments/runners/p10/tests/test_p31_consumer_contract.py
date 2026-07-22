@@ -149,6 +149,40 @@ class FormalP31ConsumerTests(unittest.TestCase):
             self.assertEqual(summary["manifest_sha256"], sha256_file(run_dir / "run-manifest.json"))
             self.assertEqual(summary["validation_sha256"], sha256_file(run_dir / "validation.json"))
 
+    def test_formal_guard_is_allowed_but_must_match_embedded_summary(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="p31-consumer-guard-") as raw:
+            run_dir = Path(raw) / "run"
+            build_formal_run(run_dir)
+            guard = {
+                "state": "PASS",
+                "consumer": "P10",
+                "lease_sha256": "b" * 64,
+            }
+            validation_path = run_dir / "validation.json"
+            manifest_path = run_dir / "run-manifest.json"
+            done_path = run_dir / "DONE"
+            validation = load_json(validation_path)
+            manifest = load_json(manifest_path)
+            validation["integrity_guard"] = guard
+            manifest["validation"] = validation
+            manifest["summary"]["integrity_guard"] = guard
+            write_json(validation_path, validation)
+            write_json(manifest_path, manifest)
+            done = load_json(done_path)
+            done["manifest_sha256"] = sha256_file(manifest_path)
+            done["validation_sha256"] = sha256_file(validation_path)
+            write_json(done_path, done)
+            self.assertEqual(
+                read_p31_summary(run_dir, performance_eligible=True)["integrity_guard"],
+                guard,
+            )
+
+            manifest["summary"]["integrity_guard"] = {**guard, "state": "FAILED"}
+            write_json(manifest_path, manifest)
+            refresh_done_manifest_sha(run_dir)
+            with self.assertRaises(ContractError):
+                read_p31_summary(run_dir, performance_eligible=True)
+
     def test_rejects_any_tampered_closed_file(self) -> None:
         def append(name: str) -> Callable[[Path], None]:
             def mutate(run_dir: Path) -> None:

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -40,6 +41,7 @@ from validate_clean_ready import validate_clean_ready
 CONFIG_SCHEMA = "p02b-sf10-sentinel-config-v1"
 RESULT_SCHEMA = "p02b-sf10-sentinel-result-v1"
 CACHE_POLICY = "no-drop-caches;independent-process;in-process-warmup;os-cache-as-is"
+CLEAN_PROTOCOL_V2 = "short-clean-window-v2"
 
 
 def utc_now() -> str:
@@ -176,8 +178,20 @@ def validate_config(path: Path) -> Dict[str, Any]:
     clean = config.get("clean_ready")
     if not isinstance(clean, dict):
         raise GateError("clean_ready must be an object")
-    require_keys(clean, {"max_age_seconds", "minimum_consecutive_samples"}, "clean_ready")
-    reject_unknown_keys(clean, {"max_age_seconds", "minimum_consecutive_samples"}, "clean_ready")
+    clean_protocol = clean.get("protocol_version")
+    if clean_protocol is None:
+        clean_keys = {"max_age_seconds", "minimum_consecutive_samples"}
+    elif clean_protocol == CLEAN_PROTOCOL_V2:
+        clean_keys = {
+            "protocol_version",
+            "max_age_seconds",
+            "minimum_consecutive_samples",
+            "sample_interval_seconds",
+        }
+    else:
+        raise GateError("clean_ready.protocol_version is unsupported")
+    require_keys(clean, clean_keys, "clean_ready")
+    reject_unknown_keys(clean, clean_keys, "clean_ready")
     if isinstance(clean["max_age_seconds"], bool) or not isinstance(clean["max_age_seconds"], (int, float)):
         raise GateError("clean_ready.max_age_seconds must be numeric")
     if isinstance(clean["minimum_consecutive_samples"], bool) or not isinstance(
@@ -186,12 +200,22 @@ def validate_config(path: Path) -> Dict[str, Any]:
         raise GateError("clean_ready.minimum_consecutive_samples must be an integer")
     if clean["max_age_seconds"] <= 0 or clean["minimum_consecutive_samples"] < 1:
         raise GateError("clean_ready limits are invalid")
+    if clean_protocol == CLEAN_PROTOCOL_V2:
+        interval = clean.get("sample_interval_seconds")
+        if isinstance(interval, bool) or not isinstance(interval, int):
+            raise GateError("clean_ready.sample_interval_seconds must be an integer")
+        if clean["minimum_consecutive_samples"] != 5 or interval != 60:
+            raise GateError("short-clean-window-v2 is frozen at exactly 5 x 60 seconds")
+        if clean["max_age_seconds"] > 300:
+            raise GateError("short-clean-window-v2 READY age may not exceed 300 seconds")
 
     if not fixture:
         if config["independent_runs"] != 3 or config["expected_queries"] != 1700:
             raise GateError("formal P02B must use exactly 3 runs and 1700 queries")
-        if clean["minimum_consecutive_samples"] < 10 or clean["max_age_seconds"] > 300:
-            raise GateError("formal P02B requires >=10 clean samples and READY age <=300s")
+        if clean_protocol is None and (
+            clean["minimum_consecutive_samples"] < 10 or clean["max_age_seconds"] > 300
+        ):
+            raise GateError("formal legacy P02B requires >=10 clean samples and READY age <=300s")
     return config
 
 
@@ -453,6 +477,92 @@ def assert_inputs_unchanged(provenance: Dict[str, Any]) -> None:
             raise GateError("frozen input changed during sentinel: {}".format(name))
 
 
+def canonical_batch_gate(repo: Path, selected: Optional[Path]) -> Path:
+    expected = (repo / "cidr-experiments/runners/batch_gate_v2.py").resolve()
+    gate = resolved_existing_file(selected or expected, "batch gate v2")
+    if gate != expected:
+        raise GateError("batch gate tool must be the canonical repository copy: {}".format(expected))
+    return gate
+
+
+def validate_v2_clean_ready(
+    ready: Path,
+    config: Dict[str, Any],
+    repo: Path,
+    git: Dict[str, Any],
+    gate: Path,
+    output: Path,
+) -> Dict[str, Any]:
+    command = [
+        sys.executable,
+        str(gate),
+        "validate-p03",
+        "--ready",
+        str(ready),
+        "--expected-repo-head",
+        str(git["head"]),
+        "--expected-hostname",
+        socket.gethostname(),
+        "--max-age-seconds",
+        str(config["clean_ready"]["max_age_seconds"]),
+        "--output",
+        str(output),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise GateError(
+            "batch gate rejected short P03 READY: {}".format(completed.stderr.strip())
+        )
+    value = read_json(output)
+    required_samples = value.get("required_consecutive_samples")
+    if (
+        value.get("schema_version") != "p02b-clean-ready-binding-v2"
+        or value.get("state") != "PASS"
+        or value.get("protocol_version") != CLEAN_PROTOCOL_V2
+        or isinstance(required_samples, bool)
+        or not isinstance(required_samples, int)
+        or required_samples < config["clean_ready"]["minimum_consecutive_samples"]
+        or value.get("git_head") != git["head"]
+        or value.get("host") != socket.gethostname()
+    ):
+        raise GateError("short P03 binding identity/protocol drift")
+    timing = value.get("timing")
+    if (
+        not isinstance(timing, dict)
+        or timing.get("expected_interval_seconds")
+        != config["clean_ready"]["sample_interval_seconds"]
+        or timing.get("gap_check_pass") is not True
+    ):
+        raise GateError("short P03 binding lacks frozen gap evidence")
+    return value
+
+
+def assert_current_formal_identity(
+    repo: Path,
+    binary: Path,
+    expected_git: Dict[str, Any],
+    expected_binary: Dict[str, Any],
+    expected_hostname: str,
+) -> None:
+    current_git = git_facts(repo)
+    if (
+        current_git.get("root") != expected_git.get("root")
+        or current_git.get("head") != expected_git.get("head")
+        or current_git.get("dirty") is not False
+    ):
+        raise GateError("repository HEAD/clean identity changed before correctness")
+    if socket.gethostname() != expected_hostname:
+        raise GateError("host identity changed before correctness")
+    if file_ref(binary) != expected_binary:
+        raise GateError("benchmark binary identity changed before correctness")
+
+
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     started_at = utc_now()
     run_dir = ensure_new_directory(args.run_dir)
@@ -472,6 +582,18 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     )
     config = validate_config(config_path)
     fixture_mode = bool(config["fixture_mode"])
+    clean_protocol = config["clean_ready"].get("protocol_version")
+    batch_gate = None  # type: Optional[Path]
+    if clean_protocol == CLEAN_PROTOCOL_V2:
+        batch_gate = canonical_batch_gate(repo, args.batch_gate_tool)
+        if fixture_mode:
+            if args.batch_lease_output is not None:
+                raise GateError("fixture P02B may not issue a formal batch lease")
+        else:
+            if args.batch_lease_output is None or not args.batch_lease_output.is_absolute():
+                raise GateError("formal short-clean-window-v2 requires absolute --batch-lease-output")
+    elif args.batch_lease_output is not None or args.batch_gate_tool is not None:
+        raise GateError("batch gate/lease options require short-clean-window-v2 config")
     if not fixture_mode:
         allowed_root = (repo / "cidr-experiments/runs/P02B-SF10-SENTINEL/raw").resolve()
         if allowed_root not in run_dir.parents:
@@ -480,12 +602,25 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     git = git_facts(repo)
     if not fixture_mode and git["dirty"]:
         raise GateError("formal P02B requires a clean Git worktree")
-    clean_binding = validate_clean_ready(
-        args.clean_ready,
-        float(config["clean_ready"]["max_age_seconds"]),
-        int(config["clean_ready"]["minimum_consecutive_samples"]),
-    )
-    atomic_write_json(run_dir / "clean-ready-binding.json", clean_binding)
+    clean_binding_path = run_dir / "clean-ready-binding.json"
+    if clean_protocol == CLEAN_PROTOCOL_V2:
+        if batch_gate is None:
+            raise GateError("short-clean-window-v2 gate resolution failed")
+        clean_binding = validate_v2_clean_ready(
+            args.clean_ready,
+            config,
+            repo,
+            git,
+            batch_gate,
+            clean_binding_path,
+        )
+    else:
+        clean_binding = validate_clean_ready(
+            args.clean_ready,
+            float(config["clean_ready"]["max_age_seconds"]),
+            int(config["clean_ready"]["minimum_consecutive_samples"]),
+        )
+        atomic_write_json(clean_binding_path, clean_binding)
 
     dataset_lineage = validate_lineage_manifest(
         dataset_manifest_path,
@@ -530,6 +665,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "clean_ready_binding_sha256": sha256_file(run_dir / "clean-ready-binding.json"),
     }
     atomic_write_json(run_dir / "provenance.json", provenance)
+
+    if not fixture_mode:
+        assert_current_formal_identity(
+            repo,
+            binary,
+            git,
+            provenance["files"]["binary"],
+            socket.gethostname(),
+        )
 
     generated_plan = run_dir / "regenerated-query-plan.json"
     truth_result_path = run_dir / "shared-truth-result.json"
@@ -778,6 +922,66 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     return result
 
 
+def issue_batch_lease(args: argparse.Namespace, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    clean = result.get("clean_ready")
+    if not isinstance(clean, dict) or clean.get("protocol_version") != CLEAN_PROTOCOL_V2:
+        return None
+    if result.get("fixture_only") is True:
+        return None
+    if args.batch_lease_output is None:
+        raise GateError("short-clean-window-v2 formal PASS omitted --batch-lease-output")
+    repo = resolved_existing_dir(args.repo_root, "repo root")
+    gate = canonical_batch_gate(repo, args.batch_gate_tool)
+    validator = resolved_existing_file(
+        repo / "cidr-experiments/runners/p02b/validate_sentinel_result.py",
+        "canonical P02B validator",
+    )
+    result_path = resolved_existing_file(args.run_dir / "sentinel-result.json", "P02B result")
+    command = [
+        sys.executable,
+        str(gate),
+        "issue-lease",
+        "--p02b-result",
+        str(result_path),
+        "--p02b-validator",
+        str(validator),
+        "--repo-root",
+        str(repo),
+        "--binary",
+        str(resolved_existing_file(args.binary, "benchmark binary", executable=True)),
+        "--output",
+        str(args.batch_lease_output),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise GateError("batch lease issuance failed: {}".format(completed.stderr.strip()))
+    lease_path = resolved_existing_file(args.batch_lease_output, "issued batch lease")
+    lease_marker = resolved_existing_file(
+        lease_path.with_name(lease_path.name + ".PASS.json"), "batch lease marker"
+    )
+    try:
+        lease = json.loads(completed.stdout)
+    except ValueError as exc:
+        raise GateError("batch gate emitted invalid lease JSON") from exc
+    if not isinstance(lease, dict) or lease.get("state") != "PASS":
+        raise GateError("batch gate did not emit a PASS lease")
+    receipt = {
+        "schema_version": "p02b-batch-lease-issuance-v2",
+        "state": "PASS",
+        "issued_at_utc": utc_now(),
+        "lease": file_ref(lease_path),
+        "lease_marker": file_ref(lease_marker),
+    }
+    atomic_write_json(args.run_dir / "BATCH-LEASE-ISSUED.json", receipt)
+    return receipt
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True, type=Path)
@@ -792,11 +996,11 @@ def main() -> int:
     parser.add_argument("--id-map-dir", required=True, type=Path)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--p31-wrapper", type=Path)
+    parser.add_argument("--batch-gate-tool", type=Path)
+    parser.add_argument("--batch-lease-output", type=Path)
     args = parser.parse_args()
     try:
         result = run(args)
-        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
     except (GateError, OSError, ValueError, subprocess.SubprocessError) as exc:
         try:
             if args.run_dir.exists() and args.run_dir.is_dir():
@@ -811,6 +1015,29 @@ def main() -> int:
             pass
         print("ERROR: {}".format(exc), file=sys.stderr)
         return 2
+    try:
+        lease_receipt = issue_batch_lease(args, result)
+    except (GateError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        try:
+            atomic_write_json(
+                args.run_dir / "BATCH-LEASE-FAILED.json",
+                {
+                    "schema_version": "p02b-batch-lease-issuance-v2",
+                    "state": "FAILED",
+                    "failed_at_utc": utc_now(),
+                    "p02b_pass_preserved": True,
+                    "error": str(exc),
+                },
+            )
+        except OSError:
+            pass
+        print("ERROR: {}".format(exc), file=sys.stderr)
+        return 3
+    output = dict(result)
+    if lease_receipt is not None:
+        output["batch_lease_issuance"] = lease_receipt
+    print(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":

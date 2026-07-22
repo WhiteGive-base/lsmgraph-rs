@@ -208,6 +208,38 @@ def create_manifest(args: argparse.Namespace) -> int:
         raise ValueError("container names must be non-empty")
     if len(args.extra_pid) != len(set(args.extra_pid)) or any(pid <= 0 for pid in args.extra_pid):
         raise ValueError("extra PIDs must be unique positive integers")
+    batch_values = (
+        args.batch_lease,
+        args.batch_gate_tool,
+        args.batch_consumer,
+        args.batch_anchor_binary,
+    )
+    if any(value is not None for value in batch_values) and not all(
+        value is not None for value in batch_values
+    ):
+        raise ValueError("batch gate options must be supplied together")
+    batch_gate = None
+    if all(value is not None for value in batch_values):
+        if args.batch_consumer not in {"P10", "P20"}:
+            raise ValueError("batch consumer must be P10 or P20")
+        lease_ref = artifact_ref(str(args.batch_lease.resolve()))
+        tool_ref = artifact_ref(str(args.batch_gate_tool.resolve()))
+        anchor_ref = artifact_ref(str(args.batch_anchor_binary.resolve()))
+        for name, reference in (
+            ("lease", lease_ref),
+            ("gate tool", tool_ref),
+            ("anchor binary", anchor_ref),
+        ):
+            if reference["kind"] != "file":
+                raise ValueError(f"batch {name} is not a current file")
+        batch_gate = {
+            "protocol_version": "short-clean-window-v2",
+            "consumer": args.batch_consumer,
+            "lease": lease_ref,
+            "gate_tool": tool_ref,
+            "anchor_binary": anchor_ref,
+            "integrity_guard_required": True,
+        }
     named_specs = [parse_named_input(raw) for raw in args.input]
     named_labels = [label for label, _, _ in named_specs]
     reserved_inputs = {"binary", "dataset", "truth", "query_or_trace", "config"}
@@ -313,6 +345,8 @@ def create_manifest(args: argparse.Namespace) -> int:
         "summary": {},
         "validation": {"state": "NOT_RUN", "errors": [], "warnings": []},
     }
+    if batch_gate is not None:
+        manifest["batch_gate"] = batch_gate
     atomic_json(manifest_path, manifest)
     return 0
 
@@ -330,6 +364,23 @@ def record_execution(args: argparse.Namespace) -> int:
         "collector_exit_code": args.collector_exit_code,
         "wrapper_signal": args.wrapper_signal,
     }
+    batch_execution_values = (
+        args.command_release_at_utc,
+        args.command_ended_at_utc,
+        args.guard_exit_code,
+    )
+    if any(value is not None for value in batch_execution_values) and not all(
+        value is not None for value in batch_execution_values
+    ):
+        raise ValueError("batch execution fields must be supplied together")
+    if all(value is not None for value in batch_execution_values):
+        execution.update(
+            {
+                "command_release_at_utc": args.command_release_at_utc,
+                "command_ended_at_utc": args.command_ended_at_utc,
+                "guard_exit_code": args.guard_exit_code,
+            }
+        )
     atomic_json(run_dir / "execution.json", execution)
     manifest.update(
         {
@@ -342,6 +393,14 @@ def record_execution(args: argparse.Namespace) -> int:
             "wrapper_signal": args.wrapper_signal,
         }
     )
+    if all(value is not None for value in batch_execution_values):
+        manifest.update(
+            {
+                "command_release_at_utc": args.command_release_at_utc,
+                "command_ended_at_utc": args.command_ended_at_utc,
+                "guard_exit_code": args.guard_exit_code,
+            }
+        )
     atomic_json(manifest_path, manifest)
     return 0
 
@@ -387,6 +446,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--temp", action="append", default=[])
     create.add_argument("--container", action="append", default=[])
     create.add_argument("--extra-pid", action="append", default=[], type=int)
+    create.add_argument("--batch-lease", type=Path)
+    create.add_argument("--batch-gate-tool", type=Path)
+    create.add_argument("--batch-consumer")
+    create.add_argument("--batch-anchor-binary", type=Path)
     for name in ("binary", "dataset", "truth", "query-or-trace", "config"):
         create.add_argument(f"--{name}")
         create.add_argument(f"--{name}-sha256")
@@ -405,6 +468,9 @@ def build_parser() -> argparse.ArgumentParser:
     execution.add_argument("--ended-at-utc", required=True)
     execution.add_argument("--command-exit-code", required=True, type=int)
     execution.add_argument("--collector-exit-code", required=True, type=int)
+    execution.add_argument("--command-release-at-utc")
+    execution.add_argument("--command-ended-at-utc")
+    execution.add_argument("--guard-exit-code", type=int)
     execution.add_argument("--wrapper-signal", type=int)
     execution.set_defaults(handler=record_execution)
 

@@ -95,10 +95,20 @@ def collapsed(stage, repeat, mode):
         "latency_histogram_json": "{}",
         "summary_path": "/fixture",
         "summary_sha256": ("6" if mode == "latency" else "7") * 64,
+        "admission_protocol": "legacy-p02b-admission-v1",
         "p02b_sentinel_result_sha256": "8" * 64,
         "p02b_pass_marker_sha256": "9" * 64,
         "p02b_provenance_sha256": "a" * 64,
         "p02b_validator_sha256": "b" * 64,
+        "p02b_admission_sha256": "c" * 64,
+        "batch_lease_sha256": "",
+        "batch_gate_tool_sha256": "",
+        "batch_lease_admission_sha256": "",
+        "batch_lease_pre_p31_sha256": "",
+        "p31_integrity_guard_status_sha256": "",
+        "p31_integrity_guard_samples_sha256": "",
+        "p31_integrity_guard_ready_sha256": "",
+        "p31_command_release_sha256": "",
     }
     return value
 
@@ -194,6 +204,32 @@ class Figure2AggregatorTest(unittest.TestCase):
             and value["mode"] == "cpu-phase"
         )
         cpu["p02b_sentinel_result_sha256"] = "0" * 64
+        with self.assertRaises(MODULE.AggregateError):
+            MODULE.build_run_rows(values, 3)
+
+    def test_one_aggregation_batch_cannot_mix_legacy_and_v2(self):
+        values = self.canonical_inputs()
+        item = values[0]
+        item["admission_protocol"] = "short-clean-window-v2"
+        for field in (
+            "p02b_sentinel_result_sha256",
+            "p02b_pass_marker_sha256",
+            "p02b_provenance_sha256",
+            "p02b_validator_sha256",
+            "p02b_admission_sha256",
+        ):
+            item[field] = ""
+        for field in (
+            "batch_lease_sha256",
+            "batch_gate_tool_sha256",
+            "batch_lease_admission_sha256",
+            "batch_lease_pre_p31_sha256",
+            "p31_integrity_guard_status_sha256",
+            "p31_integrity_guard_samples_sha256",
+            "p31_integrity_guard_ready_sha256",
+            "p31_command_release_sha256",
+        ):
+            item[field] = "d" * 64
         with self.assertRaises(MODULE.AggregateError):
             MODULE.build_run_rows(values, 3)
 
