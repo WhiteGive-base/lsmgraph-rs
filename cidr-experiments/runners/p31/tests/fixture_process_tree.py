@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -45,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temp", required=True, type=Path)
     parser.add_argument("--seconds", type=float, default=4.0)
     parser.add_argument("--exit-code", type=int, default=0)
+    parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--child", action="store_true")
     return parser.parse_args()
 
@@ -57,6 +59,10 @@ def child(args: argparse.Namespace) -> int:
 
 
 def parent(args: argparse.Namespace) -> int:
+    if args.ready_file is not None:
+        ready = json.loads(args.ready_file.read_text(encoding="utf-8"))
+        if ready.get("state") != "READY" or ready.get("resource_sample_index") != 0:
+            raise RuntimeError("adapter fixture was released without a first-sample collector gate")
     files = [
         (args.store / "levels" / "base.edge", 1024 * 1024, b"payload"),
         (args.store / "metadata.idx", 256 * 1024, b"metadata"),

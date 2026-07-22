@@ -9,7 +9,7 @@
   "process_lifetime": "external-prestarted-query-process-lifetime-v1",
   "adapter": {
     "path": "${REPO_ROOT}/cidr-experiments/runners/p10/adapters/nebulagraph/nebula_adapter.py",
-    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "sha256": "REPLACE_ADAPTER_SHA256",
     "args": [
       "--service-mode",
       "external-prestarted",
@@ -18,19 +18,33 @@
       "--runtime-manifest-sha256",
       "REPLACE_RUNTIME_MANIFEST_SHA256",
       "--store-manifest",
-      "/ABS/P10-NEBULA/store-manifest.json",
+      "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-01/store-manifest.json",
       "--store-manifest-sha256",
-      "REPLACE_STORE_MANIFEST_SHA256",
+      "REPLACE_STORE_MANIFEST_SHA256_R01",
       "--p02b-result",
       "/ABS/P02B/result.json",
+      "--p02b-result-sha256",
+      "REPLACE_P02B_RESULT_SHA256",
       "--p02b-validator",
       "${REPO_ROOT}/cidr-experiments/runners/p02b/validate_sentinel_result.py",
       "--p02b-validator-sha256",
-      "REPLACE_P02B_VALIDATOR_SHA256"
+      "REPLACE_P02B_VALIDATOR_SHA256",
+      "--p02b-binary",
+      "${REPO_ROOT}/target/release/lsmgraph",
+      "--p02b-binary-sha256",
+      "REPLACE_P02B_BINARY_SHA256",
+      "--p02b-max-age-seconds",
+      "21600",
+      "--repo-root",
+      "${REPO_ROOT}",
+      "--cluster-controller",
+      "${REPO_ROOT}/cidr-experiments/runners/p10/adapters/nebulagraph/formal_cluster.py",
+      "--cluster-controller-sha256",
+      "REPLACE_FORMAL_CLUSTER_SHA256"
     ]
   },
   "binary": {
-    "path": "/usr/bin/python3.10",
+    "path": "/usr/bin/python3.8",
     "sha256": "REPLACE_PYTHON_SHA256"
   },
   "runtime_libraries": [
@@ -42,20 +56,114 @@
   "store_roots": [
     {
       "label": "nebulagraph",
-      "path": "/ABS/P10-NEBULA/sf10-store-copy",
+      "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-01/sf10-store-copy",
       "sha256": "REPLACE_PRE_SERVICE_STORE_TREE_SHA256"
     }
   ],
-  "temp_roots": [],
+  "temp_roots": [
+    {
+      "label": "nebulagraph-logs",
+      "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-01/logs"
+    }
+  ],
   "containers": [
-    "cidr-p10-nebula-graph",
-    "cidr-p10-nebula-meta",
-    "cidr-p10-nebula-storage"
+    "cidr-p10-nebula-graph-REPLACE_RUN_TOKEN-r01",
+    "cidr-p10-nebula-meta-REPLACE_RUN_TOKEN-r01",
+    "cidr-p10-nebula-storage-REPLACE_RUN_TOKEN-r01"
   ],
   "extra_pids": [],
   "image_digests": [
     "sha256:1040573cc684ea6cc5e673b667422e9abab607c9d553c2c17c7bac6ad8a74e05",
     "sha256:ab687bd32d3e441d436842b41427ba0961a5e169c46997ef03fa4dcfd5388b35",
     "sha256:7142642ee69001a5b5c50520196538d58bb2ec3930707c067cb4c4e2be3890f9"
+  ],
+  "repeat_bindings": [
+    {
+      "repeat_index": 1,
+      "repeat_root": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-01",
+      "source_store_root": "/ABS/P10-NEBULA/golden-sf10-store",
+      "store_root": {
+        "label": "nebulagraph",
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-01/sf10-store-copy",
+        "sha256": "REPLACE_PRE_SERVICE_STORE_TREE_SHA256"
+      },
+      "logs_root": {
+        "label": "nebulagraph-logs",
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-01/logs"
+      },
+      "containers": {
+        "metad": "cidr-p10-nebula-meta-REPLACE_RUN_TOKEN-r01",
+        "storaged": "cidr-p10-nebula-storage-REPLACE_RUN_TOKEN-r01",
+        "graphd": "cidr-p10-nebula-graph-REPLACE_RUN_TOKEN-r01"
+      },
+      "network": "cidr-p10-nebula-REPLACE_RUN_TOKEN-r01-net",
+      "graph_port": 29669,
+      "store_manifest": {
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-01/store-manifest.json",
+        "sha256": "REPLACE_STORE_MANIFEST_SHA256_R01"
+      },
+      "clone_receipt": {
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-01/clone-receipt.json",
+        "sha256": "REPLACE_CLONE_RECEIPT_SHA256_R01"
+      }
+    },
+    {
+      "repeat_index": 2,
+      "repeat_root": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-02",
+      "source_store_root": "/ABS/P10-NEBULA/golden-sf10-store",
+      "store_root": {
+        "label": "nebulagraph",
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-02/sf10-store-copy",
+        "sha256": "REPLACE_PRE_SERVICE_STORE_TREE_SHA256"
+      },
+      "logs_root": {
+        "label": "nebulagraph-logs",
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-02/logs"
+      },
+      "containers": {
+        "metad": "cidr-p10-nebula-meta-REPLACE_RUN_TOKEN-r02",
+        "storaged": "cidr-p10-nebula-storage-REPLACE_RUN_TOKEN-r02",
+        "graphd": "cidr-p10-nebula-graph-REPLACE_RUN_TOKEN-r02"
+      },
+      "network": "cidr-p10-nebula-REPLACE_RUN_TOKEN-r02-net",
+      "graph_port": 29670,
+      "store_manifest": {
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-02/store-manifest.json",
+        "sha256": "REPLACE_STORE_MANIFEST_SHA256_R02"
+      },
+      "clone_receipt": {
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-02/clone-receipt.json",
+        "sha256": "REPLACE_CLONE_RECEIPT_SHA256_R02"
+      }
+    },
+    {
+      "repeat_index": 3,
+      "repeat_root": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-03",
+      "source_store_root": "/ABS/P10-NEBULA/golden-sf10-store",
+      "store_root": {
+        "label": "nebulagraph",
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-03/sf10-store-copy",
+        "sha256": "REPLACE_PRE_SERVICE_STORE_TREE_SHA256"
+      },
+      "logs_root": {
+        "label": "nebulagraph-logs",
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-03/logs"
+      },
+      "containers": {
+        "metad": "cidr-p10-nebula-meta-REPLACE_RUN_TOKEN-r03",
+        "storaged": "cidr-p10-nebula-storage-REPLACE_RUN_TOKEN-r03",
+        "graphd": "cidr-p10-nebula-graph-REPLACE_RUN_TOKEN-r03"
+      },
+      "network": "cidr-p10-nebula-REPLACE_RUN_TOKEN-r03-net",
+      "graph_port": 29671,
+      "store_manifest": {
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-03/store-manifest.json",
+        "sha256": "REPLACE_STORE_MANIFEST_SHA256_R03"
+      },
+      "clone_receipt": {
+        "path": "/ABS/P10-NEBULA/REPLACE_RUN_ID/repeat-03/clone-receipt.json",
+        "sha256": "REPLACE_CLONE_RECEIPT_SHA256_R03"
+      }
+    }
   ]
 }

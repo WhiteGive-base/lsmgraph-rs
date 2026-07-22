@@ -45,33 +45,26 @@ from p10_contract import (  # noqa: E402
     read_truth,
     sha256_file,
 )
+import store_contract as store_v2  # noqa: E402
+
+P31_DIR = P10_DIR.parent / "p31"
+sys.path.insert(0, str(P31_DIR))
+from run_manifest import host_facts as p31_host_facts  # noqa: E402
 
 
 RUNTIME_SCHEMA = "cidr-p10-nebulagraph-runtime-v1"
-STORE_SCHEMA = "cidr-p10-nebulagraph-store-v1"
+STORE_SCHEMA = store_v2.STORE_SCHEMA
 PROVENANCE_SCHEMA = "p10-nebulagraph-adapter-provenance-v1"
 TREE_HASH_METHOD = "sha256-tree-v1(relative-path,size,file-sha256)"
-FORMAL_TRUTH_SHA256 = "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
-FORMAL_QUERY_COUNT = 1700
+FORMAL_DATASET_SHA256 = store_v2.FORMAL_DATASET_SHA256
+FORMAL_TRUTH_SHA256 = store_v2.FORMAL_TRUTH_SHA256
+FORMAL_QUERY_COUNT = store_v2.FORMAL_QUERY_COUNT
 MASK = (1 << 64) - 1
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 EDGE_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-EXPECTED_IMAGES = {
-    "graphd": {
-        "tag": "vesoft/nebula-graphd:v3.8.0",
-        "digest": "sha256:1040573cc684ea6cc5e673b667422e9abab607c9d553c2c17c7bac6ad8a74e05",
-    },
-    "metad": {
-        "tag": "vesoft/nebula-metad:v3.8.0",
-        "digest": "sha256:ab687bd32d3e441d436842b41427ba0961a5e169c46997ef03fa4dcfd5388b35",
-    },
-    "storaged": {
-        "tag": "vesoft/nebula-storaged:v3.8.0",
-        "digest": "sha256:7142642ee69001a5b5c50520196538d58bb2ec3930707c067cb4c4e2be3890f9",
-    },
-}
+EXPECTED_IMAGES = store_v2.EXPECTED_IMAGES
 
 
 def unique_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
@@ -196,14 +189,18 @@ def validate_file_ref(value: object, context: str) -> Path:
     return path
 
 
-def validate_request(path: Path, store_label: str) -> tuple[dict[str, Any], list[dict[str, int]], Path, Path, Path]:
+def validate_request(
+    path: Path,
+    store_label: str,
+    sealed_admission: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, int]], Path, Path, Path]:
     request = exact_keys(
         read_strict_json(path, "NebulaGraph request"),
         (
             "schema_version", "contract_version", "suite_id", "run_id", "execution_mode",
             "system_id", "group", "system_version", "interface_scope", "repeat_index",
             "process_lifetime", "binary", "dataset", "runtime_libraries", "store_roots",
-            "truth", "timing",
+            "truth", "timing", "external_service",
         ),
         "NebulaGraph request",
     )
@@ -229,7 +226,20 @@ def validate_request(path: Path, store_label: str) -> tuple[dict[str, Any], list
     binary = validate_file_ref(request["binary"], "request.binary")
     if binary != Path(sys.executable).resolve():
         raise ContractError("request.binary must be the Python interpreter running the adapter")
-    dataset = validate_file_ref(request["dataset"], "request.dataset")
+    if sealed_admission is None:
+        dataset = validate_file_ref(request["dataset"], "request.dataset")
+    else:
+        sealed_dataset = sealed_admission.get("artifacts", {}).get("dataset")
+        if not isinstance(sealed_dataset, dict):
+            raise ContractError("sealed admission lacks the dense dataset binding")
+        dataset = canonical_path(request["dataset"]["path"], "request.dataset.path", file=True)
+        if (
+            Path(str(sealed_dataset.get("path", ""))).resolve() != dataset
+            or sealed_dataset.get("sha256") != request["dataset"].get("sha256")
+        ):
+            raise ContractError("request dataset differs from sealed admission")
+    if mode == "formal" and request["dataset"]["sha256"] != FORMAL_DATASET_SHA256:
+        raise ContractError("formal NebulaGraph requires the canonical SF10 dense dataset")
     raw_libraries = request["runtime_libraries"]
     if not isinstance(raw_libraries, list):
         raise ContractError("request.runtime_libraries must be an array")
@@ -280,6 +290,70 @@ def validate_request(path: Path, store_label: str) -> tuple[dict[str, Any], list
             raise ContractError(f"request.timing.{key} drift")
     for key in ("warmup_passes", "measured_passes", "per_query_timeout_ms"):
         integer(timing[key], f"request.timing.{key}", 1)
+    external_keys = ("service_lifecycle", "containers", "extra_pids", "image_digests")
+    if mode == "formal":
+        external_keys += ("orchestrated_lifecycle",)
+    external = exact_keys(request["external_service"], external_keys, "request.external_service")
+    if external["service_lifecycle"] != "external-prestarted":
+        raise ContractError("NebulaGraph requires service_lifecycle=external-prestarted")
+    containers = external["containers"]
+    if (
+        not isinstance(containers, list)
+        or len(containers) != 3
+        or any(not isinstance(name, str) or not NAME_RE.fullmatch(name) for name in containers)
+        or len(set(containers)) != 3
+    ):
+        raise ContractError("NebulaGraph requires exactly three distinct P31-visible containers")
+    if external["extra_pids"] != []:
+        raise ContractError("NebulaGraph requires empty extra_pids; P31 must observe the containers")
+    expected_digests = [EXPECTED_IMAGES[role]["digest"] for role in ("graphd", "metad", "storaged")]
+    if external["image_digests"] != expected_digests:
+        raise ContractError("NebulaGraph external_service image digests/order drift")
+    if mode == "formal":
+        lifecycle = exact_keys(
+            external["orchestrated_lifecycle"],
+            ("controller", "receipts", "logs_root"),
+            "request.external_service.orchestrated_lifecycle",
+        )
+        controller = validate_file_ref(lifecycle["controller"], "request lifecycle controller")
+        expected_controller = Path(__file__).resolve().with_name("formal_cluster.py")
+        if controller != expected_controller:
+            raise ContractError("request lifecycle controller is not the repository formal_cluster.py")
+        receipts = exact_keys(
+            lifecycle["receipts"],
+            (
+                "store_lock", "sealed_admission", "preflight", "partial_start", "start_cleanup",
+                "start", "live_gate", "stop",
+            ),
+            "request lifecycle receipt paths",
+        )
+        resolved_receipts: dict[str, Path] = {}
+        for name, raw_path in receipts.items():
+            if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+                raise ContractError(f"request lifecycle receipt path is not absolute: {name}")
+            resolved_receipts[name] = Path(raw_path).resolve(strict=False)
+        if resolved_receipts["live_gate"] != resolved_receipts["start"]:
+            raise ContractError("request live-gate receipt must be the launch-bound start receipt")
+        if len(set(resolved_receipts.values())) != 7:
+            raise ContractError("request lifecycle receipt paths unexpectedly alias")
+        logs_root = canonical_path(lifecycle["logs_root"], "request lifecycle logs_root", directory=True)
+        if logs_root == selected or logs_root in selected.parents or selected in logs_root.parents:
+            raise ContractError("request lifecycle logs and store roots overlap")
+        if sealed_admission is not None:
+            sealed_store = sealed_admission.get("store")
+            sealed_tree = sealed_store.get("tree") if isinstance(sealed_store, dict) else None
+            if (
+                not isinstance(sealed_store, dict)
+                or not isinstance(sealed_tree, dict)
+                or Path(str(sealed_store.get("path", ""))).resolve() != selected
+                or sealed_tree.get("sha256")
+                != next(
+                    item["sha256"]
+                    for item in request["store_roots"]
+                    if item["label"] == store_label
+                )
+            ):
+                raise ContractError("request store differs from sealed current-store audit")
     return request, truth_rows, dataset, truth, selected
 
 
@@ -349,27 +423,41 @@ def validate_store_manifest(
     dataset: Path,
     truth: Path,
     store: Path,
+    runtime_path: Path,
+    runtime_sha256: str,
+    runtime: dict[str, Any],
+    repo: dict[str, Any] | None,
+    p02b: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[int, str]]:
     value = exact_keys(
         read_strict_json(path, "NebulaGraph store manifest"),
         (
-            "schema_version", "system_version", "formal_eligible", "lineage_stage", "data_root",
-            "dataset", "truth", "space", "graph_endpoint", "authentication", "edge_type_labels",
-            "containers", "network", "import_provenance",
+            "schema_version", "system_version", "formal_eligible", "performance_eligible",
+            "lineage_stage", "data_root", "dataset", "truth", "space", "graph_endpoint",
+            "authentication", "edge_type_labels", "containers", "logical_hosts", "network",
+            "repo", "runtime_manifest", "import_receipt", "clone_receipt", "snapshot_safety",
         ),
         "NebulaGraph store manifest",
     )
     if value["schema_version"] != STORE_SCHEMA or value["system_version"] != request["system_version"]:
         raise ContractError("NebulaGraph store manifest schema/system version drift")
     formal = request["execution_mode"] == "formal"
-    if not isinstance(value["formal_eligible"], bool) or (formal and value["formal_eligible"] is not True):
-        raise ContractError("formal NebulaGraph requires a formal-eligible store manifest")
-    expected_stage = "pre-service-start-frozen-copy-v1" if formal else "empty-fixture-root-v1"
+    if value["formal_eligible"] is not formal or value["performance_eligible"] is not formal:
+        raise ContractError("store formal/performance eligibility differs from execution mode")
+    expected_stage = "offline-cloned-prestart-v2" if formal else "empty-fixture-root-v2"
     if value["lineage_stage"] != expected_stage:
         raise ContractError(f"store.lineage_stage must be {expected_stage!r}")
-    data_root, lineage = validate_tree_ref(value["data_root"], "store.data_root", recompute=not formal)
+    data_root, lineage = store_v2.validate_tree_ref(
+        value["data_root"],
+        "store.data_root",
+        expected_path=store,
+        recompute=not formal,
+        allow_empty=not formal,
+    )
     if data_root != store:
         raise ContractError("store manifest data root differs from P10 request")
+    if store_v2.paths_overlap(path, data_root):
+        raise ContractError("store manifest must be outside the mutable data root")
     requested = next(item for item in request["store_roots"] if item["label"] == "nebulagraph")
     if formal and requested["sha256"] != lineage["sha256"]:
         raise ContractError("formal request store lineage differs from store manifest")
@@ -413,45 +501,233 @@ def validate_store_manifest(
     truth_types = {row["edge_type"] for row in read_truth(truth, request["truth"]["query_count"])}
     if set(labels) != truth_types:
         raise ContractError("store edge-type map does not exactly cover truth")
-    containers = exact_keys(value["containers"], ("metad", "storaged", "graphd"), "store.containers")
-    names = list(containers.values())
-    if any(not isinstance(name, str) or not NAME_RE.fullmatch(name) for name in names) or len(set(names)) != 3:
-        raise ContractError("store container names are invalid or duplicate")
-    network = nonempty(value["network"], "store.network")
-    if not NAME_RE.fullmatch(network) or network in names:
-        raise ContractError("store network name is invalid")
-    provenance = exact_keys(value["import_provenance"], ("kind", "source", "result"), "store.import_provenance")
-    nonempty(provenance["kind"], "store.import_provenance.kind")
-    for key in ("source", "result"):
-        if provenance[key] is not None:
-            validate_file_ref(provenance[key], f"store.import_provenance.{key}")
+    if formal and len(labels) != 34:
+        raise ContractError("formal store must cover exactly 34 edge types")
+    containers, logical_hosts, network = store_v2.validate_identity_names(
+        value["containers"], value["logical_hosts"], value["network"], formal=formal
+    )
+    request_names = request["external_service"]["containers"]
+    manifest_names = [containers[role] for role in ("graphd", "metad", "storaged")]
+    if manifest_names != request_names:
+        raise ContractError("store container names differ from request.external_service")
+    safety = exact_keys(
+        value["snapshot_safety"],
+        ("offline_check_count", "symlink_policy", "manifest_outside_store", "output_noreplace"),
+        "store.snapshot_safety",
+    )
+    expected_offline_checks = 2 if formal else 0
+    if safety["offline_check_count"] != expected_offline_checks:
+        raise ContractError("store snapshot offline-check count drift")
+    if safety["symlink_policy"] != store_v2.SYMLINK_POLICY:
+        raise ContractError("store snapshot symlink policy drift")
+    if safety["manifest_outside_store"] is not True or safety["output_noreplace"] is not True:
+        raise ContractError("store snapshot lacks no-overwrite/outside-store evidence")
+
+    if formal:
+        if repo is None or p02b is None:
+            raise ContractError("formal store validation requires current Git and P02B state")
+        raw_manifest = p02b.get("canonical_dataset_manifest")
+        if not isinstance(raw_manifest, dict):
+            raise ContractError("formal P02B admission lacks canonical dataset manifest binding")
+        store_v2.validate_repo(value["repo"], repo, "store.repo")
+        store_v2.validate_file_ref(
+            value["runtime_manifest"],
+            "store.runtime_manifest",
+            expected_path=runtime_path,
+            expected_sha256=runtime_sha256,
+            recompute=False,
+        )
+        _, import_value = store_v2.validate_import_receipt(
+            value["import_receipt"],
+            repo=repo,
+            raw_dataset_manifest_path=Path(raw_manifest["path"]),
+            raw_dataset_manifest_sha256=raw_manifest["sha256"],
+            dataset_path=dataset,
+            dataset_sha256=request["dataset"]["sha256"],
+            truth_path=truth,
+            truth_sha256=request["truth"]["sha256"],
+            runtime_manifest_path=runtime_path,
+            runtime_manifest_sha256=runtime_sha256,
+            runtime_images=runtime["images"],
+            recompute_artifacts=True,
+        )
+        store_v2.validate_clone_receipt(
+            value["clone_receipt"],
+            repo=repo,
+            imported_tree=import_value["store"],
+            target_path=store,
+            target_tree=lineage,
+            run_id=request["run_id"],
+            repeat_index=request["repeat_index"],
+            recompute_tool=True,
+        )
+    else:
+        if any(value[key] is not None for key in ("repo", "runtime_manifest", "import_receipt", "clone_receipt")):
+            raise ContractError("fixture store must not claim formal repo/runtime/import/clone evidence")
+    # Keep the validated values referenced so an accidental parser-only field cannot be ignored.
+    if value["logical_hosts"] != logical_hosts or value["network"] != network:
+        raise ContractError("store logical/network identity normalization drift")
     return value, labels
 
 
-def consume_p02b(args: argparse.Namespace, formal: bool) -> dict[str, Any] | None:
-    supplied = (args.p02b_result, args.p02b_validator, args.p02b_validator_sha256)
+def git_state(repo_root: Path) -> dict[str, Any]:
+    repo = repo_root.resolve()
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+        ).strip()
+        status = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=normal"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ContractError(f"cannot audit Git repository: {exc}") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise ContractError("Git HEAD is not a full commit SHA")
+    return {
+        "root": str(repo),
+        "head": head,
+        "clean": status == "",
+        "status_sha256": hashlib.sha256(status.encode()).hexdigest(),
+    }
+
+
+def same_path(value: object, expected: Path, context: str) -> None:
+    if not isinstance(value, str) or Path(value).resolve() != expected.resolve():
+        raise ContractError(f"{context}: path mismatch")
+
+
+def consume_p02b(
+    args: argparse.Namespace,
+    formal: bool,
+    request: dict[str, Any] | None = None,
+    repo: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    supplied = (
+        args.p02b_result,
+        args.p02b_result_sha256,
+        args.p02b_validator,
+        args.p02b_validator_sha256,
+        args.p02b_binary,
+        args.p02b_binary_sha256,
+    )
     if not formal:
         if any(item is not None for item in supplied):
             raise ContractError("fixture NebulaGraph run must not claim a P02B formal admission")
         return None
     if any(item is None for item in supplied):
-        raise ContractError("formal NebulaGraph run requires P02B result/validator/SHA-256")
+        raise ContractError("formal NebulaGraph run requires a complete P02B result/validator/binary SHA-bound set")
+    if args.p02b_max_age_seconds <= 0:
+        raise ContractError("--p02b-max-age-seconds must be positive")
+    if request is None or repo is None or repo.get("clean") is not True:
+        raise ContractError("formal NebulaGraph P02B admission requires the current clean Git state")
     validator = checked_file(args.p02b_validator, args.p02b_validator_sha256, "P02B validator", executable=True)
-    result = args.p02b_result.resolve()
-    if not result.is_file():
-        raise ContractError("P02B result does not exist")
+    result = checked_file(args.p02b_result, args.p02b_result_sha256, "P02B result")
+    binary = checked_file(args.p02b_binary, args.p02b_binary_sha256, "P02B binary", executable=True)
+    command = [
+        str(validator),
+        "--result",
+        str(result),
+        "--consumer",
+        "P10",
+        "--expected-repo-root",
+        repo["root"],
+        "--expected-repo-head",
+        repo["head"],
+        "--expected-binary-sha256",
+        sha256_file(binary),
+        "--require-formal",
+        "--max-age-seconds",
+        str(args.p02b_max_age_seconds),
+    ]
     completed = subprocess.run(
-        [sys.executable, "-B", str(validator), "--result", str(result), "--consumer", "P10", "--require-formal"],
+        command,
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False,
     )
     if completed.returncode != 0:
         raise ContractError("P02B formal admission rejected NebulaGraph P10: " + completed.stderr.strip())
+    try:
+        admission = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ContractError("P02B validator emitted invalid JSON") from exc
+    if not isinstance(admission, dict) or admission.get("state") != "PASS":
+        raise ContractError("P02B validator returned a non-PASS admission")
+    exact = {
+        "consumer": "P10",
+        "formal_required": True,
+        "fixture_only": False,
+        "scale": "sf10",
+        "repo_head": repo["head"],
+        "binary_sha256": sha256_file(binary),
+        "sentinel_result_sha256": sha256_file(result),
+    }
+    for key, expected in exact.items():
+        if admission.get(key) != expected:
+            raise ContractError(f"P02B admission {key} mismatch")
+    same_path(admission.get("sentinel_result"), result, "P02B admission result")
+    same_path(admission.get("repo_root"), Path(repo["root"]), "P02B admission repo root")
+    current_host = p31_host_facts()
+    if admission.get("host") != {
+        "hostname": current_host["hostname"],
+        "fingerprint_sha256": current_host["fingerprint_sha256"],
+    }:
+        raise ContractError("P02B admission was produced on another host")
+    marker = checked_file(
+        Path(str(admission.get("pass_marker", ""))),
+        admission.get("pass_marker_sha256"),
+        "P02B PASS marker",
+    )
+    provenance = checked_file(
+        Path(str(admission.get("provenance", ""))),
+        admission.get("provenance_sha256"),
+        "P02B provenance",
+    )
+    result_value = read_strict_json(result, "P02B result")
+    result_provenance = result_value.get("provenance")
+    if not isinstance(result_provenance, dict):
+        raise ContractError("P02B result lacks provenance")
+    if result_provenance.get("repo_head") != repo["head"]:
+        raise ContractError("P02B result repo HEAD mismatch")
+    if result_provenance.get("binary_sha256") != sha256_file(binary):
+        raise ContractError("P02B result binary mismatch")
+    if result_provenance.get("truth_sha256") != request["truth"]["sha256"]:
+        raise ContractError("P02B/P10 truth mismatch")
+    canonical = read_strict_json(provenance, "P02B canonical provenance")
+    files = canonical.get("files")
+    truth_file = files.get("truth") if isinstance(files, dict) else None
+    dataset_manifest_file = files.get("dataset_manifest") if isinstance(files, dict) else None
+    if not isinstance(truth_file, dict):
+        raise ContractError("P02B canonical provenance lacks truth")
+    if not isinstance(dataset_manifest_file, dict):
+        raise ContractError("P02B canonical provenance lacks the raw dataset manifest")
+    same_path(truth_file.get("path"), Path(request["truth"]["path"]), "P02B canonical truth")
+    if truth_file.get("sha256") != request["truth"]["sha256"]:
+        raise ContractError("P02B canonical truth SHA mismatch")
+    validate_file_ref(dataset_manifest_file, "P02B canonical dataset manifest")
     return {
         "state": "PASS",
         "formal_required": True,
         "consumer": "P10",
         "result": {"path": str(result), "sha256": sha256_file(result)},
         "validator": {"path": str(validator), "sha256": sha256_file(validator)},
+        "binary": {"path": str(binary), "sha256": sha256_file(binary)},
+        "pass_marker": {"path": str(marker), "sha256": sha256_file(marker)},
+        "provenance": {"path": str(provenance), "sha256": sha256_file(provenance)},
+        "canonical_dataset_manifest": dataset_manifest_file,
+        "admission": admission,
+        "validator_argv_sha256": hashlib.sha256(
+            json.dumps(command, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "max_age_seconds": args.p02b_max_age_seconds,
+        "current_host": {
+            "hostname": current_host["hostname"],
+            "fingerprint_sha256": current_host["fingerprint_sha256"],
+        },
     }
 
 
@@ -517,11 +793,202 @@ def inspect_cluster(
     return records
 
 
+def consume_sealed_admission(args: argparse.Namespace) -> dict[str, Any] | None:
+    supplied = (args.sealed_admission, args.sealed_admission_sha256)
+    raw_request = read_strict_json(args.request.resolve(), "NebulaGraph request for sealed admission")
+    formal = raw_request.get("execution_mode") == "formal"
+    if not formal:
+        if any(item is not None for item in supplied):
+            raise ContractError("fixture NebulaGraph run must not claim a sealed admission")
+        return None
+    if any(item is None for item in supplied):
+        raise ContractError("formal NebulaGraph run requires a SHA-bound sealed admission")
+    import formal_cluster as cluster  # noqa: PLC0415
+
+    receipt_path, receipt = cluster.validate_sealed_admission_receipt(
+        args.sealed_admission,
+        args.sealed_admission_sha256,
+        request_path=args.request.resolve(),
+        request_sha256=sha256_file(args.request.resolve()),
+        max_age_seconds=900,
+    )
+    lifecycle = raw_request.get("external_service", {}).get("orchestrated_lifecycle")
+    receipts = lifecycle.get("receipts") if isinstance(lifecycle, dict) else None
+    if (
+        not isinstance(receipts, dict)
+        or Path(str(receipts.get("sealed_admission", ""))).resolve() != receipt_path
+        or Path(str(receipts.get("store_lock", ""))).resolve()
+        != Path(receipt["lock"]["stat"]["path"]).resolve()
+    ):
+        raise ContractError("sealed admission/lock paths differ from adapter request")
+    return receipt
+
+
+def consume_formal_cluster_lifecycle(
+    args: argparse.Namespace,
+    request: dict[str, Any],
+    runtime_path: Path,
+    store_manifest_path: Path,
+) -> dict[str, Any]:
+    """Validate launch receipts before the adapter can enter the P31 timed region."""
+
+    supplied = (
+        args.cluster_controller,
+        args.cluster_controller_sha256,
+        args.cluster_preflight,
+        args.cluster_preflight_sha256,
+        args.cluster_start_receipt,
+        args.cluster_start_receipt_sha256,
+    )
+    formal = request["execution_mode"] == "formal"
+    if not formal:
+        if any(item is not None for item in supplied):
+            raise ContractError("fixture NebulaGraph run must not claim formal cluster receipts")
+        return {}
+    if any(item is None for item in supplied):
+        raise ContractError(
+            "formal NebulaGraph requires controller, preflight, start, and SHA-bound receipt argv"
+        )
+    controller = checked_file(
+        args.cluster_controller,
+        args.cluster_controller_sha256,
+        "NebulaGraph lifecycle controller",
+    )
+    expected_controller = Path(__file__).resolve().with_name("formal_cluster.py")
+    if controller != expected_controller:
+        raise ContractError("formal cluster controller path differs from repository formal_cluster.py")
+    lifecycle_request = request["external_service"]["orchestrated_lifecycle"]
+    requested_controller = lifecycle_request["controller"]
+    if (
+        Path(requested_controller["path"]).resolve() != controller
+        or requested_controller["sha256"] != args.cluster_controller_sha256
+    ):
+        raise ContractError("formal cluster controller differs from the adapter request")
+    requested_paths = {
+        name: Path(path).resolve(strict=False)
+        for name, path in lifecycle_request["receipts"].items()
+    }
+    if args.cluster_preflight.resolve() != requested_paths["preflight"]:
+        raise ContractError("formal preflight receipt path differs from the adapter request")
+    if args.cluster_start_receipt.resolve() != requested_paths["start"]:
+        raise ContractError("formal start receipt path differs from the adapter request")
+    if requested_paths["live_gate"] != requested_paths["start"]:
+        raise ContractError("formal live gate is not bound to the start receipt")
+    for name in ("partial_start", "start_cleanup", "stop"):
+        if requested_paths[name].exists() or requested_paths[name].is_symlink():
+            raise ContractError(f"formal lifecycle contains an unexpected pre-adapter {name} receipt")
+
+    # Imported lazily because formal_cluster imports this adapter when it is run as
+    # a standalone controller.  At this point both modules are fully initialized.
+    import formal_cluster as cluster  # noqa: PLC0415
+
+    preflight_path, preflight, _docker = cluster.validate_preflight_receipt(
+        args.cluster_preflight,
+        args.cluster_preflight_sha256,
+        max_age_seconds=600,
+    )
+    expected_inputs = {
+        "request": {
+            "path": str(args.request.resolve()),
+            "sha256": sha256_file(args.request.resolve()),
+        },
+        "runtime_manifest": {
+            "path": str(runtime_path.resolve()),
+            "sha256": args.runtime_manifest_sha256,
+        },
+        "store_manifest": {
+            "path": str(store_manifest_path.resolve()),
+            "sha256": args.store_manifest_sha256,
+        },
+    }
+    if preflight["inputs"] != expected_inputs:
+        raise ContractError("formal preflight inputs differ from adapter request/runtime/store")
+    if Path(preflight["spec"]["logs_root"]).resolve() != Path(lifecycle_request["logs_root"]).resolve():
+        raise ContractError("formal preflight logs root differs from adapter request")
+    start_path, start = cluster.validate_start_receipt(
+        args.cluster_start_receipt,
+        args.cluster_start_receipt_sha256,
+        preflight_path=preflight_path,
+        preflight_sha256=args.cluster_preflight_sha256,
+        preflight_value=preflight,
+    )
+    return {
+        "controller": {"path": str(controller), "sha256": sha256_file(controller)},
+        "preflight": {
+            "path": str(preflight_path),
+            "sha256": args.cluster_preflight_sha256,
+            "receipt": preflight,
+        },
+        "start": {
+            "path": str(start_path),
+            "sha256": args.cluster_start_receipt_sha256,
+            "receipt": start,
+        },
+        "live_gate": {
+            "path": str(start_path),
+            "sha256": args.cluster_start_receipt_sha256,
+            "selector": "live_gate",
+            "receipt": start["live_gate"],
+        },
+        "planned_stop": str(requested_paths["stop"]),
+    }
+
+
+def inspect_formal_cluster(
+    docker: Path, lifecycle: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Re-inspect exact launch IDs and validate names, aliases, mounts, network and PIDs."""
+
+    import formal_cluster as cluster  # noqa: PLC0415
+
+    preflight = lifecycle["preflight"]["receipt"]
+    start = lifecycle["start"]["receipt"]
+    spec = preflight["spec"]
+    preflight_sha = lifecycle["preflight"]["sha256"]
+    records: list[dict[str, Any]] = []
+    expected_ids: dict[str, str] = {}
+    for role in ("graphd", "metad", "storaged"):
+        expected = start["containers"][role]
+        identifier = expected["container_id"]
+        completed = docker_call(docker, ["container", "inspect", identifier], check=True)
+        try:
+            values = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise ContractError(f"formal container inspect is malformed for {role}") from exc
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+            raise ContractError(f"formal container inspect shape is invalid for {role}")
+        snapshot = cluster.validate_container_inspect(
+            spec, role, values[0], preflight_sha256=preflight_sha
+        )
+        if snapshot != expected:
+            raise ContractError(f"formal {role} identity differs from the start receipt")
+        records.append(snapshot)
+        expected_ids[role] = identifier
+    network_id = start["network"]["network_id"]
+    completed = docker_call(docker, ["network", "inspect", network_id], check=True)
+    try:
+        values = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ContractError("formal network inspect is malformed") from exc
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        raise ContractError("formal network inspect shape is invalid")
+    network = cluster.validate_network_inspect(
+        spec,
+        values[0],
+        preflight_sha256=preflight_sha,
+        expected_container_ids=expected_ids,
+    )
+    if network != start["network"]:
+        raise ContractError("formal network identity differs from the start receipt")
+    return records, network
+
+
 class ManagedFixtureCluster:
     def __init__(self, docker: Path, runtime: dict[str, Any], store_manifest: dict[str, Any], data_root: Path):
         self.docker = docker
         self.images = {item["role"]: item for item in runtime["images"]}
         self.names = store_manifest["containers"]
+        self.hosts = store_manifest["logical_hosts"]
         self.network = store_manifest["network"]
         self.data_root = data_root
         self.instance_root = data_root / f"fixture-{self.network}"
@@ -544,33 +1011,39 @@ class ManagedFixtureCluster:
         meta = self.names["metad"]
         storage = self.names["storaged"]
         graph = self.names["graphd"]
+        meta_host = self.hosts["metad"]
+        storage_host = self.hosts["storaged"]
+        graph_host = self.hosts["graphd"]
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
             reservation.bind(("127.0.0.1", 0))
             self.port = int(reservation.getsockname()[1])
         docker_call(self.docker, [
             "run", "-d", "--name", meta, "--network", self.network,
+            "--network-alias", meta_host,
             "-v", f"{self.instance_root / 'meta'}:/data/meta",
             "-v", f"{self.instance_root / 'logs'}:/logs",
             self.images["metad"]["repo_digest"],
-            f"--meta_server_addrs={meta}:9559", f"--local_ip={meta}", "--ws_ip=0.0.0.0",
+            f"--meta_server_addrs={meta_host}:9559", f"--local_ip={meta_host}", "--ws_ip=0.0.0.0",
             "--port=9559", "--ws_http_port=19559", "--data_path=/data/meta", "--log_dir=/logs",
         ])
         time.sleep(3)
         docker_call(self.docker, [
             "run", "-d", "--name", storage, "--network", self.network,
+            "--network-alias", storage_host,
             "-v", f"{self.instance_root / 'storage'}:/data/storage",
             "-v", f"{self.instance_root / 'logs'}:/logs",
             self.images["storaged"]["repo_digest"],
-            f"--meta_server_addrs={meta}:9559", f"--local_ip={storage}", "--ws_ip=0.0.0.0",
+            f"--meta_server_addrs={meta_host}:9559", f"--local_ip={storage_host}", "--ws_ip=0.0.0.0",
             "--port=9779", "--ws_http_port=19779", "--data_path=/data/storage", "--log_dir=/logs",
         ])
         docker_call(self.docker, [
             "run", "-d", "--name", graph, "--network", self.network,
+            "--network-alias", graph_host,
             "-p", f"127.0.0.1:{self.port}:9669",
             "-v", f"{self.instance_root / 'graph'}:/data/graph",
             "-v", f"{self.instance_root / 'logs'}:/logs",
             self.images["graphd"]["repo_digest"],
-            f"--meta_server_addrs={meta}:9559", f"--local_ip={graph}", "--ws_ip=0.0.0.0",
+            f"--meta_server_addrs={meta_host}:9559", f"--local_ip={graph_host}", "--ws_ip=0.0.0.0",
             "--port=9669", "--ws_http_port=19669", "--log_dir=/logs",
         ])
         deadline = time.monotonic() + 30
@@ -840,8 +1313,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--store-manifest", required=True, type=Path)
     parser.add_argument("--store-manifest-sha256", required=True)
     parser.add_argument("--p02b-result", type=Path)
+    parser.add_argument("--p02b-result-sha256")
     parser.add_argument("--p02b-validator", type=Path)
     parser.add_argument("--p02b-validator-sha256")
+    parser.add_argument("--p02b-binary", type=Path)
+    parser.add_argument("--p02b-binary-sha256")
+    parser.add_argument("--p02b-max-age-seconds", type=int, default=21600)
+    parser.add_argument("--repo-root", type=Path)
+    parser.add_argument("--cluster-controller", type=Path)
+    parser.add_argument("--cluster-controller-sha256")
+    parser.add_argument("--sealed-admission", type=Path)
+    parser.add_argument("--sealed-admission-sha256")
+    parser.add_argument("--cluster-preflight", type=Path)
+    parser.add_argument("--cluster-preflight-sha256")
+    parser.add_argument("--cluster-start-receipt", type=Path)
+    parser.add_argument("--cluster-start-receipt-sha256")
     parser.add_argument("--request", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     return parser.parse_args()
@@ -850,14 +1336,38 @@ def parse_args() -> argparse.Namespace:
 def run(args: argparse.Namespace) -> None:
     runtime_path = checked_file(args.runtime_manifest, args.runtime_manifest_sha256, "runtime manifest")
     store_manifest_path = checked_file(args.store_manifest, args.store_manifest_sha256, "store manifest")
-    request, truth_rows, dataset, truth, store = validate_request(args.request.resolve(), args.store_label)
+    sealed_admission = consume_sealed_admission(args)
+    request, truth_rows, dataset, truth, store = validate_request(
+        args.request.resolve(), args.store_label, sealed_admission=sealed_admission
+    )
     formal = request["execution_mode"] == "formal"
     expected_service = "external-prestarted" if formal else "managed-fixture"
     if args.service_mode != expected_service:
         raise ContractError(f"{request['execution_mode']} mode requires --service-mode={expected_service}")
+    repo = None
+    if formal:
+        if args.repo_root is None:
+            raise ContractError("formal NebulaGraph run requires --repo-root")
+        repo = git_state(args.repo_root)
+        if repo["clean"] is not True:
+            raise ContractError("formal NebulaGraph run requires a clean Git worktree")
     runtime, client_root, docker = validate_runtime_manifest(runtime_path, request)
-    store_manifest, labels = validate_store_manifest(store_manifest_path, request, dataset, truth, store)
-    p02b = consume_p02b(args, formal)
+    p02b = consume_p02b(args, formal, request, repo)
+    cluster_lifecycle = consume_formal_cluster_lifecycle(
+        args, request, runtime_path, store_manifest_path
+    )
+    store_manifest, labels = validate_store_manifest(
+        store_manifest_path,
+        request,
+        dataset,
+        truth,
+        store,
+        runtime_path,
+        args.runtime_manifest_sha256,
+        runtime,
+        repo,
+        p02b,
+    )
     client_version = import_client(client_root)
     password_env = store_manifest["authentication"]["password_env"]
     password = os.environ.get(password_env)
@@ -877,11 +1387,16 @@ def run(args: argparse.Namespace) -> None:
     cleanup_error: Exception | None = None
     port = store_manifest["graph_endpoint"]["port"]
     initial_containers: list[dict[str, Any]] = []
+    initial_network: dict[str, Any] | None = None
     try:
         if not formal:
             managed = ManagedFixtureCluster(docker, runtime, store_manifest, store)
             port = managed.start()
-        initial_containers = inspect_cluster(docker, runtime, store_manifest, port)
+            initial_containers = inspect_cluster(docker, runtime, store_manifest, port)
+        else:
+            initial_containers, initial_network = inspect_formal_cluster(
+                docker, cluster_lifecycle
+            )
         pool, session = open_session(
             store_manifest["graph_endpoint"]["host"],
             port,
@@ -892,11 +1407,19 @@ def run(args: argparse.Namespace) -> None:
             load_fixture(session, store_manifest, dataset, labels)
         execute_ok(session, f"USE {store_manifest['space']}")
         write_contract_outputs(output_dir, request, truth_rows, labels, session)
-        final_containers = inspect_cluster(docker, runtime, store_manifest, port)
+        if formal:
+            final_containers, final_network = inspect_formal_cluster(
+                docker, cluster_lifecycle
+            )
+            if final_network != initial_network:
+                raise ContractError("NebulaGraph network identity changed during warmup/measured")
+        else:
+            final_containers = inspect_cluster(docker, runtime, store_manifest, port)
         for before, after in zip(initial_containers, final_containers):
-            for key in ("role", "name", "container_id", "image_id", "pid", "restart_count"):
-                if before[key] != after[key]:
-                    raise ContractError(f"NebulaGraph container lifecycle changed during warmup/measured: {before['name']}")
+            if before != after:
+                raise ContractError(
+                    f"NebulaGraph container lifecycle changed during warmup/measured: {before['name']}"
+                )
         provenance = {
             "schema_version": PROVENANCE_SCHEMA,
             "execution_mode": request["execution_mode"],
@@ -931,6 +1454,13 @@ def run(args: argparse.Namespace) -> None:
                 "cleanup_owned_fixture": not formal,
             },
             "p02b_admission": p02b,
+            "repo": repo,
+            "cluster_lifecycle": cluster_lifecycle if formal else None,
+            "sealed_admission": None if sealed_admission is None else {
+                "path": str(args.sealed_admission.resolve()),
+                "sha256": args.sealed_admission_sha256,
+                "receipt": sealed_admission,
+            },
         }
         atomic_json(output_dir / "adapter-provenance.json", provenance)
     finally:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 RESOURCE_SCHEMA_VERSION = "cidr-resource-v1"
 MANIFEST_SCHEMA_VERSION = "cidr-run-manifest-v1"
+CONTAINER_IDENTITY_SCHEMA_VERSION = "cidr-container-identity-v2"
 
 RESOURCE_COLUMNS = [
     "schema_version",
@@ -108,6 +109,7 @@ ARTIFACT_FILES = [
     "pidstat.raw",
     "iostat.raw",
     "collector-status.json",
+    "collector-ready.json",
     "collector.stdout.log",
     "collector.stderr.log",
     "command.stdout.log",

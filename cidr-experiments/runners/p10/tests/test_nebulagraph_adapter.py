@@ -156,6 +156,15 @@ class NebulaGraphAdapterTest(unittest.TestCase):
                 "per_query_timeout_ms": 5000,
                 "sequence_digest_algorithm": SEQUENCE_DIGEST_ALGORITHM,
             },
+            "external_service": {
+                "service_lifecycle": "external-prestarted",
+                "containers": [f"{prefix}-graph", f"{prefix}-meta", f"{prefix}-storage"],
+                "extra_pids": [],
+                "image_digests": [
+                    EXPECTED_IMAGES[role]["digest"]
+                    for role in ("graphd", "metad", "storaged")
+                ],
+            },
         }
         return request, runtime_manifest, store_manifest, store, prefix
 
@@ -279,10 +288,18 @@ class NebulaGraphAdapterTest(unittest.TestCase):
     def test_formal_p02b_admission_is_mandatory(self) -> None:
         args = argparse.Namespace(
             p02b_result=None,
+            p02b_result_sha256=None,
             p02b_validator=None,
             p02b_validator_sha256=None,
+            p02b_binary=None,
+            p02b_binary_sha256=None,
+            p02b_max_age_seconds=21600,
         )
-        with self.assertRaisesRegex(ContractError, "requires P02B"):
+        with self.assertRaisesRegex(
+            ContractError,
+            r"^formal NebulaGraph run requires a complete P02B "
+            r"result/validator/binary SHA-bound set$",
+        ):
             consume_p02b(args, formal=True)
 
     def test_formal_p31_binding_covers_containers_inputs_and_store(self) -> None:
@@ -290,30 +307,88 @@ class NebulaGraphAdapterTest(unittest.TestCase):
             root = Path(raw)
             store = root / "store"
             store.mkdir()
+            logs = root / "logs"
+            logs.mkdir()
             binary = Path(sys.executable).resolve()
             binary_ref = {"path": str(binary), "sha256": sha256_file(binary)}
             dataset_ref = {"path": str(self.dataset), "sha256": sha256_file(self.dataset)}
             truth_ref = {"path": str(self.truth), "sha256": sha256_file(self.truth)}
             containers = ["cidr-nebula-graph", "cidr-nebula-meta", "cidr-nebula-storage"]
+            roles = ("graphd", "metad", "storaged")
+            snapshots = {}
+            spec_roles = {}
+            for index, (role, name) in enumerate(zip(roles, containers), start=1):
+                role_store = store / role
+                role_logs = logs / role
+                role_store.mkdir()
+                role_logs.mkdir()
+                snapshots[role] = {
+                    "role": role,
+                    "name": name,
+                    "logical_host": f"nebula-{role}",
+                    "container_id": str(index) * 64,
+                    "image_id": f"sha256:{str(index + 3) * 64}",
+                    "config_image": f"nebula-{role}@sha256:{str(index + 6) * 64}",
+                    "pid": 1000 + index,
+                    "process_start_ticks": 200000 + index,
+                    "started_at_utc": f"2026-01-01T00:00:0{index}Z",
+                    "restart_count": 0,
+                    "running": True,
+                }
+                spec_roles[role] = {
+                    "mounts": [
+                        {"source": str(role_store), "target": "/data"},
+                        {"source": str(role_logs), "target": "/logs"},
+                    ]
+                }
             provenance = {
                 "binary": binary_ref,
                 "dataset": dataset_ref,
                 "truth": truth_ref,
                 "store": {"path": str(store), "sha256": "0" * 64},
                 "container_names": containers,
+                "container_runtime": [snapshots[role] for role in roles],
+                "cluster_lifecycle": {
+                    "preflight": {"receipt": {"spec": {"roles": spec_roles, "logs_root": str(logs)}}},
+                    "start": {"receipt": {"containers": snapshots}},
+                },
+            }
+            unique = {
+                snapshots[role]["name"]: [{
+                    "container_id": snapshots[role]["container_id"],
+                    "pid": snapshots[role]["pid"],
+                    "process_start_ticks": snapshots[role]["process_start_ticks"],
+                    "started_at": snapshots[role]["started_at_utc"],
+                    "restart_count": 0,
+                }]
+                for role in roles
             }
             p31 = {
-                "collector": {"containers": containers},
+                "collector": {"containers": containers, "extra_pids": []},
+                "collector_result": {
+                    "containers_seen": {
+                        snapshots[role]["name"]: snapshots[role]["pid"] for role in roles
+                    },
+                    "container_identity_unique_set": unique,
+                    "container_identity_history": {
+                        name: [{**values[0], "before_sample_index": 0, "observed_at_utc": "2026-01-01T00:01:00Z"}]
+                        for name, values in unique.items()
+                    },
+                    "ready": {"containers": {name: values[0] for name, values in unique.items()}},
+                },
                 "inputs": {
                     "binary": binary_ref,
                     "dataset": dataset_ref,
                     "truth": truth_ref,
                     "query_or_trace": truth_ref,
                 },
-                "disk_roots": [{"role": "store", "label": "nebulagraph", "path": str(store)}],
+                "disk_roots": [
+                    {"role": "store", "label": "nebulagraph", "path": str(store)},
+                    {"role": "temp", "label": "nebulagraph-logs", "path": str(logs)},
+                ],
             }
             validate_nebulagraph_p31_binding(provenance, p31)
-            p31["collector"] = {"containers": containers[:-1]}
+            p31["collector"] = {"containers": containers[:-1], "extra_pids": []}
             with self.assertRaisesRegex(ContractError, "container coverage"):
                 validate_nebulagraph_p31_binding(provenance, p31)
 

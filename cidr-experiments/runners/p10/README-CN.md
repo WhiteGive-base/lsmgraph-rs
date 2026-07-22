@@ -156,24 +156,37 @@ python3 -B -m unittest -v \
 
 ### Neo4j adapter 的当前边界
 
-Neo4j 使用 `external-prestarted-query-process-lifetime-v1`。真实 adapter 不管理服务；它在查询
-前后各复验一次唯一容器的 ID/PID/StartedAt/RestartCount、`neo4j:5.26.24` RepoDigest、
-localhost Bolt 端口、`/data` mount、`restart=no`、只读默认数据库和 Python driver
-`5.28.3`。连接 readiness 有界；查询前还会实时确认数据库名严格为 `neo4j`，且唯一
-`:V(id)` RANGE index `v_id` 为 `ONLINE`。dataset/truth/store manifest、canonical P02B
-admission 和 P31 采样对象必须逐项闭合；运行中容器漂移会 fail closed。
+Neo4j 使用 `external-prestarted-query-process-lifetime-v1`，但服务生命周期由 P10 orchestrator
+在每个 repeat 内显式管理。launcher 从 `docker container create` 捕获完整 64-hex ID；后续
+inspect/start/stop/rm 均只使用该 ID，并发布 launch/stop v2 receipt。真实 adapter 在查询前后
+复验 ID/PID/StartedAt/RestartCount、numeric `Config.User`、`neo4j:5.26.24` RepoDigest、localhost Bolt 端口、
+`/data` mount、`restart=no`、只读默认数据库和 Python driver `5.28.3`。连接 readiness 有界；
+查询前还会实时确认数据库名严格为 `neo4j`，且唯一 `:V(id)` RANGE index `v_id` 为 `ONLINE`。
 
-正式系统片段模板位于 `adapters/neo4j/formal-system.template.json`。store manifest v2 明确区分
-离线 pre-start 快照、允许 Neo4j 启动后改变的 runtime 路径，以及 import/runtime image 身份；
-历史 tag-only import 只能作为 `unverified-tag-only` correctness 证据，不能进入 formal 结果。
-详细的安全 runtime-copy 与 store 冻结流程见 `adapters/NEO4J-ADAPTER-CN.md`。
+正式系统片段模板位于 `adapters/neo4j/formal-system.template.json`。store manifest v3 使用
+owner-only `0700` root、`0600` `store_lock`、跨完整哈希持续持有的独占锁，以及哈希前后
+Docker mount/root/lock 复查来证明离线；它不依赖其他用户不可读的 `/proc`。pristine source
+与三个 runtime clone 在 P31 前做逐文件 SHA-256 和全树一致性证明，并拒绝 shared inode。
+store 与 logs root 必须同属当前 UID:GID、mode 精确为 `0700`，importer 与 launcher 均显式
+传入相同 `--user UID:GID` 并在 receipt/inspect 中闭合。受控 import receipt 为 v3，P31/adapter
+只消费封存 receipt，不在测量窗口重新哈希大 CSV。
+dataset/truth/store、canonical P02B、P31 DONE/manifest/validation/collector status/ready 的
+路径、大小与 SHA-256 必须逐项闭合；运行中任何身份漂移都会 fail closed。详细流程见
+`adapters/NEO4J-ADAPTER-CN.md`。
 
-真实 tiny fixture 自测（明确不是论文性能数据）：
+无 Docker、无 SF10 大文件读取的 contract 自测：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
-  cidr-experiments/runners/p10/tests/test_neo4j_adapter.py
+  cidr-experiments/runners/p10/tests/test_neo4j_runtime_lifecycle.py \
+  cidr-experiments/runners/p10/tests/test_neo4j_hardening.py \
+  cidr-experiments/runners/p10/tests/test_neo4j_sealed_receipts.py \
+  cidr-experiments/runners/p10/tests/test_p31_consumer_contract.py
 ```
+
+上述无容器自测通过后，仍须在合入 main 后、SF10 前，以官方 `neo4j:5.26.24` RepoDigest
+完成一次真实 tiny import/launch/stop/remove/post-stop gate，验证 numeric UID:GID 与官方
+entrypoint 的运行兼容性；缺少该真实 PASS receipt 时禁止启动 SF10。
 
 ## Fixture 自测
 

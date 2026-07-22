@@ -77,6 +77,10 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+@unittest.skip(
+    "quarantined legacy real-Docker fixture: its v2 freezer/manual-run lifecycle is "
+    "not evidence for the v3 import + receipt-bound launch/stop formal contract"
+)
 class Neo4jAdapterTests(unittest.TestCase):
     maxDiff = None
 

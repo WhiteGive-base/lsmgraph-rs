@@ -15,10 +15,14 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import posixpath
+import re
+import stat
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -51,15 +55,26 @@ from p10_contract import (  # noqa: E402
     require_keys,
     sha256_file,
     validate_adapter_outputs,
+    validate_neo4j_store_audit,
 )
+
+from adapters.neo4j_store_contract import (  # noqa: E402
+    CANONICAL_SENTINELS,
+    KNOWN_MUTABLE_PATTERNS,
+    TREE_HASH_METHOD,
+    canonical_sentinel_records,
+    validate_controlled_import_receipt,
+    validate_owner_only_offline_gate,
+    validate_recorded_tree,
+)
+from adapters.launch_neo4j_runtime import validate_launch_receipt  # noqa: E402
 
 P31_DIR = P10_DIR.parent / "p31"
 sys.path.insert(0, str(P31_DIR))
 from run_manifest import host_facts as p31_host_facts  # noqa: E402
 
-PROVENANCE_SCHEMA_VERSION = "p10-neo4j-adapter-provenance-v2"
-STORE_MANIFEST_SCHEMA_VERSION = "p10-neo4j-store-manifest-v2"
-TREE_HASH_METHOD = "sha256-tree-v1(relative-path,size,file-sha256)"
+PROVENANCE_SCHEMA_VERSION = "p10-neo4j-adapter-provenance-v4"
+STORE_MANIFEST_SCHEMA_VERSION = "p10-neo4j-store-manifest-v3"
 RELATIONSHIP_MODEL = "dense-edge-type-as-outgoing-relationship-type-v1"
 SNAPSHOT_PHASE = "offline-prestart-v1"
 DATABASE_NAME = "neo4j"
@@ -69,6 +84,19 @@ ID_PROPERTY = "id"
 EXPECTED_IMAGE_REF = "neo4j:5.26.24"
 EXPECTED_DRIVER_VERSION = "5.28.3"
 EXPECTED_SERVER_AGENT = "Neo4j/5.26.24"
+EXPECTED_DOCKER_LOG_CONFIG = {"type": "none", "config": {}}
+EXPECTED_ENTRYPOINT = ["tini", "-g", "--", "/startup/docker-entrypoint.sh"]
+EXPECTED_COMMAND = ["neo4j"]
+MEMORY_SETTING_NAMES = {
+    "heap_initial": "server.memory.heap.initial_size",
+    "heap_max": "server.memory.heap.max_size",
+    "pagecache": "server.memory.pagecache.size",
+}
+MEMORY_ENV_NAMES = {
+    "heap_initial": "NEO4J_server_memory_heap_initial__size",
+    "heap_max": "NEO4J_server_memory_heap_max__size",
+    "pagecache": "NEO4J_server_memory_pagecache_size",
+}
 MASK = (1 << 64) - 1
 SHA256_CHARS = frozenset("0123456789abcdef")
 
@@ -88,12 +116,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--readiness-timeout-s", type=int, default=180)
     parser.add_argument("--expected-image-ref", default=EXPECTED_IMAGE_REF)
     parser.add_argument("--expected-driver-version", required=True)
+    parser.add_argument("--expected-driver-tree-sha256", required=True)
     parser.add_argument("--expected-server-agent", default=EXPECTED_SERVER_AGENT)
+    parser.add_argument(
+        "--expected-entrypoint-json",
+        default=json.dumps(EXPECTED_ENTRYPOINT, separators=(",", ":")),
+    )
+    parser.add_argument(
+        "--expected-command-json",
+        default=json.dumps(EXPECTED_COMMAND, separators=(",", ":")),
+    )
+    parser.add_argument("--expected-heap-initial-size", required=True)
+    parser.add_argument("--expected-heap-max-size", required=True)
+    parser.add_argument("--expected-pagecache-size", required=True)
     parser.add_argument("--store-label", default="neo4j-runtime")
+    parser.add_argument("--logs-root", required=True, type=Path)
     parser.add_argument("--dataset-manifest", required=True, type=Path)
     parser.add_argument("--dataset-manifest-sha256", required=True)
     parser.add_argument("--store-manifest", required=True, type=Path)
     parser.add_argument("--store-manifest-sha256", required=True)
+    parser.add_argument("--store-preflight", type=Path)
+    parser.add_argument("--store-preflight-sha256")
+    parser.add_argument("--import-receipt", type=Path)
+    parser.add_argument("--import-receipt-sha256")
+    parser.add_argument("--launch-receipt", type=Path)
+    parser.add_argument("--launch-receipt-sha256")
     parser.add_argument("--p02b-result", type=Path)
     parser.add_argument("--p02b-result-sha256")
     parser.add_argument("--p02b-validator", type=Path)
@@ -120,6 +167,20 @@ def exact_sha(value: object, context: str) -> str:
         f"{context}: expected 64 lowercase hexadecimal characters",
     )
     return str(value)
+
+
+def exact_string_vector(value: str, context: str) -> list[str]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ContractError(f"{context}: expected a JSON string array") from exc
+    require(
+        isinstance(parsed, list)
+        and parsed
+        and all(isinstance(item, str) and item for item in parsed),
+        f"{context}: expected a nonempty JSON string array",
+    )
+    return list(parsed)
 
 
 def exact_image_digest(value: object, context: str) -> str:
@@ -261,7 +322,12 @@ def validate_request(
     dataset_path = Path(nonempty_string(dataset_obj["path"], "request.dataset.path")).resolve()
     require(dataset_path.exists(), f"request.dataset does not exist: {dataset_path}")
     dataset_sha = exact_sha(dataset_obj["sha256"], "request.dataset.sha256")
-    if dataset_path.is_file():
+    if mode == "formal":
+        require(
+            dataset_path.is_dir(),
+            "formal Neo4j request.dataset must be the sealed P02B dataset root directory",
+        )
+    elif dataset_path.is_file():
         require(sha256_file(dataset_path) == dataset_sha, "request.dataset SHA-256 mismatch")
     request["dataset"] = {"path": str(dataset_path), "sha256": dataset_sha}
 
@@ -435,25 +501,33 @@ def validate_store_manifest(
     expected_image_ref: str,
     expected_server_version: str,
     formal: bool,
+    import_receipt_path: Path | None,
+    import_receipt_sha256: str | None,
 ) -> dict[str, Any]:
     reference = resolve_file(path, expected_sha, "Neo4j store manifest")
     required = (
         "schema_version",
         "store_root",
         "store_sha256",
-        "hash_method",
         "file_count",
         "total_bytes",
+        "immutable_store_sha256",
+        "immutable_file_count",
+        "immutable_total_bytes",
+        "files",
+        "hash_method",
         "snapshot_phase",
-        "mutable_runtime_paths",
+        "known_mutable_patterns",
+        "canonical_sentinels",
         "runtime_compatibility",
-        "import_image_identity",
+        "import_provenance",
         "database_contract",
         "dataset_manifest_sha256",
         "dataset_sha256",
         "truth_sha256",
         "relationship_model",
         "sentinel_files",
+        "offline_audit",
     )
     manifest = require_keys(
         read_json(path, "Neo4j store manifest"),
@@ -474,12 +548,14 @@ def validate_store_manifest(
     for key, expected in exact.items():
         require(manifest[key] == expected, f"Neo4j store manifest.{key} mismatch")
     same_path(manifest["store_root"], store, "Neo4j store manifest.store_root")
-    integer(manifest["file_count"], "Neo4j store manifest.file_count", 1)
-    integer(manifest["total_bytes"], "Neo4j store manifest.total_bytes", 1)
-    mutable_paths = manifest["mutable_runtime_paths"]
+    recorded_tree = validate_recorded_tree(manifest, "Neo4j store manifest")
     require(
-        mutable_paths == ["logs/**", "server_id", "transactions/**"],
-        "Neo4j store manifest.mutable_runtime_paths mismatch",
+        manifest["known_mutable_patterns"] == list(KNOWN_MUTABLE_PATTERNS),
+        "Neo4j store manifest.known_mutable_patterns mismatch",
+    )
+    require(
+        manifest["canonical_sentinels"] == list(CANONICAL_SENTINELS),
+        "Neo4j store manifest.canonical_sentinels mismatch",
     )
     runtime = require_keys(
         manifest["runtime_compatibility"],
@@ -490,31 +566,63 @@ def validate_store_manifest(
     require(runtime["neo4j_version"] == expected_server_version, "Neo4j runtime version mismatch")
     require(runtime["image_ref"] == expected_image_ref, "Neo4j runtime image ref mismatch")
     require(runtime["image_digest"] == image_digest, "Neo4j runtime image digest mismatch")
-    import_identity = require_keys(
-        manifest["import_image_identity"],
-        required=("status", "image_ref", "image_digest"),
-        allowed=("status", "image_ref", "image_digest"),
-        context="Neo4j store manifest.import_image_identity",
-    )
-    require(import_identity["image_ref"] == expected_image_ref, "Neo4j import image ref mismatch")
     require(
-        import_identity["status"] in {"verified-repodigest", "unverified-tag-only"},
-        "Neo4j import image identity has unknown status",
+        (import_receipt_path is None) == (import_receipt_sha256 is None),
+        "--import-receipt and --import-receipt-sha256 must be provided together",
     )
-    if import_identity["status"] == "verified-repodigest":
+    import_provenance = manifest["import_provenance"]
+    require(isinstance(import_provenance, dict), "Neo4j import provenance is malformed")
+    import_status = import_provenance.get("status")
+    if import_status == "controlled-import-receipt-v3":
         require(
-            import_identity["image_digest"] == image_digest,
-            "Neo4j verified import image digest differs from runtime digest",
+            import_receipt_path is not None and import_receipt_sha256 is not None,
+            "controlled Neo4j store requires its import receipt path/SHA",
         )
+        current = p31_host_facts()
+        receipt = validate_controlled_import_receipt(
+            import_receipt_path,
+            import_receipt_sha256,
+            store_root=store,
+            dataset_manifest=dataset["reference"],
+            dataset_sha256=request["dataset"]["sha256"],
+            image_ref=expected_image_ref,
+            image_digest=image_digest,
+            offline_tree=recorded_tree,
+            importer_path=Path(__file__).with_name("import_neo4j_store.py"),
+            current_host={
+                "hostname": current["hostname"],
+                "fingerprint_sha256": current["fingerprint_sha256"],
+            },
+            # The prelaunch importer sealed the two multi-GB CSVs into input_sha256.
+            # P31 consumes that pinned receipt and only rehashes its small artifacts.
+            verify_input_files=False,
+        )
+        require(
+            import_provenance == {"status": "controlled-import-receipt-v3", **receipt},
+            "Neo4j store import provenance differs from the controlled receipt",
+        )
+    elif import_status == "unverified-historical-store":
+        require(not formal, "formal Neo4j runs reject every unverified historical store")
+        require(import_receipt_path is None, "historical store cannot be upgraded by attaching a receipt")
+        expected_historical = {
+            "status": "unverified-historical-store",
+            "reference": None,
+            "producer": None,
+            "host": None,
+            "image": {
+                "configured_ref": expected_image_ref,
+                "image_id": None,
+                "repo_digests": [],
+                "selected_repo_digest": None,
+            },
+            "input": None,
+            "stages": None,
+            "database_contract": None,
+            "final_store": None,
+        }
+        require(import_provenance == expected_historical, "historical Neo4j import marker is not canonical")
     else:
-        require(
-            import_identity["image_digest"] is None,
-            "Neo4j unverified import identity must not claim a digest",
-        )
-        require(
-            not formal,
-            "formal Neo4j runs require a verified import image RepoDigest",
-        )
+        raise ContractError("Neo4j store import provenance has unknown status")
     database = require_keys(
         manifest["database_contract"],
         required=("database_name", "node_label", "id_property", "required_index"),
@@ -534,37 +642,183 @@ def validate_store_manifest(
         required_index == {"name": INDEX_NAME, "type": "RANGE", "state": "ONLINE"},
         "Neo4j required index contract mismatch",
     )
-    sentinels = manifest["sentinel_files"]
-    require(isinstance(sentinels, list) and sentinels, "Neo4j store manifest requires sentinel_files")
-    validated: list[dict[str, Any]] = []
-    names: set[str] = set()
-    for index, raw in enumerate(sentinels):
-        context = f"Neo4j store manifest.sentinel_files[{index}]"
-        item = require_keys(
-            raw,
-            required=("path", "size_bytes", "sha256"),
-            allowed=("path", "size_bytes", "sha256"),
-            context=context,
-        )
-        relative = Path(nonempty_string(item["path"], f"{context}.path"))
-        require(not relative.is_absolute() and ".." not in relative.parts, f"{context}.path escapes store root")
-        relative_text = relative.as_posix()
-        require(relative_text not in names, f"{context}.path is duplicated")
-        names.add(relative_text)
-        target = (store / relative).resolve()
-        require(store == target or store in target.parents, f"{context}.path escapes store root")
-        reference_item = resolve_file(target, item["sha256"], context)
-        expected_size = integer(item["size_bytes"], f"{context}.size_bytes", 1)
-        require(reference_item["size_bytes"] == expected_size, f"{context}.size_bytes mismatch")
-        validated.append(
-            {
-                "path": relative_text,
-                "absolute_path": reference_item["path"],
-                "sha256": reference_item["sha256"],
-                "size_bytes": reference_item["size_bytes"],
-            }
-        )
-    return {"reference": reference, "lineage": manifest, "validated_sentinels": validated}
+    expected_sentinels = canonical_sentinel_records(recorded_tree["files"])
+    require(
+        manifest["sentinel_files"] == expected_sentinels,
+        "Neo4j store sentinel metadata differs from the complete offline inventory",
+    )
+    validated = [
+        {**item, "absolute_path": str((store / item["path"]).resolve())}
+        for item in expected_sentinels
+    ]
+    offline_audit = require_keys(
+        manifest["offline_audit"],
+        required=(
+            "proof_method", "before_hash", "after_hash", "per_file_stat_stability",
+            "owner_only_root", "exclusive_store_lock_held_across_hash",
+            "docker_mount_rescan", "proc_scan_used",
+        ),
+        allowed=(
+            "proof_method", "before_hash", "after_hash", "per_file_stat_stability",
+            "owner_only_root", "exclusive_store_lock_held_across_hash",
+            "docker_mount_rescan", "proc_scan_used",
+        ),
+        context="Neo4j store manifest.offline_audit",
+    )
+    require(
+        offline_audit["per_file_stat_stability"] is True
+        and offline_audit["owner_only_root"] is True
+        and offline_audit["exclusive_store_lock_held_across_hash"] is True
+        and offline_audit["docker_mount_rescan"] is True
+        and offline_audit["proc_scan_used"] is False,
+        "Neo4j offline store audit lacks stability/rescan proof",
+    )
+    validate_owner_only_offline_gate(
+        {key: offline_audit[key] for key in ("proof_method", "before_hash", "after_hash")},
+        store,
+        "Neo4j store manifest.offline_audit",
+    )
+    return {
+        "reference": reference,
+        "lineage": manifest,
+        "validated_sentinels": validated,
+        "import_receipt": None if import_status == "unverified-historical-store" else import_provenance["reference"],
+    }
+
+
+def validate_store_preflight(
+    path: Path | None,
+    expected_sha256: str | None,
+    *,
+    request_ref: dict[str, Any],
+    store: Path,
+    store_manifest: dict[str, Any],
+    formal: bool,
+) -> dict[str, Any] | None:
+    """Validate the small orchestrator receipt; never reread the runtime store."""
+
+    require(
+        (path is None) == (expected_sha256 is None),
+        "--store-preflight and --store-preflight-sha256 must be provided together",
+    )
+    if path is None:
+        require(not formal, "formal Neo4j runs require an external pre-P31 full-store audit")
+        return None
+    reference = resolve_file(path, expected_sha256, "Neo4j store preflight")
+    document = validate_neo4j_store_audit(
+        read_json(Path(reference["path"]), "Neo4j store preflight"),
+        stage="pre",
+        request_ref=request_ref,
+        store_root=store,
+        store_manifest_ref=store_manifest["reference"],
+    )
+    return {"reference": reference, "audit": document}
+
+
+def _same_artifact_ref(observed: object, expected: object, context: str) -> None:
+    require(isinstance(observed, dict) and isinstance(expected, dict), f"{context}: malformed artifact reference")
+    require(
+        Path(str(observed.get("path", ""))).resolve()
+        == Path(str(expected.get("path", ""))).resolve(),
+        f"{context}: artifact path mismatch",
+    )
+    require(observed.get("sha256") == expected.get("sha256"), f"{context}: artifact SHA-256 mismatch")
+
+
+def validate_runtime_launch(
+    path: Path | None,
+    expected_sha256: str | None,
+    *,
+    formal: bool,
+    request: dict[str, Any],
+    store: Path,
+    logs_root: Path,
+    store_manifest: dict[str, Any],
+    preflight: dict[str, Any] | None,
+    uri: str,
+    image_digest: str,
+) -> dict[str, Any] | None:
+    """Validate and cross-bind the orchestrator's launch receipt before queries."""
+
+    require(
+        (path is None) == (expected_sha256 is None),
+        "--launch-receipt and --launch-receipt-sha256 must be provided together",
+    )
+    if not formal:
+        require(path is None, "fixture Neo4j execution must not carry a formal launch receipt")
+        return None
+    require(path is not None and expected_sha256 is not None, "formal Neo4j execution requires a launch receipt")
+    require(preflight is not None, "formal Neo4j launch requires the pre-launch store audit")
+    reference = resolve_file(path, expected_sha256, "Neo4j launch receipt")
+    host = p31_host_facts()
+    receipt = validate_launch_receipt(
+        read_json(Path(reference["path"]), "Neo4j launch receipt"),
+        verify_artifacts=True,
+        expected_host={
+            "hostname": host["hostname"],
+            "fingerprint_sha256": host["fingerprint_sha256"],
+        },
+    )
+    repeat = receipt["repeat"]
+    require(repeat["repeat_index"] == request["repeat_index"], "Neo4j launch repeat index differs from request")
+    clone = receipt["clone"]
+    same_path(clone["runtime_store_root"]["path"], store, "Neo4j launch runtime store")
+    same_path(clone["logs_root"]["path"], logs_root, "Neo4j launch logs root")
+    _same_artifact_ref(clone["store_manifest"], store_manifest["reference"], "Neo4j launch store manifest")
+    _same_artifact_ref(clone["store_preflight"], preflight["reference"], "Neo4j launch preflight")
+    external = request["external_service"]
+    contract = receipt["runtime_contract"]
+    require(
+        external["containers"] == [contract["container_name"]],
+        "Neo4j launch container differs from request",
+    )
+    require(
+        external["image_digests"] == [receipt["image"]["selected_repo_digest"]]
+        and receipt["image"]["selected_repo_digest"] == image_digest,
+        "Neo4j launch image RepoDigest differs from request",
+    )
+    parsed_uri = urlparse(uri)
+    require(
+        parsed_uri.hostname in {"127.0.0.1", "localhost"}
+        and parsed_uri.port == contract["bolt_port"]
+        and contract["bolt_host"] == "127.0.0.1",
+        "Neo4j launch Bolt endpoint differs from request",
+    )
+    same_path(contract["store_root"], store, "Neo4j launch contract store root")
+    same_path(contract["logs_root"], logs_root, "Neo4j launch contract logs root")
+    return {"reference": reference, "receipt": receipt}
+
+
+def validate_container_against_launch(
+    container: dict[str, Any], launch: dict[str, Any] | None
+) -> None:
+    if launch is None:
+        return
+    running = launch["receipt"]["docker"]["running"]
+    config = running["config"]
+    runtime = running["runtime"]
+    exact = {
+        "name": config["container_name"],
+        "container_id": config["container_id"],
+        "pid": runtime["pid"],
+        "started_at": runtime["started_at"],
+        "restart_count": runtime["restart_count"],
+        "image_id": config["image_id"],
+        "configured_image": config["configured_image"],
+        "container_user": config["container_user"],
+        "bolt_port": launch["receipt"]["runtime_contract"]["bolt_port"],
+        "restart_policy": config["restart_policy"],
+        "docker_log_config": config["log_config"],
+        "docker_memory_limit_bytes": config["resource_limits"]["memory_bytes"],
+        "docker_memory_swap_bytes": config["resource_limits"]["memory_swap_bytes"],
+        "entrypoint": config["entrypoint"],
+        "command": config["command"],
+    }
+    for key, expected in exact.items():
+        require(container.get(key) == expected, f"Neo4j container {key} differs from launch receipt")
+    by_destination = {item["destination"]: item for item in config["mounts"]}
+    same_path(container["data_mount"], Path(str(by_destination["/data"]["source"])), "Neo4j launch /data")
+    same_path(container["logs_mount"], Path(str(by_destination["/logs"]["source"])), "Neo4j launch /logs")
 
 
 def run_json(command: list[str], context: str) -> Any:
@@ -586,30 +840,168 @@ def run_json(command: list[str], context: str) -> Any:
         raise ContractError(f"{context}: command returned invalid JSON") from exc
 
 
+def memory_size_bytes(value: object, context: str) -> int:
+    require(isinstance(value, str) and value.strip(), f"{context}: expected memory size string")
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]i?B?|B)", value.strip(), re.IGNORECASE)
+    require(match is not None, f"{context}: unsupported memory size {value!r}")
+    try:
+        amount = Decimal(match.group(1))
+    except InvalidOperation as exc:
+        raise ContractError(f"{context}: invalid memory size {value!r}") from exc
+    unit = match.group(2).lower()
+    factors = {
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
+    }
+    result = amount * factors[unit]
+    require(result == result.to_integral_value() and result > 0, f"{context}: memory size is not positive integral bytes")
+    return int(result)
+
+
+def expected_memory_contract(heap_initial: str, heap_max: str, pagecache: str) -> dict[str, Any]:
+    configured = {
+        "heap_initial": heap_initial,
+        "heap_max": heap_max,
+        "pagecache": pagecache,
+    }
+    bytes_by_role = {
+        role: memory_size_bytes(value, f"expected {role}")
+        for role, value in configured.items()
+    }
+    require(
+        bytes_by_role["heap_initial"] == bytes_by_role["heap_max"],
+        "Neo4j formal heap initial/max sizes must be equal",
+    )
+    return {
+        "configured": configured,
+        "bytes": bytes_by_role,
+        "settings": dict(MEMORY_SETTING_NAMES),
+        "environment_names": dict(MEMORY_ENV_NAMES),
+    }
+
+
+def _normalized_container_destination(value: object) -> str:
+    require(isinstance(value, str) and value.startswith("/"), "container mount destination must be absolute")
+    normalized = posixpath.normpath(value)
+    require(normalized == value, f"container mount destination is not canonical: {value!r}")
+    return normalized
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    left = left.resolve()
+    right = right.resolve()
+    return left == right or left in right.parents or right in left.parents
+
+
+def _environment_map(values: object) -> dict[str, str]:
+    require(isinstance(values, list), "Neo4j container environment is malformed")
+    result: dict[str, str] = {}
+    for raw in values:
+        require(isinstance(raw, str) and "=" in raw, "Neo4j container environment entry is malformed")
+        name, value = raw.split("=", 1)
+        require(name and name not in result, f"Neo4j container environment duplicates {name!r}")
+        result[name] = value
+    return result
+
+
+def _reject_directory_overrides(environment: dict[str, str], container: dict[str, Any]) -> None:
+    forbidden_tokens = (
+        "directories_data",
+        "directories_databases",
+        "directories_transaction__logs__root",
+        "directories_transaction_logs_root",
+        "directories_logs",
+        "directories_run",
+        "directories_home",
+        "dbms_directories_data",
+        "dbms_directories_databases",
+        "dbms_directories_tx_log",
+    )
+    forbidden_env = [
+        name for name in environment
+        if name.startswith("NEO4J_") and any(token in name.lower() for token in forbidden_tokens)
+    ]
+    require(not forbidden_env, f"Neo4j container overrides storage directories: {forbidden_env!r}")
+    command_values = []
+    for key in ("Entrypoint", "Cmd"):
+        raw = container.get("Config", {}).get(key)
+        if isinstance(raw, str):
+            command_values.append(raw)
+        elif isinstance(raw, list):
+            require(all(isinstance(item, str) for item in raw), f"Neo4j container {key} is malformed")
+            command_values.extend(raw)
+        elif raw is not None:
+            raise ContractError(f"Neo4j container {key} is malformed")
+    lowered = "\n".join(command_values).lower().replace(".", "_")
+    require(
+        not any(token in lowered for token in forbidden_tokens),
+        "Neo4j container command/entrypoint overrides a storage directory",
+    )
+
+
 def validate_container(
-    name: str,
+    inspect_target: str,
+    expected_name: str,
     expected_image_ref: str,
     expected_image_digest: str,
     store: Path,
+    logs_root: Path,
     uri: str,
     formal: bool,
+    expected_memory: dict[str, Any],
+    expected_entrypoint: list[str] = EXPECTED_ENTRYPOINT,
+    expected_command: list[str] = EXPECTED_COMMAND,
 ) -> dict[str, Any]:
     parsed = urlparse(uri)
     require(parsed.scheme in ("bolt", "neo4j"), "Neo4j URI scheme must be bolt or neo4j")
     require(parsed.hostname in ("127.0.0.1", "localhost"), "Neo4j URI must use localhost")
     require(parsed.port is not None, "Neo4j URI must contain an explicit port")
-    raw_container = run_json(["docker", "container", "inspect", name], "Docker container inspect")
+    require(
+        not formal or re.fullmatch(r"[0-9a-f]{64}", inspect_target) is not None,
+        "formal Docker container inspect requires the launch-bound full ID",
+    )
+    raw_container = run_json(
+        ["docker", "container", "inspect", inspect_target],
+        "Docker container inspect",
+    )
     require(isinstance(raw_container, list) and len(raw_container) == 1, "Docker returned an ambiguous container")
     container = raw_container[0]
-    require(container.get("Name") == f"/{name}", "Docker container name mismatch")
+    container_id = nonempty_string(container.get("Id"), "Docker container ID")
+    require(container.get("Name") == f"/{expected_name}", "Docker container name mismatch")
+    if formal:
+        require(container_id == inspect_target, "Docker inspect returned a different launch-bound ID")
     state = container.get("State", {})
     require(state.get("Running") is True, "Neo4j container is not running")
     pid = integer(state.get("Pid"), "Neo4j container PID", 1)
     started_at = nonempty_string(state.get("StartedAt"), "Neo4j container StartedAt")
     restart_count = integer(container.get("RestartCount"), "Neo4j container RestartCount", 0)
     require(restart_count == 0, "Neo4j container must have RestartCount=0")
-    require(container.get("HostConfig", {}).get("RestartPolicy", {}).get("Name") == "no", "Neo4j container restart policy must be 'no'")
-    require(container.get("Config", {}).get("Image") == expected_image_ref, "Neo4j container image tag mismatch")
+    host_config = container.get("HostConfig", {})
+    require(host_config.get("RestartPolicy", {}).get("Name") == "no", "Neo4j container restart policy must be 'no'")
+    raw_config = container.get("Config", {})
+    require(isinstance(raw_config, dict), "Neo4j container config is malformed")
+    require(raw_config.get("Image") == expected_image_ref, "Neo4j container image tag mismatch")
+    require(
+        raw_config.get("Entrypoint") == expected_entrypoint,
+        "Neo4j Docker Config.Entrypoint differs from the preregistered baseline",
+    )
+    require(
+        raw_config.get("Cmd") == expected_command,
+        "Neo4j Docker Config.Cmd differs from the preregistered baseline",
+    )
+    container_user = nonempty_string(raw_config.get("User"), "Neo4j container user")
+    require(re.fullmatch(r"[0-9]+:[0-9]+", container_user) is not None, "Neo4j container user must be numeric UID:GID")
     image_id = exact_image_digest(container.get("Image"), "Docker container image ID")
     raw_image = run_json(["docker", "image", "inspect", image_id], "Docker image inspect")
     require(isinstance(raw_image, list) and len(raw_image) == 1, "Docker returned an ambiguous image")
@@ -622,15 +1014,62 @@ def validate_container(
     )
     require(expected_image_digest in resolved_digests, "Neo4j image RepoDigest mismatch")
 
-    mounts = [
-        mount
-        for mount in container.get("Mounts", [])
-        if mount.get("Destination") == "/data"
-    ]
-    require(len(mounts) == 1, "Neo4j container must have exactly one /data mount")
-    mount = mounts[0]
-    same_path(mount.get("Source"), store, "Neo4j container /data mount")
-    require(mount.get("RW") is True, "Neo4j /data mount unexpectedly is not writable")
+    logs_root = logs_root.resolve()
+    require(logs_root.is_dir() and not logs_root.is_symlink(), f"Neo4j logs root is invalid: {logs_root}")
+    require(not _paths_overlap(store, logs_root), "Neo4j /data and /logs roots overlap")
+    if formal:
+        store_metadata = store.stat()
+        logs_metadata = logs_root.stat()
+        expected_user = f"{store_metadata.st_uid}:{store_metadata.st_gid}"
+        require(container_user == expected_user, "Neo4j container user differs from the formal store owner")
+        for metadata, context in ((store_metadata, "store"), (logs_metadata, "logs")):
+            require(
+                metadata.st_uid == os.geteuid() and metadata.st_gid == os.getegid(),
+                f"formal Neo4j {context} root is not owned by the current UID:GID",
+            )
+            require(stat.S_IMODE(metadata.st_mode) == 0o700, f"formal Neo4j {context} root mode is not 0700")
+        require(
+            (store_metadata.st_uid, store_metadata.st_gid)
+            == (logs_metadata.st_uid, logs_metadata.st_gid),
+            "formal Neo4j store/log owners differ",
+        )
+    raw_mounts = container.get("Mounts", [])
+    require(isinstance(raw_mounts, list), "Neo4j container mounts are malformed")
+    mounts_by_destination: dict[str, dict[str, Any]] = {}
+    for raw_mount in raw_mounts:
+        require(isinstance(raw_mount, dict), "Neo4j container mount entry is malformed")
+        destination = _normalized_container_destination(raw_mount.get("Destination"))
+        require(destination not in mounts_by_destination, f"Neo4j container duplicates mount {destination}")
+        require(
+            destination in {"/data", "/logs"},
+            f"Neo4j container mount is outside the exact allowlist: {destination}",
+        )
+        require(raw_mount.get("Type") == "bind", f"Neo4j {destination} must be a bind mount")
+        source = raw_mount.get("Source")
+        require(isinstance(source, str) and source.startswith("/"), f"Neo4j {destination} source is invalid")
+        mounts_by_destination[destination] = raw_mount
+    require(set(mounts_by_destination) == {"/data", "/logs"}, "Neo4j requires exactly /data and /logs bind mounts")
+    data_mount = mounts_by_destination["/data"]
+    logs_mount = mounts_by_destination["/logs"]
+    same_path(data_mount.get("Source"), store, "Neo4j container /data mount")
+    same_path(logs_mount.get("Source"), logs_root, "Neo4j container /logs mount")
+    require(data_mount.get("RW") is True, "Neo4j /data mount unexpectedly is not writable")
+    require(logs_mount.get("RW") is True, "Neo4j /logs mount unexpectedly is not writable")
+    for destination, raw_mount in mounts_by_destination.items():
+        source = Path(str(raw_mount["Source"])).resolve()
+        if destination != "/data":
+            require(not _paths_overlap(source, store), "Neo4j nested/aliased /data mount is forbidden")
+
+    raw_log_config = host_config.get("LogConfig") or {}
+    log_config = {
+        "type": raw_log_config.get("Type"),
+        "config": raw_log_config.get("Config") or {},
+    }
+    require(log_config == EXPECTED_DOCKER_LOG_CONFIG, "Neo4j Docker log driver/options mismatch")
+    memory_limit = integer(host_config.get("Memory", 0), "Neo4j container memory limit", 0)
+    memory_swap = integer(host_config.get("MemorySwap", 0), "Neo4j container memory swap limit", -1)
+    require(memory_limit == 0, "Neo4j formal template must explicitly record an unlimited Docker memory limit")
+    require(memory_swap == 0, "Neo4j formal template must record the default unlimited Docker swap limit")
 
     all_ports = container.get("NetworkSettings", {}).get("Ports", {})
     published = {
@@ -644,27 +1083,41 @@ def validate_container(
     require(ports[0].get("HostIp") == "127.0.0.1", "Neo4j Bolt port must bind only to 127.0.0.1")
     require(int(ports[0].get("HostPort", "0")) == parsed.port, "Neo4j Bolt host port differs from URI")
 
-    environment = container.get("Config", {}).get("Env") or []
-    require("NEO4J_AUTH=none" in environment, "Neo4j adapter currently requires NEO4J_AUTH=none")
+    environment = _environment_map(container.get("Config", {}).get("Env") or [])
+    _reject_directory_overrides(environment, container)
+    require(environment.get("NEO4J_AUTH") == "none", "Neo4j adapter currently requires NEO4J_AUTH=none")
     require(
-        "NEO4J_server_databases_default__to__read__only=true" in environment,
+        environment.get("NEO4J_server_databases_default__to__read__only") == "true",
         "Neo4j service must default databases to read-only",
     )
+    for role, env_name in MEMORY_ENV_NAMES.items():
+        require(
+            environment.get(env_name) == expected_memory["configured"][role],
+            f"Neo4j container {role} setting differs from the preregistered value",
+        )
     return {
-        "name": name,
-        "container_id": nonempty_string(container.get("Id"), "Docker container ID"),
+        "name": expected_name,
+        "container_id": container_id,
         "pid": pid,
         "started_at": started_at,
         "restart_count": restart_count,
         "image_id": image_id,
         "configured_image": expected_image_ref,
+        "container_user": container_user,
         "repo_digests": repo_digests,
         "expected_repo_digest": expected_image_digest,
         "data_mount": str(store),
+        "logs_mount": str(logs_root),
         "bolt_host": "127.0.0.1",
         "bolt_port": parsed.port,
         "restart_policy": "no",
         "read_only_default": True,
+        "docker_log_config": log_config,
+        "docker_memory_limit_bytes": memory_limit,
+        "docker_memory_swap_bytes": memory_swap,
+        "memory_configuration": expected_memory,
+        "entrypoint": container.get("Config", {}).get("Entrypoint"),
+        "command": container.get("Config", {}).get("Cmd"),
     }
 
 
@@ -679,12 +1132,20 @@ def validate_container_stability(
         "restart_count",
         "image_id",
         "configured_image",
+        "container_user",
         "expected_repo_digest",
         "data_mount",
+        "logs_mount",
         "bolt_host",
         "bolt_port",
         "restart_policy",
         "read_only_default",
+        "docker_log_config",
+        "docker_memory_limit_bytes",
+        "docker_memory_swap_bytes",
+        "memory_configuration",
+        "entrypoint",
+        "command",
     )
     for key in stable_keys:
         require(before.get(key) == after.get(key), f"Neo4j container {key} changed during the repeat")
@@ -693,9 +1154,13 @@ def validate_container_stability(
     return {"stable": True, "before": before, "after": after}
 
 
-def driver_binding(expected_version: str) -> dict[str, Any]:
+def driver_binding(expected_version: str, expected_tree_sha256: str) -> dict[str, Any]:
     actual_version = importlib.metadata.version("neo4j")
     require(actual_version == expected_version, f"Neo4j Python driver {actual_version!r} != {expected_version!r}")
+    expected_tree_sha256 = exact_sha(
+        expected_tree_sha256,
+        "expected Neo4j Python driver tree SHA-256",
+    )
     distribution = importlib.metadata.distribution("neo4j")
     files: list[tuple[str, Path]] = []
     for item in distribution.files or []:
@@ -711,9 +1176,15 @@ def driver_binding(expected_version: str) -> dict[str, Any]:
         total_bytes += size
         digest.update(f"file\0{relative}\0{size}\0{sha256_file(path)}\n".encode())
     module_path = Path(str(neo4j.__file__)).resolve()
+    actual_tree_sha256 = digest.hexdigest()
+    require(
+        actual_tree_sha256 == expected_tree_sha256,
+        "Neo4j Python driver package tree differs from the prebound SHA-256",
+    )
     return {
         "version": actual_version,
-        "package_tree_sha256": digest.hexdigest(),
+        "expected_package_tree_sha256": expected_tree_sha256,
+        "package_tree_sha256": actual_tree_sha256,
         "hash_method": TREE_HASH_METHOD,
         "file_count": len(files),
         "total_bytes": total_bytes,
@@ -1022,6 +1493,151 @@ def verify_database_contract(driver: Any, database: str) -> dict[str, Any]:
     }
 
 
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(item) for item in value]
+    return str(value)
+
+
+def _plan_tree(plan: Any) -> dict[str, Any]:
+    operator = getattr(plan, "operator_type", None)
+    require(isinstance(operator, str) and operator, "Neo4j EXPLAIN plan node lacks operator_type")
+    raw_children = getattr(plan, "children", []) or []
+    require(isinstance(raw_children, (list, tuple)), "Neo4j EXPLAIN plan children are malformed")
+    identifiers = getattr(plan, "identifiers", []) or []
+    arguments = getattr(plan, "arguments", {}) or {}
+    return {
+        "operator_type": operator,
+        "identifiers": _jsonable(identifiers),
+        "arguments": _jsonable(arguments),
+        "children": [_plan_tree(child) for child in raw_children],
+    }
+
+
+def _plan_nodes(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    nodes = [plan]
+    for child in plan["children"]:
+        nodes.extend(_plan_nodes(child))
+    return nodes
+
+
+def verify_live_runtime_contract(
+    driver: Any,
+    database: str,
+    expected_memory: dict[str, Any],
+    representative_truth: dict[str, int],
+) -> dict[str, Any]:
+    require(database == DATABASE_NAME, f"Neo4j database must be {DATABASE_NAME!r}")
+    with driver.session(database="system", default_access_mode=neo4j.READ_ACCESS) as session:
+        database_rows = [
+            record.data()
+            for record in session.run(
+                "SHOW DATABASES YIELD name, currentStatus, requestedStatus, access "
+                "WHERE name = $name RETURN name, currentStatus, requestedStatus, access",
+                name=database,
+            )
+        ]
+        setting_rows = [
+            record.data()
+            for record in session.run(
+                "SHOW SETTINGS YIELD name, value WHERE name IN $names RETURN name, value",
+                names=list(MEMORY_SETTING_NAMES.values()),
+            )
+        ]
+    require(len(database_rows) == 1, "Neo4j SHOW DATABASES did not return exactly the query database")
+    database_status = database_rows[0]
+    require(database_status.get("name") == database, "Neo4j live database name mismatch")
+    require(str(database_status.get("currentStatus", "")).lower() == "online", "Neo4j query database is not online")
+    require(str(database_status.get("requestedStatus", "")).lower() == "online", "Neo4j query database is not requested online")
+    require(str(database_status.get("access", "")).lower() == "read-only", "Neo4j query database is not live read-only")
+
+    by_name = {
+        row.get("name"): row.get("value")
+        for row in setting_rows
+        if isinstance(row, dict)
+    }
+    require(set(by_name) == set(MEMORY_SETTING_NAMES.values()), "Neo4j SHOW SETTINGS memory set mismatch")
+    live_memory: dict[str, Any] = {}
+    for role, name in MEMORY_SETTING_NAMES.items():
+        raw = by_name[name]
+        live_bytes = memory_size_bytes(raw, f"Neo4j live setting {name}")
+        require(
+            live_bytes == expected_memory["bytes"][role],
+            f"Neo4j live setting {name} differs from the preregistered value",
+        )
+        live_memory[role] = {"name": name, "value": raw, "bytes": live_bytes}
+
+    relationship = relationship_type(representative_truth["edge_type"])
+    cypher = f"EXPLAIN MATCH (s:V {{id: $src}})-[:{relationship}]->(d:V) RETURN d.id AS dst"
+    with driver.session(database=database, default_access_mode=neo4j.READ_ACCESS) as session:
+        summary = session.run(cypher, src=representative_truth["src"]).consume()
+    raw_plan = getattr(summary, "plan", None)
+    require(raw_plan is not None, "Neo4j EXPLAIN did not publish a logical plan")
+    plan = _plan_tree(raw_plan)
+    plan_nodes = _plan_nodes(plan)
+    index_seeks = [node for node in plan_nodes if node["operator_type"] == "NodeIndexSeek"]
+    require(index_seeks, "Neo4j representative plan lacks NodeIndexSeek")
+    seek_text = json.dumps(index_seeks, sort_keys=True, separators=(",", ":"))
+    compact_seek_text = seek_text.replace("`", "").replace(" ", "")
+    require(
+        "v_id" in seek_text or "V(id)" in compact_seek_text,
+        "Neo4j NodeIndexSeek is not bound to the frozen :V(id) index",
+    )
+    return {
+        "database_status": database_status,
+        "memory": {
+            "preregistered": expected_memory,
+            "live": live_memory,
+        },
+        "representative_plan": {
+            "cypher": cypher,
+            "parameters": {"src": representative_truth["src"]},
+            "required_operator": "NodeIndexSeek",
+            "plan": plan,
+        },
+    }
+
+
+def jvm_process_contract(container_pid: int) -> dict[str, Any]:
+    pending = [container_pid]
+    seen: set[int] = set()
+    candidates: list[tuple[int, bytes, list[str]]] = []
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        proc = Path("/proc") / str(pid)
+        try:
+            raw = (proc / "cmdline").read_bytes()
+            argv = [item.decode("utf-8", errors="strict") for item in raw.split(b"\0") if item]
+        except (OSError, UnicodeError) as exc:
+            raise ContractError(f"cannot read Neo4j container process {pid}: {exc}") from exc
+        if argv and Path(argv[0]).name == "java":
+            candidates.append((pid, raw, argv))
+        try:
+            children_text = (proc / "task" / str(pid) / "children").read_text(encoding="ascii")
+        except OSError as exc:
+            raise ContractError(f"cannot enumerate Neo4j container descendants for PID {pid}: {exc}") from exc
+        children = [int(value) for value in children_text.split()]
+        pending.extend(children)
+    require(len(candidates) == 1, "Neo4j container must have exactly one JVM descendant")
+    pid, raw, argv = candidates[0]
+    require(any("-XX:+UseG1GC" == item for item in argv), "Neo4j JVM is not explicitly using G1GC")
+    return {
+        "container_pid": container_pid,
+        "pid": pid,
+        "java_executable": argv[0],
+        "gc": "G1GC",
+        "argv": argv,
+        "argv_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def execute_queries(
     request: dict[str, Any], truth_rows: list[dict[str, int]], driver: Any, database: str
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
@@ -1115,6 +1731,23 @@ def write_phase_events(path: Path, phases: dict[str, Any]) -> None:
 
 def run(args: argparse.Namespace) -> None:
     formal = args.mode == "formal"
+    expected_entrypoint = exact_string_vector(
+        args.expected_entrypoint_json, "expected Neo4j Docker Config.Entrypoint"
+    )
+    expected_command = exact_string_vector(
+        args.expected_command_json, "expected Neo4j Docker Config.Cmd"
+    )
+    memory_contract = expected_memory_contract(
+        args.expected_heap_initial_size,
+        args.expected_heap_max_size,
+        args.expected_pagecache_size,
+    )
+    if formal:
+        require(
+            memory_contract["configured"]
+            == {"heap_initial": "8G", "heap_max": "8G", "pagecache": "16G"},
+            "formal Neo4j memory configuration must be the preregistered 8G/8G/16G profile",
+        )
     require(args.database == DATABASE_NAME, f"Neo4j database must be {DATABASE_NAME!r}")
     require(
         1 <= args.readiness_timeout_s <= 900,
@@ -1129,9 +1762,21 @@ def run(args: argparse.Namespace) -> None:
             args.expected_driver_version == EXPECTED_DRIVER_VERSION,
             f"formal Neo4j Python driver must be {EXPECTED_DRIVER_VERSION!r}",
         )
+        exact_sha(
+            args.expected_driver_tree_sha256,
+            "formal Neo4j Python driver tree SHA-256",
+        )
         require(
             args.expected_server_agent == EXPECTED_SERVER_AGENT,
             f"formal Neo4j server agent must be {EXPECTED_SERVER_AGENT!r}",
+        )
+        require(
+            expected_entrypoint == EXPECTED_ENTRYPOINT,
+            "formal Neo4j Docker Config.Entrypoint baseline mismatch",
+        )
+        require(
+            expected_command == EXPECTED_COMMAND,
+            "formal Neo4j Docker Config.Cmd baseline mismatch",
         )
     request_path = args.request.resolve()
     request_ref = artifact_ref(request_path)
@@ -1144,9 +1789,14 @@ def run(args: argparse.Namespace) -> None:
         "request.binary must identify the running Python interpreter",
     )
     output_dir = args.output_dir.resolve()
+    logs_root = args.logs_root.resolve()
     require(
         output_dir != store and store not in output_dir.parents and output_dir not in store.parents,
         "Neo4j adapter output and store roots must not overlap",
+    )
+    require(
+        not _paths_overlap(output_dir, logs_root) and not _paths_overlap(store, logs_root),
+        "Neo4j adapter output, /data, and /logs roots must be independent",
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     for name in (
@@ -1172,17 +1822,53 @@ def run(args: argparse.Namespace) -> None:
         args.expected_image_ref,
         server_version,
         formal,
+        None if args.import_receipt is None else args.import_receipt.resolve(),
+        args.import_receipt_sha256,
     )
-    driver = driver_binding(args.expected_driver_version)
+    preflight = validate_store_preflight(
+        None if args.store_preflight is None else args.store_preflight.resolve(),
+        args.store_preflight_sha256,
+        request_ref=request_ref,
+        store=store,
+        store_manifest=store_manifest,
+        formal=formal,
+    )
+    launch = validate_runtime_launch(
+        None if args.launch_receipt is None else args.launch_receipt.resolve(),
+        args.launch_receipt_sha256,
+        formal=formal,
+        request=request,
+        store=store,
+        logs_root=logs_root,
+        store_manifest=store_manifest,
+        preflight=preflight,
+        uri=args.uri,
+        image_digest=image_digest,
+    )
+    driver = driver_binding(
+        args.expected_driver_version,
+        args.expected_driver_tree_sha256,
+    )
     external = request["external_service"]
+    container_name = external["containers"][0]
+    container_inspect_target = container_name
+    if launch is not None:
+        container_inspect_target = launch["receipt"]["docker"]["running"]["config"]["container_id"]
     container_before = validate_container(
-        external["containers"][0],
+        container_inspect_target,
+        container_name,
         args.expected_image_ref,
         image_digest,
         store,
+        logs_root,
         args.uri,
         formal,
+        memory_contract,
+        expected_entrypoint,
+        expected_command,
     )
+    validate_container_against_launch(container_before, launch)
+    jvm_before = jvm_process_contract(container_before["pid"])
 
     git: dict[str, Any] | None = None
     p02b: dict[str, Any] | None = None
@@ -1200,6 +1886,18 @@ def run(args: argparse.Namespace) -> None:
             args.readiness_timeout_s,
         )
         database_contract = verify_database_contract(query_driver, args.database)
+        runtime_contract = verify_live_runtime_contract(
+            query_driver,
+            args.database,
+            memory_contract,
+            truth_rows[0],
+        )
+        current_host = p31_host_facts()
+        runtime_contract["host"] = {
+            "hostname": current_host["hostname"],
+            "fingerprint_sha256": current_host["fingerprint_sha256"],
+            "mem_total_bytes": current_host["mem_total_bytes"],
+        }
         observations, phases = execute_queries(
             request, truth_rows, query_driver, args.database
         )
@@ -1207,13 +1905,21 @@ def run(args: argparse.Namespace) -> None:
         if query_driver is not None:
             query_driver.close()
     container_after = validate_container(
-        external["containers"][0],
+        container_inspect_target,
+        container_name,
         args.expected_image_ref,
         image_digest,
         store,
+        logs_root,
         args.uri,
         formal,
+        memory_contract,
+        expected_entrypoint,
+        expected_command,
     )
+    validate_container_against_launch(container_after, launch)
+    jvm_after = jvm_process_contract(container_after["pid"])
+    require(jvm_before == jvm_after, "Neo4j JVM PID/argv changed during the repeat")
     container_lifecycle = validate_container_stability(container_before, container_after)
     write_observations(output_dir / "query-observations.tsv", observations)
     write_phase_events(output_dir / "phase-events.jsonl", phases)
@@ -1249,13 +1955,16 @@ def run(args: argparse.Namespace) -> None:
         "python_binary": request["binary"],
         "python_driver": driver,
         "server_agent": server_agent,
+        "launch": launch,
         "container_lifecycle": container_lifecycle,
         "readiness": readiness,
         "database_contract": database_contract,
+        "runtime_contract": runtime_contract,
+        "jvm_lifecycle": {"stable": True, "before": jvm_before, "after": jvm_after},
         "dataset_input": request["dataset"],
         "dataset": dataset,
         "truth": artifact_ref(Path(request["truth"]["path"])),
-        "store": store_manifest,
+        "store": {**store_manifest, "preflight": preflight},
         "query_contract": {
             "cypher_shape": "MATCH (s:V {id: $src})-[:E_{P|N}<type>]->(d:V) RETURN d.id AS dst",
             "relationship_model": RELATIONSHIP_MODEL,

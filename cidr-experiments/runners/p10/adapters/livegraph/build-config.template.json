@@ -1,0 +1,7 @@
+{
+  "schema_version": "p10-livegraph-runtime-build-config-v1",
+  "integration_root": "__ABSOLUTE_CLEAN_INTEGRATION_ROOT__",
+  "livegraph_source_root": "__ABSOLUTE_CLEAN_LIVEGRAPH_SOURCE_ROOT__",
+  "output_dir": "__ABSOLUTE_NEW_OUTPUT_DIR__",
+  "compiler": "/usr/bin/g++"
+}

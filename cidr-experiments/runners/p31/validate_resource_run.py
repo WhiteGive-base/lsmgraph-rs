@@ -23,6 +23,7 @@ from typing import Any
 
 from resource_schema import (
     ARTIFACT_FILES,
+    CONTAINER_IDENTITY_SCHEMA_VERSION,
     DISK_CATEGORIES,
     DISK_COLUMNS,
     IOSTAT_COLUMNS,
@@ -30,6 +31,9 @@ from resource_schema import (
     RESOURCE_COLUMNS,
     RESOURCE_SCHEMA_VERSION,
 )
+
+_CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
+PROCESS_IDENTITY_SCHEMA_VERSION = "cidr-process-identity-v1"
 
 
 def utc_now() -> str:
@@ -479,15 +483,460 @@ def validate_formal_provenance(manifest: dict[str, Any], errors: list[str]) -> N
             if not ref.get("sha256"):
                 errors.append(f"formal run specified {name} but omitted SHA-256")
     for name, ref in inputs.items():
+        if not isinstance(ref, dict):
+            errors.append(f"formal run {name} input reference is malformed")
+            continue
         if not ref.get("path"):
             continue
         path = Path(ref["path"])
+        sha_mode = ref.get("content_sha256_mode", "verify")
+        if sha_mode not in {"verify", "declared-no-read-v1"}:
+            errors.append(f"formal run {name} has an unknown SHA-256 mode")
+            continue
+        if sha_mode == "declared-no-read-v1" and name != "dataset":
+            errors.append(f"formal run {name} cannot use declared-no-read SHA-256 mode")
         if ref.get("kind") == "directory" and not path.is_dir():
             errors.append(f"formal run {name} directory disappeared since launch")
-        if ref.get("kind") == "file" and (
-            not path.is_file() or not ref.get("sha256") or sha256_file(path) != ref["sha256"]
-        ):
-            errors.append(f"formal run {name} file is missing or changed since launch")
+        if ref.get("kind") == "file":
+            if not path.is_file() or not ref.get("sha256"):
+                errors.append(f"formal run {name} file is missing or lacks SHA-256")
+            elif sha_mode == "declared-no-read-v1":
+                if path.stat().st_size != ref.get("size_bytes"):
+                    errors.append(f"formal run {name} declared file size changed since launch")
+            elif sha256_file(path) != ref["sha256"]:
+                errors.append(f"formal run {name} file changed since launch")
+
+
+def container_identity_tuple(
+    value: object,
+    context: str,
+    errors: list[str],
+) -> tuple[str, int, str, int] | None:
+    if not isinstance(value, dict):
+        errors.append(f"{context}: identity is not an object")
+        return None
+    container_id = value.get("container_id")
+    pid = value.get("pid")
+    started_at = value.get("started_at")
+    restart_count = value.get("restart_count")
+    if not isinstance(container_id, str) or _CONTAINER_ID.fullmatch(container_id) is None:
+        errors.append(f"{context}: container_id is not a full Docker ID")
+        return None
+    if type(pid) is not int or pid <= 0:
+        errors.append(f"{context}: pid is not a positive integer")
+        return None
+    if not isinstance(started_at, str) or not started_at:
+        errors.append(f"{context}: started_at is empty or malformed")
+        return None
+    if type(restart_count) is not int or restart_count < 0:
+        errors.append(f"{context}: restart_count is not a non-negative integer")
+        return None
+    return container_id, pid, started_at, restart_count
+
+
+def validate_container_tracking(
+    collector_config: dict[str, Any],
+    collector: dict[str, Any],
+    ready: dict[str, Any],
+    resources: list[dict[str, str]],
+    expected_root_pid: object,
+    errors: list[str],
+) -> None:
+    """Fail closed on unresolved, unsampled, or changing external identities."""
+
+    requested = collector_config.get("containers")
+    configured_extra = collector_config.get("extra_pids")
+    if not isinstance(requested, list) or any(not isinstance(name, str) or not name for name in requested):
+        errors.append("run-manifest.json: collector containers are malformed")
+        requested = []
+    if len(requested) != len(set(requested)):
+        errors.append("run-manifest.json: collector containers contain duplicates")
+    if (
+        not isinstance(configured_extra, list)
+        or any(type(pid) is not int or pid <= 0 for pid in configured_extra)
+        or len(configured_extra) != len(set(configured_extra))
+    ):
+        errors.append("run-manifest.json: extra_pids are not unique positive integers")
+        configured_extra = []
+
+    sample_pids_by_index: dict[int, set[int]] = {}
+    all_sample_pids: set[int] = set()
+    for row in resources:
+        try:
+            index = int(row["sample_index"])
+            pids = {int(raw) for raw in row.get("pids", "").split(",") if raw}
+        except (KeyError, TypeError, ValueError):
+            continue
+        sample_pids_by_index[index] = pids
+        all_sample_pids.update(pids)
+
+    seen = collector.get("containers_seen")
+    history = collector.get("container_identity_history")
+    unique = collector.get("container_identity_unique_set")
+    expected_names = set(requested)
+    for label, value in (
+        ("containers_seen", seen),
+        ("container_identity_history", history),
+        ("container_identity_unique_set", unique),
+    ):
+        if not isinstance(value, dict) or set(value) != expected_names:
+            errors.append(f"collector-status.json: {label} keys differ from requested containers")
+    if not isinstance(seen, dict) or not isinstance(history, dict) or not isinstance(unique, dict):
+        return
+    if collector.get("container_identity_schema_version") != CONTAINER_IDENTITY_SCHEMA_VERSION:
+        errors.append("collector-status.json: wrong container identity schema version")
+
+    normalized_unique: dict[str, tuple[str, int, str, int]] = {}
+    for name in requested:
+        seen_pid = seen.get(name)
+        if type(seen_pid) is not int or seen_pid <= 0:
+            errors.append(f"collector-status.json: containers_seen[{name!r}] is not a positive integer")
+        elif seen_pid not in all_sample_pids:
+            errors.append(f"collector-status.json: containers_seen[{name!r}] PID was never sampled")
+
+        observations = history.get(name)
+        identities = unique.get(name)
+        if not isinstance(observations, list) or not observations:
+            errors.append(f"collector-status.json: no identity history for container {name!r}")
+            observations = []
+        if not isinstance(identities, list) or not identities:
+            errors.append(f"collector-status.json: no unique identity for container {name!r}")
+            identities = []
+
+        derived: list[tuple[str, int, str, int]] = []
+        for index, observation in enumerate(observations):
+            identity = container_identity_tuple(
+                observation,
+                f"collector-status.json: {name} history[{index}]",
+                errors,
+            )
+            if identity is not None and identity not in derived:
+                derived.append(identity)
+            before_sample = observation.get("before_sample_index") if isinstance(observation, dict) else None
+            observed_at = observation.get("observed_at_utc") if isinstance(observation, dict) else None
+            if type(before_sample) is not int or before_sample not in sample_pids_by_index:
+                errors.append(f"collector-status.json: {name} history[{index}] has no matching sample")
+            elif identity is not None and identity[1] not in sample_pids_by_index[before_sample]:
+                errors.append(f"collector-status.json: {name} history[{index}] PID is absent from its sample")
+            if not isinstance(observed_at, str) or not observed_at:
+                errors.append(f"collector-status.json: {name} history[{index}] lacks observed_at_utc")
+
+        declared: list[tuple[str, int, str, int]] = []
+        for index, value in enumerate(identities):
+            identity = container_identity_tuple(
+                value,
+                f"collector-status.json: {name} unique[{index}]",
+                errors,
+            )
+            if identity is not None:
+                declared.append(identity)
+        if declared != derived:
+            errors.append(f"collector-status.json: {name} unique set is not derived from identity history")
+        if len(declared) != 1:
+            errors.append(f"collector-status.json: {name} did not retain exactly one stable identity")
+        else:
+            normalized_unique[name] = declared[0]
+            if declared[0][1] != seen_pid:
+                errors.append(f"collector-status.json: {name} containers_seen PID differs from identity")
+            if declared[0][1] not in all_sample_pids:
+                errors.append(f"collector-status.json: {name} identity PID was never sampled")
+
+    if ready.get("schema_version") != CONTAINER_IDENTITY_SCHEMA_VERSION or ready.get("state") != "READY":
+        errors.append("collector-ready.json: missing clean READY identity gate")
+    if collector.get("collector_ready") != ready:
+        errors.append("collector-status.json: collector_ready differs from collector-ready.json")
+    if ready.get("root_pid") != expected_root_pid:
+        errors.append("collector-ready.json: root_pid differs from execution.json")
+    if ready.get("external_zero_baseline") is not True:
+        errors.append("collector-ready.json: external zero baseline was not established")
+    ready_index = ready.get("resource_sample_index")
+    if type(ready_index) is not int or ready_index not in sample_pids_by_index:
+        errors.append("collector-ready.json: resource_sample_index has no matching sample")
+        ready_sample_pids: set[int] = set()
+    else:
+        ready_sample_pids = sample_pids_by_index[ready_index]
+        if ready_index != 0:
+            errors.append("collector-ready.json: adapter was not released from the first resource sample")
+    if not isinstance(ready.get("ready_at_utc"), str) or not ready.get("ready_at_utc"):
+        errors.append("collector-ready.json: ready_at_utc is missing")
+    declared_sample_pids = ready.get("sample_pids")
+    if (
+        not isinstance(declared_sample_pids, list)
+        or any(type(pid) is not int or pid <= 0 for pid in declared_sample_pids)
+        or declared_sample_pids != sorted(ready_sample_pids)
+    ):
+        errors.append("collector-ready.json: sample_pids differ from the readiness resource sample")
+    baseline_pids = ready.get("external_zero_baseline_pids")
+    if (
+        not isinstance(baseline_pids, list)
+        or any(type(pid) is not int or pid <= 0 for pid in baseline_pids)
+        or baseline_pids != sorted(set(baseline_pids))
+        or not set(baseline_pids).issubset(ready_sample_pids)
+    ):
+        errors.append("collector-ready.json: external_zero_baseline_pids are malformed or unsampled")
+        baseline_pid_set: set[int] = set()
+    else:
+        baseline_pid_set = set(baseline_pids)
+    if ready.get("extra_pids") != configured_extra or not set(configured_extra).issubset(baseline_pid_set):
+        errors.append("collector-ready.json: extra PID baseline differs from the manifest")
+    ready_containers = ready.get("containers")
+    if not isinstance(ready_containers, dict) or set(ready_containers) != expected_names:
+        errors.append("collector-ready.json: container keys differ from the manifest")
+    else:
+        for name in requested:
+            identity = container_identity_tuple(
+                ready_containers.get(name),
+                f"collector-ready.json: containers[{name!r}]",
+                errors,
+            )
+            if identity is not None:
+                if normalized_unique.get(name) != identity:
+                    errors.append(f"collector-ready.json: {name} identity differs from final unique identity")
+                if identity[1] not in ready_sample_pids or identity[1] not in baseline_pid_set:
+                    errors.append(f"collector-ready.json: {name} PID lacks a zero-baseline readiness sample")
+
+
+def validate_process_tracking(
+    collector: dict[str, Any],
+    resources: list[dict[str, str]],
+    errors: list[str],
+) -> None:
+    """Validate compact PID/start-ticks evidence used for embedded workers."""
+
+    if collector.get("process_identity_schema_version") != PROCESS_IDENTITY_SCHEMA_VERSION:
+        errors.append("collector-status.json: wrong process identity schema version")
+    values = collector.get("process_identity_unique_set")
+    if not isinstance(values, list) or not values:
+        errors.append("collector-status.json: process identity unique set is missing or empty")
+        return
+    sample_pids: dict[int, set[int]] = {}
+    for row in resources:
+        try:
+            sample_pids[int(row["sample_index"])] = {
+                int(raw) for raw in row.get("pids", "").split(",") if raw
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    normalized: list[tuple[int, int]] = []
+    exact_keys = {
+        "pid", "ppid", "pgrp", "start_ticks", "first_sample_index",
+        "last_sample_index", "sample_count",
+    }
+    for index, value in enumerate(values):
+        context = f"collector-status.json: process identity[{index}]"
+        if not isinstance(value, dict) or set(value) != exact_keys:
+            errors.append(f"{context} has malformed keys")
+            continue
+        if any(type(value[key]) is not int for key in exact_keys):
+            errors.append(f"{context} contains a non-integer field")
+            continue
+        pid = value["pid"]
+        start_ticks = value["start_ticks"]
+        first = value["first_sample_index"]
+        last = value["last_sample_index"]
+        count = value["sample_count"]
+        if pid <= 0 or value["ppid"] < 0 or value["pgrp"] <= 0 or start_ticks <= 0:
+            errors.append(f"{context} has an invalid Linux process identity")
+        if first < 0 or last < first or count <= 0 or count > last - first + 1:
+            errors.append(f"{context} has an invalid sample interval/count")
+        if pid not in sample_pids.get(first, set()) or pid not in sample_pids.get(last, set()):
+            errors.append(f"{context} is absent from its boundary resource sample")
+        normalized.append((pid, start_ticks))
+    if normalized != sorted(normalized) or len(normalized) != len(set(normalized)):
+        errors.append("collector-status.json: process identity set is not unique/sorted")
+
+
+def container_identity_tuple(
+    value: object,
+    context: str,
+    errors: list[str],
+) -> tuple[str, int, int, str, int] | None:
+    if not isinstance(value, dict):
+        errors.append(f"{context}: identity is not an object")
+        return None
+    container_id = value.get("container_id")
+    pid = value.get("pid")
+    process_start_ticks = value.get("process_start_ticks")
+    started_at = value.get("started_at")
+    restart_count = value.get("restart_count")
+    if not isinstance(container_id, str) or _CONTAINER_ID.fullmatch(container_id) is None:
+        errors.append(f"{context}: container_id is not a full Docker ID")
+        return None
+    if type(pid) is not int or pid <= 0:
+        errors.append(f"{context}: pid is not a positive integer")
+        return None
+    if type(process_start_ticks) is not int or process_start_ticks <= 0:
+        errors.append(f"{context}: process_start_ticks is not a positive integer")
+        return None
+    if not isinstance(started_at, str) or not started_at:
+        errors.append(f"{context}: started_at is empty or malformed")
+        return None
+    if type(restart_count) is not int or restart_count < 0:
+        errors.append(f"{context}: restart_count is not a non-negative integer")
+        return None
+    return container_id, pid, process_start_ticks, started_at, restart_count
+
+
+def validate_container_tracking(
+    collector_config: dict[str, Any],
+    collector: dict[str, Any],
+    ready: dict[str, Any],
+    resources: list[dict[str, str]],
+    expected_root_pid: object,
+    errors: list[str],
+) -> None:
+    """Fail closed on unresolved, unsampled, or changing external identities."""
+
+    requested = collector_config.get("containers")
+    configured_extra = collector_config.get("extra_pids")
+    if not isinstance(requested, list) or any(not isinstance(name, str) or not name for name in requested):
+        errors.append("run-manifest.json: collector containers are malformed")
+        requested = []
+    if len(requested) != len(set(requested)):
+        errors.append("run-manifest.json: collector containers contain duplicates")
+    if (
+        not isinstance(configured_extra, list)
+        or any(type(pid) is not int or pid <= 0 for pid in configured_extra)
+        or len(configured_extra) != len(set(configured_extra))
+    ):
+        errors.append("run-manifest.json: extra_pids are not unique positive integers")
+        configured_extra = []
+
+    sample_pids_by_index: dict[int, set[int]] = {}
+    all_sample_pids: set[int] = set()
+    for row in resources:
+        try:
+            index = int(row["sample_index"])
+            pids = {int(raw) for raw in row.get("pids", "").split(",") if raw}
+        except (KeyError, TypeError, ValueError):
+            continue
+        sample_pids_by_index[index] = pids
+        all_sample_pids.update(pids)
+
+    seen = collector.get("containers_seen")
+    history = collector.get("container_identity_history")
+    unique = collector.get("container_identity_unique_set")
+    expected_names = set(requested)
+    for label, value in (
+        ("containers_seen", seen),
+        ("container_identity_history", history),
+        ("container_identity_unique_set", unique),
+    ):
+        if not isinstance(value, dict) or set(value) != expected_names:
+            errors.append(f"collector-status.json: {label} keys differ from requested containers")
+    if not isinstance(seen, dict) or not isinstance(history, dict) or not isinstance(unique, dict):
+        return
+    if collector.get("container_identity_schema_version") != CONTAINER_IDENTITY_SCHEMA_VERSION:
+        errors.append("collector-status.json: wrong container identity schema version")
+
+    normalized_unique: dict[str, tuple[str, int, int, str, int]] = {}
+    for name in requested:
+        seen_pid = seen.get(name)
+        if type(seen_pid) is not int or seen_pid <= 0:
+            errors.append(f"collector-status.json: containers_seen[{name!r}] is not a positive integer")
+        elif seen_pid not in all_sample_pids:
+            errors.append(f"collector-status.json: containers_seen[{name!r}] PID was never sampled")
+
+        observations = history.get(name)
+        identities = unique.get(name)
+        if not isinstance(observations, list) or not observations:
+            errors.append(f"collector-status.json: no identity history for container {name!r}")
+            observations = []
+        if not isinstance(identities, list) or not identities:
+            errors.append(f"collector-status.json: no unique identity for container {name!r}")
+            identities = []
+
+        derived: list[tuple[str, int, int, str, int]] = []
+        for index, observation in enumerate(observations):
+            identity = container_identity_tuple(
+                observation,
+                f"collector-status.json: {name} history[{index}]",
+                errors,
+            )
+            if identity is not None and identity not in derived:
+                derived.append(identity)
+            before_sample = observation.get("before_sample_index") if isinstance(observation, dict) else None
+            observed_at = observation.get("observed_at_utc") if isinstance(observation, dict) else None
+            if type(before_sample) is not int or before_sample not in sample_pids_by_index:
+                errors.append(f"collector-status.json: {name} history[{index}] has no matching sample")
+            elif identity is not None and identity[1] not in sample_pids_by_index[before_sample]:
+                errors.append(f"collector-status.json: {name} history[{index}] PID is absent from its sample")
+            if not isinstance(observed_at, str) or not observed_at:
+                errors.append(f"collector-status.json: {name} history[{index}] lacks observed_at_utc")
+
+        declared: list[tuple[str, int, int, str, int]] = []
+        for index, value in enumerate(identities):
+            identity = container_identity_tuple(
+                value,
+                f"collector-status.json: {name} unique[{index}]",
+                errors,
+            )
+            if identity is not None:
+                declared.append(identity)
+        if declared != derived:
+            errors.append(f"collector-status.json: {name} unique set is not derived from identity history")
+        if len(declared) != 1:
+            errors.append(f"collector-status.json: {name} did not retain exactly one stable identity")
+        else:
+            normalized_unique[name] = declared[0]
+            if declared[0][1] != seen_pid:
+                errors.append(f"collector-status.json: {name} containers_seen PID differs from identity")
+            if declared[0][1] not in all_sample_pids:
+                errors.append(f"collector-status.json: {name} identity PID was never sampled")
+
+    if ready.get("schema_version") != CONTAINER_IDENTITY_SCHEMA_VERSION or ready.get("state") != "READY":
+        errors.append("collector-ready.json: missing clean READY identity gate")
+    if collector.get("collector_ready") != ready:
+        errors.append("collector-status.json: collector_ready differs from collector-ready.json")
+    if ready.get("root_pid") != expected_root_pid:
+        errors.append("collector-ready.json: root_pid differs from execution.json")
+    if ready.get("external_zero_baseline") is not True:
+        errors.append("collector-ready.json: external zero baseline was not established")
+    ready_index = ready.get("resource_sample_index")
+    if type(ready_index) is not int or ready_index not in sample_pids_by_index:
+        errors.append("collector-ready.json: resource_sample_index has no matching sample")
+        ready_sample_pids: set[int] = set()
+    else:
+        ready_sample_pids = sample_pids_by_index[ready_index]
+        if ready_index != 0:
+            errors.append("collector-ready.json: adapter was not released from the first resource sample")
+    if not isinstance(ready.get("ready_at_utc"), str) or not ready.get("ready_at_utc"):
+        errors.append("collector-ready.json: ready_at_utc is missing")
+    declared_sample_pids = ready.get("sample_pids")
+    if (
+        not isinstance(declared_sample_pids, list)
+        or any(type(pid) is not int or pid <= 0 for pid in declared_sample_pids)
+        or declared_sample_pids != sorted(ready_sample_pids)
+    ):
+        errors.append("collector-ready.json: sample_pids differ from the readiness resource sample")
+    baseline_pids = ready.get("external_zero_baseline_pids")
+    if (
+        not isinstance(baseline_pids, list)
+        or any(type(pid) is not int or pid <= 0 for pid in baseline_pids)
+        or baseline_pids != sorted(set(baseline_pids))
+        or not set(baseline_pids).issubset(ready_sample_pids)
+    ):
+        errors.append("collector-ready.json: external_zero_baseline_pids are malformed or unsampled")
+        baseline_pid_set: set[int] = set()
+    else:
+        baseline_pid_set = set(baseline_pids)
+    if ready.get("extra_pids") != configured_extra or not set(configured_extra).issubset(baseline_pid_set):
+        errors.append("collector-ready.json: extra PID baseline differs from the manifest")
+    ready_containers = ready.get("containers")
+    if not isinstance(ready_containers, dict) or set(ready_containers) != expected_names:
+        errors.append("collector-ready.json: container keys differ from the manifest")
+    else:
+        for name in requested:
+            identity = container_identity_tuple(
+                ready_containers.get(name),
+                f"collector-ready.json: containers[{name!r}]",
+                errors,
+            )
+            if identity is not None:
+                if normalized_unique.get(name) != identity:
+                    errors.append(f"collector-ready.json: {name} identity differs from final unique identity")
+                if identity[1] not in ready_sample_pids or identity[1] not in baseline_pid_set:
+                    errors.append(f"collector-ready.json: {name} PID lacks a zero-baseline readiness sample")
 
 
 def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tuple[bool, dict[str, Any]]:
@@ -497,6 +946,7 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
     manifest = read_json(manifest_path, errors)
     execution = read_json(run_dir / "execution.json", errors)
     collector = read_json(run_dir / "collector-status.json", errors)
+    ready = read_json(run_dir / "collector-ready.json", errors)
     if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         errors.append("run-manifest.json: wrong schema_version")
     if manifest.get("resource_schema_version") != RESOURCE_SCHEMA_VERSION:
@@ -574,18 +1024,21 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
         errors.append("collector-status.json: containers differ from manifest")
     if collector.get("extra_pids") != collector_config.get("extra_pids"):
         errors.append("collector-status.json: extra_pids differ from manifest")
-    requested_containers = set(collector_config.get("containers", []))
-    resolved_containers = set(collector.get("containers_seen", {}))
-    if requested_containers != resolved_containers:
-        errors.append(
-            f"collector-status.json: containers never resolved: {sorted(requested_containers - resolved_containers)!r}"
-        )
     requested_extra_pids = set(collector_config.get("extra_pids", []))
     seen_extra_pids = set(collector.get("extra_pids_seen", []))
     if requested_extra_pids != seen_extra_pids:
         errors.append(
             f"collector-status.json: extra PIDs never observed: {sorted(requested_extra_pids - seen_extra_pids)!r}"
         )
+    validate_container_tracking(
+        collector_config,
+        collector,
+        ready,
+        resources,
+        expected_root_pid,
+        errors,
+    )
+    validate_process_tracking(collector, resources, errors)
 
     require_aux = bool(manifest.get("collector", {}).get("require_aux_tools", True))
     if require_aux:
@@ -649,6 +1102,24 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
             artifacts[name] = {"size_bytes": path.stat().st_size, "sha256": sha256_file(path)}
         else:
             errors.append(f"missing required artifact: {name}")
+
+    manifest["collector_result"] = {
+        "container_identity_schema_version": collector.get("container_identity_schema_version"),
+        "ready": ready,
+        "containers_seen": collector.get("containers_seen"),
+        "container_identity_history": collector.get("container_identity_history"),
+        "container_identity_unique_set": collector.get("container_identity_unique_set"),
+        "process_identity_schema_version": collector.get("process_identity_schema_version"),
+        "process_identity_unique_set": collector.get("process_identity_unique_set"),
+        "status_artifact": {
+            "path": str((run_dir / "collector-status.json").resolve()),
+            **artifacts.get("collector-status.json", {}),
+        },
+        "ready_artifact": {
+            "path": str((run_dir / "collector-ready.json").resolve()),
+            **artifacts.get("collector-ready.json", {}),
+        },
+    }
 
     passed = not errors
     validation = {

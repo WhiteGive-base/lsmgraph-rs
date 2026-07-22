@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,11 +23,18 @@ from resource_collector import (  # noqa: E402
     device_delta,
     parse_iostat_raw,
     parse_proc_stat_text,
+    record_container_identity,
+    resolve_container_identity,
     scan_disk_root,
 )
 from resource_schema import DISK_CATEGORIES, DISK_COLUMNS, RESOURCE_COLUMNS  # noqa: E402
 from run_manifest import artifact_ref  # noqa: E402
-from validate_resource_run import pidstat_has_pid_sample, validate_formal_provenance  # noqa: E402
+from validate_resource_run import (  # noqa: E402
+    pidstat_has_pid_sample,
+    validate_container_tracking,
+    validate_formal_provenance,
+    validate_process_tracking,
+)
 
 
 class ResourceCollectorUnitTests(unittest.TestCase):
@@ -150,6 +158,201 @@ nvme1n1 0.00 0.00 0.00 0.00 0.00 0.00 2.00 0.15 37.00 94.87 0.00 78.00 0.00 0.00
         self.assertEqual(final["process_write_bytes"], 170)
         self.assertEqual(final["process_count"], 0)
 
+    def test_forced_external_pid_establishes_zero_baseline(self) -> None:
+        proc = ProcCounters(
+            stat=ProcStat(pid=42, ppid=0, pgrp=42, utime_ticks=50, stime_ticks=10, start_ticks=200),
+            rss_bytes=4096,
+            rss_readable=True,
+            pss_bytes=2048,
+            pss_readable=True,
+            io_readable=True,
+            read_bytes=100,
+            write_bytes=200,
+            cancelled_write_bytes=0,
+            rchar=300,
+            wchar=400,
+        )
+        after = ProcCounters(
+            stat=ProcStat(pid=42, ppid=0, pgrp=42, utime_ticks=55, stime_ticks=12, start_ticks=200),
+            rss_bytes=4096,
+            rss_readable=True,
+            pss_bytes=2048,
+            pss_readable=True,
+            io_readable=True,
+            read_bytes=110,
+            write_bytes=225,
+            cancelled_write_bytes=0,
+            rchar=330,
+            wchar=440,
+        )
+        accumulator = ProcessAccumulator(zero_baseline_start_ticks=100)
+        with patch("resource_collector.read_proc_counters", side_effect=[proc, after]):
+            first = accumulator.snapshot([42], 1.0, zero_baseline_pids=[42])
+            second = accumulator.snapshot([42], 2.0, zero_baseline_pids=[42])
+        self.assertEqual(first["process_user_cpu_s"], 0)
+        self.assertEqual(first["process_write_bytes"], 0)
+        self.assertGreater(second["process_user_cpu_s"], 0)
+        self.assertEqual(second["process_write_bytes"], 25)
+
+    def test_docker_identity_resolution_and_unique_history(self) -> None:
+        raw = json.dumps(
+            [
+                {
+                    "Id": "a" * 64,
+                    "RestartCount": 0,
+                    "State": {
+                        "Running": True,
+                        "Pid": 4321,
+                        "StartedAt": "2026-07-22T00:00:00.000000000Z",
+                    },
+                }
+            ]
+        )
+        proc_stat = ProcStat(
+            pid=4321, ppid=1, pgrp=4321, utime_ticks=0, stime_ticks=0, start_ticks=987654
+        )
+        with patch("resource_collector.shutil.which", return_value="/usr/bin/docker"), patch(
+            "resource_collector.subprocess.check_output", return_value=raw
+        ), patch(
+            "resource_collector.read_proc_stat", return_value=proc_stat
+        ):
+            identity = resolve_container_identity("neo4j-formal")
+        self.assertEqual(identity["pid"], 4321)
+        self.assertEqual(identity["process_start_ticks"], 987654)
+        history: dict[str, list[dict[str, object]]] = {}
+        unique: dict[str, list[dict[str, object]]] = {}
+        record_container_identity("neo4j-formal", identity, 0, history, unique)
+        record_container_identity("neo4j-formal", identity, 1, history, unique)
+        self.assertEqual(len(history["neo4j-formal"]), 2)
+        self.assertEqual(unique["neo4j-formal"], [identity])
+
+    @staticmethod
+    def container_tracking_fixture() -> tuple[dict, dict, dict, list[dict[str, str]]]:
+        identity = {
+            "container_id": "b" * 64,
+            "pid": 4321,
+            "process_start_ticks": 987654,
+            "started_at": "2026-07-22T00:00:00.000000000Z",
+            "restart_count": 0,
+        }
+        ready = {
+            "schema_version": "cidr-container-identity-v2",
+            "state": "READY",
+            "ready_at_utc": "2026-07-22T00:00:01.000Z",
+            "root_pid": 100,
+            "resource_sample_index": 0,
+            "external_zero_baseline": True,
+            "containers": {"neo4j-formal": identity},
+            "extra_pids": [],
+            "sample_pids": [100, 4321],
+            "external_zero_baseline_pids": [4321],
+        }
+        collector = {
+            "container_identity_schema_version": "cidr-container-identity-v2",
+            "containers_seen": {"neo4j-formal": 4321},
+            "container_identity_history": {
+                "neo4j-formal": [
+                    {
+                        **identity,
+                        "observed_at_utc": "2026-07-22T00:00:00.500Z",
+                        "before_sample_index": 0,
+                    }
+                ]
+            },
+            "container_identity_unique_set": {"neo4j-formal": [identity]},
+            "collector_ready": ready,
+        }
+        config = {"containers": ["neo4j-formal"], "extra_pids": []}
+        resources = [{"sample_index": "0", "pids": "100,4321"}]
+        return config, collector, ready, resources
+
+    def test_container_tracking_accepts_one_sampled_stable_identity(self) -> None:
+        config, collector, ready, resources = self.container_tracking_fixture()
+        errors: list[str] = []
+        validate_container_tracking(config, collector, ready, resources, 100, errors)
+        self.assertEqual(errors, [])
+
+    def test_container_tracking_rejects_unsampled_pid_and_identity_drift(self) -> None:
+        config, collector, ready, resources = self.container_tracking_fixture()
+        changed = {
+            "container_id": "c" * 64,
+            "pid": 9876,
+            "process_start_ticks": 987655,
+            "started_at": "2026-07-22T00:00:02.000000000Z",
+            "restart_count": 1,
+        }
+        collector["container_identity_history"]["neo4j-formal"].append(
+            {
+                **changed,
+                "observed_at_utc": "2026-07-22T00:00:02.500Z",
+                "before_sample_index": 0,
+            }
+        )
+        collector["container_identity_unique_set"]["neo4j-formal"].append(changed)
+        collector["containers_seen"]["neo4j-formal"] = 9876
+        errors: list[str] = []
+        validate_container_tracking(config, collector, ready, resources, 100, errors)
+        self.assertTrue(any("never sampled" in error for error in errors))
+        self.assertTrue(any("exactly one stable identity" in error for error in errors))
+
+    def test_container_tracking_rejects_non_integer_containers_seen_pid(self) -> None:
+        config, collector, ready, resources = self.container_tracking_fixture()
+        collector["containers_seen"]["neo4j-formal"] = "4321"
+        errors: list[str] = []
+        validate_container_tracking(config, collector, ready, resources, 100, errors)
+        self.assertTrue(any("not a positive integer" in error for error in errors))
+
+    def test_process_tracking_accepts_exact_sorted_sampled_identity(self) -> None:
+        collector = {
+            "process_identity_schema_version": "cidr-process-identity-v1",
+            "process_identity_unique_set": [
+                {
+                    "pid": 4321,
+                    "ppid": 100,
+                    "pgrp": 4321,
+                    "start_ticks": 987654,
+                    "first_sample_index": 0,
+                    "last_sample_index": 1,
+                    "sample_count": 2,
+                }
+            ],
+        }
+        resources = [
+            {"sample_index": "0", "pids": "100,4321"},
+            {"sample_index": "1", "pids": "100,4321"},
+        ]
+        errors: list[str] = []
+        validate_process_tracking(collector, resources, errors)
+        self.assertEqual(errors, [])
+
+    def test_process_tracking_rejects_identity_and_boundary_drift(self) -> None:
+        base = {
+            "pid": 4321,
+            "ppid": 100,
+            "pgrp": 4321,
+            "start_ticks": 987654,
+            "first_sample_index": 0,
+            "last_sample_index": 1,
+            "sample_count": 2,
+        }
+        resources = [
+            {"sample_index": "0", "pids": "100,4321"},
+            {"sample_index": "1", "pids": "100,4321"},
+        ]
+        for label, values in (
+            ("start_ticks", [{**base, "start_ticks": 0}]),
+            ("process_group", [{**base, "pgrp": 0}]),
+            ("boundary", [{**base, "last_sample_index": 2}]),
+            ("duplicate", [dict(base), dict(base)]),
+        ):
+            collector = {
+                "process_identity_schema_version": "cidr-process-identity-v1",
+                "process_identity_unique_set": values,
+            }
+            errors: list[str] = []
+            validate_process_tracking(collector, resources, errors)
+            with self.subTest(label=label):
+                self.assertTrue(errors)
     def test_schemas_have_unique_columns(self) -> None:
         self.assertEqual(len(RESOURCE_COLUMNS), len(set(RESOURCE_COLUMNS)))
         self.assertEqual(len(DISK_COLUMNS), len(set(DISK_COLUMNS)))

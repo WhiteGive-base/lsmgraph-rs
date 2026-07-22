@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Iterable
 
 from resource_schema import (
+    CONTAINER_IDENTITY_SCHEMA_VERSION,
     DISK_CATEGORIES,
     DISK_COLUMNS,
     IOSTAT_COLUMNS,
@@ -33,6 +34,8 @@ from resource_schema import (
 
 _STOP = False
 _DATE_LINE = re.compile(r"^\d{2}/\d{2}/\d{2}(?:\d{2})?\s+\d{1,2}:\d{2}:\d{2}(?:\s+[AP]M)?$")
+_CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
+PROCESS_IDENTITY_SCHEMA_VERSION = "cidr-process-identity-v1"
 
 
 def utc_now() -> str:
@@ -204,20 +207,97 @@ def descendants(roots: Iterable[int]) -> set[int]:
     return found
 
 
-def resolve_container_pid(name: str) -> int | None:
+def resolve_container_identity(name: str) -> dict[str, object] | None:
+    """Return one strict identity snapshot for a running Docker container."""
+
     if shutil.which("docker") is None:
         return None
     try:
         output = subprocess.check_output(
-            ["docker", "inspect", "-f", "{{.State.Pid}}", name],
+            ["docker", "inspect", "--type", "container", name],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=3,
-        ).strip()
-        pid = int(output)
-        return pid if pid > 0 else None
-    except (subprocess.SubprocessError, ValueError, OSError):
+        )
+        values = json.loads(output)
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+            return None
+        value = values[0]
+        state = value.get("State")
+        container_id = value.get("Id")
+        pid = state.get("Pid") if isinstance(state, dict) else None
+        started_at = state.get("StartedAt") if isinstance(state, dict) else None
+        running = state.get("Running") if isinstance(state, dict) else None
+        restart_count = value.get("RestartCount")
+        if (
+            not isinstance(container_id, str)
+            or _CONTAINER_ID.fullmatch(container_id) is None
+            or type(pid) is not int
+            or pid <= 0
+            or not isinstance(started_at, str)
+            or not started_at
+            or running is not True
+            or type(restart_count) is not int
+            or restart_count < 0
+        ):
+            return None
+        proc_stat = read_proc_stat(pid)
+        if proc_stat is None or proc_stat.pid != pid or proc_stat.start_ticks <= 0:
+            return None
+        return {
+            "container_id": container_id,
+            "pid": pid,
+            "process_start_ticks": proc_stat.start_ticks,
+            "started_at": started_at,
+            "restart_count": restart_count,
+        }
+    except (json.JSONDecodeError, subprocess.SubprocessError, ValueError, OSError):
         return None
+
+
+def resolve_container_pid(name: str) -> int | None:
+    """Compatibility helper; the collector itself records full identities."""
+
+    identity = resolve_container_identity(name)
+    return int(identity["pid"]) if identity is not None else None
+
+
+def identity_key(identity: dict[str, object]) -> tuple[str, int, int, str, int]:
+    return (
+        str(identity["container_id"]),
+        int(identity["pid"]),
+        int(identity["process_start_ticks"]),
+        str(identity["started_at"]),
+        int(identity["restart_count"]),
+    )
+
+
+def record_container_identity(
+    name: str,
+    identity: dict[str, object],
+    sample_index: int,
+    history: dict[str, list[dict[str, object]]],
+    unique: dict[str, list[dict[str, object]]],
+) -> None:
+    """Record every resolution and a deterministic first-seen unique set."""
+
+    snapshot = {
+        "container_id": str(identity["container_id"]),
+        "pid": int(identity["pid"]),
+        "process_start_ticks": int(identity["process_start_ticks"]),
+        "started_at": str(identity["started_at"]),
+        "restart_count": int(identity["restart_count"]),
+    }
+    history.setdefault(name, []).append(
+        {
+            **snapshot,
+            "observed_at_utc": utc_now(),
+            "before_sample_index": sample_index,
+        }
+    )
+    identities = unique.setdefault(name, [])
+    if identity_key(snapshot) not in {identity_key(value) for value in identities}:
+        identities.append(snapshot)
 
 
 class ProcessAccumulator:
@@ -263,7 +343,13 @@ class ProcessAccumulator:
             return proc.stat.stime_ticks
         return int(getattr(proc, field))
 
-    def snapshot(self, pids: Iterable[int], now_mono: float) -> dict[str, object]:
+    def snapshot(
+        self,
+        pids: Iterable[int],
+        now_mono: float,
+        zero_baseline_pids: Iterable[int] = (),
+    ) -> dict[str, object]:
+        forced_zero = set(zero_baseline_pids)
         current: dict[tuple[int, int], ProcCounters] = {}
         for pid in sorted(set(pids)):
             proc = read_proc_counters(pid)
@@ -273,7 +359,11 @@ class ProcessAccumulator:
         for key, proc in current.items():
             previous = self.last_seen.get(key)
             if previous is None:
-                if self.zero_baseline_start_ticks is not None and proc.stat.start_ticks >= self.zero_baseline_start_ticks:
+                if (
+                    proc.stat.pid not in forced_zero
+                    and self.zero_baseline_start_ticks is not None
+                    and proc.stat.start_ticks >= self.zero_baseline_start_ticks
+                ):
                     for field in self.COUNTER_FIELDS:
                         self.totals[field] += self._counter(proc, field)
             else:
@@ -319,6 +409,19 @@ class ProcessAccumulator:
             "process_read_mib_s": read_rate,
             "process_write_mib_s": write_rate,
         }
+
+    def identities(self) -> list[dict[str, int]]:
+        """Return the exact PID/start-time identities from the latest sample."""
+
+        return [
+            {
+                "pid": proc.stat.pid,
+                "ppid": proc.stat.ppid,
+                "pgrp": proc.stat.pgrp,
+                "start_ticks": proc.stat.start_ticks,
+            }
+            for _, proc in sorted(self.active.items())
+        ]
 
 
 def read_meminfo() -> dict[str, int]:
@@ -627,6 +730,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root-pid", required=True, type=int)
     parser.add_argument("--root-pgid", type=int)
     parser.add_argument("--stop-file", required=True, type=Path)
+    parser.add_argument("--ready-file", required=True, type=Path)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--disk-interval", type=float, default=15.0)
     parser.add_argument("--device", default="nvme1n1")
@@ -655,6 +759,9 @@ def main() -> int:
     resource_path = run_dir / "resource-samples.tsv"
     disk_path = run_dir / "disk-samples.tsv"
     iostat_tsv_path = run_dir / "iostat-samples.tsv"
+    ready_path = args.ready_file.resolve()
+    if ready_path.parent != run_dir or ready_path.name != "collector-ready.json":
+        raise SystemExit("--ready-file must be RUN_DIR/collector-ready.json")
     owned_paths = [
         resource_path,
         disk_path,
@@ -662,6 +769,7 @@ def main() -> int:
         run_dir / "pidstat.raw",
         run_dir / "iostat.raw",
         run_dir / "collector-status.json",
+        ready_path,
     ]
     if any(path.exists() for path in owned_paths):
         raise SystemExit("refusing to overwrite existing collector artifact")
@@ -700,8 +808,17 @@ def main() -> int:
     previous_device_mono = started_mono
     known_pids: set[int] = set()
     container_pids: dict[str, int] = {}
+    container_current: dict[str, dict[str, object]] = {}
     containers_seen: dict[str, int] = {}
+    container_identity_history: dict[str, list[dict[str, object]]] = {
+        name: [] for name in args.container
+    }
+    container_identity_unique_set: dict[str, list[dict[str, object]]] = {
+        name: [] for name in args.container
+    }
     extra_pids_seen: set[int] = set()
+    process_identity_intervals: dict[tuple[int, int], dict[str, int]] = {}
+    collector_ready: dict[str, object] | None = None
     next_container_resolve = 0.0
     next_disk = started_mono
     next_resource = started_mono
@@ -727,19 +844,59 @@ def main() -> int:
 
             while True:
                 now = time.monotonic()
-                if now >= next_container_resolve:
+                stop_requested = args.stop_file.exists() or _STOP
+                if now >= next_container_resolve or stop_requested:
                     for name in args.container:
-                        resolved = resolve_container_pid(name)
-                        if resolved is not None:
+                        identity = resolve_container_identity(name)
+                        if identity is not None:
+                            record_container_identity(
+                                name,
+                                identity,
+                                sample_index,
+                                container_identity_history,
+                                container_identity_unique_set,
+                            )
+                            resolved = int(identity["pid"])
+                            container_current[name] = identity
                             container_pids[name] = resolved
                             containers_seen[name] = resolved
+                            if len(container_identity_unique_set[name]) > 1:
+                                message = f"container identity changed during collection: {name}"
+                                if message not in errors:
+                                    errors.append(message)
+                        else:
+                            container_current.pop(name, None)
+                            container_pids.pop(name, None)
+                            if collector_ready is not None:
+                                message = f"container disappeared after collector readiness: {name}"
+                                if message not in errors:
+                                    errors.append(message)
                     next_container_resolve = now + 10.0
 
-                discovery_roots = {args.root_pid, *args.extra_pid, *container_pids.values(), *known_pids}
+                external_roots = {*args.extra_pid, *container_pids.values()}
+                external_pids = descendants(external_roots)
+                discovery_roots = {args.root_pid, *external_roots, *known_pids}
                 extra_pids_seen.update(pid for pid in args.extra_pid if read_proc_stat(pid) is not None)
                 pids = descendants(discovery_roots) | process_group_members(root_pgid)
                 known_pids = set(pids)
-                proc_values = accumulator.snapshot(pids, now)
+                proc_values = accumulator.snapshot(pids, now, external_pids)
+                for identity in accumulator.identities():
+                    identity_key = (identity["pid"], identity["start_ticks"])
+                    current = process_identity_intervals.get(identity_key)
+                    if current is None:
+                        process_identity_intervals[identity_key] = {
+                            **identity,
+                            "first_sample_index": sample_index,
+                            "last_sample_index": sample_index,
+                            "sample_count": 1,
+                        }
+                    else:
+                        current["last_sample_index"] = sample_index
+                        current["sample_count"] += 1
+                sampled_pids = {
+                    int(raw) for raw in str(proc_values["pids"]).split(",") if raw
+                }
+                sampled_external_pids = external_pids & sampled_pids
 
                 root_stat = read_proc_stat(args.root_pid)
                 root_alive = int(root_stat is not None and root_stat.start_ticks == root_start_ticks)
@@ -777,9 +934,39 @@ def main() -> int:
                 }
                 resource_writer.writerow(row)
                 resource_handle.flush()
+                if collector_ready is None and sample_index == 0:
+                    containers_resolved = set(container_current) == set(args.container)
+                    container_roots_sampled = all(pid in sampled_pids for pid in container_pids.values())
+                    extra_roots_sampled = all(pid in sampled_pids for pid in args.extra_pid)
+                    if containers_resolved and container_roots_sampled and extra_roots_sampled:
+                        collector_ready = {
+                            "schema_version": CONTAINER_IDENTITY_SCHEMA_VERSION,
+                            "state": "READY",
+                            "ready_at_utc": utc_now(),
+                            "root_pid": args.root_pid,
+                            "resource_sample_index": sample_index,
+                            "external_zero_baseline": True,
+                            "containers": {
+                                name: {
+                                    "container_id": str(container_current[name]["container_id"]),
+                                    "pid": int(container_current[name]["pid"]),
+                                    "started_at": str(container_current[name]["started_at"]),
+                                    "restart_count": int(container_current[name]["restart_count"]),
+                                }
+                                for name in args.container
+                            },
+                            "extra_pids": list(args.extra_pid),
+                            "sample_pids": sorted(sampled_pids),
+                            "external_zero_baseline_pids": sorted(sampled_external_pids),
+                        }
+                        atomic_json(ready_path, collector_ready)
+                    else:
+                        errors.append(
+                            "external container/PID zero baseline was not established in the first sample"
+                        )
                 sample_index += 1
 
-                if now >= next_disk or args.stop_file.exists() or _STOP:
+                if now >= next_disk or stop_requested:
                     for role, label, root in roots:
                         disk_writer.writerow(scan_disk_root(role, label, root, now - started_mono, disk_round))
                         disk_rows += 1
@@ -793,7 +980,9 @@ def main() -> int:
                     orphan_since = orphan_since or now
                 else:
                     orphan_since = None
-                if args.stop_file.exists() or _STOP:
+                if stop_requested:
+                    break
+                if collector_ready is None and errors:
                     break
                 if orphan_since is not None and now - orphan_since >= args.orphan_grace:
                     errors.append("collector auto-stopped after command process tree disappeared without stop marker")
@@ -837,6 +1026,20 @@ def main() -> int:
         "stores": [{"role": role, "label": label, "path": str(path)} for role, label, path in roots],
         "containers": args.container,
         "containers_seen": containers_seen,
+        "container_identity_schema_version": CONTAINER_IDENTITY_SCHEMA_VERSION,
+        "container_identity_history": container_identity_history,
+        "container_identity_unique_set": container_identity_unique_set,
+        "process_identity_schema_version": PROCESS_IDENTITY_SCHEMA_VERSION,
+        "process_identity_unique_set": [
+            process_identity_intervals[key] for key in sorted(process_identity_intervals)
+        ],
+        "collector_ready": collector_ready
+        or {
+            "schema_version": CONTAINER_IDENTITY_SCHEMA_VERSION,
+            "state": "NOT_READY",
+            "root_pid": args.root_pid,
+            "external_zero_baseline": False,
+        },
         "extra_pids": args.extra_pid,
         "extra_pids_seen": sorted(extra_pids_seen),
         "errors": errors,

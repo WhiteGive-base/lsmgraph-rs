@@ -23,6 +23,7 @@ Core options:
   --data-mount PATH        Defaults to /data.
   --interval SECONDS       Process/host sample interval (default 1).
   --disk-interval SECONDS  Store scan interval (default 15).
+  --collector-ready-timeout SECONDS  Bound before adapter release (default 60).
   --min-samples N          Validator minimum (default 2).
   --temp LABEL=PATH        Temporary-disk root (repeatable).
   --container NAME         Add a Docker container process tree (repeatable).
@@ -32,9 +33,11 @@ Core options:
 Provenance inputs (paths and optional precomputed directory hashes):
   --binary PATH [--binary-sha256 HEX]
   --dataset PATH [--dataset-sha256 HEX]
+  --dataset-sha256-mode verify|declared-no-read-v1
   --truth PATH [--truth-sha256 HEX]
   --query-or-trace PATH [--query-or-trace-sha256 HEX]
   --config PATH [--config-sha256 HEX]
+  --input LABEL=PATH=SHA256   Additional immutable formal input (repeatable).
 
 Only the validator creates DONE. Any command/collector/validation failure creates
 FAILED and the wrapper exits non-zero.
@@ -50,16 +53,19 @@ DEVICE="nvme1n1"
 DATA_MOUNT="/data"
 INTERVAL="1"
 DISK_INTERVAL="15"
+COLLECTOR_READY_TIMEOUT="60"
 MIN_SAMPLES="2"
 REQUIRE_AUX_TOOLS="true"
 declare -a STORES=()
 declare -a TEMPS=()
 declare -a CONTAINERS=()
 declare -a EXTRA_PIDS=()
+declare -a INPUTS=()
 BINARY=""
 BINARY_SHA256=""
 DATASET=""
 DATASET_SHA256=""
+DATASET_SHA256_MODE="verify"
 TRUTH=""
 TRUTH_SHA256=""
 QUERY_OR_TRACE=""
@@ -79,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --data-mount) DATA_MOUNT="${2:?}"; shift 2 ;;
     --interval) INTERVAL="${2:?}"; shift 2 ;;
     --disk-interval) DISK_INTERVAL="${2:?}"; shift 2 ;;
+    --collector-ready-timeout) COLLECTOR_READY_TIMEOUT="${2:?}"; shift 2 ;;
     --min-samples) MIN_SAMPLES="${2:?}"; shift 2 ;;
     --store) STORES+=("${2:?}"); shift 2 ;;
     --temp) TEMPS+=("${2:?}"); shift 2 ;;
@@ -89,6 +96,8 @@ while [[ $# -gt 0 ]]; do
     --binary-sha256) BINARY_SHA256="${2:?}"; shift 2 ;;
     --dataset) DATASET="${2:?}"; shift 2 ;;
     --dataset-sha256) DATASET_SHA256="${2:?}"; shift 2 ;;
+    --dataset-sha256-mode) DATASET_SHA256_MODE="${2:?}"; shift 2 ;;
+    --input) INPUTS+=("${2:?}"); shift 2 ;;
     --truth) TRUTH="${2:?}"; shift 2 ;;
     --truth-sha256) TRUTH_SHA256="${2:?}"; shift 2 ;;
     --query-or-trace) QUERY_OR_TRACE="${2:?}"; shift 2 ;;
@@ -109,6 +118,16 @@ done
 [[ "$PERFORMANCE_ELIGIBLE" == "true" || "$PERFORMANCE_ELIGIBLE" == "false" ]] || {
   echo "--performance-eligible must be true or false" >&2; exit 64;
 }
+[[ "$DATASET_SHA256_MODE" == "verify" || "$DATASET_SHA256_MODE" == "declared-no-read-v1" ]] || {
+  echo "--dataset-sha256-mode is invalid" >&2; exit 64;
+}
+if [[ "$DATASET_SHA256_MODE" == "declared-no-read-v1" && "$PERFORMANCE_ELIGIBLE" != "true" ]]; then
+  echo "declared-no-read dataset SHA mode is formal-only" >&2
+  exit 64
+fi
+[[ "$COLLECTOR_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+  echo "--collector-ready-timeout must be a positive integer" >&2; exit 64;
+}
 if [[ -e "$RUN_DIR" && -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
   echo "refusing non-empty run directory: $RUN_DIR" >&2
   exit 73
@@ -119,6 +138,8 @@ RUN_DIR="$(cd "$RUN_DIR" && pwd)"
 RUN_ID="${RUN_ID:-$(basename "$RUN_DIR")}"
 REPO_ROOT="${REPO_ROOT:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}"
 STOP_FILE="${RUN_DIR}/COLLECTOR_STOP"
+READY_FILE="${RUN_DIR}/collector-ready.json"
+COLLECTOR_STATUS_FILE="${RUN_DIR}/collector-status.json"
 COMMAND_FILE="${RUN_DIR}/command.txt"
 printf '%q ' "${COMMAND[@]}" > "$COMMAND_FILE"
 printf '\n' >> "$COMMAND_FILE"
@@ -139,6 +160,7 @@ declare -a MANIFEST_ARGS=(
   --data-mount "$DATA_MOUNT"
   --interval "$INTERVAL"
   --disk-interval "$DISK_INTERVAL"
+  --ready-timeout "$COLLECTOR_READY_TIMEOUT"
   --min-samples "$MIN_SAMPLES"
   --require-aux-tools "$REQUIRE_AUX_TOOLS"
 )
@@ -146,10 +168,12 @@ for value in "${STORES[@]}"; do MANIFEST_ARGS+=(--store "$value"); done
 for value in "${TEMPS[@]}"; do MANIFEST_ARGS+=(--temp "$value"); done
 for value in "${CONTAINERS[@]}"; do MANIFEST_ARGS+=(--container "$value"); done
 for value in "${EXTRA_PIDS[@]}"; do MANIFEST_ARGS+=(--extra-pid "$value"); done
+for value in "${INPUTS[@]}"; do MANIFEST_ARGS+=(--input "$value"); done
 [[ -n "$BINARY" ]] && MANIFEST_ARGS+=(--binary "$BINARY")
 [[ -n "$BINARY_SHA256" ]] && MANIFEST_ARGS+=(--binary-sha256 "$BINARY_SHA256")
 [[ -n "$DATASET" ]] && MANIFEST_ARGS+=(--dataset "$DATASET")
 [[ -n "$DATASET_SHA256" ]] && MANIFEST_ARGS+=(--dataset-sha256 "$DATASET_SHA256")
+MANIFEST_ARGS+=(--dataset-sha256-mode "$DATASET_SHA256_MODE")
 [[ -n "$TRUTH" ]] && MANIFEST_ARGS+=(--truth "$TRUTH")
 [[ -n "$TRUTH_SHA256" ]] && MANIFEST_ARGS+=(--truth-sha256 "$TRUTH_SHA256")
 [[ -n "$QUERY_OR_TRACE" ]] && MANIFEST_ARGS+=(--query-or-trace "$QUERY_OR_TRACE")
@@ -212,7 +236,26 @@ trap 'on_signal 2' INT
 trap 'on_signal 15' TERM
 
 STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
-setsid -- "${COMMAND[@]}" > "${RUN_DIR}/command.stdout.log" 2> "${RUN_DIR}/command.stderr.log" &
+setsid -- bash -c '
+  ready_file="$1"
+  status_file="$2"
+  timeout_s="$3"
+  shift 3
+  deadline=$((SECONDS + timeout_s))
+  while [[ ! -f "$ready_file" ]]; do
+    if [[ -f "$status_file" ]]; then
+      echo "collector exited before readiness; adapter command was not released" >&2
+      exit 125
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "collector readiness timed out after ${timeout_s}s; adapter command was not released" >&2
+      exit 125
+    fi
+    sleep 0.05
+  done
+  exec "$@"
+' cidr-collector-gate "$READY_FILE" "$COLLECTOR_STATUS_FILE" "$COLLECTOR_READY_TIMEOUT" "${COMMAND[@]}" \
+  > "${RUN_DIR}/command.stdout.log" 2> "${RUN_DIR}/command.stderr.log" &
 COMMAND_PID=$!
 
 declare -a COLLECTOR_ARGS=(
@@ -221,6 +264,7 @@ declare -a COLLECTOR_ARGS=(
   --root-pid "$COMMAND_PID"
   --root-pgid "$COMMAND_PID"
   --stop-file "$STOP_FILE"
+  --ready-file "$READY_FILE"
   --interval "$INTERVAL"
   --disk-interval "$DISK_INTERVAL"
   --device "$DEVICE"

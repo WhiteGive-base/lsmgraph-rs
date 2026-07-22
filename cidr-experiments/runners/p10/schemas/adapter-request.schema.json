@@ -112,6 +112,30 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        },
+        "orchestrated_lifecycle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["controller", "receipts", "logs_root"],
+          "properties": {
+            "controller": {"$ref": "#/$defs/artifact"},
+            "receipts": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["store_lock", "sealed_admission", "preflight", "partial_start", "start_cleanup", "start", "live_gate", "stop"],
+              "properties": {
+                "store_lock": {"type": "string", "minLength": 1},
+                "sealed_admission": {"type": "string", "minLength": 1},
+                "preflight": {"type": "string", "minLength": 1},
+                "partial_start": {"type": "string", "minLength": 1},
+                "start_cleanup": {"type": "string", "minLength": 1},
+                "start": {"type": "string", "minLength": 1},
+                "live_gate": {"type": "string", "minLength": 1},
+                "stop": {"type": "string", "minLength": 1}
+              }
+            },
+            "logs_root": {"type": "string", "minLength": 1}
+          }
         }
       }
     }

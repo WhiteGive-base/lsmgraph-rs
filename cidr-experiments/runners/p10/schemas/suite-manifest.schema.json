@@ -126,6 +126,73 @@
         "sha256": {"$ref": "#/$defs/sha256"}
       }
     },
+    "neo4j_repeat_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repeat_index",
+        "clone_id",
+        "repeat_root",
+        "source_store_root",
+        "launcher",
+        "store_root",
+        "logs_root",
+        "container",
+        "uri",
+        "store_manifest",
+        "import_receipt"
+      ],
+      "properties": {
+        "repeat_index": {"type": "integer", "minimum": 1},
+        "clone_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,80}$"},
+        "repeat_root": {"type": "string", "minLength": 1},
+        "source_store_root": {"type": "string", "minLength": 1},
+        "launcher": {"$ref": "#/$defs/artifact"},
+        "store_root": {"$ref": "#/$defs/store_root"},
+        "logs_root": {"$ref": "#/$defs/root"},
+        "container": {"type": "string", "minLength": 1},
+        "uri": {"type": "string", "pattern": "^(bolt|neo4j)://(127\\.0\\.0\\.1|localhost):[0-9]+/?$"},
+        "store_manifest": {"$ref": "#/$defs/artifact"},
+        "import_receipt": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "nebulagraph_repeat_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repeat_index",
+        "repeat_root",
+        "source_store_root",
+        "store_root",
+        "logs_root",
+        "containers",
+        "network",
+        "graph_port",
+        "store_manifest",
+        "clone_receipt"
+      ],
+      "properties": {
+        "repeat_index": {"type": "integer", "minimum": 1},
+        "repeat_root": {"type": "string", "minLength": 1},
+        "source_store_root": {"type": "string", "minLength": 1},
+        "store_root": {"$ref": "#/$defs/store_root"},
+        "logs_root": {"$ref": "#/$defs/root"},
+        "containers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["metad", "storaged", "graphd"],
+          "properties": {
+            "metad": {"type": "string", "minLength": 1},
+            "storaged": {"type": "string", "minLength": 1},
+            "graphd": {"type": "string", "minLength": 1}
+          }
+        },
+        "network": {"type": "string", "minLength": 1},
+        "graph_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "store_manifest": {"$ref": "#/$defs/artifact"},
+        "clone_receipt": {"$ref": "#/$defs/artifact"}
+      }
+    },
     "system": {
       "type": "object",
       "additionalProperties": false,
@@ -173,6 +240,15 @@
         "image_digests": {
           "type": "array",
           "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        },
+        "repeat_bindings": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {"$ref": "#/$defs/neo4j_repeat_binding"},
+              {"$ref": "#/$defs/nebulagraph_repeat_binding"}
+            ]
+          }
         }
       }
     }

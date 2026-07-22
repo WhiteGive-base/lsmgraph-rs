@@ -78,4 +78,17 @@ bash -n run_with_resources.sh tests/smoke_resource_collector.sh
 tests/smoke_resource_collector.sh
 ```
 
+### 外部容器身份与启动门控
+
+指定 `--container NAME` 时，collector 会在第一个资源样本中为容器进程树建立零基线，并将
+`container_id`、正整数 `pid`、`started_at` 和 `restart_count` 原子写入
+`collector-ready.json`。wrapper 只有看到该文件后才会 `exec` 正式命令；默认等待上限为
+60 秒，可用 `--collector-ready-timeout` 调整。首样本未覆盖容器 PID、容器无法解析或 collector
+提前退出时，正式命令不会被释放。
+
+`collector-status.json` 保留每次身份解析历史和按首次出现排序的唯一身份集合。validator 要求
+每个请求容器在全程只有一个身份，且 `containers_seen` 中的 PID 为正整数并真实出现在
+`resource-samples.tsv`。最终 `run-manifest.json` 的 `collector_result` 会复制 ready 信息、身份历史、
+唯一集合及 ready/status artifact 的 SHA-256，供 P10 做端到端交叉绑定。
+
 smoke 只运行数秒的小型 Python fixture，不启动任何正式 benchmark。

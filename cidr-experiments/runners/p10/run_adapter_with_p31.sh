@@ -22,6 +22,7 @@ Required scalar options:
   --min-samples N
   --binary PATH --binary-sha256 HEX
   --dataset PATH --dataset-sha256 HEX
+  --dataset-sha256-mode verify|declared-no-read-v1
   --truth PATH --truth-sha256 HEX
   --query-or-trace PATH --query-or-trace-sha256 HEX
   --config PATH --config-sha256 HEX
@@ -29,6 +30,7 @@ Required scalar options:
 Repeatable:
   --store LABEL=PATH (at least one), --temp LABEL=PATH,
   --container NAME, --extra-pid PID
+  --input LABEL=PATH=SHA256
 
 Fixture only:
   --allow-missing-aux-tools
@@ -50,6 +52,7 @@ BINARY=""
 BINARY_SHA256=""
 DATASET=""
 DATASET_SHA256=""
+DATASET_SHA256_MODE="verify"
 TRUTH=""
 TRUTH_SHA256=""
 QUERY_OR_TRACE=""
@@ -61,6 +64,7 @@ declare -a STORES=()
 declare -a TEMPS=()
 declare -a CONTAINERS=()
 declare -a EXTRA_PIDS=()
+declare -a INPUTS=()
 declare -a COMMAND=()
 
 while [[ $# -gt 0 ]]; do
@@ -84,6 +88,8 @@ while [[ $# -gt 0 ]]; do
     --binary-sha256) BINARY_SHA256="${2:?}"; shift 2 ;;
     --dataset) DATASET="${2:?}"; shift 2 ;;
     --dataset-sha256) DATASET_SHA256="${2:?}"; shift 2 ;;
+    --dataset-sha256-mode) DATASET_SHA256_MODE="${2:?}"; shift 2 ;;
+    --input) INPUTS+=("${2:?}"); shift 2 ;;
     --truth) TRUTH="${2:?}"; shift 2 ;;
     --truth-sha256) TRUTH_SHA256="${2:?}"; shift 2 ;;
     --query-or-trace) QUERY_OR_TRACE="${2:?}"; shift 2 ;;
@@ -126,6 +132,12 @@ done
 [[ "$RUN_DIR" == /* ]] || { echo '--run-dir must be absolute' >&2; exit 64; }
 [[ "$PERFORMANCE_ELIGIBLE" == "true" || "$PERFORMANCE_ELIGIBLE" == "false" ]] \
   || { echo '--performance-eligible must be true or false' >&2; exit 64; }
+[[ "$DATASET_SHA256_MODE" == "verify" || "$DATASET_SHA256_MODE" == "declared-no-read-v1" ]] \
+  || { echo '--dataset-sha256-mode is invalid' >&2; exit 64; }
+if [[ "$DATASET_SHA256_MODE" == "declared-no-read-v1" && "$PERFORMANCE_ELIGIBLE" != "true" ]]; then
+  echo 'declared-no-read dataset SHA mode is formal-only' >&2
+  exit 64
+fi
 [[ ${#STORES[@]} -gt 0 ]] || { echo 'at least one --store is required' >&2; exit 64; }
 [[ ${#COMMAND[@]} -gt 0 ]] || { echo 'adapter command after -- is required' >&2; exit 64; }
 [[ -x "$P31" ]] || { echo "P31 wrapper is not executable: $P31" >&2; exit 66; }
@@ -151,6 +163,7 @@ for value in "${STORES[@]}"; do P31_ARGS+=(--store "$value"); done
 for value in "${TEMPS[@]}"; do P31_ARGS+=(--temp "$value"); done
 for value in "${CONTAINERS[@]}"; do P31_ARGS+=(--container "$value"); done
 for value in "${EXTRA_PIDS[@]}"; do P31_ARGS+=(--extra-pid "$value"); done
+for value in "${INPUTS[@]}"; do P31_ARGS+=(--input "$value"); done
 P31_ARGS+=(
   --binary "$BINARY" --binary-sha256 "$BINARY_SHA256"
   --dataset "$DATASET" --dataset-sha256 "$DATASET_SHA256"
@@ -158,6 +171,7 @@ P31_ARGS+=(
   --query-or-trace "$QUERY_OR_TRACE" --query-or-trace-sha256 "$QUERY_OR_TRACE_SHA256"
   --config "$CONFIG" --config-sha256 "$CONFIG_SHA256"
 )
+[[ "$DATASET_SHA256_MODE" != "verify" ]] && P31_ARGS+=(--dataset-sha256-mode "$DATASET_SHA256_MODE")
 [[ "$ALLOW_MISSING_AUX" == "1" ]] && P31_ARGS+=(--allow-missing-aux-tools)
 P31_ARGS+=(-- "${COMMAND[@]}")
 

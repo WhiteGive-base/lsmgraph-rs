@@ -9,11 +9,15 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
 P10_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(P10_DIR))
+from p10_contract import ContractError, _validate_protocol, claim_empty_directory  # noqa: E402
 RUNNER = P10_DIR / "run_suite.py"
 MANIFEST = Path(__file__).resolve().parent / "fixture-suite.json"
 FIXTURE_P31 = Path(__file__).resolve().parent / "fixture_p31.sh"
@@ -25,6 +29,74 @@ def load_json(path: Path) -> dict:
 
 class P10OrchestratorTests(unittest.TestCase):
     maxDiff = None
+
+    def test_run_root_claim_has_exactly_one_owner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="p10-run-claim-") as temporary:
+            run_root = Path(temporary) / "run"
+            barrier = threading.Barrier(2)
+
+            def attempt(owner: str) -> bool:
+                barrier.wait(timeout=5)
+                try:
+                    claim_empty_directory(
+                        run_root,
+                        claim_name="RUN-CLAIM.json",
+                        claim={"state": "CLAIMED", "owner": owner},
+                        context="P10 run root",
+                    )
+                except ContractError:
+                    return False
+                return True
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(attempt, ("first", "second")))
+            self.assertEqual(sum(outcomes), 1)
+            claim_path = run_root / "RUN-CLAIM.json"
+            before = claim_path.read_bytes()
+            self.assertIn(json.loads(before)["owner"], {"first", "second"})
+            with self.assertRaises(ContractError):
+                claim_empty_directory(
+                    run_root,
+                    claim_name="RUN-CLAIM.json",
+                    claim={"state": "CLAIMED", "owner": "loser"},
+                    context="P10 run root",
+                )
+            self.assertEqual(claim_path.read_bytes(), before)
+            self.assertEqual({path.name for path in run_root.iterdir()}, {"RUN-CLAIM.json"})
+            self.assertFalse((run_root / "FAILED").exists())
+
+            empty_root = Path(temporary) / "precreated-empty"
+            empty_root.mkdir()
+            claim_empty_directory(
+                empty_root,
+                claim_name="RUN-CLAIM.json",
+                claim={"state": "CLAIMED", "owner": "empty-root-owner"},
+                context="P10 run root",
+            )
+            self.assertTrue((empty_root / "RUN-CLAIM.json").is_file())
+
+            contaminated = Path(temporary) / "contaminated"
+            contaminated.mkdir()
+            foreign = contaminated / "foreign-evidence"
+            foreign.write_bytes(b"preserve me\n")
+            with self.assertRaises(ContractError):
+                claim_empty_directory(
+                    contaminated,
+                    claim_name="RUN-CLAIM.json",
+                    claim={"state": "CLAIMED", "owner": "must-not-own"},
+                    context="P10 run root",
+                )
+            self.assertEqual(foreign.read_bytes(), b"preserve me\n")
+            self.assertFalse((contaminated / "RUN-CLAIM.json").exists())
+
+    def test_formal_repeats_are_exactly_three_while_fixture_counts_remain_compatible(self) -> None:
+        protocol = load_json(MANIFEST)["protocol"]
+        for repeats in (1, 2, 4):
+            drifted = {**protocol, "repeats": repeats}
+            with self.subTest(mode="formal", repeats=repeats), self.assertRaises(ContractError):
+                _validate_protocol(drifted, formal=True)
+            self.assertEqual(_validate_protocol(drifted, formal=False)["repeats"], repeats)
+        self.assertEqual(_validate_protocol({**protocol, "repeats": 3}, formal=True)["repeats"], 3)
 
     def run_cli(self, *args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
@@ -176,6 +248,97 @@ class P10OrchestratorTests(unittest.TestCase):
             self.assertFalse(summary["complete_frozen_suite"])
             self.assertEqual(summary["system_count"], 4)
 
+    def test_one_selected_repeat_uses_its_real_index_and_cannot_publish_done(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="p10-repeat-select-") as temporary:
+            temporary_path = Path(temporary)
+            value = load_json(MANIFEST)
+            value["protocol"]["repeats"] = 2
+            manifest = temporary_path / "two-repeats.json"
+            manifest.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+            run_root = temporary_path / "run"
+            self.run_cli(
+                "run",
+                "--manifest",
+                str(manifest),
+                "--run-root",
+                str(run_root),
+                "--mode",
+                "fixture",
+                "--p31-wrapper",
+                str(FIXTURE_P31),
+                "--system",
+                "nebulagraph",
+                "--repeat-index",
+                "2",
+            )
+            self.assertTrue((run_root / "PARTIAL-DONE").is_file())
+            self.assertFalse((run_root / "DONE").exists())
+            self.assertFalse((run_root / "systems" / "nebulagraph" / "repeat-01").exists())
+            request_path = run_root / "systems" / "nebulagraph" / "repeat-02" / "adapter-request.json"
+            request = load_json(request_path)
+            self.assertEqual(2, request["repeat_index"])
+            summary = load_json(run_root / "suite-summary.json")
+            self.assertEqual([2], summary["selected_repeat_indices"])
+            self.assertEqual(1, summary["repeat_count"])
+            self.assertFalse(summary["complete_frozen_suite"])
+
+    def test_repeat_selection_rejects_duplicates_and_out_of_range_before_run(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="p10-repeat-invalid-") as temporary:
+            temporary_path = Path(temporary)
+            value = load_json(MANIFEST)
+            value["protocol"]["repeats"] = 2
+            manifest = temporary_path / "two-repeats.json"
+            manifest.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+            for selected in (("1", "1"), ("3",)):
+                with self.subTest(selected=selected):
+                    run_root = temporary_path / ("run-" + "-".join(selected))
+                    arguments = [
+                        "run",
+                        "--manifest",
+                        str(manifest),
+                        "--run-root",
+                        str(run_root),
+                        "--mode",
+                        "fixture",
+                        "--p31-wrapper",
+                        str(FIXTURE_P31),
+                    ]
+                    for index in selected:
+                        arguments.extend(("--repeat-index", index))
+                    self.run_cli(*arguments, expected=2)
+                    self.assertFalse(run_root.exists())
+
+    def test_selected_repeat_failure_publishes_failed_and_never_done(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="p10-repeat-failure-") as temporary:
+            temporary_path = Path(temporary)
+            value = load_json(MANIFEST)
+            value["protocol"]["repeats"] = 2
+            value["systems"][0]["adapter"]["args"][1] = "mismatch"
+            manifest = temporary_path / "repeat-failure.json"
+            manifest.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+            run_root = temporary_path / "run"
+            self.run_cli(
+                "run",
+                "--manifest",
+                str(manifest),
+                "--run-root",
+                str(run_root),
+                "--mode",
+                "fixture",
+                "--p31-wrapper",
+                str(FIXTURE_P31),
+                "--system",
+                "seml0",
+                "--repeat-index",
+                "2",
+                expected=2,
+            )
+            self.assertTrue((run_root / "FAILED").is_file())
+            self.assertFalse((run_root / "DONE").exists())
+            self.assertFalse((run_root / "PARTIAL-DONE").exists())
+            self.assertTrue((run_root / "systems" / "seml0" / "repeat-02").is_dir())
+            self.assertEqual([2], load_json(run_root / "FAILED")["selected_repeat_indices"])
+
     def altered_manifest(self, directory: Path, profile: str) -> Path:
         value = json.loads(MANIFEST.read_text(encoding="utf-8"))
         value["systems"][0]["adapter"]["args"][1] = profile
@@ -228,6 +391,7 @@ class P10OrchestratorTests(unittest.TestCase):
             temporary_path = Path(temporary)
             value = load_json(MANIFEST)
             value["fixture_only"] = False
+            value["protocol"]["repeats"] = 3
             for key in ("dataset", "truth"):
                 source = Path(str(value[key]["path"]).replace("${REPO_ROOT}", str(P10_DIR.parents[2])))
                 value[key]["sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()

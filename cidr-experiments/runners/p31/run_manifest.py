@@ -64,7 +64,12 @@ def normalize_sha(value: str | None) -> str:
     return lowered
 
 
-def artifact_ref(path_raw: str | None, explicit_sha: str | None = None) -> dict[str, Any]:
+def artifact_ref(
+    path_raw: str | None,
+    explicit_sha: str | None = None,
+    *,
+    declare_file_sha: bool = False,
+) -> dict[str, Any]:
     if not path_raw:
         return {"path": "", "kind": "unspecified", "exists": False, "size_bytes": None, "sha256": normalize_sha(explicit_sha)}
     path = Path(path_raw).resolve()
@@ -73,10 +78,15 @@ def artifact_ref(path_raw: str | None, explicit_sha: str | None = None) -> dict[
         kind = "file"
         size: int | None = path.stat().st_size
         explicit_digest = normalize_sha(explicit_sha)
-        actual_digest = sha256_file(path)
-        if explicit_digest and explicit_digest != actual_digest:
-            raise ValueError(f"explicit SHA-256 does not match file: {path}")
-        digest = actual_digest
+        if declare_file_sha:
+            if not explicit_digest:
+                raise ValueError(f"declared file SHA-256 is required: {path}")
+            digest = explicit_digest
+        else:
+            actual_digest = sha256_file(path)
+            if explicit_digest and explicit_digest != actual_digest:
+                raise ValueError(f"explicit SHA-256 does not match file: {path}")
+            digest = actual_digest
     elif path.is_dir():
         kind = "directory"
         size = None
@@ -85,7 +95,24 @@ def artifact_ref(path_raw: str | None, explicit_sha: str | None = None) -> dict[
         kind = "missing"
         size = None
         digest = normalize_sha(explicit_sha)
-    return {"path": str(path), "kind": kind, "exists": exists, "size_bytes": size, "sha256": digest}
+    result = {"path": str(path), "kind": kind, "exists": exists, "size_bytes": size, "sha256": digest}
+    if declare_file_sha:
+        result["content_sha256_mode"] = "declared-no-read-v1"
+    return result
+
+
+def parse_named_input(raw: str) -> tuple[str, str, str]:
+    try:
+        label, remainder = raw.split("=", 1)
+        path, digest = remainder.rsplit("=", 1)
+    except ValueError as exc:
+        raise ValueError(f"invalid LABEL=PATH=SHA256 input: {raw!r}") from exc
+    if not LABEL_RE.fullmatch(label) or not path:
+        raise ValueError(f"invalid named input label/path: {raw!r}")
+    normalized = normalize_sha(digest)
+    if not normalized:
+        raise ValueError(f"named input requires SHA-256: {raw!r}")
+    return label, path, normalized
 
 
 def host_facts() -> dict[str, Any]:
@@ -167,7 +194,7 @@ def create_manifest(args: argparse.Namespace) -> int:
         raise SystemExit(f"refusing to overwrite {manifest_path}")
     repo = args.repo_root.resolve()
     command_file = args.command_file.resolve()
-    if args.interval <= 0 or args.disk_interval <= 0:
+    if args.interval <= 0 or args.disk_interval <= 0 or args.ready_timeout <= 0:
         raise ValueError("collector intervals must be positive")
     if args.min_samples < 2:
         raise ValueError("min_samples must be at least 2")
@@ -175,6 +202,19 @@ def create_manifest(args: argparse.Namespace) -> int:
         raise ValueError("device must be non-empty")
     if not args.data_mount.resolve().is_dir():
         raise ValueError(f"data mount is not a directory: {args.data_mount.resolve()}")
+    if len(args.container) != len(set(args.container)):
+        raise ValueError("duplicate container name")
+    if any(not name.strip() for name in args.container):
+        raise ValueError("container names must be non-empty")
+    if len(args.extra_pid) != len(set(args.extra_pid)) or any(pid <= 0 for pid in args.extra_pid):
+        raise ValueError("extra PIDs must be unique positive integers")
+    named_specs = [parse_named_input(raw) for raw in args.input]
+    named_labels = [label for label, _, _ in named_specs]
+    reserved_inputs = {"binary", "dataset", "truth", "query_or_trace", "config"}
+    if len(named_labels) != len(set(named_labels)):
+        raise ValueError("duplicate named provenance input")
+    if reserved_inputs.intersection(named_labels):
+        raise ValueError("named provenance input collides with a reserved input")
     git_sha_ok, git_sha = command_output(["git", "rev-parse", "HEAD"], repo)
     git_status_ok, git_status = command_output(
         ["git", "status", "--porcelain=v1", "--untracked-files=normal"], repo
@@ -246,6 +286,7 @@ def create_manifest(args: argparse.Namespace) -> int:
             "data_mount": str(args.data_mount.resolve()),
             "interval_s": args.interval,
             "disk_interval_s": args.disk_interval,
+            "ready_timeout_s": args.ready_timeout,
             "min_samples": args.min_samples,
             "require_aux_tools": args.require_aux_tools == "true",
             "containers": args.container,
@@ -254,10 +295,18 @@ def create_manifest(args: argparse.Namespace) -> int:
         "disk_roots": stores,
         "inputs": {
             "binary": artifact_ref(args.binary, args.binary_sha256),
-            "dataset": artifact_ref(args.dataset, args.dataset_sha256),
+            "dataset": artifact_ref(
+                args.dataset,
+                args.dataset_sha256,
+                declare_file_sha=args.dataset_sha256_mode == "declared-no-read-v1",
+            ),
             "truth": artifact_ref(args.truth, args.truth_sha256),
             "query_or_trace": artifact_ref(args.query_or_trace, args.query_or_trace_sha256),
             "config": artifact_ref(args.config, args.config_sha256),
+            **{
+                label: artifact_ref(path, digest)
+                for label, path, digest in named_specs
+            },
         },
         "execution_artifact": "execution.json",
         "artifacts": {},
@@ -331,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--data-mount", required=True, type=Path)
     create.add_argument("--interval", required=True, type=float)
     create.add_argument("--disk-interval", required=True, type=float)
+    create.add_argument("--ready-timeout", required=True, type=float)
     create.add_argument("--min-samples", required=True, type=int)
     create.add_argument("--require-aux-tools", choices=["true", "false"], required=True)
     create.add_argument("--store", action="append", default=[])
@@ -340,6 +390,12 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("binary", "dataset", "truth", "query-or-trace", "config"):
         create.add_argument(f"--{name}")
         create.add_argument(f"--{name}-sha256")
+    create.add_argument(
+        "--dataset-sha256-mode",
+        choices=("verify", "declared-no-read-v1"),
+        default="verify",
+    )
+    create.add_argument("--input", action="append", default=[])
     create.set_defaults(handler=create_manifest)
 
     execution = subs.add_parser("execution")

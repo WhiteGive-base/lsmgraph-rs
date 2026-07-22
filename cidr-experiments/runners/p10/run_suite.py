@@ -11,15 +11,24 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib
 import json
 import os
+import secrets
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - formal execution is Linux-only
+    fcntl = None  # type: ignore[assignment]
 
 from p10_contract import (
     CLOCK_NAME,
@@ -32,14 +41,28 @@ from p10_contract import (
     SEQUENCE_DIGEST_ALGORITHM,
     TIMING_BOUNDARY,
     ContractError,
+    audit_neo4j_runtime_store,
     atomic_json,
+    claim_empty_directory,
     load_suite_manifest,
+    publish_livegraph_post_p31_store_seal,
+    read_json,
     read_p31_summary,
     sha256_file,
     validate_adapter_outputs,
     validate_adapter_p31_binding,
+    validate_livegraph_p31_binding,
     validate_neo4j_p31_binding,
+    validate_neo4j_store_audit,
+    validate_neo4j_store_audit_pair,
     validate_nebulagraph_p31_binding,
+)
+from adapters.launch_neo4j_runtime import (
+    IMAGE_REPO_DIGEST as NEO4J_IMAGE_REPO_DIGEST,
+    current_host as neo4j_current_host,
+    validate_launch_receipt,
+    validate_launch_receipts_independent,
+    validate_stop_receipt,
 )
 
 
@@ -47,6 +70,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 DEFAULT_P31 = REPO_ROOT / "cidr-experiments/runners/p31/run_with_resources.sh"
 P31_ADAPTER_WRAPPER = SCRIPT_DIR / "run_adapter_with_p31.sh"
+NEO4J_LIFECYCLE = SCRIPT_DIR / "adapters" / "launch_neo4j_runtime.py"
+NEBULAGRAPH_LIFECYCLE = (
+    SCRIPT_DIR / "adapters" / "nebulagraph" / "formal_cluster.py"
+)
+
+
+def _nebulagraph_cluster_module() -> Any:
+    """Load the standalone controller only for an actual formal NebulaGraph repeat."""
+
+    module_dir = str(NEBULAGRAPH_LIFECYCLE.parent)
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+    return importlib.import_module("formal_cluster")
 
 REPEAT_COLUMNS = [
     "system_id",
@@ -178,6 +214,18 @@ def select_systems(suite: dict[str, Any], ids: list[str], group: str | None) -> 
     return selected
 
 
+def select_repeat_indices(suite: dict[str, Any], requested: list[int]) -> list[int]:
+    total = suite["protocol"]["repeats"]
+    if not requested:
+        return list(range(1, total + 1))
+    if len(requested) != len(set(requested)):
+        raise ContractError("duplicate --repeat-index selection")
+    invalid = sorted(index for index in requested if index < 1 or index > total)
+    if invalid:
+        raise ContractError(f"--repeat-index is outside the frozen 1..{total} range: {invalid}")
+    return sorted(requested)
+
+
 def build_request(
     suite: dict[str, Any],
     system: dict[str, Any],
@@ -233,6 +281,20 @@ def build_request(
             "extra_pids": list(system["extra_pids"]),
             "image_digests": list(system["image_digests"]),
         }
+        lifecycle = system.get("active_nebulagraph_lifecycle")
+        if lifecycle is not None:
+            if system["id"] != "nebulagraph" or mode != "formal":
+                raise ContractError(
+                    "NebulaGraph lifecycle receipt paths are restricted to formal NebulaGraph"
+                )
+            request["external_service"]["orchestrated_lifecycle"] = {
+                "controller": dict(lifecycle["controller"]),
+                "receipts": {
+                    name: str(Path(path).resolve())
+                    for name, path in lifecycle["receipt_paths"].items()
+                },
+                "logs_root": str(Path(lifecycle["logs_root"]).resolve()),
+            }
     return request
 
 
@@ -247,6 +309,8 @@ def p31_command(
     resolved_manifest: Path,
     p31_wrapper: Path,
     mode: str,
+    extra_adapter_args: list[str] | None = None,
+    named_inputs: list[str] | None = None,
 ) -> list[str]:
     performance_eligible = mode == "formal"
     p31_dir = repeat_dir / "p31"
@@ -284,6 +348,8 @@ def p31_command(
         command.extend(("--container", container))
     for pid in system["extra_pids"]:
         command.extend(("--extra-pid", str(pid)))
+    for value in named_inputs or []:
+        command.extend(("--input", value))
     command.extend(
         (
             "--binary",
@@ -308,6 +374,8 @@ def p31_command(
             sha256_file(resolved_manifest),
         )
     )
+    if mode == "formal" and system["id"] == "livegraph":
+        command.extend(("--dataset-sha256-mode", "declared-no-read-v1"))
     if mode == "fixture":
         command.append("--allow-missing-aux-tools")
     timeout_binary = shutil.which("timeout")
@@ -316,6 +384,7 @@ def p31_command(
     adapter_command = [
         system["adapter"]["path"],
         *system["adapter"]["args"],
+        *(extra_adapter_args or []),
         "--request",
         str(request_path),
         "--output-dir",
@@ -332,6 +401,97 @@ def p31_command(
         )
     )
     return command
+
+
+def exact_adapter_arg(system: dict[str, Any], flag: str) -> str:
+    """Return one flag value from a static adapter argv, rejecting ambiguity."""
+
+    args = system.get("adapter", {}).get("args", [])
+    if not isinstance(args, list):
+        raise ContractError(f"{system.get('id', 'system')} adapter args are malformed")
+    positions = [index for index, value in enumerate(args) if value == flag]
+    if len(positions) != 1 or positions[0] + 1 >= len(args):
+        raise ContractError(f"{system.get('id', 'system')} adapter requires exactly one {flag}")
+    value = args[positions[0] + 1]
+    if not isinstance(value, str) or not value or value.startswith("--"):
+        raise ContractError(f"{system.get('id', 'system')} adapter {flag} value is invalid")
+    return value
+
+
+def livegraph_p31_inputs(system: dict[str, Any]) -> list[str]:
+    """Revalidate and bind every small formal gate artifact into P31."""
+
+    from adapters.livegraph import run_sf10_formal as formal_gate
+
+    adapter_args = {
+        flag: exact_adapter_arg(system, flag)
+        for flag in (
+            "--build-receipt", "--build-receipt-sha256", "--p02b-result",
+            "--p02b-result-sha256", "--p02b-validator", "--p02b-validator-sha256",
+            "--p02b-max-age-seconds",
+        )
+    }
+    build = formal_gate.validate_build_receipt(
+        Path(adapter_args["--build-receipt"]),
+        adapter_args["--build-receipt-sha256"],
+        system,
+    )
+    p02b = formal_gate.validate_p02b(
+        adapter_args,
+        expected_repo_root=Path(build["integration"]["root"]),
+        expected_repo_head=build["integration"]["head"],
+        expected_binary_sha256=system["binary"]["sha256"],
+    )
+    admission = p02b["admission"]
+    references = {
+        "livegraph_build_receipt": build["receipt"],
+        "livegraph_build_marker": build["marker"],
+        "livegraph_source_library": build["source_library"],
+        "livegraph_runtime_library": build["liblivegraph"],
+        "livegraph_p02b_result": p02b["result"],
+        "livegraph_p02b_validator": p02b["validator"],
+        "livegraph_p02b_pass_marker": {
+            "path": admission["pass_marker"], "sha256": admission["pass_marker_sha256"]
+        },
+        "livegraph_p02b_provenance": {
+            "path": admission["provenance"], "sha256": admission["provenance_sha256"]
+        },
+    }
+    values: list[str] = []
+    for label, ref in references.items():
+        path = Path(str(ref.get("path", ""))).resolve()
+        digest = str(ref.get("sha256", ""))
+        if not path.is_file() or len(digest) != 64:
+            raise ContractError(f"formal LiveGraph P31 input {label} is malformed")
+        values.append(f"{label}={path}={digest}")
+    return values
+
+
+def seal_livegraph_dataset(request: dict[str, Any], repeat_dir: Path) -> tuple[Path, str]:
+    """Publish the post-hash inode identity consumed inside P31 without rehashing SF10."""
+
+    dataset = Path(str(request["dataset"]["path"])).resolve()
+    if not dataset.is_file() or dataset.is_symlink():
+        raise ContractError("formal LiveGraph dataset is not one regular file")
+    stat = dataset.stat()
+    receipt = {
+        "schema_version": "p10-livegraph-dataset-seal-v1",
+        "state": "PASS",
+        "dataset": {
+            "path": str(dataset),
+            "sha256": request["dataset"]["sha256"],
+            "identity": {
+                "device": stat.st_dev,
+                "inode": stat.st_ino,
+                "size_bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "ctime_ns": stat.st_ctime_ns,
+            },
+        },
+    }
+    path = repeat_dir / "livegraph-dataset-seal.json"
+    atomic_json(path, receipt)
+    return path, sha256_file(path)
 
 
 def materialize_fresh_repeat_roots(
@@ -374,7 +534,990 @@ def materialize_fresh_repeat_roots(
     return effective
 
 
-def execute_repeat(
+def materialize_external_repeat_binding(
+    system: dict[str, Any], repeat_index: int
+) -> dict[str, Any]:
+    """Select one pre-registered, independent Neo4j service for this repeat."""
+
+    bindings = system.get("repeat_bindings", [])
+    if not bindings:
+        return system
+    if system.get("id") != "neo4j":
+        raise ContractError("external repeat bindings are reserved for Neo4j")
+    matches = [binding for binding in bindings if binding.get("repeat_index") == repeat_index]
+    if len(matches) != 1:
+        raise ContractError(f"Neo4j repeat {repeat_index} lacks one exact repeat binding")
+    binding = matches[0]
+    effective = dict(system)
+    effective["store_roots"] = [dict(binding["store_root"])]
+    effective["temp_roots"] = [dict(binding["logs_root"])]
+    effective["containers"] = [binding["container"]]
+    effective_adapter = dict(system["adapter"])
+    args = list(effective_adapter["args"])
+
+    def replace(flag: str, value: str) -> None:
+        positions = [index for index, item in enumerate(args) if item == flag]
+        if len(positions) != 1 or positions[0] + 1 >= len(args):
+            raise ContractError(f"Neo4j adapter args require exactly one {flag}")
+        args[positions[0] + 1] = value
+
+    replacements = {
+        "--uri": binding["uri"],
+        "--logs-root": binding["logs_root"]["path"],
+        "--store-manifest": binding["store_manifest"]["path"],
+        "--store-manifest-sha256": binding["store_manifest"]["sha256"],
+        "--import-receipt": binding["import_receipt"]["path"],
+        "--import-receipt-sha256": binding["import_receipt"]["sha256"],
+    }
+    for flag, value in replacements.items():
+        replace(flag, value)
+    effective_adapter["args"] = args
+    effective["adapter"] = effective_adapter
+    effective["active_repeat_binding"] = binding
+    return effective
+
+
+def materialize_nebulagraph_repeat_binding(
+    system: dict[str, Any], repeat_index: int
+) -> dict[str, Any]:
+    """Select one independently cloned NebulaGraph store and Docker namespace."""
+
+    if system.get("id") != "nebulagraph":
+        return system
+    bindings = system.get("repeat_bindings", [])
+    if not bindings:
+        return system
+    matches = [binding for binding in bindings if binding.get("repeat_index") == repeat_index]
+    if len(matches) != 1:
+        raise ContractError(f"NebulaGraph repeat {repeat_index} lacks one exact repeat binding")
+    binding = matches[0]
+    effective = dict(system)
+    effective["store_roots"] = [dict(binding["store_root"])]
+    effective["temp_roots"] = [dict(binding["logs_root"])]
+    effective["containers"] = [
+        binding["containers"][role] for role in ("graphd", "metad", "storaged")
+    ]
+    effective_adapter = dict(system["adapter"])
+    args = list(effective_adapter["args"])
+
+    def replace(flag: str, value: str) -> None:
+        positions = [index for index, item in enumerate(args) if item == flag]
+        if len(positions) != 1 or positions[0] + 1 >= len(args):
+            raise ContractError(f"NebulaGraph adapter args require exactly one {flag}")
+        args[positions[0] + 1] = value
+
+    replace("--store-manifest", binding["store_manifest"]["path"])
+    replace("--store-manifest-sha256", binding["store_manifest"]["sha256"])
+    effective_adapter["args"] = args
+    effective["adapter"] = effective_adapter
+    effective["active_nebulagraph_repeat_binding"] = binding
+    return effective
+
+
+def materialize_nebulagraph_lifecycle(
+    system: dict[str, Any], repeat_dir: Path, mode: str
+) -> dict[str, Any]:
+    """Bind one formal NebulaGraph repeat to orchestrator-owned receipt paths."""
+
+    if mode != "formal" or system.get("id") != "nebulagraph":
+        return system
+    controller = Path(exact_adapter_arg(system, "--cluster-controller")).resolve()
+    controller_sha = exact_adapter_arg(system, "--cluster-controller-sha256")
+    if controller != NEBULAGRAPH_LIFECYCLE.resolve() or not controller.is_file():
+        raise ContractError(
+            f"formal NebulaGraph requires the repository lifecycle controller: {NEBULAGRAPH_LIFECYCLE}"
+        )
+    if sha256_file(controller) != controller_sha:
+        raise ContractError(
+            "formal NebulaGraph lifecycle controller differs from the suite-pinned SHA-256"
+        )
+    logs = system.get("temp_roots")
+    if not isinstance(logs, list) or len(logs) != 1:
+        raise ContractError("formal NebulaGraph requires exactly one P31-visible logs root")
+    logs_root = Path(str(logs[0].get("path", ""))).resolve()
+    if logs[0].get("label") != "nebulagraph-logs" or not logs_root.is_dir():
+        raise ContractError(
+            "formal NebulaGraph requires an existing nebulagraph-logs temp root"
+        )
+    receipt_root = repeat_dir / "nebulagraph-lifecycle"
+    receipt_root.mkdir()
+    paths = {
+        "store_lock": receipt_root / "store-admission.lock",
+        "sealed_admission": receipt_root / "sealed-admission.json",
+        "preflight": receipt_root / "preflight-receipt.json",
+        "partial_start": receipt_root / "partial-start-receipt.json",
+        "start_cleanup": receipt_root / "start-cleanup-receipt.json",
+        "start": receipt_root / "start-receipt.json",
+        "live_gate": receipt_root / "start-receipt.json",
+        "stop": receipt_root / "stop-receipt.json",
+    }
+    effective = dict(system)
+    effective["active_nebulagraph_lifecycle"] = {
+        "controller": {"path": str(controller), "sha256": controller_sha},
+        "receipt_root": str(receipt_root.resolve()),
+        "receipt_paths": {name: str(path.resolve()) for name, path in paths.items()},
+        "logs_root": str(logs_root),
+    }
+    return effective
+
+
+def _run_nebulagraph_lifecycle_command(
+    command: list[str], *, repeat_dir: Path, phase: str, timeout_s: int,
+    require_success: bool = True,
+) -> int:
+    """Run one controller phase outside P31 and retain bounded command evidence."""
+
+    atomic_json(repeat_dir / f"nebulagraph-{phase}-command.json", command)
+    with (repeat_dir / f"nebulagraph-{phase}.stdout.log").open("wb") as stdout_handle, (
+        repeat_dir / f"nebulagraph-{phase}.stderr.log"
+    ).open("wb") as stderr_handle:
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                check=False,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ContractError(
+                f"NebulaGraph {phase} exceeded its {timeout_s}s hard deadline"
+            ) from exc
+    if require_success and completed.returncode != 0:
+        raise ContractError(
+            f"NebulaGraph {phase} exited {completed.returncode}; "
+            f"see {repeat_dir / f'nebulagraph-{phase}.stderr.log'}"
+        )
+    return completed.returncode
+
+
+def _nebulagraph_common_lifecycle_args(
+    *, system: dict[str, Any], request_path: Path
+) -> list[str]:
+    """Build the exact immutable admission argv shared by preflight phases."""
+
+    return [
+        "--request", str(request_path.resolve()),
+        "--request-sha256", sha256_file(request_path),
+        "--runtime-manifest", exact_adapter_arg(system, "--runtime-manifest"),
+        "--runtime-manifest-sha256", exact_adapter_arg(system, "--runtime-manifest-sha256"),
+        "--store-manifest", exact_adapter_arg(system, "--store-manifest"),
+        "--store-manifest-sha256", exact_adapter_arg(system, "--store-manifest-sha256"),
+        "--repo-root", exact_adapter_arg(system, "--repo-root"),
+        "--p02b-result", exact_adapter_arg(system, "--p02b-result"),
+        "--p02b-result-sha256", exact_adapter_arg(system, "--p02b-result-sha256"),
+        "--p02b-validator", exact_adapter_arg(system, "--p02b-validator"),
+        "--p02b-validator-sha256", exact_adapter_arg(system, "--p02b-validator-sha256"),
+        "--p02b-binary", exact_adapter_arg(system, "--p02b-binary"),
+        "--p02b-binary-sha256", exact_adapter_arg(system, "--p02b-binary-sha256"),
+        "--p02b-max-age-seconds", exact_adapter_arg(system, "--p02b-max-age-seconds"),
+    ]
+
+
+def _current_process_start_ticks() -> int:
+    try:
+        raw = Path(f"/proc/{os.getpid()}/stat").read_text(encoding="utf-8")
+        fields = raw.rsplit(")", 1)[1].split()
+        value = int(fields[19])
+    except (OSError, UnicodeError, ValueError, IndexError) as exc:
+        raise ContractError(f"cannot capture orchestrator process identity: {exc}") from exc
+    if value <= 0:
+        raise ContractError("orchestrator process start ticks are invalid")
+    return value
+
+
+def acquire_nebulagraph_store_lock(lock_path: Path) -> dict[str, Any]:
+    """Create and retain one non-inheritable lock for the whole formal repeat."""
+
+    if fcntl is None:
+        raise ContractError("formal NebulaGraph store locking requires POSIX flock")
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ContractError(f"cannot create exclusive NebulaGraph store lock: {exc}") from exc
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        owner = {
+            "schema_version": "cidr-p10-nebulagraph-store-lock-v1",
+            "pid": os.getpid(),
+            "process_start_ticks": _current_process_start_ticks(),
+            "hostname": socket.gethostname(),
+            "created_at_utc": utc_now(),
+        }
+        payload = (json.dumps(owner, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        written = os.write(descriptor, payload)
+        if written != len(payload):
+            raise ContractError("short write while publishing NebulaGraph store lock owner")
+        os.fsync(descriptor)
+        return {"fd": descriptor, "path": lock_path.resolve(), "owner": owner}
+    except BaseException:
+        os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def release_nebulagraph_store_lock(lifecycle: dict[str, Any]) -> None:
+    lock = lifecycle.get("_store_lock")
+    if not isinstance(lock, dict):
+        return
+    descriptor = lock.get("fd")
+    if not isinstance(descriptor, int):
+        raise ContractError("NebulaGraph lifecycle lock descriptor is malformed")
+    if fcntl is None:
+        raise ContractError("formal NebulaGraph store unlocking requires POSIX flock")
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+    os.close(descriptor)
+    lifecycle.pop("_store_lock", None)
+
+
+def launch_nebulagraph_repeat(
+    *, system: dict[str, Any], request_path: Path, repeat_dir: Path
+) -> dict[str, Any]:
+    """Preflight and launch one formal cluster, then validate its full identity."""
+
+    lifecycle = system.get("active_nebulagraph_lifecycle")
+    if not isinstance(lifecycle, dict):
+        raise ContractError("formal NebulaGraph repeat lacks orchestrated lifecycle paths")
+    controller = Path(lifecycle["controller"]["path"]).resolve()
+    paths = {name: Path(path) for name, path in lifecycle["receipt_paths"].items()}
+    lock = acquire_nebulagraph_store_lock(paths["store_lock"])
+    pending = {**lifecycle, "_store_lock": lock, "_start_attempted": False}
+    try:
+        seal_command = [
+            system["binary"]["path"],
+            str(controller),
+            "seal",
+            *_nebulagraph_common_lifecycle_args(system=system, request_path=request_path),
+            "--lock-file", str(lock["path"]),
+            "--lock-owner-pid", str(lock["owner"]["pid"]),
+            "--lock-owner-start-ticks", str(lock["owner"]["process_start_ticks"]),
+            "--output", str(paths["sealed_admission"]),
+        ]
+        _run_nebulagraph_lifecycle_command(
+            seal_command, repeat_dir=repeat_dir, phase="seal", timeout_s=7200
+        )
+        sealed_sha = sha256_file(paths["sealed_admission"])
+        cluster = _nebulagraph_cluster_module()
+        sealed_path, sealed = cluster.validate_sealed_admission_receipt(
+            paths["sealed_admission"],
+            sealed_sha,
+            request_path=request_path,
+            request_sha256=sha256_file(request_path),
+            max_age_seconds=900,
+        )
+        pending.update(
+            {
+                "sealed_admission_path": sealed_path,
+                "sealed_admission_sha256": sealed_sha,
+                "sealed_admission": sealed,
+            }
+        )
+        preflight_command = [
+            system["binary"]["path"],
+            str(controller),
+            "preflight",
+            *_nebulagraph_common_lifecycle_args(system=system, request_path=request_path),
+            "--logs-root", lifecycle["logs_root"],
+            "--query-timeout-ms", "5000",
+            "--output", str(paths["preflight"]),
+        ]
+        _run_nebulagraph_lifecycle_command(
+            preflight_command, repeat_dir=repeat_dir, phase="preflight", timeout_s=900
+        )
+        preflight_sha = sha256_file(paths["preflight"])
+        preflight_path, preflight, _docker = cluster.validate_preflight_receipt(
+            paths["preflight"], preflight_sha, max_age_seconds=600
+        )
+        pending.update(
+            {
+                "preflight_path": preflight_path,
+                "preflight_sha256": preflight_sha,
+                "preflight": preflight,
+            }
+        )
+        start_command = [
+            system["binary"]["path"],
+            str(controller),
+            "start",
+            "--preflight", str(preflight_path),
+            "--preflight-sha256", preflight_sha,
+            "--max-preflight-age-seconds", "600",
+            "--startup-timeout-seconds", "300",
+            "--partial-output", str(paths["partial_start"]),
+            "--cleanup-output", str(paths["start_cleanup"]),
+            "--cleanup-stop-timeout-seconds", "30",
+            "--output", str(paths["start"]),
+        ]
+        pending["_start_attempted"] = True
+        _run_nebulagraph_lifecycle_command(
+            start_command, repeat_dir=repeat_dir, phase="start", timeout_s=900
+        )
+        start_sha = sha256_file(paths["start"])
+        start_path, start = cluster.validate_start_receipt(
+            paths["start"],
+            start_sha,
+            preflight_path=preflight_path,
+            preflight_sha256=preflight_sha,
+            preflight_value=preflight,
+        )
+        pending.update(
+            {
+                "start_path": start_path,
+                "start_sha256": start_sha,
+                "start": start,
+            }
+        )
+        return pending
+    except BaseException as failure:
+        try:
+            recovery = recover_nebulagraph_failure(
+                system=system,
+                repeat_dir=repeat_dir,
+                lifecycle=pending,
+                primary_failure=failure,
+            )
+            if hasattr(failure, "add_note"):
+                failure.add_note(
+                    f"NebulaGraph launch recovery state: {recovery.get('state', 'UNKNOWN')}"
+                )
+        except BaseException as recovery_error:
+            if hasattr(failure, "add_note"):
+                failure.add_note(
+                    "NebulaGraph launch recovery also failed: "
+                    f"{type(recovery_error).__name__}: {recovery_error}"
+                )
+        finally:
+            release_nebulagraph_store_lock(pending)
+        raise
+
+
+def stop_nebulagraph_repeat(
+    *, system: dict[str, Any], repeat_dir: Path, lifecycle: dict[str, Any]
+) -> dict[str, Any]:
+    """Stop one launch-bound cluster by exact IDs and validate teardown evidence."""
+
+    controller = Path(lifecycle["controller"]["path"]).resolve()
+    if (
+        controller != NEBULAGRAPH_LIFECYCLE.resolve()
+        or sha256_file(controller) != lifecycle["controller"]["sha256"]
+    ):
+        raise ContractError("NebulaGraph stop controller differs from its launch binding")
+    stop_path = Path(lifecycle["receipt_paths"]["stop"])
+    command = [
+        system["binary"]["path"],
+        str(controller),
+        "stop",
+        "--preflight", str(lifecycle["preflight_path"]),
+        "--preflight-sha256", lifecycle["preflight_sha256"],
+        "--start-receipt", str(lifecycle["start_path"]),
+        "--start-receipt-sha256", lifecycle["start_sha256"],
+        "--stop-timeout-seconds", "30",
+        "--output", str(stop_path),
+    ]
+    _run_nebulagraph_lifecycle_command(
+        command, repeat_dir=repeat_dir, phase="stop", timeout_s=180
+    )
+    stop_sha = sha256_file(stop_path)
+    cluster = _nebulagraph_cluster_module()
+    validated_path, stop = cluster.validate_stop_receipt(
+        stop_path,
+        stop_sha,
+        preflight_path=Path(lifecycle["preflight_path"]),
+        preflight_sha256=lifecycle["preflight_sha256"],
+        start_path=Path(lifecycle["start_path"]),
+        start_sha256=lifecycle["start_sha256"],
+        preflight_value=lifecycle["preflight"],
+        start_value=lifecycle["start"],
+    )
+    return {
+        **lifecycle,
+        "stop_path": validated_path,
+        "stop_sha256": stop_sha,
+        "stop": stop,
+    }
+
+
+def recover_nebulagraph_failure(
+    *,
+    system: dict[str, Any],
+    repeat_dir: Path,
+    lifecycle: dict[str, Any],
+    primary_failure: BaseException,
+) -> dict[str, Any]:
+    """Publish terminal exact-ID cleanup evidence while the store lock is still held."""
+
+    status_path = repeat_dir / "nebulagraph-failure-recovery.json"
+    controller = Path(lifecycle["controller"]["path"]).resolve()
+    if (
+        controller != NEBULAGRAPH_LIFECYCLE.resolve()
+        or sha256_file(controller) != lifecycle["controller"]["sha256"]
+    ):
+        raise ContractError("NebulaGraph recovery controller differs from its launch binding")
+    paths = {name: Path(path) for name, path in lifecycle["receipt_paths"].items()}
+    cluster = _nebulagraph_cluster_module()
+    failure_value = {
+        "type": type(primary_failure).__name__,
+        "message": (str(primary_failure) or "unspecified failure")[:2000],
+    }
+
+    def publish(
+        state: str,
+        disposition: str,
+        *,
+        receipt_path: Path | None = None,
+        receipt_state: str | None = None,
+        detail: str | None = None,
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "schema_version": "cidr-p10-nebulagraph-failure-recovery-v1",
+            "state": state,
+            "created_at_utc": utc_now(),
+            "primary_failure": failure_value,
+            "disposition": disposition,
+            "name_lookup_used": False,
+            "store_lock_held": "_store_lock" in lifecycle,
+            "detail": detail,
+            "recovery_receipt": None,
+        }
+        if receipt_path is not None:
+            value["recovery_receipt"] = {
+                "path": str(receipt_path.resolve()),
+                "sha256": sha256_file(receipt_path),
+                "state": receipt_state,
+            }
+        atomic_json(status_path, value)
+        return value
+
+    preflight_path = lifecycle.get("preflight_path")
+    preflight_sha = lifecycle.get("preflight_sha256")
+    preflight = lifecycle.get("preflight")
+    if not isinstance(preflight_path, Path) or not isinstance(preflight_sha, str) or not isinstance(preflight, dict):
+        if lifecycle.get("_start_attempted") is True:
+            return publish(
+                "BLOCKED",
+                "START_ATTEMPT_WITHOUT_VALIDATED_PREFLIGHT",
+                detail="resource identities cannot be recovered without a validated preflight receipt",
+            )
+        return publish("PASS", "NO_DOCKER_MUTATION_ATTEMPTED")
+
+    start_path = paths["start"]
+    cleanup_path = paths["start_cleanup"]
+    if start_path.is_file() and not start_path.is_symlink():
+        start_sha = sha256_file(start_path)
+        validated_start_path, start = cluster.validate_start_receipt(
+            start_path,
+            start_sha,
+            preflight_path=preflight_path,
+            preflight_sha256=preflight_sha,
+            preflight_value=preflight,
+        )
+        if cleanup_path.exists() or cleanup_path.is_symlink():
+            raise ContractError("start-bound recovery output already exists")
+        command = [
+            system["binary"]["path"],
+            str(controller),
+            "recover",
+            "--preflight", str(preflight_path),
+            "--preflight-sha256", preflight_sha,
+            "--start-receipt", str(validated_start_path),
+            "--start-receipt-sha256", start_sha,
+            "--stop-timeout-seconds", "30",
+            "--output", str(cleanup_path),
+        ]
+        _run_nebulagraph_lifecycle_command(
+            command,
+            repeat_dir=repeat_dir,
+            phase="failure-recover-start",
+            timeout_s=420,
+            require_success=False,
+        )
+        if not cleanup_path.is_file() or cleanup_path.is_symlink():
+            return publish(
+                "BLOCKED", "START_BOUND_CLEANUP_MISSING",
+                detail="recovery controller did not publish an exact-ID receipt",
+            )
+        cleanup_sha = sha256_file(cleanup_path)
+        _validated_cleanup_path, cleanup = cluster.validate_start_cleanup_receipt(
+            cleanup_path,
+            cleanup_sha,
+            preflight_path=preflight_path,
+            preflight_sha256=preflight_sha,
+            start_path=validated_start_path,
+            start_sha256=start_sha,
+            preflight_value=preflight,
+            start_value=start,
+        )
+        return publish(
+            cleanup["state"],
+            "START_BOUND_EXACT_ID_CLEANUP",
+            receipt_path=cleanup_path,
+            receipt_state=cleanup["state"],
+            detail=cleanup.get("blocked_reason"),
+        )
+
+    partial_path = paths["partial_start"]
+    if partial_path.is_file() and not partial_path.is_symlink():
+        partial_sha = sha256_file(partial_path)
+        validated_partial_path, partial = cluster.validate_partial_start_receipt(
+            partial_path,
+            partial_sha,
+            preflight_path=preflight_path,
+            preflight_sha256=preflight_sha,
+            preflight_value=preflight,
+        )
+        if not cleanup_path.exists() and not cleanup_path.is_symlink():
+            command = [
+                system["binary"]["path"],
+                str(controller),
+                "cleanup",
+                "--preflight", str(preflight_path),
+                "--preflight-sha256", preflight_sha,
+                "--partial-start", str(validated_partial_path),
+                "--partial-start-sha256", partial_sha,
+                "--max-preflight-age-seconds", "604800",
+                "--stop-timeout-seconds", "30",
+                "--output", str(cleanup_path),
+            ]
+            _run_nebulagraph_lifecycle_command(
+                command,
+                repeat_dir=repeat_dir,
+                phase="failure-recover-partial",
+                timeout_s=420,
+                require_success=False,
+            )
+        if not cleanup_path.is_file() or cleanup_path.is_symlink():
+            return publish(
+                "BLOCKED", "PARTIAL_CLEANUP_MISSING",
+                detail="partial start has no exact-ID cleanup receipt",
+            )
+        cleanup_sha = sha256_file(cleanup_path)
+        _validated_cleanup_path, cleanup = cluster.validate_cleanup_receipt(
+            cleanup_path,
+            cleanup_sha,
+            preflight_path=preflight_path,
+            preflight_sha256=preflight_sha,
+            partial_path=validated_partial_path,
+            partial_sha256=partial_sha,
+            preflight_value=preflight,
+            partial_value=partial,
+        )
+        return publish(
+            cleanup["state"],
+            "PARTIAL_START_EXACT_ID_CLEANUP",
+            receipt_path=cleanup_path,
+            receipt_state=cleanup["state"],
+            detail=cleanup.get("blocked_reason"),
+        )
+
+    if lifecycle.get("_start_attempted") is True:
+        return publish(
+            "BLOCKED",
+            "START_ATTEMPT_WITHOUT_RESOURCE_IDS",
+            detail=(
+                "start was attempted but neither a start receipt nor a partial-start receipt exists; "
+                "name-based deletion is forbidden"
+            ),
+        )
+    return publish("PASS", "NO_DOCKER_MUTATION_ATTEMPTED")
+
+
+def _run_lifecycle_command(command: list[str], *, repeat_dir: Path, phase: str) -> None:
+    """Run one small Neo4j lifecycle command and preserve its exact invocation/logs."""
+
+    atomic_json(repeat_dir / f"neo4j-{phase}-command.json", command)
+    with (repeat_dir / f"neo4j-{phase}.stdout.log").open("wb") as stdout_handle, (
+        repeat_dir / f"neo4j-{phase}.stderr.log"
+    ).open("wb") as stderr_handle:
+        completed = subprocess.run(
+            command,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            check=False,
+        )
+    if completed.returncode != 0:
+        raise ContractError(
+            f"Neo4j {phase} exited {completed.returncode}; "
+            f"see {repeat_dir / f'neo4j-{phase}.stderr.log'}"
+        )
+
+
+def launch_neo4j_repeat(
+    *,
+    system: dict[str, Any],
+    repeat_index: int,
+    repeat_dir: Path,
+    run_id: str,
+    store_preflight: Path,
+) -> dict[str, Any]:
+    """Launch one preregistered repeat and validate the resulting receipt."""
+
+    binding = system.get("active_repeat_binding")
+    if not isinstance(binding, dict) or binding.get("repeat_index") != repeat_index:
+        raise ContractError("formal Neo4j launch lacks its active repeat binding")
+    launcher = binding.get("launcher")
+    if not isinstance(launcher, dict):
+        raise ContractError("formal Neo4j repeat lacks its pinned lifecycle helper")
+    launcher_path = Path(str(launcher.get("path", ""))).resolve()
+    if launcher_path != NEO4J_LIFECYCLE.resolve() or not launcher_path.is_file():
+        raise ContractError(f"Neo4j lifecycle helper is missing: {NEO4J_LIFECYCLE}")
+    if sha256_file(launcher_path) != launcher.get("sha256"):
+        raise ContractError("Neo4j lifecycle helper differs from the suite-pinned SHA-256")
+    repeat_root = Path(binding["repeat_root"]).resolve()
+    receipt_root = repeat_root / "p10-lifecycle" / run_id
+    receipt_root.mkdir(parents=True, exist_ok=False)
+    launch_path = receipt_root / "launch-receipt.json"
+    parsed_uri = urlparse(binding["uri"])
+    if parsed_uri.port is None:
+        raise ContractError("formal Neo4j repeat URI lacks a Bolt port")
+    image_digests = system.get("image_digests")
+    if image_digests != [NEO4J_IMAGE_REPO_DIGEST]:
+        raise ContractError("formal Neo4j launch lacks the frozen image RepoDigest")
+    command = [
+        system["binary"]["path"],
+        str(launcher_path),
+        "launch",
+        "--repeat-index", str(repeat_index),
+        "--clone-id", binding["clone_id"],
+        "--repeat-root", str(repeat_root),
+        "--source-store-root", binding["source_store_root"],
+        "--store-root", binding["store_root"]["path"],
+        "--logs-root", binding["logs_root"]["path"],
+        "--store-manifest", binding["store_manifest"]["path"],
+        "--store-manifest-sha256", binding["store_manifest"]["sha256"],
+        "--store-preflight", str(store_preflight.resolve()),
+        "--store-preflight-sha256", sha256_file(store_preflight),
+        "--container-name", binding["container"],
+        "--bolt-port", str(parsed_uri.port),
+        "--image-digest", image_digests[0],
+        "--output", str(launch_path),
+    ]
+    _run_lifecycle_command(command, repeat_dir=repeat_dir, phase="launch")
+    launch = validate_launch_receipt(
+        read_json(launch_path, "Neo4j runtime launch receipt"),
+        verify_artifacts=True,
+        expected_host=neo4j_current_host(),
+    )
+    return {
+        "receipt_root": receipt_root,
+        "launch_path": launch_path,
+        "launch_sha256": sha256_file(launch_path),
+        "launch": launch,
+    }
+
+
+def stop_neo4j_repeat(
+    *,
+    system: dict[str, Any],
+    repeat_dir: Path,
+    lifecycle: dict[str, Any],
+) -> dict[str, Any]:
+    """Gracefully stop/remove one launched repeat and validate exact-ID evidence."""
+
+    stop_path = Path(lifecycle["receipt_root"]) / "stop-receipt.json"
+    binding = system.get("active_repeat_binding")
+    launcher_path = Path(str(binding.get("launcher", {}).get("path", ""))).resolve() if isinstance(binding, dict) else Path()
+    if launcher_path != NEO4J_LIFECYCLE.resolve() or sha256_file(launcher_path) != binding["launcher"]["sha256"]:
+        raise ContractError("Neo4j stop helper differs from the suite-pinned launcher")
+    command = [
+        system["binary"]["path"],
+        str(launcher_path),
+        "stop",
+        "--launch-receipt", str(lifecycle["launch_path"]),
+        "--launch-receipt-sha256", lifecycle["launch_sha256"],
+        "--output", str(stop_path),
+    ]
+    _run_lifecycle_command(command, repeat_dir=repeat_dir, phase="stop")
+    stop = validate_stop_receipt(
+        read_json(stop_path, "Neo4j runtime stop receipt"),
+        verify_artifacts=True,
+        expected_host=neo4j_current_host(),
+        launch_document=lifecycle["launch"],
+    )
+    return {
+        **lifecycle,
+        "stop_path": stop_path,
+        "stop_sha256": sha256_file(stop_path),
+        "stop": stop,
+    }
+
+
+def _failure_cleanup_command(
+    command: list[str],
+    *,
+    repeat_dir: Path,
+    phase: str,
+    timeout_s: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    """Run one exact-target cleanup command while retaining its full evidence."""
+
+    atomic_json(repeat_dir / f"neo4j-failure-{phase}-command.json", command)
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_s,
+    )
+    (repeat_dir / f"neo4j-failure-{phase}.stdout.log").write_text(
+        completed.stdout, encoding="utf-8"
+    )
+    (repeat_dir / f"neo4j-failure-{phase}.stderr.log").write_text(
+        completed.stderr, encoding="utf-8"
+    )
+    if completed.returncode != 0:
+        raise ContractError(
+            f"Neo4j failure cleanup phase {phase} exited {completed.returncode}; "
+            f"see {repeat_dir / f'neo4j-failure-{phase}.stderr.log'}"
+        )
+    return completed
+
+
+def _inspect_failure_cleanup_target(
+    *,
+    container_name: str,
+    expected_container_id: str,
+    repeat_dir: Path,
+    phase: str,
+) -> dict[str, Any]:
+    """Inspect the launch-bound full ID and verify its recorded name."""
+
+    completed = _failure_cleanup_command(
+        ["docker", "container", "inspect", expected_container_id],
+        repeat_dir=repeat_dir,
+        phase=phase,
+    )
+    try:
+        values = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ContractError("Neo4j failure cleanup inspect is not JSON") from exc
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        raise ContractError("Neo4j failure cleanup inspect must return one container")
+    inspect = values[0]
+    if inspect.get("Id") != expected_container_id:
+        raise ContractError("Neo4j failure cleanup target ID differs from the launch receipt")
+    if inspect.get("Name") != f"/{container_name}":
+        raise ContractError("Neo4j failure cleanup target name differs from the launch receipt")
+    state = inspect.get("State")
+    restart_count = inspect.get("RestartCount")
+    if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
+        raise ContractError("Neo4j failure cleanup inspect lacks an exact running state")
+    if not isinstance(state.get("Pid"), int) or isinstance(state.get("Pid"), bool):
+        raise ContractError("Neo4j failure cleanup inspect lacks an exact PID")
+    if not isinstance(state.get("ExitCode"), int) or isinstance(state.get("ExitCode"), bool):
+        raise ContractError("Neo4j failure cleanup inspect lacks an exact exit code")
+    if not isinstance(restart_count, int) or isinstance(restart_count, bool):
+        raise ContractError("Neo4j failure cleanup inspect lacks an exact restart count")
+    return {
+        "container_name": container_name,
+        "container_id": expected_container_id,
+        "running": state["Running"],
+        "pid": state["Pid"],
+        "exit_code": state["ExitCode"],
+        "restart_count": restart_count,
+    }
+
+
+def cleanup_failed_neo4j_repeat(
+    *,
+    system: dict[str, Any],
+    repeat_dir: Path,
+    lifecycle: dict[str, Any],
+    failure: BaseException,
+) -> dict[str, Any]:
+    """Gracefully stop and remove only the failed repeat's launch-bound container."""
+
+    binding = system.get("active_repeat_binding")
+    launch = lifecycle.get("launch")
+    if not isinstance(binding, dict) or not isinstance(launch, dict):
+        raise ContractError("Neo4j failure cleanup lacks its launch-bound repeat identity")
+    runtime_contract = launch.get("runtime_contract")
+    running = launch.get("docker", {}).get("running")
+    running_config = running.get("config") if isinstance(running, dict) else None
+    if not isinstance(runtime_contract, dict) or not isinstance(running_config, dict):
+        raise ContractError("Neo4j failure cleanup launch receipt lacks container identity")
+    container_name = runtime_contract.get("container_name")
+    container_id = running_config.get("container_id")
+    if (
+        not isinstance(container_name, str)
+        or container_name != binding.get("container")
+        or not isinstance(container_id, str)
+        or len(container_id) != 64
+    ):
+        raise ContractError("Neo4j failure cleanup binding differs from the launch receipt")
+    intent = {
+        "schema_version": "cidr-p10-neo4j-failure-cleanup-intent-v1",
+        "failure": {"type": type(failure).__name__, "message": str(failure)},
+        "target": {"container_name": container_name, "container_id": container_id},
+        "launch_receipt": {
+            "path": str(Path(lifecycle["launch_path"]).resolve()),
+            "sha256": lifecycle["launch_sha256"],
+        },
+        "policy": "exact-launch-identity-graceful-stop-then-remove-v1",
+    }
+    atomic_json(repeat_dir / "neo4j-failure-cleanup-intent.json", intent)
+    validated_stop = lifecycle.get("stop")
+    if (
+        isinstance(validated_stop, dict)
+        and validated_stop.get("outcome")
+        == {
+            "completed": True,
+            "container_running": False,
+            "container_absent": True,
+            "exit_code": 0,
+            "restart_count": 0,
+        }
+    ):
+        receipt = {
+            "schema_version": "cidr-p10-neo4j-failure-cleanup-v1",
+            "failure": intent["failure"],
+            "target": intent["target"],
+            "before": None,
+            "after_graceful_stop": validated_stop["post_stop_inspect"]["runtime"],
+            "validated_stop_receipt": {
+                "path": str(Path(lifecycle["stop_path"]).resolve()),
+                "sha256": lifecycle["stop_sha256"],
+            },
+            "failure_graceful_stop": validated_stop["stop"],
+            "remove": validated_stop["remove"],
+            "absence_probe": validated_stop["absence_probe"],
+            "outcome": {
+                "gracefully_stopped": True,
+                "container_absent": True,
+                "non_target_containers_touched": False,
+            },
+        }
+        receipt_path = repeat_dir / "neo4j-failure-cleanup.json"
+        atomic_json(receipt_path, receipt)
+        return {**lifecycle, "failure_cleanup_path": receipt_path, "failure_cleanup": receipt}
+    before = _inspect_failure_cleanup_target(
+        container_name=container_name,
+        expected_container_id=container_id,
+        repeat_dir=repeat_dir,
+        phase="cleanup-inspect-before",
+    )
+    failure_stop: dict[str, Any] | None = None
+    after_stop = before
+    if before["running"]:
+        # Mutate by the immutable full ID, never by a potentially reused name.
+        stop_command = ["docker", "container", "stop", "--time", "60", container_id]
+        stopped = _failure_cleanup_command(
+            stop_command,
+            repeat_dir=repeat_dir,
+            phase="cleanup-graceful-stop",
+            timeout_s=90,
+        )
+        if stopped.stdout.strip() != container_id:
+            raise ContractError("Neo4j failure cleanup stop did not return its exact full ID")
+        failure_stop = {"command": stop_command, "stdout": stopped.stdout.strip()}
+        after_stop = _inspect_failure_cleanup_target(
+            container_name=container_name,
+            expected_container_id=container_id,
+            repeat_dir=repeat_dir,
+            phase="cleanup-inspect-after-stop",
+        )
+    if (
+        after_stop["running"]
+        or after_stop["pid"] != 0
+        or after_stop["exit_code"] != 0
+        or after_stop["restart_count"] != 0
+    ):
+        raise ContractError("Neo4j failed repeat is not cleanly stopped; refusing removal")
+    # Removal is also ID-bound so a concurrent same-name container is never touched.
+    remove_command = ["docker", "container", "rm", container_id]
+    removed = _failure_cleanup_command(
+        remove_command,
+        repeat_dir=repeat_dir,
+        phase="cleanup-remove",
+    )
+    if removed.stdout.strip() != container_id:
+        raise ContractError("Neo4j failure cleanup removal did not return its exact full ID")
+    absence_command = [
+        "docker", "container", "ls", "--all",
+        "--filter", f"name=^/{container_name}$", "--format", "{{.ID}}",
+    ]
+    absent = _failure_cleanup_command(
+        absence_command,
+        repeat_dir=repeat_dir,
+        phase="cleanup-prove-absent",
+    )
+    if absent.stdout.strip():
+        raise ContractError("Neo4j failed repeat container still exists after removal")
+    receipt = {
+        "schema_version": "cidr-p10-neo4j-failure-cleanup-v1",
+        "failure": intent["failure"],
+        "target": intent["target"],
+        "before": before,
+        "after_graceful_stop": after_stop,
+        "validated_stop_receipt": None if "stop" not in lifecycle else {
+            "path": str(Path(lifecycle["stop_path"]).resolve()),
+            "sha256": lifecycle["stop_sha256"],
+        },
+        "failure_graceful_stop": failure_stop,
+        "remove": {"command": remove_command, "stdout": removed.stdout.strip()},
+        "absence_probe": {"command": absence_command, "stdout": absent.stdout},
+        "outcome": {
+            "gracefully_stopped": True,
+            "container_absent": True,
+            "non_target_containers_touched": False,
+        },
+    }
+    receipt_path = repeat_dir / "neo4j-failure-cleanup.json"
+    atomic_json(receipt_path, receipt)
+    return {**lifecycle, "failure_cleanup_path": receipt_path, "failure_cleanup": receipt}
+
+
+def preserve_failed_neo4j_repeat(
+    *,
+    system: dict[str, Any],
+    repeat_dir: Path,
+    lifecycle: dict[str, Any] | None,
+    failure: BaseException,
+) -> None:
+    """Retain the primary error while making a best-effort, evidenced cleanup."""
+
+    atomic_json(
+        repeat_dir / "neo4j-failure-context.json",
+        {
+            "schema_version": "cidr-p10-neo4j-failure-context-v1",
+            "failure": {"type": type(failure).__name__, "message": str(failure)},
+            "launch_completed": lifecycle is not None,
+        },
+    )
+    if lifecycle is None:
+        return
+    try:
+        cleanup_failed_neo4j_repeat(
+            system=system,
+            repeat_dir=repeat_dir,
+            lifecycle=lifecycle,
+            failure=failure,
+        )
+    except BaseException as cleanup_error:  # never replace the experiment's primary failure
+        atomic_json(
+            repeat_dir / "neo4j-failure-cleanup-error.json",
+            {
+                "schema_version": "cidr-p10-neo4j-failure-cleanup-error-v1",
+                "primary_failure": {"type": type(failure).__name__, "message": str(failure)},
+                "cleanup_failure": {
+                    "type": type(cleanup_error).__name__,
+                    "message": str(cleanup_error),
+                },
+            },
+        )
+        if hasattr(failure, "add_note"):
+            failure.add_note(
+                f"Neo4j exact-target cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
+
+def _execute_repeat_impl(
     *,
     suite: dict[str, Any],
     system: dict[str, Any],
@@ -390,32 +1533,219 @@ def execute_repeat(
     adapter_output = repeat_dir / "adapter-output"
     adapter_output.mkdir()
     effective_system = materialize_fresh_repeat_roots(system, run_root, repeat_index)
+    effective_system = materialize_external_repeat_binding(effective_system, repeat_index)
+    effective_system = materialize_nebulagraph_repeat_binding(
+        effective_system, repeat_index
+    )
+    effective_system = materialize_nebulagraph_lifecycle(
+        effective_system, repeat_dir, mode
+    )
     request = build_request(suite, effective_system, repeat_index, run_root.name, mode)
     request_path = repeat_dir / "adapter-request.json"
     atomic_json(request_path, request)
-    command = p31_command(
-        suite=suite,
-        system=effective_system,
-        repeat_index=repeat_index,
-        repeat_dir=repeat_dir,
-        request_path=request_path,
-        adapter_output=adapter_output,
-        resolved_manifest=resolved_manifest,
-        p31_wrapper=p31_wrapper,
-        mode=mode,
-    )
-    (repeat_dir / "orchestrator-command.json").write_text(
-        json.dumps(command, indent=2) + "\n", encoding="utf-8"
-    )
-    with (repeat_dir / "p31-wrapper.stdout.log").open("wb") as stdout_handle, (
-        repeat_dir / "p31-wrapper.stderr.log"
-    ).open("wb") as stderr_handle:
-        completed = subprocess.run(command, stdout=stdout_handle, stderr=stderr_handle, check=False)
-    if completed.returncode != 0:
-        raise ContractError(
-            f"{system['id']} repeat {repeat_index}: P31/adapter exited {completed.returncode}; "
-            f"see {repeat_dir / 'p31-wrapper.stderr.log'}"
+    neo4j_audits: dict[str, Any] | None = None
+    neo4j_lifecycle: dict[str, Any] | None = None
+    nebulagraph_lifecycle: dict[str, Any] | None = None
+    dynamic_adapter_args: list[str] = []
+    named_inputs: list[str] = []
+    if mode == "formal" and system["id"] == "livegraph":
+        named_inputs = livegraph_p31_inputs(effective_system)
+        dataset_seal, dataset_seal_sha = seal_livegraph_dataset(request, repeat_dir)
+        named_inputs.append(f"livegraph_dataset_seal={dataset_seal}={dataset_seal_sha}")
+        dynamic_adapter_args.extend(
+            ["--dataset-seal", str(dataset_seal), "--dataset-seal-sha256", dataset_seal_sha]
         )
+    if mode == "formal" and system["id"] == "neo4j":
+        matching_stores = [
+            root for root in effective_system["store_roots"]
+            if root.get("label") == "neo4j-runtime"
+        ]
+        if len(matching_stores) != 1:
+            raise ContractError("formal Neo4j requires exactly one neo4j-runtime store root")
+        store_root = Path(matching_stores[0]["path"]).resolve()
+        manifest_path = Path(exact_adapter_arg(effective_system, "--store-manifest")).resolve()
+        manifest_sha = exact_adapter_arg(effective_system, "--store-manifest-sha256")
+        pre_path = repeat_dir / "neo4j-store-audit-pre.json"
+        pre = audit_neo4j_runtime_store(
+            stage="pre",
+            store_root=store_root,
+            store_manifest_path=manifest_path,
+            store_manifest_sha256=manifest_sha,
+            request_path=request_path,
+            output_path=pre_path,
+        )
+        request_ref = {
+            "path": str(request_path.resolve()),
+            "sha256": sha256_file(request_path),
+            "size_bytes": request_path.stat().st_size,
+        }
+        manifest_ref = {
+            "path": str(manifest_path),
+            "sha256": manifest_sha,
+            "size_bytes": manifest_path.stat().st_size,
+        }
+        pre = validate_neo4j_store_audit(
+            pre,
+            stage="pre",
+            request_ref=request_ref,
+            store_root=store_root,
+            store_manifest_ref=manifest_ref,
+        )
+        neo4j_audits = {
+            "store_root": store_root,
+            "store_manifest": manifest_ref,
+            "request": request_ref,
+            "pre_path": pre_path,
+            "pre": pre,
+        }
+        dynamic_adapter_args = [
+            "--store-preflight",
+            str(pre_path),
+            "--store-preflight-sha256",
+            sha256_file(pre_path),
+        ]
+        neo4j_lifecycle = launch_neo4j_repeat(
+            system=effective_system,
+            repeat_index=repeat_index,
+            repeat_dir=repeat_dir,
+            run_id=run_root.name,
+            store_preflight=pre_path,
+        )
+        dynamic_adapter_args.extend(
+            [
+                "--launch-receipt",
+                str(neo4j_lifecycle["launch_path"]),
+                "--launch-receipt-sha256",
+                neo4j_lifecycle["launch_sha256"],
+            ]
+        )
+    elif mode == "formal" and system["id"] == "nebulagraph":
+        nebulagraph_lifecycle = launch_nebulagraph_repeat(
+            system=effective_system,
+            request_path=request_path,
+            repeat_dir=repeat_dir,
+        )
+        dynamic_adapter_args = [
+            "--sealed-admission",
+            str(nebulagraph_lifecycle["sealed_admission_path"]),
+            "--sealed-admission-sha256",
+            nebulagraph_lifecycle["sealed_admission_sha256"],
+            "--cluster-preflight",
+            str(nebulagraph_lifecycle["preflight_path"]),
+            "--cluster-preflight-sha256",
+            nebulagraph_lifecycle["preflight_sha256"],
+            "--cluster-start-receipt",
+            str(nebulagraph_lifecycle["start_path"]),
+            "--cluster-start-receipt-sha256",
+            nebulagraph_lifecycle["start_sha256"],
+        ]
+    completed: subprocess.CompletedProcess[Any] | None = None
+    p31_error: BaseException | None = None
+    teardown_error: BaseException | None = None
+    try:
+        command = p31_command(
+            suite=suite,
+            system=effective_system,
+            repeat_index=repeat_index,
+            repeat_dir=repeat_dir,
+            request_path=request_path,
+            adapter_output=adapter_output,
+            resolved_manifest=resolved_manifest,
+            p31_wrapper=p31_wrapper,
+            mode=mode,
+            extra_adapter_args=dynamic_adapter_args,
+            named_inputs=named_inputs,
+        )
+        (repeat_dir / "orchestrator-command.json").write_text(
+            json.dumps(command, indent=2) + "\n", encoding="utf-8"
+        )
+        with (repeat_dir / "p31-wrapper.stdout.log").open("wb") as stdout_handle, (
+            repeat_dir / "p31-wrapper.stderr.log"
+        ).open("wb") as stderr_handle:
+            completed = subprocess.run(command, stdout=stdout_handle, stderr=stderr_handle, check=False)
+        if completed.returncode != 0:
+            p31_error = ContractError(
+                f"{system['id']} repeat {repeat_index}: P31/adapter exited "
+                f"{completed.returncode}; see {repeat_dir / 'p31-wrapper.stderr.log'}"
+            )
+    except BaseException as exc:
+        p31_error = exc
+    finally:
+        if neo4j_lifecycle is not None:
+            neo4j_lifecycle = stop_neo4j_repeat(
+                system=effective_system,
+                repeat_dir=repeat_dir,
+                lifecycle=neo4j_lifecycle,
+            )
+        if nebulagraph_lifecycle is not None:
+            try:
+                nebulagraph_lifecycle = stop_nebulagraph_repeat(
+                    system=effective_system,
+                    repeat_dir=repeat_dir,
+                    lifecycle=nebulagraph_lifecycle,
+                )
+            except BaseException as stop_failure:
+                try:
+                    recovery = recover_nebulagraph_failure(
+                        system=effective_system,
+                        repeat_dir=repeat_dir,
+                        lifecycle=nebulagraph_lifecycle,
+                        primary_failure=stop_failure,
+                    )
+                    teardown_error = ContractError(
+                        "NebulaGraph graceful stop failed; exact-ID recovery state="
+                        f"{recovery.get('state', 'UNKNOWN')}: {stop_failure}"
+                    )
+                except BaseException as recovery_failure:
+                    teardown_error = ContractError(
+                        "NebulaGraph graceful stop and exact-ID recovery both failed: "
+                        f"stop={stop_failure}; recovery={recovery_failure}"
+                    )
+            finally:
+                release_nebulagraph_store_lock(nebulagraph_lifecycle)
+    if neo4j_audits is not None:
+        post_path = repeat_dir / "neo4j-store-audit-post-stop.json"
+        post = audit_neo4j_runtime_store(
+            stage="post-stop",
+            store_root=neo4j_audits["store_root"],
+            store_manifest_path=Path(neo4j_audits["store_manifest"]["path"]),
+            store_manifest_sha256=neo4j_audits["store_manifest"]["sha256"],
+            request_path=request_path,
+            output_path=post_path,
+            stop_receipt_path=Path(neo4j_lifecycle["stop_path"]) if neo4j_lifecycle is not None else None,
+            stop_receipt_sha256=neo4j_lifecycle["stop_sha256"] if neo4j_lifecycle is not None else None,
+        )
+        stop_ref = None if neo4j_lifecycle is None else {
+            "path": str(Path(neo4j_lifecycle["stop_path"]).resolve()),
+            "sha256": neo4j_lifecycle["stop_sha256"],
+            "size_bytes": Path(neo4j_lifecycle["stop_path"]).stat().st_size,
+        }
+        post = validate_neo4j_store_audit(
+            post,
+            stage="post-stop",
+            request_ref=neo4j_audits["request"],
+            store_root=neo4j_audits["store_root"],
+            store_manifest_ref=neo4j_audits["store_manifest"],
+            stop_receipt_ref=stop_ref,
+        )
+        validate_neo4j_store_audit_pair(neo4j_audits["pre"], post)
+        neo4j_audits.update({"post_stop_path": post_path, "post_stop": post})
+    if p31_error is not None:
+        if teardown_error is not None and hasattr(p31_error, "add_note"):
+            p31_error.add_note(
+                f"NebulaGraph teardown also failed: {type(teardown_error).__name__}: {teardown_error}"
+            )
+        if isinstance(p31_error, ContractError):
+            raise p31_error
+        if isinstance(p31_error, (KeyboardInterrupt, SystemExit)):
+            raise p31_error
+        raise ContractError(
+            f"{system['id']} repeat {repeat_index}: cannot run P31/adapter: {p31_error}"
+        ) from p31_error
+    if teardown_error is not None:
+        raise teardown_error
+    if completed is None:
+        raise ContractError(f"{system['id']} repeat {repeat_index}: P31/adapter did not start")
     p31 = read_p31_summary(repeat_dir / "p31", performance_eligible=mode == "formal")
     validated = validate_adapter_outputs(
         output_dir=adapter_output,
@@ -434,13 +1764,186 @@ def execute_repeat(
         validate_neo4j_p31_binding(validated.get("adapter_provenance"), p31)
     elif mode == "formal" and system["id"] == "nebulagraph":
         validate_nebulagraph_p31_binding(validated.get("adapter_provenance"), p31)
+    elif mode == "formal" and system["id"] == "livegraph":
+        validate_livegraph_p31_binding(validated.get("adapter_provenance"), p31)
+        provenance_path = adapter_output / "adapter-provenance.json"
+        validated["livegraph_post_p31_store_seal"] = publish_livegraph_post_p31_store_seal(
+            provenance_path,
+            validated["adapter_provenance"],
+            p31,
+            repeat_dir / "livegraph-post-p31-store-seal.json",
+        )
     validated["p31"] = p31
+    if neo4j_audits is not None:
+        validated["neo4j_store_audit"] = {
+            "pre": {
+                "path": str(neo4j_audits["pre_path"].resolve()),
+                "sha256": sha256_file(neo4j_audits["pre_path"]),
+            },
+            "post_stop": {
+                "path": str(neo4j_audits["post_stop_path"].resolve()),
+                "sha256": sha256_file(neo4j_audits["post_stop_path"]),
+            },
+            "immutable_unchanged": True,
+        }
+    if neo4j_lifecycle is not None:
+        validated["neo4j_lifecycle"] = {
+            "launch": {
+                "path": str(Path(neo4j_lifecycle["launch_path"]).resolve()),
+                "sha256": neo4j_lifecycle["launch_sha256"],
+            },
+            "stop": {
+                "path": str(Path(neo4j_lifecycle["stop_path"]).resolve()),
+                "sha256": neo4j_lifecycle["stop_sha256"],
+            },
+            "graceful_stop": True,
+        }
+    if nebulagraph_lifecycle is not None:
+        validated["nebulagraph_lifecycle"] = {
+            "controller": dict(nebulagraph_lifecycle["controller"]),
+            "sealed_admission": {
+                "path": str(Path(nebulagraph_lifecycle["sealed_admission_path"]).resolve()),
+                "sha256": nebulagraph_lifecycle["sealed_admission_sha256"],
+            },
+            "preflight": {
+                "path": str(Path(nebulagraph_lifecycle["preflight_path"]).resolve()),
+                "sha256": nebulagraph_lifecycle["preflight_sha256"],
+            },
+            "start": {
+                "path": str(Path(nebulagraph_lifecycle["start_path"]).resolve()),
+                "sha256": nebulagraph_lifecycle["start_sha256"],
+            },
+            "live_gate": {
+                "path": str(Path(nebulagraph_lifecycle["start_path"]).resolve()),
+                "sha256": nebulagraph_lifecycle["start_sha256"],
+                "selector": "live_gate",
+            },
+            "stop": {
+                "path": str(Path(nebulagraph_lifecycle["stop_path"]).resolve()),
+                "sha256": nebulagraph_lifecycle["stop_sha256"],
+            },
+            "graceful_stop": True,
+        }
     validated["request"] = {
         "path": str(request_path.resolve()),
         "sha256": sha256_file(request_path),
     }
     atomic_json(repeat_dir / "validated-result.json", validated)
     return validated
+
+
+def _recover_neo4j_lifecycle(
+    *,
+    system: dict[str, Any],
+    repeat_index: int,
+    run_id: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Recover the published launch identity after any orchestration exception."""
+
+    effective_system = materialize_external_repeat_binding(system, repeat_index)
+    binding = effective_system.get("active_repeat_binding")
+    if not isinstance(binding, dict):
+        raise ContractError("cannot recover failed Neo4j repeat binding")
+    receipt_root = Path(binding["repeat_root"]).resolve() / "p10-lifecycle" / run_id
+    launch_path = receipt_root / "launch-receipt.json"
+    if not launch_path.is_file():
+        return effective_system, None
+    launch = validate_launch_receipt(
+        read_json(launch_path, "Neo4j runtime launch receipt"),
+        verify_artifacts=True,
+        expected_host=neo4j_current_host(),
+    )
+    lifecycle: dict[str, Any] = {
+        "receipt_root": receipt_root,
+        "launch_path": launch_path,
+        "launch_sha256": sha256_file(launch_path),
+        "launch": launch,
+    }
+    stop_path = receipt_root / "stop-receipt.json"
+    if stop_path.is_file():
+        try:
+            stop = validate_stop_receipt(
+                read_json(stop_path, "Neo4j runtime stop receipt"),
+                verify_artifacts=True,
+                expected_host=neo4j_current_host(),
+                launch_document=launch,
+            )
+        except (ContractError, OSError, ValueError):
+            # The launch identity remains sufficient for exact-target cleanup.
+            pass
+        else:
+            lifecycle.update(
+                {
+                    "stop_path": stop_path,
+                    "stop_sha256": sha256_file(stop_path),
+                    "stop": stop,
+                }
+            )
+    return effective_system, lifecycle
+
+
+def execute_repeat(
+    *,
+    suite: dict[str, Any],
+    system: dict[str, Any],
+    truth_rows: list[dict[str, int]],
+    repeat_index: int,
+    run_root: Path,
+    resolved_manifest: Path,
+    p31_wrapper: Path,
+    mode: str,
+) -> dict[str, Any]:
+    """Execute one repeat and fail-closed cleanup every launched Neo4j failure."""
+
+    try:
+        return _execute_repeat_impl(
+            suite=suite,
+            system=system,
+            truth_rows=truth_rows,
+            repeat_index=repeat_index,
+            run_root=run_root,
+            resolved_manifest=resolved_manifest,
+            p31_wrapper=p31_wrapper,
+            mode=mode,
+        )
+    except BaseException as failure:
+        if mode == "formal" and system.get("id") == "neo4j":
+            repeat_dir = run_root / "systems" / "neo4j" / f"repeat-{repeat_index:02d}"
+            repeat_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                effective_system, lifecycle = _recover_neo4j_lifecycle(
+                    system=system,
+                    repeat_index=repeat_index,
+                    run_id=run_root.name,
+                )
+            except BaseException as recovery_error:
+                atomic_json(
+                    repeat_dir / "neo4j-failure-recovery-error.json",
+                    {
+                        "schema_version": "cidr-p10-neo4j-failure-recovery-error-v1",
+                        "primary_failure": {
+                            "type": type(failure).__name__,
+                            "message": str(failure),
+                        },
+                        "recovery_failure": {
+                            "type": type(recovery_error).__name__,
+                            "message": str(recovery_error),
+                        },
+                    },
+                )
+                if hasattr(failure, "add_note"):
+                    failure.add_note(
+                        f"Neo4j lifecycle recovery also failed: "
+                        f"{type(recovery_error).__name__}: {recovery_error}"
+                    )
+            else:
+                preserve_failed_neo4j_repeat(
+                    system=effective_system,
+                    repeat_dir=repeat_dir,
+                    lifecycle=lifecycle,
+                    failure=failure,
+                )
+        raise
 
 
 def flatten_repeat(result: dict[str, Any]) -> dict[str, Any]:
@@ -524,6 +2027,148 @@ def aggregate_systems(repeat_rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     return output
 
 
+def validate_neo4j_driver_cross_repeat(results: list[dict[str, Any]], expected_repeats: int) -> None:
+    neo4j_results = [result for result in results if result.get("system_id") == "neo4j"]
+    if not neo4j_results:
+        return
+    if len(neo4j_results) != expected_repeats:
+        raise ContractError("formal Neo4j driver binding lacks one result per repeat")
+    bindings: list[tuple[object, ...]] = []
+    launch_receipts: list[dict[str, Any]] = []
+    for result in neo4j_results:
+        provenance = result.get("adapter_provenance")
+        driver = provenance.get("python_driver") if isinstance(provenance, dict) else None
+        if not isinstance(driver, dict):
+            raise ContractError("formal Neo4j result lacks Python driver provenance")
+        bindings.append(
+            (
+                driver.get("version"),
+                driver.get("expected_package_tree_sha256"),
+                driver.get("package_tree_sha256"),
+                driver.get("file_count"),
+                driver.get("total_bytes"),
+            )
+        )
+        lifecycle = provenance.get("container_lifecycle")
+        before = lifecycle.get("before") if isinstance(lifecycle, dict) else None
+        store = provenance.get("store")
+        lineage = store.get("lineage") if isinstance(store, dict) else None
+        reference = store.get("reference") if isinstance(store, dict) else None
+        if not isinstance(before, dict) or not isinstance(lineage, dict) or not isinstance(reference, dict):
+            raise ContractError("formal Neo4j result lacks repeat service/store identity")
+        launch = provenance.get("launch")
+        launch_receipt = launch.get("receipt") if isinstance(launch, dict) else None
+        if not isinstance(launch_receipt, dict):
+            raise ContractError("formal Neo4j result lacks its validated launch receipt")
+        launch_receipts.append(launch_receipt)
+    if len(set(bindings)) != 1:
+        raise ContractError("Neo4j Python driver tree differs across repeats")
+    validate_launch_receipts_independent(launch_receipts)
+
+
+def validate_nebulagraph_cross_repeat(
+    results: list[dict[str, Any]], expected_repeats: int, selected_indices: list[int]
+) -> None:
+    """Bind full formal NebulaGraph output to three independent clone/lifecycle identities."""
+
+    nebula_results = [result for result in results if result.get("system_id") == "nebulagraph"]
+    if not nebula_results:
+        return
+    if len(nebula_results) != len(selected_indices):
+        raise ContractError("formal NebulaGraph lacks one result per selected repeat")
+    specs: list[dict[str, Any]] = []
+    sealed_values: list[dict[str, Any]] = []
+    start_values: list[dict[str, Any]] = []
+    stop_refs: list[tuple[str, str]] = []
+    for result in nebula_results:
+        provenance = result.get("adapter_provenance")
+        lifecycle = provenance.get("cluster_lifecycle") if isinstance(provenance, dict) else None
+        preflight = lifecycle.get("preflight") if isinstance(lifecycle, dict) else None
+        start = lifecycle.get("start") if isinstance(lifecycle, dict) else None
+        preflight_receipt = preflight.get("receipt") if isinstance(preflight, dict) else None
+        start_receipt = start.get("receipt") if isinstance(start, dict) else None
+        sealed = provenance.get("sealed_admission") if isinstance(provenance, dict) else None
+        sealed_receipt = sealed.get("receipt") if isinstance(sealed, dict) else None
+        result_lifecycle = result.get("nebulagraph_lifecycle")
+        stop = result_lifecycle.get("stop") if isinstance(result_lifecycle, dict) else None
+        if (
+            not isinstance(preflight_receipt, dict)
+            or not isinstance(start_receipt, dict)
+            or not isinstance(sealed_receipt, dict)
+            or not isinstance(stop, dict)
+            or not isinstance(stop.get("path"), str)
+            or not isinstance(stop.get("sha256"), str)
+        ):
+            raise ContractError("formal NebulaGraph cross-repeat lineage is incomplete")
+        spec = preflight_receipt.get("spec")
+        if not isinstance(spec, dict):
+            raise ContractError("formal NebulaGraph preflight lacks its launch spec")
+        specs.append(spec)
+        sealed_values.append(sealed_receipt)
+        start_values.append(start_receipt)
+        stop_refs.append((str(Path(stop["path"]).resolve()), stop["sha256"]))
+    observed_indices = sorted(spec.get("repeat_index") for spec in specs)
+    if observed_indices != selected_indices:
+        raise ContractError("NebulaGraph result repeat indices differ from the selected repeats")
+    if selected_indices != list(range(1, expected_repeats + 1)):
+        return
+    cluster = _nebulagraph_cluster_module()
+    cluster.validate_repeat_isolation(specs)
+    run_ids = {spec.get("run_id") for spec in specs}
+    if len(run_ids) != 1:
+        raise ContractError("NebulaGraph repeat launch specs do not share one run ID")
+    clone_receipts: list[str] = []
+    clone_targets: list[str] = []
+    clone_sources: set[tuple[str, str]] = set()
+    store_shas: set[str] = set()
+    dense_refs: set[tuple[str, str]] = set()
+    for expected_repeat, sealed in zip(
+        sorted(selected_indices), sorted(sealed_values, key=lambda value: value["validated"]["repeat_index"])
+    ):
+        lineage = sealed.get("lineage")
+        validated = sealed.get("validated")
+        artifacts = sealed.get("artifacts")
+        if not isinstance(lineage, dict) or not isinstance(validated, dict) or not isinstance(artifacts, dict):
+            raise ContractError("NebulaGraph sealed admission lineage is malformed")
+        if (
+            validated.get("repeat_index") != expected_repeat
+            or lineage.get("clone_repeat_index") != expected_repeat
+            or lineage.get("clone_run_id") not in run_ids
+        ):
+            raise ContractError("NebulaGraph sealed clone run/repeat lineage drift")
+        clone_ref = lineage.get("clone_receipt")
+        target = lineage.get("clone_target")
+        source = lineage.get("clone_source")
+        store = sealed.get("store")
+        tree = store.get("tree") if isinstance(store, dict) else None
+        dense = artifacts.get("dataset")
+        if not all(isinstance(value, dict) for value in (clone_ref, target, source, tree, dense)):
+            raise ContractError("NebulaGraph sealed clone/tree/dense lineage is incomplete")
+        clone_receipts.append(str(Path(str(clone_ref.get("path", ""))).resolve()))
+        clone_targets.append(str(Path(str(target.get("path", ""))).resolve()))
+        clone_sources.add((str(Path(str(source.get("path", ""))).resolve()), str(source.get("sha256"))))
+        store_shas.add(str(tree.get("sha256")))
+        dense_refs.add((str(Path(str(dense.get("path", ""))).resolve()), str(dense.get("sha256"))))
+    if (
+        len(set(clone_receipts)) != expected_repeats
+        or len(set(clone_targets)) != expected_repeats
+        or len(clone_sources) != 1
+        or len(store_shas) != 1
+        or len(dense_refs) != 1
+        or len(stop_refs) != expected_repeats
+        or len(set(stop_refs)) != expected_repeats
+    ):
+        raise ContractError("NebulaGraph three-repeat clone/dense/stop lineage is not independent")
+    container_ids = [
+        start["containers"][role]["container_id"]
+        for start in start_values
+        for role in ("metad", "storaged", "graphd")
+    ]
+    network_ids = [start["network"]["network_id"] for start in start_values]
+    if len(container_ids) != len(set(container_ids)) or len(network_ids) != len(set(network_ids)):
+        raise ContractError("NebulaGraph three-repeat Docker IDs are reused")
+
+
 def run(args: argparse.Namespace) -> int:
     manifest_path = args.manifest.resolve()
     run_root = args.run_root.resolve()
@@ -533,9 +2178,14 @@ def run(args: argparse.Namespace) -> int:
     if run_root.exists() and any(run_root.iterdir()):
         raise ContractError(f"refusing non-empty run root: {run_root}")
     suite, truth_rows = load_suite_manifest(
-        manifest_path, repo_root=REPO_ROOT, run_root=run_root, mode=args.mode
+        manifest_path,
+        repo_root=REPO_ROOT,
+        run_root=run_root,
+        mode=args.mode,
+        manifest_base_dir=getattr(args, "manifest_base_dir", None),
     )
     selected = select_systems(suite, args.system, args.group)
+    repeat_indices = select_repeat_indices(suite, args.repeat_index)
     for required_executable in (p31_wrapper, P31_ADAPTER_WRAPPER):
         if not required_executable.is_file() or not os.access(required_executable, os.X_OK):
             raise ContractError(f"required wrapper is missing or not executable: {required_executable}")
@@ -544,23 +2194,39 @@ def run(args: argparse.Namespace) -> int:
     elif args.clean_ready_file is not None:
         raise ContractError("--clean-ready-file is only valid in formal mode")
 
-    run_root.mkdir(parents=True, exist_ok=True)
-    running_path = run_root / "RUNNING"
-    atomic_json(
-        running_path,
-        {
-            "state": "RUNNING",
-            "started_at_utc": utc_now(),
+    claim_empty_directory(
+        run_root,
+        claim_name="RUN-CLAIM.json",
+        claim={
+            "schema_version": "cidr-p10-run-claim-v1",
+            "state": "CLAIMED",
+            "claim_id": secrets.token_hex(16),
+            "claimed_at_utc": utc_now(),
+            "owner_pid": os.getpid(),
             "mode": args.mode,
+            "manifest_path": str(manifest_path),
             "selected_systems": [system["id"] for system in selected],
+            "selected_repeat_indices": repeat_indices,
         },
+        context="P10 run root",
     )
+    running_path = run_root / "RUNNING"
     resolved_manifest = run_root / "resolved-suite-manifest.json"
-    atomic_json(resolved_manifest, suite)
     repeat_results: list[dict[str, Any]] = []
     try:
+        atomic_json(
+            running_path,
+            {
+                "state": "RUNNING",
+                "started_at_utc": utc_now(),
+                "mode": args.mode,
+                "selected_systems": [system["id"] for system in selected],
+                "selected_repeat_indices": repeat_indices,
+            },
+        )
+        atomic_json(resolved_manifest, suite)
         for system in selected:
-            for repeat_index in range(1, suite["protocol"]["repeats"] + 1):
+            for repeat_index in repeat_indices:
                 repeat_results.append(
                     execute_repeat(
                         suite=suite,
@@ -573,13 +2239,55 @@ def run(args: argparse.Namespace) -> int:
                         mode=args.mode,
                     )
                 )
+        if args.mode == "formal":
+            validate_neo4j_driver_cross_repeat(repeat_results, len(repeat_indices))
+            validate_nebulagraph_cross_repeat(
+                repeat_results, suite["protocol"]["repeats"], repeat_indices
+            )
         repeat_rows = [flatten_repeat(result) for result in repeat_results]
         repeat_path = run_root / "repeat-results.tsv"
         write_tsv(repeat_path, REPEAT_COLUMNS, repeat_rows)
         system_rows = aggregate_systems(repeat_rows)
         system_path = run_root / "system-results.tsv"
         write_tsv(system_path, SYSTEM_COLUMNS, system_rows)
-        complete_suite = {system["id"] for system in selected} == set(FROZEN_SYSTEM_GROUPS)
+        repeat_evidence: list[dict[str, Any]] = []
+        if args.mode == "formal":
+            for result in repeat_results:
+                if result.get("system_id") != "livegraph":
+                    continue
+                repeat_index = int(result["repeat_index"])
+                repeat_dir = run_root / "systems" / "livegraph" / f"repeat-{repeat_index:02d}"
+
+                def evidence_ref(path: Path) -> dict[str, Any]:
+                    if not path.is_file() or path.is_symlink():
+                        raise ContractError(f"LiveGraph repeat evidence is missing: {path}")
+                    return {
+                        "path": str(path.resolve()),
+                        "size_bytes": path.stat().st_size,
+                        "sha256": sha256_file(path),
+                    }
+
+                output = repeat_dir / "adapter-output"
+                repeat_evidence.append(
+                    {
+                        "system_id": "livegraph",
+                        "repeat_index": repeat_index,
+                        "validated_result": evidence_ref(repeat_dir / "validated-result.json"),
+                        "adapter_provenance": evidence_ref(output / "adapter-provenance.json"),
+                        "adapter_stages": evidence_ref(output / "adapter-stage-events.jsonl"),
+                        "worker_start": evidence_ref(output / "worker-start.json"),
+                        "worker_exit": evidence_ref(output / "worker-exit.json"),
+                        "worker_stdout": evidence_ref(output / "livegraph-worker.stdout.log"),
+                        "worker_stderr": evidence_ref(output / "livegraph-worker.stderr.log"),
+                        "post_p31_store_seal": evidence_ref(
+                            repeat_dir / "livegraph-post-p31-store-seal.json"
+                        ),
+                    }
+                )
+        complete_suite = (
+            {system["id"] for system in selected} == set(FROZEN_SYSTEM_GROUPS)
+            and repeat_indices == list(range(1, suite["protocol"]["repeats"] + 1))
+        )
         summary = {
             "schema_version": "cidr-p10-suite-result-v1",
             "state": "PASS",
@@ -589,6 +2297,7 @@ def run(args: argparse.Namespace) -> int:
             "suite_id": suite["suite_id"],
             "complete_frozen_suite": complete_suite,
             "selected_systems": [system["id"] for system in selected],
+            "selected_repeat_indices": repeat_indices,
             "system_count": len(selected),
             "repeat_count": len(repeat_results),
             "group_policy": GROUP_POLICY,
@@ -602,6 +2311,7 @@ def run(args: argparse.Namespace) -> int:
             "resolved_manifest_sha256": sha256_file(resolved_manifest),
             "repeat_results": {"path": str(repeat_path), "sha256": sha256_file(repeat_path)},
             "system_results": {"path": str(system_path), "sha256": sha256_file(system_path)},
+            "repeat_evidence": repeat_evidence,
             "completed_at_utc": utc_now(),
         }
         summary_path = run_root / "suite-summary.json"
@@ -620,7 +2330,7 @@ def run(args: argparse.Namespace) -> int:
         running_path.unlink()
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
-    except Exception as exc:
+    except BaseException as exc:
         done = run_root / "DONE"
         partial = run_root / "PARTIAL-DONE"
         for marker in (done, partial):
@@ -634,6 +2344,7 @@ def run(args: argparse.Namespace) -> int:
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "validated_repeats": len(repeat_results),
+                "selected_repeat_indices": repeat_indices,
             },
         )
         if running_path.exists():
@@ -643,7 +2354,11 @@ def run(args: argparse.Namespace) -> int:
 
 def validate_only(args: argparse.Namespace) -> int:
     suite, truth_rows = load_suite_manifest(
-        args.manifest.resolve(), repo_root=REPO_ROOT, run_root=args.run_root.resolve(), mode=args.mode
+        args.manifest.resolve(),
+        repo_root=REPO_ROOT,
+        run_root=args.run_root.resolve(),
+        mode=args.mode,
+        manifest_base_dir=getattr(args, "manifest_base_dir", None),
     )
     output = {
         "state": "VALID",
@@ -663,6 +2378,7 @@ def build_parser() -> argparse.ArgumentParser:
     for action in ("validate", "run"):
         command = subparsers.add_parser(action)
         command.add_argument("--manifest", required=True, type=Path)
+        command.add_argument("--manifest-base-dir", type=Path)
         command.add_argument("--run-root", required=True, type=Path)
         command.add_argument("--mode", choices=("fixture", "formal"), required=True)
         if action == "run":
@@ -670,6 +2386,7 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--clean-ready-file", type=Path)
             command.add_argument("--system", action="append", default=[])
             command.add_argument("--group", choices=("embedded", "client-server"))
+            command.add_argument("--repeat-index", action="append", type=int, default=[])
     return parser
 
 

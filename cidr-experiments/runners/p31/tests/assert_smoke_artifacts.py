@@ -29,6 +29,17 @@ def main() -> int:
     assert not (run_dir / "FAILED").exists(), "successful run has FAILED marker"
     assert manifest["state"] == "PASS"
     assert validation["state"] == "PASS"
+    ready = json.loads((run_dir / "collector-ready.json").read_text(encoding="utf-8"))
+    status = json.loads((run_dir / "collector-status.json").read_text(encoding="utf-8"))
+    assert ready["state"] == "READY"
+    assert ready["resource_sample_index"] == 0
+    assert ready["external_zero_baseline"] is True
+    assert status["collector_ready"] == ready
+    result = manifest["collector_result"]
+    assert result["ready"] == ready
+    assert result["containers_seen"] == {}
+    assert result["container_identity_history"] == {}
+    assert result["container_identity_unique_set"] == {}
     done = json.loads((run_dir / "DONE").read_text(encoding="utf-8"))
     for filename, key in (
         ("run-manifest.json", "manifest_sha256"),

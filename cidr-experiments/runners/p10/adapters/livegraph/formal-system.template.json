@@ -1,0 +1,66 @@
+{
+  "id": "livegraph",
+  "display_name": "LiveGraph",
+  "group": "embedded",
+  "interface_scope": "typed-neighbor-dense-id-v1",
+  "system_version": "LiveGraph@REPLACE_SOURCE_HEAD",
+  "fixture_only": false,
+  "service_lifecycle": "in-process",
+  "process_lifetime": "fresh-import-and-query-process-lifetime-v1",
+  "adapter": {
+    "path": "${REPO_ROOT}/cidr-experiments/runners/p10/adapters/livegraph_adapter.py",
+    "sha256": "REPLACE_ADAPTER_SHA256",
+    "args": [
+      "--store-label",
+      "livegraph",
+      "--block-name",
+      "livegraph-block",
+      "--wal-name",
+      "livegraph-wal",
+      "--temp-base",
+      "/ABS/P10-LIVEGRAPH-RUNS/tmp",
+      "--temp-label",
+      "scratch",
+      "--build-receipt",
+      "/ABS/P10-LIVEGRAPH-BUILD/build-receipt.json",
+      "--build-receipt-sha256",
+      "REPLACE_BUILD_RECEIPT_SHA256",
+      "--p02b-result",
+      "/ABS/P02B-SENTINEL/sentinel-result.json",
+      "--p02b-result-sha256",
+      "REPLACE_P02B_RESULT_SHA256",
+      "--p02b-validator",
+      "${REPO_ROOT}/cidr-experiments/runners/p02b/validate_sentinel_result.py",
+      "--p02b-validator-sha256",
+      "REPLACE_P02B_VALIDATOR_SHA256",
+      "--p02b-max-age-seconds",
+      "21600"
+    ]
+  },
+  "binary": {
+    "path": "/ABS/P10-LIVEGRAPH-BUILD/bin/livegraph_p10_driver",
+    "sha256": "REPLACE_WORKER_SHA256"
+  },
+  "runtime_libraries": [
+    {
+      "path": "/ABS/P10-LIVEGRAPH-BUILD/lib/liblivegraph.so",
+      "sha256": "REPLACE_LIBLIVEGRAPH_SHA256"
+    }
+  ],
+  "store_roots": [
+    {
+      "label": "livegraph",
+      "path": "/ABS/P10-LIVEGRAPH-RUNS/store",
+      "sha256": ""
+    }
+  ],
+  "temp_roots": [
+    {
+      "label": "scratch",
+      "path": "/ABS/P10-LIVEGRAPH-RUNS/tmp"
+    }
+  ],
+  "containers": [],
+  "extra_pids": [],
+  "image_digests": []
+}

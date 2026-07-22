@@ -33,12 +33,14 @@ PASS_RUN="${TMP_ROOT}/pass"
   --data-mount /tmp \
   --interval 0.5 \
   --disk-interval 0.5 \
+  --collector-ready-timeout 10 \
   --min-samples 3 \
   --store "fixture-store=${TMP_ROOT}/pass-store" \
   --temp "fixture-temp=${TMP_ROOT}/pass-temp" \
   -- python3 "${SCRIPT_DIR}/fixture_process_tree.py" \
     --store "${TMP_ROOT}/pass-store" \
     --temp "${TMP_ROOT}/pass-temp" \
+    --ready-file "${PASS_RUN}/collector-ready.json" \
     --seconds 4
 
 python3 "${SCRIPT_DIR}/assert_smoke_artifacts.py" --run-dir "$PASS_RUN" --expect pass

@@ -14,7 +14,7 @@
       "--mode",
       "formal",
       "--uri",
-      "bolt://127.0.0.1:REPLACE_BOLT_PORT",
+      "bolt://127.0.0.1:REPLACE_R01_BOLT_PORT",
       "--database",
       "neo4j",
       "--readiness-timeout-s",
@@ -23,16 +23,34 @@
       "neo4j:5.26.24",
       "--expected-driver-version",
       "5.28.3",
+      "--expected-driver-tree-sha256",
+      "77c6f87a8f944f08431f943bda42e6df5d99f6f898ae10f9a4cdd7f33899eb50",
       "--expected-server-agent",
       "Neo4j/5.26.24",
+      "--expected-entrypoint-json",
+      "[\"tini\",\"-g\",\"--\",\"/startup/docker-entrypoint.sh\"]",
+      "--expected-command-json",
+      "[\"neo4j\"]",
+      "--expected-heap-initial-size",
+      "8G",
+      "--expected-heap-max-size",
+      "8G",
+      "--expected-pagecache-size",
+      "16G",
+      "--logs-root",
+      "/ABS/P10-NEO4J/repeat-01/logs",
       "--dataset-manifest",
       "/ABS/P02B/sf10-dataset-manifest.json",
       "--dataset-manifest-sha256",
       "REPLACE_DATASET_MANIFEST_SHA256",
       "--store-manifest",
-      "/ABS/P10-NEO4J/neo4j-store-manifest-v2.json",
+      "/ABS/P10-NEO4J/repeat-01/store-manifest-v3.json",
       "--store-manifest-sha256",
-      "REPLACE_STORE_MANIFEST_SHA256",
+      "REPLACE_R01_STORE_MANIFEST_SHA256",
+      "--import-receipt",
+      "/ABS/P10-NEO4J/repeat-01/controlled-import-receipt.json",
+      "--import-receipt-sha256",
+      "REPLACE_R01_IMPORT_RECEIPT_SHA256",
       "--p02b-result",
       "/ABS/P02B/sentinel-result.json",
       "--p02b-result-sha256",
@@ -52,23 +70,81 @@
     ]
   },
   "binary": {
-    "path": "/usr/bin/python3.10",
-    "sha256": "REPLACE_PYTHON_SHA256"
+    "path": "/usr/bin/python3.8",
+    "sha256": "f7b4f724cf8d9414029dc6684326d9744928cd423ea9cb4c4be509c53a013ca7"
   },
   "runtime_libraries": [],
   "store_roots": [
     {
       "label": "neo4j-runtime",
-      "path": "/ABS/P10-NEO4J/neo4j-runtime-copy",
-      "sha256": "REPLACE_OFFLINE_STORE_TREE_SHA256"
+      "path": "/ABS/P10-NEO4J/repeat-01/neo4j-runtime-copy",
+      "sha256": "REPLACE_R01_OFFLINE_STORE_TREE_SHA256"
     }
   ],
-  "temp_roots": [],
+  "temp_roots": [
+    {
+      "label": "neo4j-logs",
+      "path": "/ABS/P10-NEO4J/repeat-01/logs"
+    }
+  ],
   "containers": [
     "cidr-p10-neo4j-sf10-r01"
   ],
   "extra_pids": [],
   "image_digests": [
     "sha256:f66304b9511c60d33555a2c451f88e03d82d1ebc893f32d84c98a6b326096435"
+  ],
+  "repeat_bindings": [
+    {
+      "repeat_index": 1,
+      "clone_id": "cidr-p10-neo4j-sf10-r01",
+      "repeat_root": "/ABS/P10-NEO4J/repeat-01",
+      "source_store_root": "/ABS/P10-NEO4J/pristine-source-store",
+      "launcher": {"path": "${REPO_ROOT}/cidr-experiments/runners/p10/adapters/launch_neo4j_runtime.py", "sha256": "REPLACE_LAUNCHER_SHA256"},
+      "store_root": {
+        "label": "neo4j-runtime",
+        "path": "/ABS/P10-NEO4J/repeat-01/neo4j-runtime-copy",
+        "sha256": "REPLACE_R01_OFFLINE_STORE_TREE_SHA256"
+      },
+      "logs_root": {"label": "neo4j-logs", "path": "/ABS/P10-NEO4J/repeat-01/logs"},
+      "container": "cidr-p10-neo4j-sf10-r01",
+      "uri": "bolt://127.0.0.1:REPLACE_R01_BOLT_PORT",
+      "store_manifest": {"path": "/ABS/P10-NEO4J/repeat-01/store-manifest-v3.json", "sha256": "REPLACE_R01_STORE_MANIFEST_SHA256"},
+      "import_receipt": {"path": "/ABS/P10-NEO4J/repeat-01/controlled-import-receipt.json", "sha256": "REPLACE_R01_IMPORT_RECEIPT_SHA256"}
+    },
+    {
+      "repeat_index": 2,
+      "clone_id": "cidr-p10-neo4j-sf10-r02",
+      "repeat_root": "/ABS/P10-NEO4J/repeat-02",
+      "source_store_root": "/ABS/P10-NEO4J/pristine-source-store",
+      "launcher": {"path": "${REPO_ROOT}/cidr-experiments/runners/p10/adapters/launch_neo4j_runtime.py", "sha256": "REPLACE_LAUNCHER_SHA256"},
+      "store_root": {
+        "label": "neo4j-runtime",
+        "path": "/ABS/P10-NEO4J/repeat-02/neo4j-runtime-copy",
+        "sha256": "REPLACE_R02_OFFLINE_STORE_TREE_SHA256"
+      },
+      "logs_root": {"label": "neo4j-logs", "path": "/ABS/P10-NEO4J/repeat-02/logs"},
+      "container": "cidr-p10-neo4j-sf10-r02",
+      "uri": "bolt://127.0.0.1:REPLACE_R02_BOLT_PORT",
+      "store_manifest": {"path": "/ABS/P10-NEO4J/repeat-02/store-manifest-v3.json", "sha256": "REPLACE_R02_STORE_MANIFEST_SHA256"},
+      "import_receipt": {"path": "/ABS/P10-NEO4J/repeat-02/controlled-import-receipt.json", "sha256": "REPLACE_R02_IMPORT_RECEIPT_SHA256"}
+    },
+    {
+      "repeat_index": 3,
+      "clone_id": "cidr-p10-neo4j-sf10-r03",
+      "repeat_root": "/ABS/P10-NEO4J/repeat-03",
+      "source_store_root": "/ABS/P10-NEO4J/pristine-source-store",
+      "launcher": {"path": "${REPO_ROOT}/cidr-experiments/runners/p10/adapters/launch_neo4j_runtime.py", "sha256": "REPLACE_LAUNCHER_SHA256"},
+      "store_root": {
+        "label": "neo4j-runtime",
+        "path": "/ABS/P10-NEO4J/repeat-03/neo4j-runtime-copy",
+        "sha256": "REPLACE_R03_OFFLINE_STORE_TREE_SHA256"
+      },
+      "logs_root": {"label": "neo4j-logs", "path": "/ABS/P10-NEO4J/repeat-03/logs"},
+      "container": "cidr-p10-neo4j-sf10-r03",
+      "uri": "bolt://127.0.0.1:REPLACE_R03_BOLT_PORT",
+      "store_manifest": {"path": "/ABS/P10-NEO4J/repeat-03/store-manifest-v3.json", "sha256": "REPLACE_R03_STORE_MANIFEST_SHA256"},
+      "import_receipt": {"path": "/ABS/P10-NEO4J/repeat-03/controlled-import-receipt.json", "sha256": "REPLACE_R03_IMPORT_RECEIPT_SHA256"}
+    }
   ]
 }
