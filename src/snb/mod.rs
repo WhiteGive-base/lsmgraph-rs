@@ -4,7 +4,10 @@ mod queries;
 mod server;
 
 pub use full_loader::{
-    import_snb_full, import_snb_full_multi, import_snb_updates, rebuild_snb_edge_props,
+    audit_snb_edge_property_materialization, import_snb_full, import_snb_full_multi,
+    import_snb_full_multi_with_edge_properties, import_snb_full_with_edge_properties,
+    import_snb_updates, rebuild_snb_edge_props, SnbEdgePropertyAudit,
+    SnbEdgePropertyMaterialization, SnbEdgePropertyMaterializationStats,
 };
 pub use props::{encode_vid, external_id, SnbGraph};
 pub use queries::{

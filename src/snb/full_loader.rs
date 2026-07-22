@@ -9,6 +9,8 @@ use csv::StringRecord;
 use crate::error::Result;
 use crate::graph::Engine;
 use crate::loader::ImportStats;
+use crate::property_encoding::PropertyValue;
+use crate::schema::{NewPropertyEntry, PropertyOwner};
 use crate::snb::props::{
     encode_vid, load_adjacency_cache, write_adjacency_cache_atomic, AdjacencyBuilder, CommentProps,
     EdgeProp, EdgePropRow, ForumProps, OrgProps, PersonProps, PlaceProps, PostProps, TagClassProps,
@@ -17,6 +19,237 @@ use crate::snb::props::{
 use crate::types::{EdgeLabel, VertexLabel};
 
 const IMPORT_PROGRESS_ROWS: u64 = 1_000_000;
+
+/// Formal P20 profile for a real LDBC SNB edge property.
+///
+/// `person_knows_person.creationDate` is present on every positive Knows edge in
+/// the source CSV.  It is deliberately owned by edge label `Knows` (`+1`): the
+/// synthetic reverse index (`-1`) remains topology-only.  A property-presence
+/// benchmark using this profile must therefore omit an edge-type constraint;
+/// constraining the query to `Knows` would make it equivalent to typed one-hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnbEdgePropertyMaterialization {
+    pub property_id: u32,
+}
+
+impl SnbEdgePropertyMaterialization {
+    pub fn knows_creation_date(property_id: u32) -> Self {
+        Self { property_id }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnbEdgePropertyMaterializationStats {
+    pub profile: &'static str,
+    pub property_id: u32,
+    pub edge_type: i32,
+    pub schema_epoch: u64,
+    pub materialized_property_values: u64,
+    pub topology_only_directed_edges: u64,
+    pub property_bitmap_nonzero_segments_per_store: Vec<u64>,
+    pub property_bitmap_zero_segments_per_store: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnbEdgePropertyAudit {
+    pub profile: &'static str,
+    pub property_id: u32,
+    pub edge_type: i32,
+    pub snapshot: u64,
+    pub property_bitmap_nonzero_segments: u64,
+    pub property_bitmap_zero_segments: u64,
+}
+
+const KNOWS_CREATION_DATE_PROFILE: &str = "snb-knows-creation-date-v1";
+const KNOWS_CREATION_DATE_NAME: &str = "creation_date";
+const KNOWS_CREATION_DATE_LOGICAL_TYPE: &str = "datetime_ms";
+const KNOWS_CREATION_DATE_PHYSICAL_ENCODING: &str = "plain_i64";
+const KNOWS_CREATION_DATE_DEFAULT_OR_NULL_RULE: &str = "null";
+
+fn preflight_knows_creation_date(
+    csv_root: &Path,
+    materialization: SnbEdgePropertyMaterialization,
+) -> Result<()> {
+    if materialization.property_id >= 64 {
+        anyhow::bail!(
+            "{KNOWS_CREATION_DATE_PROFILE} requires property_id < 64 for an exact CSR presence bitmap; got {}",
+            materialization.property_id
+        );
+    }
+    let path = csv_root.join("dynamic").join("person_knows_person_0_0.csv");
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b'|')
+        .has_headers(true)
+        .from_path(&path)?;
+    let headers = reader.headers()?.clone();
+    if headers.len() < 3 {
+        anyhow::bail!(
+            "{KNOWS_CREATION_DATE_PROFILE} requires at least three columns in {}; got {}",
+            path.display(),
+            headers.len()
+        );
+    }
+    let property_header = headers.get(2).unwrap_or("").trim_start_matches('\u{feff}');
+    if property_header != "creationDate" {
+        anyhow::bail!(
+            "{KNOWS_CREATION_DATE_PROFILE} expected column 3 to be creationDate in {}; got {:?}",
+            path.display(),
+            property_header
+        );
+    }
+    let first = reader.records().next().transpose()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{KNOWS_CREATION_DATE_PROFILE} source CSV {} has no data rows",
+            path.display()
+        )
+    })?;
+    for (index, name) in [(0usize, "src"), (1usize, "dst"), (2usize, "creationDate")] {
+        let raw = first.get(index).unwrap_or("").trim();
+        if raw.is_empty() {
+            anyhow::bail!(
+                "{KNOWS_CREATION_DATE_PROFILE} first row has empty {name} in {}",
+                path.display()
+            );
+        }
+        raw.parse::<i64>().map_err(|error| {
+            anyhow::anyhow!(
+                "{KNOWS_CREATION_DATE_PROFILE} first-row {name} is not i64 in {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn register_materialization_schema(
+    engines: &[Arc<Engine>],
+    materialization: SnbEdgePropertyMaterialization,
+) -> Result<u64> {
+    if engines.is_empty() {
+        anyhow::bail!("{KNOWS_CREATION_DATE_PROFILE} requires at least one engine");
+    }
+    for (index, engine) in engines.iter().enumerate() {
+        if engine.current_snapshot() != 0 {
+            anyhow::bail!(
+                "{KNOWS_CREATION_DATE_PROFILE} requires a fresh store; engine_index={index} snapshot={}",
+                engine.current_snapshot()
+            );
+        }
+        let catalog = engine.schema_catalog_snapshot();
+        if !catalog.properties.is_empty() {
+            anyhow::bail!(
+                "{KNOWS_CREATION_DATE_PROFILE} refuses a pre-populated property catalog; engine_index={index} properties={}",
+                catalog.properties.len()
+            );
+        }
+    }
+
+    let mut epochs = Vec::with_capacity(engines.len());
+    for (index, engine) in engines.iter().enumerate() {
+        let epoch = engine
+            .add_schema_property(NewPropertyEntry {
+            id: materialization.property_id,
+            owner: PropertyOwner::EdgeLabel(EdgeLabel::Knows.as_i32()),
+            name: KNOWS_CREATION_DATE_NAME.to_string(),
+            logical_type: KNOWS_CREATION_DATE_LOGICAL_TYPE.to_string(),
+            physical_encoding: KNOWS_CREATION_DATE_PHYSICAL_ENCODING.to_string(),
+            encoding_version: 1,
+            default_or_null_rule: KNOWS_CREATION_DATE_DEFAULT_OR_NULL_RULE.to_string(),
+            })
+            .map_err(|error| anyhow::anyhow!(
+                "{KNOWS_CREATION_DATE_PROFILE} schema registration failed at engine_index={index}; the entire multi-store candidate is invalid and every store must be discarded: {error:#}"
+            ))?;
+        epochs.push(epoch);
+    }
+    let schema_epoch = epochs[0];
+    if epochs.iter().any(|epoch| *epoch != schema_epoch) {
+        anyhow::bail!(
+            "{KNOWS_CREATION_DATE_PROFILE} schema epochs differ across stores: {:?}",
+            epochs
+        );
+    }
+    Ok(schema_epoch)
+}
+
+fn verify_materialization_outputs(
+    engines: &[Arc<Engine>],
+    materialization: SnbEdgePropertyMaterialization,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    if materialization.property_id >= 64 {
+        anyhow::bail!(
+            "{KNOWS_CREATION_DATE_PROFILE} requires property_id < 64 for exact bitmap audit; got {}",
+            materialization.property_id
+        );
+    }
+    let bit = 1u64 << materialization.property_id;
+    let mut nonzero_segments = Vec::with_capacity(engines.len());
+    let mut zero_segments = Vec::with_capacity(engines.len());
+    for (index, engine) in engines.iter().enumerate() {
+        let catalog = engine.schema_catalog_snapshot();
+        let property = catalog
+            .properties
+            .get(&materialization.property_id)
+            .ok_or_else(|| anyhow::anyhow!(
+                "{KNOWS_CREATION_DATE_PROFILE} property {} missing after import in engine_index={index}",
+                materialization.property_id
+            ))?;
+        if property.owner != PropertyOwner::EdgeLabel(EdgeLabel::Knows.as_i32())
+            || property.name != KNOWS_CREATION_DATE_NAME
+            || property.logical_type != KNOWS_CREATION_DATE_LOGICAL_TYPE
+            || property.physical_encoding != KNOWS_CREATION_DATE_PHYSICAL_ENCODING
+            || property.encoding_version != 1
+            || property.default_or_null_rule != KNOWS_CREATION_DATE_DEFAULT_OR_NULL_RULE
+        {
+            anyhow::bail!(
+                "{KNOWS_CREATION_DATE_PROFILE} schema drift in engine_index={index}: {:?}",
+                property
+            );
+        }
+        let guard = engine.version_guard();
+        let mut with_property = 0u64;
+        let mut without_property = 0u64;
+        for meta in guard.version().levels.iter().flatten() {
+            if meta.property_presence_bitmap & bit != 0 {
+                with_property += 1;
+            } else {
+                without_property += 1;
+            }
+        }
+        if with_property == 0 {
+            anyhow::bail!(
+                "{KNOWS_CREATION_DATE_PROFILE} produced no live CSR segment with property bit {} in engine_index={index}",
+                materialization.property_id
+            );
+        }
+        if without_property == 0 {
+            anyhow::bail!(
+                "{KNOWS_CREATION_DATE_PROFILE} produced no live CSR segment without property bit {} in engine_index={index}; property-presence would lack a segment-level negative population",
+                materialization.property_id
+            );
+        }
+        nonzero_segments.push(with_property);
+        zero_segments.push(without_property);
+    }
+    Ok((nonzero_segments, zero_segments))
+}
+
+/// Re-open-time audit used by the formal SF1/SF10 gate.  The caller must open
+/// the Engine in a new process after import so this validates persisted catalog
+/// and manifest/CSR metadata rather than the importer object's memory state.
+pub fn audit_snb_edge_property_materialization(
+    engine: &Arc<Engine>,
+    materialization: SnbEdgePropertyMaterialization,
+) -> Result<SnbEdgePropertyAudit> {
+    let (nonzero, zero) = verify_materialization_outputs(&[engine.clone()], materialization)?;
+    Ok(SnbEdgePropertyAudit {
+        profile: KNOWS_CREATION_DATE_PROFILE,
+        property_id: materialization.property_id,
+        edge_type: EdgeLabel::Knows.as_i32(),
+        snapshot: engine.current_snapshot(),
+        property_bitmap_nonzero_segments: nonzero[0],
+        property_bitmap_zero_segments: zero[0],
+    })
+}
 
 pub async fn import_snb_full(
     engine: Arc<Engine>,
@@ -28,11 +261,90 @@ pub async fn import_snb_full(
     import_snb_full_multi(&engines, csv_root, &store_dirs).await
 }
 
+pub async fn import_snb_full_with_edge_properties(
+    engine: Arc<Engine>,
+    csv_root: &Path,
+    store_dir: &Path,
+    materialization: SnbEdgePropertyMaterialization,
+) -> Result<(ImportStats, SnbEdgePropertyMaterializationStats)> {
+    let engines = [engine];
+    let store_dirs = [store_dir.to_path_buf()];
+    import_snb_full_multi_with_edge_properties(&engines, csv_root, &store_dirs, materialization)
+        .await
+}
+
 pub async fn import_snb_full_multi(
     engines: &[Arc<Engine>],
     csv_root: &Path,
     store_dirs: &[PathBuf],
 ) -> Result<ImportStats> {
+    Ok(
+        import_snb_full_multi_inner(engines, csv_root, store_dirs, None)
+            .await?
+            .0,
+    )
+}
+
+pub async fn import_snb_full_multi_with_edge_properties(
+    engines: &[Arc<Engine>],
+    csv_root: &Path,
+    store_dirs: &[PathBuf],
+    materialization: SnbEdgePropertyMaterialization,
+) -> Result<(ImportStats, SnbEdgePropertyMaterializationStats)> {
+    validate_snb_full_multi_inputs(engines, store_dirs)?;
+    preflight_knows_creation_date(csv_root, materialization)?;
+    let schema_epoch = register_materialization_schema(engines, materialization)?;
+    let (stats, materialized_property_values) = import_snb_full_multi_inner(
+        engines,
+        csv_root,
+        store_dirs,
+        Some(materialization),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(
+        "{KNOWS_CREATION_DATE_PROFILE} import failed; the entire multi-store candidate is invalid and every store must be discarded: {error:#}"
+    ))?;
+    if materialized_property_values == 0 {
+        anyhow::bail!(
+            "{KNOWS_CREATION_DATE_PROFILE} produced zero property values; refusing vacuous store"
+        );
+    }
+    if materialized_property_values > stats.directed_edges {
+        anyhow::bail!(
+            "materialized property count {} exceeds directed edge count {}",
+            materialized_property_values,
+            stats.directed_edges
+        );
+    }
+    let (nonzero_segments, zero_segments) =
+        verify_materialization_outputs(engines, materialization)?;
+    let topology_only_directed_edges = stats.directed_edges - materialized_property_values;
+    Ok((
+        stats,
+        SnbEdgePropertyMaterializationStats {
+            profile: KNOWS_CREATION_DATE_PROFILE,
+            property_id: materialization.property_id,
+            edge_type: EdgeLabel::Knows.as_i32(),
+            schema_epoch,
+            materialized_property_values,
+            topology_only_directed_edges,
+            property_bitmap_nonzero_segments_per_store: nonzero_segments,
+            property_bitmap_zero_segments_per_store: zero_segments,
+        },
+    ))
+}
+
+async fn import_snb_full_multi_inner(
+    engines: &[Arc<Engine>],
+    csv_root: &Path,
+    store_dirs: &[PathBuf],
+    materialization: Option<SnbEdgePropertyMaterialization>,
+) -> Result<(ImportStats, u64)> {
+    let skip_adj = validate_snb_full_multi_inputs(engines, store_dirs)?;
+    import_snb_full_inner(engines, csv_root, &store_dirs[0], skip_adj, materialization).await
+}
+
+fn validate_snb_full_multi_inputs(engines: &[Arc<Engine>], store_dirs: &[PathBuf]) -> Result<bool> {
     if engines.is_empty() {
         anyhow::bail!("import_snb_full_multi requires at least one engine");
     }
@@ -52,7 +364,7 @@ pub async fn import_snb_full_multi(
              vertex JSONL, edge-prop JSONL, and adjacency cache are single-store artifacts"
         );
     }
-    import_snb_full_inner(engines, csv_root, &store_dirs[0], skip_adj).await
+    Ok(skip_adj)
 }
 
 async fn import_snb_full_inner(
@@ -60,7 +372,8 @@ async fn import_snb_full_inner(
     csv_root: &Path,
     store_dir: &Path,
     skip_adj: bool,
-) -> Result<ImportStats> {
+    materialization: Option<SnbEdgePropertyMaterialization>,
+) -> Result<(ImportStats, u64)> {
     let import_started = Instant::now();
     fs::create_dir_all(store_dir)?;
     // For the L0-layout ablation (SNB_SKIP_ADJ_CACHE=1) the vertex JSONL, edge-prop JSONL and
@@ -78,6 +391,7 @@ async fn import_snb_full_inner(
         input_rows: 0,
         directed_edges: 0,
     };
+    let mut materialized_property_values = 0u64;
     let mut adjacency = if skip_adj {
         AdjacencyBuilder::new_disabled()
     } else {
@@ -102,7 +416,7 @@ async fn import_snb_full_inner(
     let static_dir = csv_root.join("static");
 
     stats.add(
-        import_edge_file(
+        import_edge_file_with_materialization(
             engines,
             &mut edge_props,
             &dynamic.join("person_knows_person_0_0.csv"),
@@ -114,6 +428,8 @@ async fn import_snb_full_inner(
             ColRef::Index(1),
             PropSpec::I64Col(2),
             &mut adjacency,
+            materialization,
+            &mut materialized_property_values,
         )
         .await?,
     );
@@ -393,7 +709,7 @@ async fn import_snb_full_inner(
             import_started.elapsed().as_secs_f64()
         );
         drop(adjacency);
-        return Ok(stats);
+        return Ok((stats, materialized_property_values));
     }
     let cache_started = Instant::now();
     eprintln!(
@@ -423,7 +739,7 @@ async fn import_snb_full_inner(
         cache_started.elapsed().as_secs_f64(),
         import_started.elapsed().as_secs_f64()
     );
-    Ok(stats)
+    Ok((stats, materialized_property_values))
 }
 
 pub fn rebuild_snb_edge_props(csv_root: &Path, store_dir: &Path) -> Result<u64> {
@@ -936,6 +1252,41 @@ async fn import_edge_file(
     prop: PropSpec,
     adjacency: &mut AdjacencyBuilder,
 ) -> Result<ImportStats> {
+    let mut ignored_materialized_property_values = 0u64;
+    import_edge_file_with_materialization(
+        engines,
+        edge_props,
+        path,
+        src_label,
+        dst_label,
+        edge_label,
+        bidirectional_positive,
+        src_col,
+        dst_col,
+        prop,
+        adjacency,
+        None,
+        &mut ignored_materialized_property_values,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_edge_file_with_materialization(
+    engines: &[Arc<Engine>],
+    edge_props: &mut BufWriter<File>,
+    path: &Path,
+    src_label: VertexLabel,
+    dst_label: VertexLabel,
+    edge_label: EdgeLabel,
+    bidirectional_positive: bool,
+    src_col: ColRef,
+    dst_col: ColRef,
+    prop: PropSpec,
+    adjacency: &mut AdjacencyBuilder,
+    materialization: Option<SnbEdgePropertyMaterialization>,
+    materialized_property_values: &mut u64,
+) -> Result<ImportStats> {
     let started = Instant::now();
     eprintln!(
         "[snb-full][edge] start file={} edge={:?} src={:?} dst={:?}",
@@ -963,7 +1314,7 @@ async fn import_edge_file(
         let src = encode_vid(src_label, src_ext);
         let dst = encode_vid(dst_label, dst_ext);
         let prop_value = prop.read(&headers, &rec)?;
-        insert_forward_reverse_many(
+        insert_forward_reverse_many_with_materialization(
             engines,
             edge_props,
             src,
@@ -972,11 +1323,13 @@ async fn import_edge_file(
             prop_value,
             true,
             adjacency,
+            materialization,
+            materialized_property_values,
         )
         .await?;
         directed_edges += 2;
         if bidirectional_positive {
-            insert_forward_reverse_many(
+            insert_forward_reverse_many_with_materialization(
                 engines,
                 edge_props,
                 dst,
@@ -985,6 +1338,8 @@ async fn import_edge_file(
                 prop_value,
                 false,
                 adjacency,
+                materialization,
+                materialized_property_values,
             )
             .await?;
             directed_edges += 1;
@@ -1450,11 +1805,55 @@ async fn insert_forward_reverse_many(
     include_reverse: bool,
     adjacency: &mut AdjacencyBuilder,
 ) -> Result<()> {
+    let mut ignored_materialized_property_values = 0u64;
+    insert_forward_reverse_many_with_materialization(
+        engines,
+        edge_props,
+        src,
+        dst,
+        edge_label,
+        prop,
+        include_reverse,
+        adjacency,
+        None,
+        &mut ignored_materialized_property_values,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_forward_reverse_many_with_materialization(
+    engines: &[Arc<Engine>],
+    edge_props: &mut BufWriter<File>,
+    src: u64,
+    dst: u64,
+    edge_label: EdgeLabel,
+    prop: EdgeProp,
+    include_reverse: bool,
+    adjacency: &mut AdjacencyBuilder,
+    materialization: Option<SnbEdgePropertyMaterialization>,
+    materialized_property_values: &mut u64,
+) -> Result<()> {
     let label = edge_label.as_i32();
+    let property_value = materialized_knows_creation_date_value(materialization, edge_label, prop)?;
     let mut first_ts = None;
     for engine in engines {
-        let ts = engine.insert_edge(src, dst, label).await?;
+        let ts = if let Some((property_id, value)) = &property_value {
+            engine
+                .insert_edge_with_property_values_prototype(
+                    src,
+                    dst,
+                    label,
+                    vec![(*property_id, value.clone())],
+                )
+                .await?
+        } else {
+            engine.insert_edge(src, dst, label).await?
+        };
         first_ts.get_or_insert(ts);
+    }
+    if property_value.is_some() {
+        *materialized_property_values += 1;
     }
     adjacency.record_edge(src, label, dst, first_ts.unwrap_or(0));
     write_edge_prop(edge_props, src, dst, label, prop)?;
@@ -1468,6 +1867,31 @@ async fn insert_forward_reverse_many(
         write_edge_prop(edge_props, dst, src, -label, prop)?;
     }
     Ok(())
+}
+
+fn materialized_knows_creation_date_value(
+    materialization: Option<SnbEdgePropertyMaterialization>,
+    edge_label: EdgeLabel,
+    prop: EdgeProp,
+) -> Result<Option<(u32, PropertyValue)>> {
+    let Some(materialization) = materialization else {
+        return Ok(None);
+    };
+    if edge_label != EdgeLabel::Knows {
+        return Ok(None);
+    }
+    match prop {
+        EdgeProp::I64(value) => Ok(Some((
+            materialization.property_id,
+            PropertyValue::I64(value),
+        ))),
+        EdgeProp::Empty => anyhow::bail!(
+            "{KNOWS_CREATION_DATE_PROFILE} requires a creationDate for every Knows row"
+        ),
+        EdgeProp::I32(_) => {
+            anyhow::bail!("{KNOWS_CREATION_DATE_PROFILE} requires an i64 creationDate, got i32")
+        }
+    }
 }
 
 fn write_edge_prop(
@@ -1549,8 +1973,26 @@ impl PropSpec {
     fn read(&self, _headers: &StringRecord, rec: &StringRecord) -> Result<EdgeProp> {
         Ok(match self {
             Self::None => EdgeProp::Empty,
-            Self::I32Col(i) => EdgeProp::I32(rec[*i].parse()?),
-            Self::I64Col(i) => EdgeProp::I64(rec[*i].parse()?),
+            Self::I32Col(i) => {
+                let raw = rec
+                    .get(*i)
+                    .ok_or_else(|| anyhow::anyhow!("missing i32 property column {i}"))?
+                    .trim();
+                if raw.is_empty() {
+                    anyhow::bail!("empty i32 property column {i}");
+                }
+                EdgeProp::I32(raw.parse()?)
+            }
+            Self::I64Col(i) => {
+                let raw = rec
+                    .get(*i)
+                    .ok_or_else(|| anyhow::anyhow!("missing i64 property column {i}"))?
+                    .trim();
+                if raw.is_empty() {
+                    anyhow::bail!("empty i64 property column {i}");
+                }
+                EdgeProp::I64(raw.parse()?)
+            }
         })
     }
 }
@@ -1625,4 +2067,202 @@ fn parse_org_year_list(raw: &str) -> Vec<(i64, i32)> {
             Some((org.parse().ok()?, year.parse().ok()?))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod property_materialization_tests {
+    use super::*;
+    use crate::config::LsmGraphConfig;
+    use crate::csr::CsrPropertyValuePredicate;
+
+    fn write_knows_fixture(root: &Path, rows: &str) -> Result<PathBuf> {
+        let dynamic = root.join("dynamic");
+        fs::create_dir_all(&dynamic)?;
+        let path = dynamic.join("person_knows_person_0_0.csv");
+        fs::write(&path, format!("Person.id|Person.id|creationDate\n{rows}"))?;
+        Ok(path)
+    }
+
+    #[test]
+    fn materialization_preflight_rejects_empty_and_unrepresentable_inputs() -> Result<()> {
+        let empty = tempfile::tempdir()?;
+        write_knows_fixture(empty.path(), "")?;
+        let err = preflight_knows_creation_date(
+            empty.path(),
+            SnbEdgePropertyMaterialization::knows_creation_date(5),
+        )
+        .expect_err("empty property source must fail");
+        assert!(err.to_string().contains("has no data rows"));
+
+        let valid = tempfile::tempdir()?;
+        write_knows_fixture(valid.path(), "1|2|1340000000000\n")?;
+        let err = preflight_knows_creation_date(
+            valid.path(),
+            SnbEdgePropertyMaterialization::knows_creation_date(64),
+        )
+        .expect_err("property ids outside the exact bitmap must fail");
+        assert!(err.to_string().contains("property_id < 64"));
+
+        let malformed = tempfile::tempdir()?;
+        write_knows_fixture(malformed.path(), "1|2|not-a-timestamp\n")?;
+        let err = preflight_knows_creation_date(
+            malformed.path(),
+            SnbEdgePropertyMaterialization::knows_creation_date(5),
+        )
+        .expect_err("malformed source property must fail");
+        assert!(err.to_string().contains("creationDate is not i64"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn materialization_rejects_nonfresh_or_prepopulated_store() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let engine = Engine::create(LsmGraphConfig::new(store.path())).await?;
+        engine.add_schema_property(NewPropertyEntry {
+            id: 17,
+            owner: PropertyOwner::EdgeLabel(EdgeLabel::LikesPost.as_i32()),
+            name: "existing".to_string(),
+            logical_type: "int64".to_string(),
+            physical_encoding: "plain_i64".to_string(),
+            encoding_version: 1,
+            default_or_null_rule: "null".to_string(),
+        })?;
+        let err = register_materialization_schema(
+            &[engine],
+            SnbEdgePropertyMaterialization::knows_creation_date(5),
+        )
+        .expect_err("pre-populated catalog must fail");
+        assert!(err.to_string().contains("pre-populated property catalog"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_knows_property_survives_flush_reopen_and_compaction() -> Result<()> {
+        let csv_root = tempfile::tempdir()?;
+        let knows_path =
+            write_knows_fixture(csv_root.path(), "1|2|1340000000000\n2|3|1350000000000\n")?;
+        let store = tempfile::tempdir()?;
+        let config = LsmGraphConfig::new(store.path()).with_memgraph_capacity(64 * 1024 * 1024);
+        let materialization = SnbEdgePropertyMaterialization::knows_creation_date(5);
+        preflight_knows_creation_date(csv_root.path(), materialization)?;
+
+        let engine = Engine::create(config.clone()).await?;
+        let schema_epoch = register_materialization_schema(&[engine.clone()], materialization)?;
+        assert!(schema_epoch > 0);
+        let sidecar_path = store.path().join("test-edge-props.jsonl");
+        let mut sidecar = BufWriter::new(File::create(sidecar_path)?);
+        let mut adjacency = AdjacencyBuilder::new_disabled();
+        let mut property_values = 0u64;
+        let stats = import_edge_file_with_materialization(
+            &[engine.clone()],
+            &mut sidecar,
+            &knows_path,
+            VertexLabel::Person,
+            VertexLabel::Person,
+            EdgeLabel::Knows,
+            true,
+            ColRef::Index(0),
+            ColRef::Index(1),
+            PropSpec::I64Col(2),
+            &mut adjacency,
+            Some(materialization),
+            &mut property_values,
+        )
+        .await?;
+        sidecar.flush()?;
+        assert_eq!(stats.input_rows, 2);
+        assert_eq!(stats.directed_edges, 6);
+        assert_eq!(
+            property_values, 4,
+            "count is per source-derived edge, not per Engine"
+        );
+        engine.flush_active().await?;
+
+        // Force a separate exact-negative segment and a record-level negative
+        // population for a property-only (edge_type=None) query.
+        let src = encode_vid(VertexLabel::Person, 1);
+        let likes_dst = encode_vid(VertexLabel::Post, 99);
+        engine
+            .insert_edge(src, likes_dst, EdgeLabel::LikesPost.as_i32())
+            .await?;
+        engine.flush_active().await?;
+
+        let (nonzero, zero) = verify_materialization_outputs(&[engine.clone()], materialization)?;
+        assert!(nonzero[0] > 0);
+        assert!(zero[0] > 0);
+        let snapshot = engine.current_snapshot();
+        let present = engine
+            .get_neighbors_with_present_property_prototype(src, None, snapshot, 5)
+            .await?;
+        let all = engine.get_neighbors(src, snapshot).await?;
+        assert_eq!(
+            present.len(),
+            1,
+            "property-only query needs a positive record"
+        );
+        assert!(
+            all.len() > present.len(),
+            "property-only query needs property-absent records at the same source"
+        );
+        let typed_knows = engine
+            .get_neighbors_typed(src, EdgeLabel::Knows.as_i32(), snapshot)
+            .await?;
+        assert_eq!(
+            present, typed_knows,
+            "per-source result correlation is explicit; the formal property plan must use edge_type=null and a distinct workload digest"
+        );
+        let matching_value = engine
+            .get_neighbors_matching_csr_property_value_prototype(
+                src,
+                None,
+                snapshot,
+                CsrPropertyValuePredicate::equals(5, PropertyValue::I64(1340000000000)),
+            )
+            .await?;
+        assert_eq!(
+            matching_value.len(),
+            1,
+            "the original CSV value must be decodable"
+        );
+        drop(engine);
+
+        let reopened = Engine::open(config.clone()).await?;
+        let (reopened_nonzero, reopened_zero) =
+            verify_materialization_outputs(&[reopened.clone()], materialization)?;
+        assert_eq!(reopened_nonzero, nonzero);
+        assert_eq!(reopened_zero, zero);
+        let reopened_present = reopened
+            .get_neighbors_with_present_property_prototype(
+                src,
+                None,
+                reopened.current_snapshot(),
+                5,
+            )
+            .await?;
+        assert_eq!(reopened_present, present);
+
+        reopened.compact_l0_to_l1().await?;
+        let after_compaction = reopened
+            .get_neighbors_matching_csr_property_value_prototype(
+                src,
+                None,
+                reopened.current_snapshot(),
+                CsrPropertyValuePredicate::equals(5, PropertyValue::I64(1340000000000)),
+            )
+            .await?;
+        assert_eq!(after_compaction, matching_value);
+        drop(reopened);
+
+        let reopened_after_compaction = Engine::open(config).await?;
+        let final_present = reopened_after_compaction
+            .get_neighbors_with_present_property_prototype(
+                src,
+                None,
+                reopened_after_compaction.current_snapshot(),
+                5,
+            )
+            .await?;
+        assert_eq!(final_present, present);
+        Ok(())
+    }
 }

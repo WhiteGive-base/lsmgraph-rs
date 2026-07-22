@@ -17,9 +17,11 @@ use lsmgraph::shared_truth::{
     TruthRow,
 };
 use lsmgraph::snb::{
-    import_snb_full, import_snb_full_multi, import_snb_updates, rebuild_snb_edge_props,
-    start_dgs_compatible_server, validate_ic1_ic14_dynamic, validate_ic_batch_dynamic,
-    validate_mixed_tugraph_dynamic, SnbGraph,
+    audit_snb_edge_property_materialization, import_snb_full, import_snb_full_multi,
+    import_snb_full_multi_with_edge_properties, import_snb_full_with_edge_properties,
+    import_snb_updates, rebuild_snb_edge_props, start_dgs_compatible_server,
+    validate_ic1_ic14_dynamic, validate_ic_batch_dynamic, validate_mixed_tugraph_dynamic,
+    SnbEdgePropertyMaterialization, SnbGraph,
 };
 use lsmgraph::types::{source_label_from_vertex_id, EdgeMarker, UNKNOWN_SOURCE_LABEL};
 use lsmgraph::{
@@ -96,6 +98,12 @@ enum Command {
         semantic_budget_feedback_only: bool,
         #[arg(long, default_value_t = false)]
         semantic_budget_disable_feedback: bool,
+        /// Materialize the real LDBC `person_knows_person.creationDate` value into Engine/CSR.
+        /// This is opt-in because it changes the physical store and schema epoch.
+        #[arg(long, default_value_t = false)]
+        materialize_knows_creation_date: bool,
+        #[arg(long, default_value_t = 5)]
+        knows_creation_date_property_id: u32,
     },
     ImportMany {
         #[arg(long, default_value = DEFAULT_DATA)]
@@ -142,6 +150,11 @@ enum Command {
         semantic_budget_feedback_only: bool,
         #[arg(long, default_value_t = false)]
         semantic_budget_disable_feedback: bool,
+        /// Materialize the real LDBC `person_knows_person.creationDate` value into every store.
+        #[arg(long, default_value_t = false)]
+        materialize_knows_creation_date: bool,
+        #[arg(long, default_value_t = 5)]
+        knows_creation_date_property_id: u32,
     },
     BaseBuild {
         #[arg(long, default_value = DEFAULT_DATA)]
@@ -358,6 +371,13 @@ enum Command {
         input: PathBuf,
         #[arg(long, default_value = DEFAULT_STORE)]
         data_dir: PathBuf,
+    },
+    /// Re-open-time fail-closed audit for the formal SNB edge-property store.
+    SnbPropertyAudit {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        property_id: u32,
     },
     SnbUpdates {
         #[arg(long, default_value = DEFAULT_DATA)]
@@ -618,6 +638,8 @@ async fn main() -> Result<()> {
             semantic_budget_degree_weight,
             semantic_budget_feedback_only,
             semantic_budget_disable_feedback,
+            materialize_knows_creation_date,
+            knows_creation_date_property_id,
         } => {
             if matches!(relation.as_str(), "snb-base" | "base" | "base-graph") {
                 let output_dir = data_dir.join("base_graph");
@@ -631,6 +653,19 @@ async fn main() -> Result<()> {
             } else {
                 l0_layout
             };
+            if materialize_knows_creation_date && !matches!(relation.as_str(), "snb-full" | "full")
+            {
+                anyhow::bail!("--materialize-knows-creation-date requires --relation snb-full");
+            }
+            if materialize_knows_creation_date
+                && (compact
+                    || compact_after_import
+                    || matches!(l0_layout, L0LayoutPolicy::FullCompact))
+            {
+                anyhow::bail!(
+                    "property materialization cannot be combined with import-time compaction; import a pristine store, close/reopen/audit it, then compact an isolated clone"
+                );
+            }
             let config = LsmGraphConfig::new(&data_dir)
                 .with_memgraph_capacity(memgraph_bytes)
                 .with_io_backend(io_backend)
@@ -654,10 +689,24 @@ async fn main() -> Result<()> {
                 .with_semantic_budget_feedback_only(semantic_budget_feedback_only)
                 .with_semantic_budget_disable_feedback(semantic_budget_disable_feedback);
             let engine = Engine::create(config).await?;
+            let mut property_materialization = None;
             let stats = match relation.as_str() {
                 "person_knows" => import_person_knows(engine.clone(), &input).await?,
                 "all-topology" | "topology" | "all" => {
                     import_snb_topology(engine.clone(), &input).await?
+                }
+                "snb-full" | "full" if materialize_knows_creation_date => {
+                    let (stats, receipt) = import_snb_full_with_edge_properties(
+                        engine.clone(),
+                        &input,
+                        &data_dir,
+                        SnbEdgePropertyMaterialization::knows_creation_date(
+                            knows_creation_date_property_id,
+                        ),
+                    )
+                    .await?;
+                    property_materialization = Some(receipt);
+                    stats
                 }
                 "snb-full" | "full" => import_snb_full(engine.clone(), &input, &data_dir).await?,
                 _ => anyhow::bail!(
@@ -686,14 +735,40 @@ async fn main() -> Result<()> {
                 "[import] persist semantic sidecars complete elapsed_s={:.1}",
                 sidecar_start.elapsed().as_secs_f64()
             );
-            println!(
-                "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{},\"l0_layout\":\"{:?}\",\"query_control_stage\":\"{:?}\"}}",
-                stats.input_rows,
-                stats.directed_edges,
-                engine.current_snapshot(),
-                l0_layout,
-                query_control_stage
-            );
+            if let Some(receipt) = property_materialization.as_ref() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "input_rows": stats.input_rows,
+                        "directed_edges": stats.directed_edges,
+                        "snapshot": engine.current_snapshot(),
+                        "l0_layout": format!("{:?}", l0_layout),
+                        "query_control_stage": format!("{:?}", query_control_stage),
+                        "property_materialization": {
+                            "profile": receipt.profile,
+                            "property_id": receipt.property_id,
+                            "edge_type": receipt.edge_type,
+                            "schema_epoch": receipt.schema_epoch,
+                            "materialized_property_values": receipt.materialized_property_values,
+                            "topology_only_directed_edges": receipt.topology_only_directed_edges,
+                            "property_bitmap_nonzero_segments_per_store": receipt.property_bitmap_nonzero_segments_per_store,
+                            "property_bitmap_zero_segments_per_store": receipt.property_bitmap_zero_segments_per_store,
+                            "missing_semantics": "source creationDate is required for positive Knows edges; synthetic -1 reverse index and all other relations are absent/null",
+                            "formal_query_constraint": "property-only: sample-plan edge_type must be null",
+                        },
+                    }))?
+                );
+            } else {
+                // Preserve the canonical BASE output byte-for-byte.
+                println!(
+                    "{{\"input_rows\":{},\"directed_edges\":{},\"snapshot\":{},\"l0_layout\":\"{:?}\",\"query_control_stage\":\"{:?}\"}}",
+                    stats.input_rows,
+                    stats.directed_edges,
+                    engine.current_snapshot(),
+                    l0_layout,
+                    query_control_stage
+                );
+            }
         }
         Command::ImportMany {
             input,
@@ -715,6 +790,8 @@ async fn main() -> Result<()> {
             semantic_budget_degree_weight,
             semantic_budget_feedback_only,
             semantic_budget_disable_feedback,
+            materialize_knows_creation_date,
+            knows_creation_date_property_id,
         } => {
             if !matches!(relation.as_str(), "snb-full" | "full") {
                 anyhow::bail!("import-many currently supports only --relation snb-full");
@@ -758,7 +835,23 @@ async fn main() -> Result<()> {
                 .iter()
                 .map(|spec| spec.data_dir.clone())
                 .collect::<Vec<_>>();
-            let stats = import_snb_full_multi(&engines, &input, &store_dirs).await?;
+            let (stats, property_materialization) = if materialize_knows_creation_date {
+                let (stats, receipt) = import_snb_full_multi_with_edge_properties(
+                    &engines,
+                    &input,
+                    &store_dirs,
+                    SnbEdgePropertyMaterialization::knows_creation_date(
+                        knows_creation_date_property_id,
+                    ),
+                )
+                .await?;
+                (stats, Some(receipt))
+            } else {
+                (
+                    import_snb_full_multi(&engines, &input, &store_dirs).await?,
+                    None,
+                )
+            };
             let sidecar_start = Instant::now();
             eprintln!(
                 "[import-many] persist semantic sidecars start stores={} elapsed_s={:.1}",
@@ -792,15 +885,35 @@ async fn main() -> Result<()> {
                     })
                 })
                 .collect::<Vec<_>>();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
+            let output = if let Some(receipt) = property_materialization.as_ref() {
+                json!({
                     "input_rows": stats.input_rows,
                     "directed_edges": stats.directed_edges,
                     "query_control_stage": format!("{:?}", query_control_stage),
                     "stores": stores,
-                }))?
-            );
+                    "property_materialization": {
+                        "profile": receipt.profile,
+                        "property_id": receipt.property_id,
+                        "edge_type": receipt.edge_type,
+                        "schema_epoch": receipt.schema_epoch,
+                        "materialized_property_values_per_store": receipt.materialized_property_values,
+                        "topology_only_directed_edges_per_store": receipt.topology_only_directed_edges,
+                        "property_bitmap_nonzero_segments_per_store": receipt.property_bitmap_nonzero_segments_per_store,
+                        "property_bitmap_zero_segments_per_store": receipt.property_bitmap_zero_segments_per_store,
+                        "missing_semantics": "source creationDate is required for positive Knows edges; synthetic -1 reverse index and all other relations are absent/null",
+                        "formal_query_constraint": "property-only: sample-plan edge_type must be null",
+                    },
+                })
+            } else {
+                // Preserve the canonical BASE output fields exactly.
+                json!({
+                    "input_rows": stats.input_rows,
+                    "directed_edges": stats.directed_edges,
+                    "query_control_stage": format!("{:?}", query_control_stage),
+                    "stores": stores,
+                })
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::BaseBuild { input, data_dir } => {
             let output_dir = data_dir.join("base_graph");
@@ -1311,6 +1424,34 @@ async fn main() -> Result<()> {
                 data_dir.display(),
                 rows,
                 data_dir.join("snb_edge_props.jsonl").display()
+            );
+        }
+        Command::SnbPropertyAudit {
+            data_dir,
+            property_id,
+        } => {
+            let engine = Engine::open(
+                LsmGraphConfig::new(&data_dir)
+                    .with_io_backend(io_backend)
+                    .with_metadata_cache_entries(csr_metadata_cache_entries),
+            )
+            .await?;
+            let audit = audit_snb_edge_property_materialization(
+                &engine,
+                SnbEdgePropertyMaterialization::knows_creation_date(property_id),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "profile": audit.profile,
+                    "data_dir": data_dir,
+                    "property_id": audit.property_id,
+                    "edge_type": audit.edge_type,
+                    "snapshot": audit.snapshot,
+                    "property_bitmap_nonzero_segments": audit.property_bitmap_nonzero_segments,
+                    "property_bitmap_zero_segments": audit.property_bitmap_zero_segments,
+                    "reopened": true,
+                }))?
             );
         }
         Command::SnbUpdates { input, data_dir } => {
@@ -2247,7 +2388,10 @@ fn p10_monotonic_ns() -> Result<u64> {
     // the libc call, and CLOCK_MONOTONIC is supported on the Linux runner.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) };
     if rc != 0 || value.tv_sec < 0 || value.tv_nsec < 0 {
-        bail!("clock_gettime(CLOCK_MONOTONIC) failed: {}", std::io::Error::last_os_error());
+        bail!(
+            "clock_gettime(CLOCK_MONOTONIC) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
     let seconds = u64::try_from(value.tv_sec).context("CLOCK_MONOTONIC seconds overflow")?;
     let nanos = u64::try_from(value.tv_nsec).context("CLOCK_MONOTONIC nanos overflow")?;
@@ -3182,8 +3326,7 @@ mod tests {
             xor_hash: digest.xor_hash,
         }];
         let shared = build_storage_sample_plan(&rows, &ids, false, false)?;
-        let plan: StorageBenchSamplePlan =
-            serde_json::from_str(&serde_json::to_string(&shared)?)?;
+        let plan: StorageBenchSamplePlan = serde_json::from_str(&serde_json::to_string(&shared)?)?;
         let output = temp.path().join("raw");
         let summary = run_p10_storage_bench(
             &engine, &plan, &rows, &ids, false, false, 1, 1, 1_000, &output,

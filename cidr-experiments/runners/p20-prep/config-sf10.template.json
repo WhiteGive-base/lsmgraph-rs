@@ -1,0 +1,72 @@
+{
+  "binary": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-integration/target/release/lsmgraph",
+    "sha256": "f93f645ed38305bb8fe321235e42a75b432d8fb7563688343e71043c5af3df94"
+  },
+  "dataset": {
+    "manifest": "/data/WorkSpace/results/P02B/sf10-dataset-manifest.json",
+    "manifest_sha256": "be11fd8a150af8ccd8cb88e1ad18c03b0f6e4f8279c8345be2d44e772977d51b",
+    "path": "/data/WorkSpace/ldbc-sf10/social_network",
+    "sha256": "baa7c4b9701936253ebaeb4b3436c16403373af0b48c4276dacef780479952c5"
+  },
+  "p20": {
+    "correctness_builder": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-integration/cidr-experiments/runners/p20/build_correctness_pass.py",
+      "sha256": "3f6b1397aec1cffacb76dcb334b852a94367fca93a5e3a095c28a06ad70d3dfa"
+    },
+    "profile_validator": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-integration/cidr-experiments/runners/p20/validate_profiles.py",
+      "sha256": "f378b3289f1b3742e3ab56cf66ca0e509c0d34a4061d22c6bd94b9806cbfe48b"
+    },
+    "profiles": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-integration/cidr-experiments/runners/p20/profiles.json",
+      "sha256": "0f3f9953c9fb53e0b30aa100f680898db619c8e051ee3059b9d807be9bfee810"
+    }
+  },
+  "pristine_store": {
+    "inventory_sha256": "REPLACE_WITH_P20_CANONICAL_INVENTORY_SHA256",
+    "manifest": "/data/WorkSpace/results/P20-PREP/INPUT_RUN_ID/pristine-store-manifest.json",
+    "manifest_sha256": "REPLACE_WITH_MANIFEST_FILE_SHA256",
+    "path": "/data/WorkSpace/lsmgraph-rs/store/P20_SF10_PROPERTY_B64_PRISTINE"
+  },
+  "runtime": {
+    "cpuset": "16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,80,82,84,86,88,90,92,94,96,98,100,102,104,106,108,110,112,114,116,118,120,122,124,126",
+    "csr_metadata_cache_entries": 4096,
+    "worker_threads": 48
+  },
+  "scale": "sf10",
+  "schema_version": "p20-correctness-prep-config-v2",
+  "workloads": {
+    "degree-stratified": {
+      "property_id": 0,
+      "reference_output": "/data/WorkSpace/results/P20-PREP/INPUT_RUN_ID/reference/degree-stratified.json",
+      "reference_output_sha256": "REPLACE_WITH_REFERENCE_SHA256",
+      "reference_stage": "A0",
+      "sample_plan": "/data/WorkSpace/lsmgraph-rs/remote-logs/w6-sf10-priority-20260709/sample-plan-core-s1000.json",
+      "sample_plan_sha256": "61f3bd9f391c0a056f76d60c228a44801d00265b8f8798c495e127fbfc424d0c"
+    },
+    "property-presence": {
+      "candidate_pool_requested": 300000,
+      "expected_queries": 1000,
+      "min_mixed": 500,
+      "min_positive": 500,
+      "min_zero": 500,
+      "property_id": 5,
+      "reference_output": "/data/WorkSpace/results/P20-PREP/INPUT_RUN_ID/reference/property-presence.json",
+      "reference_output_sha256": "REPLACE_WITH_REFERENCE_SHA256",
+      "reference_stage": "A0",
+      "sample_plan": "/data/WorkSpace/results/P20-PREP/INPUT_RUN_ID/property-aware-sample-plan.json",
+      "sample_plan_sha256": "REPLACE_WITH_PROPERTY_PLAN_SHA256",
+      "stratified_plan_receipt": "/data/WorkSpace/results/P20-PREP/INPUT_RUN_ID/property-aware-sample-plan.receipt.json",
+      "stratified_plan_receipt_sha256": "REPLACE_WITH_PROPERTY_PLAN_RECEIPT_SHA256"
+    },
+    "typed-one-hop": {
+      "property_id": 0,
+      "reference_output": "/data/WorkSpace/results/P20-PREP/INPUT_RUN_ID/reference/typed-one-hop.json",
+      "reference_output_sha256": "REPLACE_WITH_REFERENCE_SHA256",
+      "reference_stage": "A0",
+      "sample_plan": "/data/WorkSpace/lsmgraph-rs/remote-logs/w6-sf10-priority-20260709/sample-plan-core-s1000.json",
+      "sample_plan_sha256": "61f3bd9f391c0a056f76d60c228a44801d00265b8f8798c495e127fbfc424d0c"
+    }
+  }
+}
