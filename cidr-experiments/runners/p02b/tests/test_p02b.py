@@ -12,6 +12,7 @@ from pathlib import Path
 from build_lineage_manifest import build_tree_manifest
 from calculate_cv import calculate_cv
 from p02b_common import GateError, sha256_file
+from run_sf10_sentinel import validate_lineage_manifest
 from validate_clean_ready import validate_clean_ready
 from validate_sentinel_result import validate_result
 
@@ -85,10 +86,25 @@ class LineageManifestTests(unittest.TestCase):
             (root / "b").write_text("two\n", encoding="utf-8")
             first = build_tree_manifest(root, "store")
             second = build_tree_manifest(root, "store")
+            self.assertEqual(first["store_path"], str(root.resolve()))
+            self.assertNotIn("store_root", first)
             self.assertEqual(first["store_sha256"], second["store_sha256"])
+            manifest_path = Path(temporary) / "store-manifest.json"
+            manifest_path.write_text(json.dumps(first), encoding="utf-8")
+            validated = validate_lineage_manifest(
+                manifest_path,
+                "p02b-store-manifest-v1",
+                "store_path",
+                "store_sha256",
+                root,
+            )
+            self.assertEqual(validated["root"], str(root.resolve()))
             (root / "b").write_text("changed\n", encoding="utf-8")
             third = build_tree_manifest(root, "store")
             self.assertNotEqual(first["store_sha256"], third["store_sha256"])
+
+            dataset = build_tree_manifest(root, "dataset")
+            self.assertEqual(dataset["dataset_root"], str(root.resolve()))
 
 
 class CleanReadyTests(unittest.TestCase):

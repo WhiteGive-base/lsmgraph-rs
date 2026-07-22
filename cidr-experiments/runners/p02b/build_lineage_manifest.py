@@ -42,7 +42,10 @@ def build_tree_manifest(root: Path, kind: str) -> Dict[str, Any]:
         total_bytes += size
         record = "file\0{}\0{}\0{}\n".format(relative, size, digest).encode("utf-8")
         tree_digest.update(record)
-    root_key = "{}_root".format(kind)
+    # The formal P02B contract intentionally names the selected store
+    # `store_path` (while datasets use `dataset_root`).  Keep the builder and
+    # both producer/consumer validators on that same v1 schema.
+    root_key = "store_path" if kind == "store" else "dataset_root"
     digest_key = "{}_sha256".format(kind)
     return {
         "schema_version": "p02b-{}-manifest-v1".format(kind),
