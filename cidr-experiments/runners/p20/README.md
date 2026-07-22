@@ -52,3 +52,10 @@ feedback and applies its one selected compaction.  The admissible claim is the
 overall effect of **feedback-driven adaptation, including its triggered
 compaction**.  It is not a pure-feedback-priority or isolated compaction-
 algorithm comparison.
+
+A4 and A5 use one frozen training replay, so their profiles explicitly pass
+`--ra-min-score 0` for the pre-measurement feedback compaction.  The production
+default score floor of 10 can reject this intentionally short trace (the SF10
+diagnostic maximum was 4.397).  The existing minimum-query and minimum-L0-
+segment eligibility gates remain enabled, so this setting does not manufacture
+a candidate when the trace has insufficient observations or eligible segments.

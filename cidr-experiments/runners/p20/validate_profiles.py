@@ -108,6 +108,7 @@ FORBIDDEN_WORKLOAD_ARGS = {
     "--query-cpu-phases",
     "--training-runs",
     "--training-feedback-compactions",
+    "--ra-min-score",
 }
 
 
@@ -232,6 +233,7 @@ def validate(doc: dict[str, Any]) -> None:
                     "adaptation_prestate",
                     "feedback",
                     "feedback_compactions",
+                    "ra_min_score",
                     "paired_stage",
                     "compaction_output",
                     "claim_scope",
@@ -241,7 +243,7 @@ def validate(doc: dict[str, Any]) -> None:
         elif stage_id == "A5":
             require_keys(
                 pre,
-                required={"kind", "trace", "compaction_output"},
+                required={"kind", "trace", "ra_min_score", "compaction_output"},
                 context=f"{stage_id}.pre_measurement",
             )
         else:
@@ -284,6 +286,10 @@ def validate(doc: dict[str, Any]) -> None:
         if expected_output is not None:
             require(pre.get("trace") == "shared-training-trace", f"{stage_id}: shared training trace required")
             require(pre.get("compaction_output") == expected_output, f"{stage_id}: compaction output must be {expected_output}")
+            require(
+                type(pre.get("ra_min_score")) is int and pre["ra_min_score"] == 0,
+                f"{stage_id}: fixed single-trace feedback compaction must pin ra_min_score to 0",
+            )
         if stage_id == "A6":
             require(pre.get("trace") == "shared-training-trace", "A6: shared training trace required")
             require(pre.get("settle") == "engine-quiescence", "A6: engine quiescence gate required")
@@ -416,9 +422,17 @@ def resolve(
     if precondition_kind == "fixed-trace-adaptation-control":
         args.extend(["--training-runs", "1"])
     elif precondition_kind == "fixed-trace-feedback-adaptation":
-        args.extend(["--training-runs", "1", "--training-feedback-compactions", "1"])
+        args.extend([
+            "--training-runs", "1",
+            "--training-feedback-compactions", "1",
+            "--ra-min-score", str(stage["pre_measurement"]["ra_min_score"]),
+        ])
     elif precondition_kind == "fixed-trace-manual-feedback-compaction":
-        args.extend(["--training-runs", "1", "--training-feedback-compactions", "1"])
+        args.extend([
+            "--training-runs", "1",
+            "--training-feedback-compactions", "1",
+            "--ra-min-score", str(stage["pre_measurement"]["ra_min_score"]),
+        ])
     elif precondition_kind == "fixed-trace-automatic-maintenance":
         args.extend(["--training-runs", "1"])
 

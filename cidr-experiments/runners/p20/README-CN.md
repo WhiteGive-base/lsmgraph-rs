@@ -27,7 +27,9 @@ A0 与 A1 必须使用同一 `semantic-budgeted` 物理 store；A0 只是不读�
 
 测量中的 `--auto-compact` 一律禁止。A4/A5 所需 feedback compaction 是单独的测量前训练步骤，训练输出、digest 与 store SHA 必须进入 manifest。
 
-resolver 会把预处理直接编码进同一个 `storage-bench` 进程：A3 使用 `--training-runs 1`；A4/A5 使用 `--training-runs 1 --training-feedback-compactions 1`；A6 使用 `--training-runs 1 --automatic-maintenance`。不能把训练与 compaction 拆成两个 CLI 进程，因为 feedback map 只存在于当前 Engine 进程；拆开后得到的不是 A4/A5。
+resolver 会把预处理直接编码进同一个 `storage-bench` 进程：A3 使用 `--training-runs 1`；A4/A5 使用 `--training-runs 1 --training-feedback-compactions 1 --ra-min-score 0`；A6 使用 `--training-runs 1 --automatic-maintenance`。不能把训练与 compaction 拆成两个 CLI 进程，因为 feedback map 只存在于当前 Engine 进程；拆开后得到的不是 A4/A5。
+
+A4/A5 只重放一次冻结训练 trace，因此在测量前 feedback compaction 中显式固定 `--ra-min-score 0`。生产默认 score 下限 10 会拒绝这条刻意缩短的 trace（本次 SF10 诊断的最大 score 为 4.397）。minimum-query 与 minimum-L0-segment 两个资格门仍保持默认值，故该设置不会在观测量或可选 segment 不足时强行制造 compaction 候选。
 
 ## 矩阵
 

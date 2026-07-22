@@ -70,6 +70,7 @@
         "adaptation_prestate": "post-identical-training-trace",
         "feedback": "enabled",
         "feedback_compactions": 1,
+        "ra_min_score": 0,
         "paired_stage": "A3",
         "compaction_output": "legacy-global",
         "claim_scope": "feedback-driven-adaptation-including-triggered-compaction"
@@ -83,6 +84,7 @@
       "pre_measurement": {
         "kind": "fixed-trace-manual-feedback-compaction",
         "trace": "shared-training-trace",
+        "ra_min_score": 0,
         "compaction_output": "semantic-partitioned"
       }
     },

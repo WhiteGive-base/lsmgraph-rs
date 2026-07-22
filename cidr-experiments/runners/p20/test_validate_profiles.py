@@ -138,7 +138,38 @@ class ProfileValidationTest(unittest.TestCase):
         args = resolved["storage_bench_args"]
         self.assertIn("--training-runs", args)
         self.assertIn("--training-feedback-compactions", args)
+        self.assertEqual(args[args.index("--ra-min-score") + 1], "0")
         self.assertNotIn("--automatic-maintenance", args)
+
+    def test_a4_a5_pin_single_trace_feedback_score_floor(self):
+        for stage_id in ("A4", "A5"):
+            resolved = MODULE.resolve(
+                self.doc,
+                scale="sf10",
+                stage_id=stage_id,
+                mode_name="correctness",
+                workload_name="typed-one-hop",
+                bindings={},
+            )
+            args = resolved["storage_bench_args"]
+            self.assertEqual(args.count("--ra-min-score"), 1)
+            self.assertEqual(args[args.index("--ra-min-score") + 1], "0")
+
+            changed = copy.deepcopy(self.doc)
+            changed["stages"][int(stage_id[1:])]["pre_measurement"]["ra_min_score"] = 10
+            with self.assertRaises(MODULE.ProfileError):
+                MODULE.validate(changed)
+
+    def test_a3_does_not_override_feedback_score_floor(self):
+        resolved = MODULE.resolve(
+            self.doc,
+            scale="sf10",
+            stage_id="A3",
+            mode_name="correctness",
+            workload_name="typed-one-hop",
+            bindings={},
+        )
+        self.assertNotIn("--ra-min-score", resolved["storage_bench_args"])
 
     def test_a3_a4_share_training_prestate_but_only_a4_compacts(self):
         a3 = MODULE.resolve(
