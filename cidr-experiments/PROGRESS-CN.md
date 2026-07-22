@@ -1,6 +1,6 @@
 # CIDR 正式实验进度表
 
-更新时间：2026-07-22 08:26 CST
+更新时间：2026-07-22 08:47 CST
 正式验收真源：`plan/ARTICLE-EXPERIMENT-OUTLINE-CN.md`。大纲决定必须覆盖的 RQ、指标和正确性边界；本文件第 3 节冻结七天内的代表性配置。用户于 2026-07-21 提供的最新 ZIP 用于核对当前稿已有内容与缺口，其 SHA-256、逐项清单和 claim 审计见 `work/latest-paper-audit/`。
 
 ## 0. 最新执行看板
@@ -10,15 +10,15 @@
 | 工作包 | 状态 | 已完成/已验证 | 尚缺或下一步 |
 |---|---|---|---|
 | P00 论文与旧证据审计 | `DONE` | 20 个来源完成 `REUSE=5 / FIX=6 / RERUN=9` 分类；六图和 RQ 证据边界已冻结 | 后续正式数据回填后再做 claim-to-evidence 终审 |
-| S0 Linux 同步、SHA、commit | `PASS_INITIAL` | Windows/Linux `145/145` payload SHA 一致，目录总文件数 146；初始同步包提交为 `acb167e`；已建立 clean 集成分支 | 当前集成 HEAD `912e6a31e926`；外部 store gate 收口后做最终全量 SHA、反向同步和封板 commit |
+| S0 Linux 同步、SHA、commit | `PASS_INITIAL` | 初始 Windows/Linux payload SHA 一致，初始同步包提交为 `acb167e`；已建立 clean 集成分支；当前登记清单自检全过 | 当前集成 HEAD `63e207ba2c02`；目录已增长到 407+ 文件，外部工程收口后重生成全目录 SHA、反向同步和封板 commit |
 | P01 shared truth / ID bridge | `PASS_INTEGRATED` | 完整扫描 `355,185,382` edges、`29,987,835` vertices；双向 ID map、lockstep、bijection、输入/输出 SHA 全 PASS；独立执行 `sha256sum -c SHA256SUMS` 3/3 OK；历史 converter lineage 已固化 | 集成态 8 Python + 6 Rust shared-truth tests 均 PASS |
 | P02A correctness | `PASS` | W13 `10/10`；W6 SF1 九变体的 8 组 compare 均 `checked=180, mismatches=0` | 只作 correctness 证据，不能引用该轮 timing |
 | P02B SF10 sentinel | `PREPARED_BLOCKED_LOAD` | fail-closed runner/consumer 已集成；14/14 tests + 3-repeat fake P31 smoke PASS；dataset、四套 SemL0 store、plan/preflight 的 `SHA256SUMS` 7/7 PASS；四 store 各 `1700/1700, mismatches=0` | 只等 P03 READY；清场后放行链预计 23--35 min |
 | P20 A0--A6 组件消融 | `PASS_INTEGRATED_BLOCKED_LOAD` | A0--A6 core、formal runner、current-binary correctness generator、run-level Figure 2 aggregator 与 canonical P02B admission 已合入；Python 40/40（另 1 项按设计条件运行）、Rust 8/8、real-P31 fake smoke、cargo check 均 PASS | 正式 A0--A6 只等 P02B formal PASS 与 clean window |
 | P31 资源采集与并发规则 | `PASS_INTEGRATED` | collector/validator、11 项单测、fixture smoke、11/11 双端 SHA 均 PASS；已接入 P02B/P20/P40/P10；正式实验单任务串行 | clean window 中验证真实长任务采样数量与 cpuset 绑定 |
 | P40 fixed trace | `PASS_CORRECTNESS_INTEGRATED` | clean-head run `P40-CLEAN-HEAD-36Q-20260721T181522Z-d7c283c5808f`：3×4 arms、36 queries、0 mismatch、62/62 SHA PASS | `performance_eligible=false`；正式 30 min×3 等 clean window |
-| P10/P11 跨系统 orchestrator | `6_OF_6_ADAPTERS / 3_STORE_GATES_PASS / 3_FORMAL_HARDENING` | SemL0、Aster、TuGraph 的 SF10 frozen store gate 已 PASS；Aster fresh/reopen 四阶段均 1700/0，37/37 SHA；TuGraph 3400/0，45/45 SHA；六系统真实 adapter 已集成 | LiveGraph LG4 正在关闭独立审查 P1；Neo4j 正在补 strict 3 repeats 与 Entrypoint/Cmd authoritative binding；Nebula F1 纯测试 39/39，F2--F4 正在补 importer/store/cleanup。候选均未合并，复审通过后才跑 SF10 correctness |
-| P03 clean-window monitor | `BLOCKED_LOAD` | monitor 持续运行；08:26 sample 491：load1=1.03、CPU idle=99.207%、磁盘 util/await=0/0、`/data` 可用 871.851 GiB | zcl 大内存 worker、4 个 rsync、GPStore、TuGraph；MemAvailable 341.724 GiB，未达 400 GiB；当前 0/15，清场后还需连续 15 个 60 s 样本 |
+| P10/P11 跨系统 orchestrator | `6_OF_6_ADAPTERS / 3_STORE_GATES_PASS / HARDENING_CHECKPOINTED` | SemL0、Aster、TuGraph SF10 gate PASS；Nebula F1 `39/39`、F2 `54/54` 已提交；Neo strict-3/Entrypoint-Cmd、LG4 主体与 Nebula F3 草稿均保存到独立 staging | Neo 尚未跑 Linux tests；LiveGraph 仍有 3 个 P1；Nebula F3 未完成、F4 未开始。候选均未合并，复审与组合测试后才跑 SF10 correctness |
+| P03 clean-window monitor | `BLOCKED_LOAD` | monitor 持续运行；08:47 sample 512：load1=1.00、CPU idle=99.206%、磁盘 util/await=0/0、`/data` 可用 871.851 GiB | zcl 大内存 worker、4 个 rsync、GPStore、TuGraph；MemAvailable 339.573 GiB，未达 400 GiB；当前 0/15，清场后还需连续 15 个 60 s 样本 |
 | P10/P11/P20/P31/P40/P50/P60 正式性能 | `NOT_STARTED` | 前置 runner/contract 按优先级并行准备 | 清场后先连续观察 15 min，再跑 P02B sentinel；通过后正式任务严格串行 |
 
 进度口径：上表的 `PASS` 表示对应工程或正确性 gate 已验收，不代表论文性能数据已经完成。当前 **正式性能数据点完成数为 0**。按五个外部系统历史单次耗时复核后，E01 从 12 h 修正为 18--24 h；当前计划为 `132--138 h` 主路径 + `30--36 h` 风险缓冲，硬上限仍为 `168 h`。已在 T0 前完成的工程会直接形成实际余量。
@@ -33,11 +33,11 @@
 | 当前可做的 correctness-only smoke | `PASS` | W13 已 10/10 PASS；W6 SF1 九变体 neighbor-compare 已全部 PASS，二者均为 `performance_eligible=false` |
 | 正式 timing/resource 实验 | `BLOCKED_LOAD` | `zcl` 大内存任务+rsync、GPStore/TuGraph 常驻服务未释放；并行完成 runner/collector 工程，不启动正式 timing |
 
-远端快照（2026-07-22 08:26 CST，sample 491）：load1=`1.03`、CPU idle=`99.207%`、MemAvailable=`341.724 GiB`、`/data` 可用=`871.851 GiB`、NVMe util/await=`0/0`。瞬时 CPU 与磁盘已较空闲，但 zcl 的大内存 worker、4 个 rsync以及 GPStore/TuGraph 仍在；共享内存、page cache、NUMA 和服务干扰不能排除，所以当前 timing 数据不具备论文资格。
+远端快照（2026-07-22 08:47 CST，sample 512）：load1=`1.00`、CPU idle=`99.206%`、MemAvailable=`339.573 GiB`、`/data` 可用=`871.851 GiB`、NVMe util/await=`0/0`。瞬时 CPU 与磁盘已较空闲，但 zcl 的大内存 worker、4 个 rsync以及 GPStore/TuGraph 仍在；共享内存、page cache、NUMA 和服务干扰不能排除，所以当前 timing 数据不具备论文资格。
 
-执行恢复点（2026-07-22 00:07--08:26 CST）：W13 与 W6 SF1 correctness-only、P01 全量 ID map、P31 collector、P20 runner/admission、P40 fixed trace 均已验收；SemL0 四 store 和六系统 P10 adapter 已完成 correctness/contract 回归。TuGraph 4.5.2 SF10 fresh import、查询修复和 3400-query gate 已 PASS；Aster SF10 fresh-import/freeze/reopen gate 也已 PASS。LiveGraph/Neo4j/NebulaGraph 已分成三条并行硬化线：Neo4j 原五项 P1 已关闭但仍补两项复审门禁；LiveGraph 正在补 build/P02B/P31/final-evidence 绑定；Nebula F1 已通过 39/39 纯测试并继续 F2--F4。三条候选均须复审、组合回归和真实 tiny 后才可合入。正式性能仍等待 clean-window gate。
+执行恢复点（2026-07-22 00:07--08:47 CST）：W13、W6 SF1、P01、P31、P20、P40、SemL0 四 store、TuGraph 4.5.2 SF10 与 Aster SF10 gate 均已验收。Nebula F1 `07db56f`（39/39）和 F2 `6c8dafb`（54/54）已提交；F3 仅为八文件本地草稿，F4 未开始。Neo strict-3/Entrypoint-Cmd 与 LG4 主体仅保存在本地 staging；预审确认 LiveGraph 仍有 PID cleanup、builder 早期 FAILED、block/WAL P31 内大哈希三个 P1。所有未测试草稿均未同步或合并。正式性能仍等待 clean-window gate。
 
-当前 clean-window 阻塞（2026-07-22 08:26 CST）：`zcl` 的大内存 worker 仍在；4 个 rsync 仍被监控到；正式测量前还需由维护者停止 GPStore 与 TuGraph。P03 当前 `0/15`。全部释放后要求连续 15 个 60 s 样本满足 load <5、CPU idle >95%、MemAvailable >=400 GiB、`/data` util <5%、await <5 ms，再执行 QPS CV <=3%、P99 CV <=5% 的 SF10 sentinel。
+当前 clean-window 阻塞（2026-07-22 08:47 CST）：`zcl` 的大内存 worker 仍在；4 个 rsync 仍被监控到；正式测量前还需由维护者停止 GPStore 与 TuGraph。P03 当前 `0/15`。全部释放后要求连续 15 个 60 s 样本满足 load <5、CPU idle >95%、MemAvailable >=400 GiB、`/data` util <5%、await <5 ms，再执行 QPS CV <=3%、P99 CV <=5% 的 SF10 sentinel。
 
 ### P02A correctness-only 实时结果
 

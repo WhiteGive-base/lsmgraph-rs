@@ -1,6 +1,6 @@
 # CIDR Linux 正式补跑进度表
 
-最后审计：2026-07-22 08:26（Asia/Shanghai）
+最后审计：2026-07-22 08:47（Asia/Shanghai）
 当前执行真源：`cidr-experiments/PROGRESS-CN.md` 第 3 节。
 七天预算：按 E01 历史实测复核后，主路径 `132--138 h`，风险缓冲 `30--36 h`，硬上限 `168 h`。T0 是其他用户重负载释放且 clean-window sentinel PASS 的时刻；T0 前已经完成的工程会形成实际余量。
 
@@ -10,10 +10,10 @@
 
 | ID | 阶段 | 状态 | 已完成 | 当前阻塞/下一步 | T0 后预算 |
 |---|---|---|---|---|---:|
-| S0 | 论文审计、目录同步、文件数、SHA、commit | `PASS_INITIAL` | 20 来源完成 REUSE/FIX/RERUN 审计；145/145 payload SHA、146 总文件通过；初始提交 `acb167e` | clean integration 当前 `912e6a31e926`；外部 store gate 收口后做最终全量 SHA、反向同步和封板 commit | 已完成 |
+| S0 | 论文审计、目录同步、文件数、SHA、commit | `PASS_INITIAL` | 20 来源完成 REUSE/FIX/RERUN 审计；当前已登记 payload SHA 自检全过；初始提交 `acb167e` | clean integration 当前 `63e207ba2c02`；目录已增长到 407+ 文件，外部工程收口后重生成全目录 SHA、反向同步和封板 commit | 已完成 |
 | S1 | ID map、shared truth、统一 telemetry、sentinel | `PASS_PREPARED / BLOCKED_LOAD` | P01 全量双向 ID map PASS；P31 PASS；P02B canonical admission 已接入 P20/P10；四套 SemL0 SF10 store、tree manifests 与 1,700-query plan 均完成，7/7 SHA、四套 0 mismatch | P03 READY 后跑真实 sentinel | T0 后 23--35 min |
 | S2 | SF1 correctness gates | `PASS` | W13 10/10；W6 九变体 8 组 compare 均 checked=180、mismatches=0 | 跨系统 P02B gate 要在 clean window 运行 | 计入 setup 2 h |
-| S3 | G1 matched external / 条件式 LDBC E2E | `6_OF_6_ADAPTERS / 3_STORE_GATES_PASS / 3_HARDENING` | 六系统真实 adapter 全部集成；SemL0/Aster/TuGraph SF10 store gates PASS；Aster build 与 Neo4j/Nebula image identity 已冻结；Neo4j P1 候选与 LiveGraph LG1--LG3 候选已通过纯测试；Nebula F1 为 39/39 | LiveGraph LG4 正在关闭独立审查 P1；Neo4j 正在固定 3 repeats 与 Entrypoint/Cmd；Nebula F2--F4 正在补 importer/store/cleanup；全部须独立复审后才合并和跑 SF10 correctness | 18--24 h |
+| S3 | G1 matched external / 条件式 LDBC E2E | `6_OF_6_ADAPTERS / 3_STORE_GATES_PASS / HARDENING_CHECKPOINTED` | 六系统真实 adapter 全部集成；SemL0/Aster/TuGraph SF10 store gates PASS；Nebula F1 `39/39`、F2 `54/54` 已提交；Neo strict-3/Entrypoint-Cmd 与 LG4 主体、Nebula F3 草稿均已保存到本地 staging | Neo staging 尚未跑 Linux tests；LiveGraph 仍有 3 个 P1；Nebula F3 未完成、F4 未开始；复审、组合回归、真实 tiny 后才合并和跑 SF10 correctness | 18--24 h |
 | S4 | G2 A0--A6 staircase + G3 resource | `PASS_INTEGRATED / BLOCKED_LOAD` | A0--A6 core、formal runner、correctness generator、run-level Figure 2 aggregator、P31 与 canonical P02B admission 已集成；Python 40/40（另 1 条件项）、Rust 8/8 PASS | 正式点等 P02B formal PASS 与清场 | 54 h |
 | S5 | G4 fixed-trace dynamic/full-read | `PASS_CORRECTNESS / BLOCKED_LOAD` | clean-head fixture 3×4 arms、36 queries、0 mismatch、62/62 SHA PASS | 30 min×3 正式运行及 real full-read 等清场 | 14 h |
 | S6 | G5 workload coverage | `PREPARING / BLOCKED_LOAD` | workload 维度和代表 cells 已冻结；旧 raw 仅作校准 | runner 接统一 truth/P31；正式 representative cells 等清场 | 8 h |
@@ -40,19 +40,19 @@
 | TuGraph 4.5.2 SF10 store | `PASS_CORRECTNESS` | importer `e1bdf312`；traversal fix `36f0fc14`；run `P10-TUGRAPH-SF10-REBUILD-20260721T205301Z-2fc3a11/attempts/attempt2` | 29,987,835 vertices/355,185,382 edges；warmup+measured 各1700/0/84,104,814；45/45 SHA；旧867 mismatch attempt保留；性能点0 |
 | Aster SF10 store | `PASS_CORRECTNESS` | `P10-ASTER-SF10-FRESH-20260721T215115Z-6abb258e` | fresh/reopen warmup+measured 四阶段各1700/0/0/84,104,814；154 files/11.92GB；store SHA稳定；37/37 SHA；性能点0 |
 | Neo4j/Nebula runtime | `PASS_TINY / FORMAL_HARDENING` | `/data/WorkSpace/results/P10-NEO4J-ADAPTER/`；`/data/WorkSpace/results/P10-NEBULA-RUNTIME/` | Neo4j Bolt 4/4、Nebula nGQL 5/5 与 image digest 可复用；tiny 不覆盖 receipt/P31/repeat/launch/stop/RAFT logical-host，相关正式路径正在修复 |
-| Neo4j formal candidate | `REVIEW_FIXING / NOT_MERGED` | `b53f9db8940e` | 原五项 P1 已由 78 项纯测试复核关闭；新增门禁为 formal repeats 必须精确等于 3，以及 authoritative Entrypoint/Cmd 逐阶段绑定；修复完成前不合并 |
-| LiveGraph formal candidate | `REVIEW_FIXING / NOT_MERGED` | LG1 `ed28821`、LG2 `c323f55`、LG3 `010c3e1`、LG4 worktree | build/template/lifecycle 已实现；独立审查仍要求移出 6.638GB dense hash、补 P02B commit/binary 绑定、完整 repeat evidence chain、可复现 build env/source 和 fail-closed 失败证据 |
-| NebulaGraph formal candidate | `F1_PASS / F2--F4_RUNNING / NOT_MERGED` | F1 `07db56ff85a6` | formal lifecycle 已接 run_suite/P31，纯 Python/mocks 39/39；仍须完成 importer 实际执行、prelaunch store seal、repeat lineage、partial-start cleanup、logical-host/SHOW parser/deadline/clone timeout |
+| Neo4j formal candidate | `LOCAL_STAGING / NOT_TESTED_LINUX / NOT_MERGED` | remote `b53f9db8940e`；local `livegraph-lg4-strict-local/` | strict `repeats==3`、`--repeat-index` 与 authoritative Entrypoint/Cmd 逐阶段绑定已写入本地并通过 Python compile；尚未做 SHA 同步、Linux targeted tests、fixture/schema 修复与独立 commit |
+| LiveGraph formal candidate | `3_P1_REMAIN / NOT_MERGED` | remote `9be66bcffdbac`；local `livegraph-lg4-local/` | P02B 三重 identity、dense-input external seal、P31 PID/provenance/final evidence、sanitized build 等主体已落盘；仍须修 `same_process_alive`/cleanup、builder 早期 `FAILED`、block/WAL 移出 P31 external seal，并跑全套 Linux no-Docker tests |
+| NebulaGraph formal candidate | `F2_PASS / F3_DRAFT / F4_NOT_STARTED / NOT_MERGED` | F1 `07db56ff85a6`；F2 `6c8dafb24375`；local `nebula-fix-staging/` | F2 wrapper 真实执行 pinned importer 并从 raw observations 派生 correctness，54/54；F3 八文件草稿仅 AST/JSON 通过，仍缺行为回归、dense-SHA spy、3-repeat lineage/template/冲突审计；F4 cleanup/host/parser/deadline 未开始 |
 
 ## 最新服务器门禁
 
-采样时间：2026-07-22 08:26:11 CST（sample 491），run `P03-CLEAN-WINDOW-20260721T161610Z-acb167eba8fd`。
+采样时间：2026-07-22 08:47:11 CST（sample 512），run `P03-CLEAN-WINDOW-20260721T161610Z-acb167eba8fd`。
 
 | 指标 | 当前值 | 门槛 | 结果 |
 |---|---:|---:|---|
-| load1 | 1.03 | <5 | PASS |
-| CPU idle | 99.207% | >95% | PASS |
-| MemAvailable | 341.724 GiB | >=400 GiB | FAIL |
+| load1 | 1.00 | <5 | PASS |
+| CPU idle | 99.206% | >95% | PASS |
+| MemAvailable | 339.573 GiB | >=400 GiB | FAIL |
 | `/data` free | 871.851 GiB | 足够本阶段且保留硬水位 | PASS |
 | NVMe util / await | 0% / 0 ms | <5% / <5 ms | PASS |
 | 外部任务 | zcl 约120 GiB worker、4 个 rsync、GPStore、TuGraph | 正式窗口内全部退出/干净停止 | FAIL |
@@ -82,6 +82,13 @@
 - [ ] 将最终工程分支集成，同步后复核全量文件数/SHA，并做最终 commit。
 - [ ] 等 zcl 释放大内存与全部 rsync、维护者停止 GPStore/TuGraph；P03 连续 15 个 60 s 样本后运行 SF10 sentinel。
 - [ ] sentinel PASS 后启动 P02B，再按 S3→S8 串行跑正式性能数据。
+
+## 2026-07-22 08:47 小收尾恢复点
+
+- clean integration：`/data/WorkSpace/lsmgraph-cidr-integration`，branch `codex/cidr-experiment-integration`，HEAD `63e207ba2c02`（本次进度文档提交后以最新 `git log -1` 为准）。
+- Neo/LiveGraph 远端候选：`/data/WorkSpace/lsmgraph-cidr-livegraph-lg4`，clean at `9be66bcffdbac`；未测试草稿只保存在 `E:/文档/DGS项目复现/livegraph-lg4-strict-local/` 与 `livegraph-lg4-local/`，不得直接覆盖式同步。
+- Nebula 远端候选：`/data/WorkSpace/lsmgraph-cidr-nebula-blocker-fixes`，clean at `6c8dafb24375`；F3 草稿位于 `E:/文档/DGS项目复现/nebula-fix-staging/cidr-experiments/runners/p10/`，不得直接合并。
+- 恢复顺序：先验证并提交 Neo/shared；再关闭 3 个 LiveGraph P1；再完成 Nebula F3/F4；随后做 merge-tree、组合纯测试、三套真实 tiny、SF10 correctness-only；最后才做全目录 SHA/反向同步/封板 commit。
 
 ## 每次正式运行更新模板
 
