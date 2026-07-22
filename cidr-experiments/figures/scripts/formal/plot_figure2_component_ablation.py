@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from plot_support import (
+    DEFAULT_MINIMUM_RUNS,
     DataContractError,
     HERE,
     PALETTE,
@@ -32,6 +33,7 @@ from plot_support import (
 
 
 STAGES = ["A0", "A1", "A2", "A3", "A4", "A5", "A6"]
+CPU_STAGES = STAGES[:-1]
 PLOT_FIELDS = {
     "ablation_stage",
     "feature_switches",
@@ -40,7 +42,7 @@ PLOT_FIELDS = {
     "body_read_segments_total",
     "measured_operations",
     "body_read_bytes_total",
-    "cpu_signature_ns",
+    "cpu_query_setup_ns",
     "cpu_admission_ns",
     "cpu_routing_ns",
     "cpu_body_decode_filter_ns",
@@ -49,7 +51,7 @@ PLOT_FIELDS = {
 }
 
 CPU_PHASES = [
-    ("cpu_signature_ns", "Signature", "#BFD7EA"),
+    ("cpu_query_setup_ns", "Query setup", "#BFD7EA"),
     ("cpu_admission_ns", "Admission", "#84B6D7"),
     ("cpu_routing_ns", "Routing", "#4E92C4"),
     ("cpu_body_decode_filter_ns", "Body/filter", "#9CA3AF"),
@@ -248,7 +250,8 @@ def aggregate(groups: dict[str, list[dict[str, str]]], minimum_runs: int):
     for stage in STAGES:
         rows = groups[stage]
         for row in rows:
-            validate_cpu_accounting(row)
+            if stage in CPU_STAGES:
+                validate_cpu_accounting(row)
             candidates = number(row, "candidate_segments_total", nonnegative=True)
             reads = number(row, "body_read_segments_total", nonnegative=True)
             assert candidates is not None and reads is not None
@@ -282,26 +285,27 @@ def aggregate(groups: dict[str, list[dict[str, str]]], minimum_runs: int):
                 label=f"F2/{stage}/read-MiB-per-op",
                 minimum_runs=minimum_runs,
             ),
-            "cpu_total": estimate(
+        }
+        if stage in CPU_STAGES:
+            stage_summary["cpu_total"] = estimate(
                 rows,
                 lambda row: per_operation(row, "cpu_total_ns", scale=1000.0),
                 label=f"F2/{stage}/cpu-us-per-op",
                 minimum_runs=minimum_runs,
-            ),
-        }
-        for field, label, _ in CPU_PHASES:
-            stage_summary[field] = estimate(
+            )
+            for field, label, _ in CPU_PHASES:
+                stage_summary[field] = estimate(
+                    rows,
+                    lambda row, phase=field: per_operation(row, phase, scale=1000.0),
+                    label=f"F2/{stage}/{label}-cpu-us-per-op",
+                    minimum_runs=minimum_runs,
+                )
+            stage_summary["cpu_unattributed"] = estimate(
                 rows,
-                lambda row, phase=field: per_operation(row, phase, scale=1000.0),
-                label=f"F2/{stage}/{label}-cpu-us-per-op",
+                unattributed_cpu_us_per_op,
+                label=f"F2/{stage}/Unattributed-cpu-us-per-op",
                 minimum_runs=minimum_runs,
             )
-        stage_summary["cpu_unattributed"] = estimate(
-            rows,
-            unattributed_cpu_us_per_op,
-            label=f"F2/{stage}/Unattributed-cpu-us-per-op",
-            minimum_runs=minimum_runs,
-        )
         summary[stage] = stage_summary
     return summary
 
@@ -449,12 +453,13 @@ def build_figure(summary):
     ax_bytes.set_title("Physical read volume")
     panel_label(ax_bytes, "(c)")
 
-    bottoms = np.zeros(len(STAGES), dtype=float)
+    cpu_x = np.arange(len(CPU_STAGES))
+    bottoms = np.zeros(len(CPU_STAGES), dtype=float)
     plot_phases = CPU_PHASES + [("cpu_unattributed", "Unattributed", "#4B5563")]
     for field, label, color in plot_phases:
-        values = np.array([summary[stage][field].center for stage in STAGES])
+        values = np.array([summary[stage][field].center for stage in CPU_STAGES])
         ax_cpu.bar(
-            x,
+            cpu_x,
             values,
             bottom=bottoms,
             label=label,
@@ -463,9 +468,9 @@ def build_figure(summary):
             linewidth=0.25,
         )
         bottoms += values
-    totals = [summary[stage]["cpu_total"] for stage in STAGES]
+    totals = [summary[stage]["cpu_total"] for stage in CPU_STAGES]
     ax_cpu.errorbar(
-        x,
+        cpu_x,
         [item.center for item in totals],
         yerr=np.array(
             [
@@ -490,8 +495,8 @@ def build_figure(summary):
         )
     ax_cpu.set_ylim(bottom=0)
     ax_cpu.set_ylabel("CPU (us/op)")
-    ax_cpu.set_xticks(x, STAGES)
-    ax_cpu.set_title("CPU attribution")
+    ax_cpu.set_xticks(cpu_x, CPU_STAGES)
+    ax_cpu.set_title("CPU attribution (A0--A5)")
     ax_cpu.legend(frameon=False, ncol=3, loc="upper center", handlelength=1.2, columnspacing=0.7)
     panel_label(ax_cpu, "(d)")
     return fig
@@ -502,7 +507,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True, help="Tidy TSV satisfying F2+COMMON contract")
     parser.add_argument("--out-dir", type=Path, default=HERE / "output")
     parser.add_argument("--experiment-id", default="E03")
-    parser.add_argument("--min-runs", type=int, default=5)
+    parser.add_argument(
+        "--min-runs",
+        type=int,
+        default=DEFAULT_MINIMUM_RUNS,
+        help="Independent-run floor (default: 3; n=3 uses range, n>=5 uses bootstrap 95%% CI)",
+    )
     parser.add_argument("--stem", default="fig_component_ablation")
     return parser.parse_args()
 

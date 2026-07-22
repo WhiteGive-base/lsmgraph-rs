@@ -31,6 +31,10 @@ from figure_common import (  # noqa: E402
 )
 
 
+DEFAULT_MINIMUM_RUNS = 3
+BOOTSTRAP_CI_MINIMUM_RUNS = 5
+
+
 class DataContractError(RuntimeError):
     """Raised when a tidy TSV cannot satisfy the frozen figure contract."""
 
@@ -41,6 +45,10 @@ class Estimate:
     low: float
     high: float
     n: int
+
+    @property
+    def interval_kind(self) -> str:
+        return "range" if self.n == DEFAULT_MINIMUM_RUNS else "bootstrap_95_ci"
 
     @property
     def lower_error(self) -> float:
@@ -233,9 +241,28 @@ def require_min_runs(
     run_ids = [row["run_id"] for row in rows]
     if len(run_ids) != len(set(run_ids)):
         raise DataContractError(f"{label}: duplicate run_id within one plotted group")
-    if len(run_ids) < minimum:
+    _require_repeat_count(len(run_ids), minimum, label=label)
+
+
+def _require_repeat_count(count: int, minimum: int, *, label: str) -> None:
+    if (
+        isinstance(minimum, bool)
+        or not isinstance(minimum, int)
+        or minimum < DEFAULT_MINIMUM_RUNS
+    ):
         raise DataContractError(
-            f"{label}: requires at least {minimum} independent runs, found {len(run_ids)}"
+            f"{label}: minimum_runs must be an integer >= {DEFAULT_MINIMUM_RUNS}, "
+            f"got {minimum!r}"
+        )
+    if count < minimum:
+        raise DataContractError(
+            f"{label}: requires at least {minimum} independent runs, found {count}"
+        )
+    if count == 4:
+        raise DataContractError(
+            f"{label}: found 4 independent runs, which is an incomplete adaptive repeat set; "
+            "formal points must contain exactly 3 runs (range) or at least 5 runs "
+            "(bootstrap 95% CI)"
         )
 
 
@@ -248,7 +275,7 @@ def estimate(
     getter: Callable[[Mapping[str, str]], float | None],
     *,
     label: str,
-    minimum_runs: int,
+    minimum_runs: int = DEFAULT_MINIMUM_RUNS,
     allow_all_missing: bool = False,
     bootstrap_samples: int = 4000,
 ) -> Estimate | None:
@@ -272,13 +299,25 @@ def estimate(
 
     array = np.asarray(values, dtype=float)
     center = float(np.median(array))
-    if len(array) == 1:
-        return Estimate(center, center, center, 1)
+    if len(array) == DEFAULT_MINIMUM_RUNS:
+        return Estimate(
+            center=center,
+            low=float(np.min(array)),
+            high=float(np.max(array)),
+            n=len(array),
+        )
+    if len(array) < BOOTSTRAP_CI_MINIMUM_RUNS:
+        raise AssertionError("repeat-count gate must reject n=4")
     rng = np.random.default_rng(_stable_seed(label))
     indices = rng.integers(0, len(array), size=(bootstrap_samples, len(array)))
     medians = np.median(array[indices], axis=1)
     low, high = np.quantile(medians, [0.025, 0.975])
-    return Estimate(center, float(low), float(high), len(array))
+    return Estimate(
+        center=center,
+        low=float(low),
+        high=float(high),
+        n=len(array),
+    )
 
 
 def estimate_field(
@@ -286,7 +325,7 @@ def estimate_field(
     field: str,
     *,
     label: str,
-    minimum_runs: int,
+    minimum_runs: int = DEFAULT_MINIMUM_RUNS,
     positive: bool = False,
     nonnegative: bool = False,
     allow_all_missing: bool = False,
@@ -343,6 +382,8 @@ def report_saved(report: Mapping[str, object]) -> None:
 
 
 __all__ = [
+    "BOOTSTRAP_CI_MINIMUM_RUNS",
+    "DEFAULT_MINIMUM_RUNS",
     "DataContractError",
     "Estimate",
     "HERE",

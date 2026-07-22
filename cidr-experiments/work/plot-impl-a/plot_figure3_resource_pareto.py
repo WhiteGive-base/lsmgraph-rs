@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from plot_support import (
+    DEFAULT_MINIMUM_RUNS,
     DataContractError,
     HERE,
     PALETTE,
@@ -410,8 +411,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--performance-phase", default="warm_read")
     parser.add_argument("--resource-phase", default="warm_read")
     parser.add_argument("--resource-workload", default="uniform")
-    parser.add_argument("--performance-min-runs", type=int, default=5)
-    parser.add_argument("--resource-min-runs", type=int, default=3)
+    parser.add_argument(
+        "--performance-min-runs",
+        type=int,
+        default=DEFAULT_MINIMUM_RUNS,
+        help="Performance independent-run floor (default: 3)",
+    )
+    parser.add_argument(
+        "--resource-min-runs",
+        type=int,
+        default=DEFAULT_MINIMUM_RUNS,
+        help="Resource independent-run floor (default: 3)",
+    )
     parser.add_argument("--stem", default="fig_budget_resource_pareto")
     return parser.parse_args()
 

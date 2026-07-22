@@ -17,6 +17,7 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import NullFormatter
 
 from plot_support import (
+    DEFAULT_MINIMUM_RUNS,
     DataContractError,
     Estimate,
     PALETTE,
@@ -33,6 +34,7 @@ from plot_support import (
     passing_rows,
     report_saved,
     require_constant,
+    require_min_runs,
     resolve_input,
     save_figure,
     text,
@@ -173,7 +175,7 @@ def _estimate(
     getter: Callable[[Mapping[str, str]], float],
     *,
     label: str,
-    minimum_runs: int = 5,
+    minimum_runs: int = DEFAULT_MINIMUM_RUNS,
 ) -> Estimate:
     values = [(row["run_id"], float(getter(row))) for row in rows]
     return estimate_values(values, label=label, minimum_runs=minimum_runs)
@@ -226,6 +228,8 @@ def _require_scale_matches(rows: Sequence[dict[str, str]], edge_count: int) -> N
 
 def _build_scale_points(
     rows: Sequence[dict[str, str]],
+    *,
+    minimum_runs: int,
 ) -> tuple[dict[str, list[ScalePoint]], list[int]]:
     for row in rows:
         _validate_scale_row(row)
@@ -284,10 +288,11 @@ def _build_scale_points(
                 )
             scale_factor = next(iter(scale_values)) if scale_values else None
             if oom_rows:
-                if len({row["run_id"] for row in point_rows}) < 5:
-                    warn(
-                        f"F6 scale {variant}/{edge_count}: OOM censoring has fewer than five independent attempts"
-                    )
+                require_min_runs(
+                    point_rows,
+                    minimum_runs,
+                    label=f"F6 scale {variant}/{edge_count} OOM censoring",
+                )
                 if len(oom_rows) != len(point_rows):
                     warn(
                         f"F6 scale {variant}/{edge_count}: mixed OOM/success outcomes; "
@@ -318,6 +323,7 @@ def _build_scale_points(
                     passing,
                     _scale_getter(metric),
                     label=f"F6 scale {variant}/{edge_count} {metric}",
+                    minimum_runs=minimum_runs,
                 )
                 for metric in SCALE_METRICS
             }
@@ -336,6 +342,8 @@ def _build_scale_points(
 
 def _build_concurrency_points(
     rows: Sequence[dict[str, str]],
+    *,
+    minimum_runs: int,
 ) -> dict[str, list[ConcurrencyPoint]]:
     for row in rows:
         _validate_concurrency_row(row)
@@ -377,10 +385,11 @@ def _build_concurrency_points(
                 )
             oom_rows = [row for row in point_rows if bool_field(row, "oom_flag")]
             if oom_rows:
-                if len({row["run_id"] for row in point_rows}) < 5:
-                    warn(
-                        f"F6 concurrency {variant}/C={concurrency}: OOM censoring has fewer than five attempts"
-                    )
+                require_min_runs(
+                    point_rows,
+                    minimum_runs,
+                    label=f"F6 concurrency {variant}/C={concurrency} OOM censoring",
+                )
                 if len(oom_rows) != len(point_rows):
                     warn(
                         f"F6 concurrency {variant}/C={concurrency}: mixed OOM/success outcomes; point censored"
@@ -404,11 +413,13 @@ def _build_concurrency_points(
                 passing,
                 lambda row: float(number(row, "completed_qps", nonnegative=True)),
                 label=f"F6 concurrency {variant}/C={concurrency} QPS",
+                minimum_runs=minimum_runs,
             )
             timeout_rate = _estimate(
                 passing,
                 lambda row: float(number(row, "timeout_rate", nonnegative=True)),
                 label=f"F6 concurrency {variant}/C={concurrency} timeout rate",
+                minimum_runs=minimum_runs,
             )
             timed_out = any(float(row["timeout_rate"]) > 0.0 for row in passing)
             latency: Estimate | None = None
@@ -417,6 +428,7 @@ def _build_concurrency_points(
                     passing,
                     lambda row: float(number(row, "latency_p99_us", positive=True)),
                     label=f"F6 concurrency {variant}/C={concurrency} P99",
+                    minimum_runs=minimum_runs,
                 )
             result[variant].append(
                 ConcurrencyPoint(
@@ -802,9 +814,15 @@ def _plot_concurrency_latency(
 def build_figure(
     scale_rows: Sequence[dict[str, str]],
     concurrency_rows: Sequence[dict[str, str]],
+    *,
+    minimum_runs: int = DEFAULT_MINIMUM_RUNS,
 ) -> plt.Figure:
-    scale_data, edges = _build_scale_points(scale_rows)
-    concurrency_data = _build_concurrency_points(concurrency_rows)
+    scale_data, edges = _build_scale_points(
+        scale_rows, minimum_runs=minimum_runs
+    )
+    concurrency_data = _build_concurrency_points(
+        concurrency_rows, minimum_runs=minimum_runs
+    )
     allow_slopes = len(edges) >= 4
     if not allow_slopes:
         warn(
@@ -890,6 +908,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--scale-experiment-id", default="E07")
     parser.add_argument("--concurrency-experiment-id", default="E08")
+    parser.add_argument(
+        "--min-runs",
+        type=int,
+        default=DEFAULT_MINIMUM_RUNS,
+        help="Independent-run floor (default: 3; n=3 uses range, n>=5 uses bootstrap 95%% CI)",
+    )
     return parser.parse_args(argv)
 
 
@@ -919,7 +943,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise DataContractError(
                 "F6 input must contain both selected scale and concurrency experiments"
             )
-        fig = build_figure(scale_rows, concurrency_rows)
+        fig = build_figure(
+            scale_rows,
+            concurrency_rows,
+            minimum_runs=args.min_runs,
+        )
         report = save_figure(fig, args.out_dir, STEM)
         report_saved(report)
         return 0

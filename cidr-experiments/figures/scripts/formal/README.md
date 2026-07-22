@@ -14,11 +14,20 @@ python plot_figure5_workload_coverage.py --input E06-results.tsv --out-dir outpu
 python plot_figure6_scalability.py --input E07-E08-results.tsv --out-dir output
 ```
 
-Each successful command uses `../figure_common.py` and emits
-PNG, SVG, PDF, and a `.layout.json` QA report. Figures 1--3 expose their run
-minimums/selectors as CLI options. Figure 4 uses E05 and fixed 30-second windows;
-Figure 5 uses E06 and defaults its fallback panel to `budg-b64`; Figure 6 expects
-E07 scaling plus E08 concurrency rows in the same TSV (IDs are configurable).
+Each successful command uses `../figure_common.py` and emits PNG, SVG, PDF, and
+a `.layout.json` QA report. Figures 1--3, 5, and 6 expose their independent-run
+floor as CLI options; every default is three. Figure 4 uses the same three-run
+floor with E05 and fixed 30-second windows. Figure 5 uses E06 and defaults its
+fallback panel to `budg-b64`; Figure 6 expects E07 scaling plus E08 concurrency
+rows in the same TSV (IDs are configurable).
+
+The frozen adaptive-repeat rule is enforced centrally: exactly three valid
+independent runs produce a median with the observed run-level range, while five
+or more produce a median with a run-level bootstrap 95% CI. Four runs are an
+incomplete adaptive set and fail closed. A stricter explicit `--min-runs`
+override remains effective, but cannot lower the frozen floor below three.
+Estimators retain every supplied run ID/value; an override changes only the
+acceptance floor and never truncates a five-run set to three.
 
 Validation is intentionally strict:
 
@@ -42,9 +51,9 @@ Figure-specific gates include:
 - Figure 4 excludes an entire run on any digest/mismatch/writer error, requires at
   least three paired repeats across all four policies, and leaves missing windows
   as real line/step gaps without interpolation.
-- Figure 5 requires at least five matched repeats for numeric cells, renders
+- Figure 5 requires at least three matched repeats for numeric cells, renders
   unsupported (`////`) separately from missing (`xx`), and exits nonzero after
   saving a diagnostic figure if a fallback scenario fails correctness.
-- Figure 6 uses actual directed-edge counts, requires at least five runs per
-  uncensored point, retains OOM/timeout censoring, and labels a log-log slope only
-  with at least four successful scale points and `R^2 >= 0.9`.
+- Figure 6 uses actual directed-edge counts, requires at least three runs per
+  uncensored or OOM-censored point, retains OOM/timeout censoring, and labels a
+  log-log slope only with at least four successful scale points and `R^2 >= 0.9`.

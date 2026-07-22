@@ -15,7 +15,7 @@
 
 ### 0.2 统计与数值规则
 
-- 所有正式点先做 3 个独立进程 run；QPS CV >3% 或 P99 CV >5% 时补到 5 个；长时动态、导入和 compaction 至少 3 个独立 run。图上显示全部独立 run 点与 run-level median；n=3 报告范围，n>=5 再使用 run-level bootstrap 95% CI。
+- 所有正式点先做 3 个独立进程 run；QPS CV >3% 或 P99 CV >5% 时补到 5 个；长时动态、导入和 compaction 至少 3 个独立 run。图上显示全部独立 run 点与 run-level median；n=3 报告范围，n=4 视为未完成的自适应重复集合并拒绝封图，n>=5 再使用 run-level bootstrap 95% CI。
 - P50/P95/P99 先在每个 run 内计算，再跨 run 聚合；禁止把多个 run 的所有请求池化后重算分位数。
 - 比率必须由 matched run 或相同实验批次的中心值计算，并在图注说明分母。所有绝对值保留在数据文件中。
 - log 轴只接受严格正值。缺测、超时和 unsupported 使用空值及原因字段，不得填 0 或任意 epsilon。
@@ -50,28 +50,28 @@
 
 - **x**：latency，单位 us，log10。
 - **y**：系统，固定顺序：SemL0、SemL0-naive、LiveGraph、Aster RocksGraph、TuGraph、NebulaGraph、Neo4j；不按本次结果排序。
-- **marks**：每个系统一条细 horizontal range `P50 -> P99`；P50 圆点、P95 三角、P99 菱形。每个 quantile 带跨 run 95% CI 横向误差线。
+- **marks**：每个系统一条细 horizontal range `P50 -> P99`；P50 圆点、P95 三角、P99 菱形。每个 quantile 带跨 run 不确定性横向误差线：n=3 画范围，n>=5 才画 bootstrap 95% CI。
 - **series**：系统身份使用全局颜色/marker；分位数身份用 marker 形状，避免再引入颜色。
-- **annotation**：轴内写 `SF10, same trace, C=<n>, digest pass`；若某系统缺 P99，位置显示灰色 `P99 N/A`，不画到原点。只标注 SemL0 相对最强主要基线的 P99 比率及 CI。
+- **annotation**：轴内写 `SF10, same trace, C=<n>, digest pass`；若某系统缺 P99，位置显示灰色 `P99 N/A`，不画到原点。只标注 SemL0 相对最强主要基线的 P99 比率及对应不确定性区间。
 - **scale/ticks**：`set_xscale("log")`；tick 使用 `100 us, 1 ms, 10 ms, 100 ms, 1 s, 10 s` 的格式化标签。
 
 ### Panel (b)：固定并发下吞吐
 
 - **x**：系统，沿用 panel (a) 顺序，标签旋转 32°、右对齐。
 - **y**：completed QPS，log10；起点不能伪装为 0。
-- **marks**：bar + 95% CI；超时请求不计入 completed QPS，并在 bar 上方标 `timeout=<rate>%`。
+- **marks**：bar + run-level 不确定性区间（n=3 为范围，n>=5 为 bootstrap 95% CI）；超时请求不计入 completed QPS，并在 bar 上方标 `timeout=<rate>%`。
 - **annotation**：一条浅灰水平线标 offered load（仅 open-loop 实验）；closed-loop 时不画 offered-load 线。
 
 ### Panel (c)：导入与磁盘代价
 
 - **x**：最终数据库 disk footprint，GiB，log10。
 - **y**：load/build wall time，seconds，log10。
-- **marks**：每个系统一个等面积散点；load time 使用跨 run 95% CI，disk 若只有单次测量则只画点且在 caption 声明。
+- **marks**：每个系统一个等面积散点；load time 与 disk 都使用跨 run 不确定性区间（n=3 为范围，n>=5 为 bootstrap 95% CI）；单次 disk 测量只能作为诊断证据，不得进入正式图。
 - **annotation**：直接标系统短名；不使用 bubble size 编码第三指标。右下角箭头 `lower is better`。
 
 ### Caption claim
 
-安全模板：**“On the matched SF10 outgoing typed-neighbor interface, all plotted runs pass the same digest gate. The figure compares end-to-end latency, completed throughput, and load/storage cost; it does not rank complete graph-database functionality.”** 只有当 CI 支持时，才在正文添加具体倍数；不得写“SemL0 全面优于现有图数据库”。
+安全模板：**“On the matched SF10 outgoing typed-neighbor interface, all plotted runs pass the same digest gate. The figure compares end-to-end latency, completed throughput, and load/storage cost; it does not rank complete graph-database functionality.”** 只有当所绘 run-level 不确定性区间支持时，才在正文添加具体倍数；不得写“SemL0 全面优于现有图数据库”。
 
 ### 所需数据字段
 
@@ -82,7 +82,7 @@
 - 外部系统接口功能不同：caption 必须重复限定 matched outgoing typed-neighbor。
 - closed-loop QPS 与 latency 近似互为倒数，不能将两 panel 描述为两份独立证据。
 - 系统跨度可达多个数量级，线性轴会压平快系统；log 轴必须明确标单位。
-- 长系统名、P99 N/A 和 CI 易越过左/右边界；必须以最终 PDF 字体尺寸检查。
+- 长系统名、P99 N/A 和不确定性误差线易越过左/右边界；必须以最终 PDF 字体尺寸检查。
 - 不得恢复旧脚本中口径不一致的 SF100 `LSM-style*` 点到 SF10 图中。
 
 ---
@@ -97,8 +97,8 @@
 ### Panel (a)：tail latency
 
 - **y**：P99 latency，us，log10。
-- **marks**：单条深蓝折线，marker + 95% CI；A0 灰色、A6 绿色，其余浅蓝。折线只表达配置顺序，不暗示理论单调性。
-- **annotation**：每个相邻阶段只在变化超过 CI 且绝对变化超过 10% 时标 `-x%`/`+x%`；回退点必须保留正号，不隐藏 regression。
+- **marks**：单条深蓝折线，marker + run-level 不确定性区间（n=3 为范围，n>=5 为 bootstrap 95% CI）；A0 灰色、A6 绿色，其余浅蓝。折线只表达配置顺序，不暗示理论单调性。
+- **annotation**：每个相邻阶段只在变化超过所绘不确定性区间且绝对变化超过 10% 时标 `-x%`/`+x%`；回退点必须保留正号，不隐藏 regression。
 
 ### Panel (b)：候选与 body read
 
@@ -109,13 +109,13 @@
 ### Panel (c)：物理读取
 
 - **y**：physical read bytes/op，MiB，log10。
-- **marks**：bar + 95% CI；每个 bar 上方可标相对 A0 的 `x×`，不标超过两位有效数字。
+- **marks**：bar + run-level 不确定性区间（n=3 为范围，n>=5 为 bootstrap 95% CI）；每个 bar 上方可标相对 A0 的 `x×`，不标超过两位有效数字。
 - **annotation**：若 page-cache 命中使设备读与逻辑 body bytes 不同，图中采用 `body_read_bytes/op`，caption 同时说明 `device_read_bytes` 在补充表中。
 
 ### Panel (d)：CPU/op 分解
 
 - **y**：CPU us/op，线性，从 0 起。
-- **marks**：stacked bar，依次为 signature build、metadata admission、routing/index、body decode/filter、MVCC/result；bar 顶端是 total CPU/op 的跨 run 95% CI。
+- **marks**：stacked bar，依次为 signature build、metadata admission、routing/index、body decode/filter、MVCC/result；bar 顶端是 total CPU/op 的跨 run 不确定性区间（n=3 为范围，n>=5 为 bootstrap 95% CI）。
 - **颜色**：各 phase 使用同一蓝灰色系，由浅到深；body decode/filter 用灰色，避免与 variant 身份颜色冲突。
 - **annotation**：bar 顶只标总 CPU/op；不在细小 stack 内强塞文本。
 
@@ -133,7 +133,7 @@
 - 连接线可能被读成预算连续曲线；caption 必须写 ordered categorical configurations。
 - stacked CPU 只能加和 mutually exclusive CPU phases；wall time、I/O wait 不能混入 CPU stack。
 - log 轴遇到 0 body read 时显示 `< detection limit` 或空值，不填 epsilon。
-- A0--A6 标签、相邻百分比和 CI 容易相撞；最多标显著且大于 10% 的三处变化。
+- A0--A6 标签、相邻百分比和不确定性误差线容易相撞；最多标显著且大于 10% 的三处变化。
 
 ---
 
@@ -187,7 +187,7 @@
 **输出 stem**：`fig_dynamic_compaction_timeline`  
 **主版式**：双栏，`figsize=(7.05, 5.10)`，`GridSpec(4, 2, hspace=0.10, wspace=0.22)`，所有轴共享时间 x。单栏不得缩成八 panel；应拆成 performance/lifecycle 与 resource 两张 `(3.38, 4.8)` 图。
 
-**共同 x**：elapsed minutes，线性。所有 run 使用固定 workload phase 边界；背景仅用极浅灰区分 steady、burst、A→B shift，边界处标一次文字。每 30 s 一个聚合 window；中心线是跨 run median，带为 95% CI。
+**共同 x**：elapsed minutes，线性。所有 run 使用固定 workload phase 边界；背景仅用极浅灰区分 steady、burst、A→B shift，边界处标一次文字。每 30 s 一个聚合 window；中心线是跨 run median，带在 n=3 时为范围，n>=5 时才为 bootstrap 95% CI。
 
 **共同 series**：`none` 灰色点线、`capacity-naive` 橙色虚线、`semantic-static` 绿色实线、`semantic-feedback` 紫色实线加 P marker。`none` 只作 L0 accumulation 诊断，不进入 steady-state 胜负结论。
 
@@ -217,10 +217,10 @@ compaction 事件不在八个 panel 全部画竖线；只在 (e)/(h) 顶部用 2
 ### 潜在误读与穿模风险
 
 - 当前旧 W9 若 `COMPACT_EVERY_SECS=0`，不能进入 semantic-compaction 因果图，只能作为 `none` 诊断。
-- checkpoint 是相关时间点，不能当作六次重复计算 CI。
+- checkpoint 是相关时间点，不能当作独立重复计算范围或 CI。
 - workload phase、compaction 和 latency 同时变化时只能表述相关性；需要 controlled trace 与 policy 对照支持归因。
 - 八 panel legend 只出现一次；每个 panel 重复 legend 会吞掉数据区。
-- CI band、四条 policy 线和 phase shading 可能混色；phase alpha 不超过 0.045，CI alpha 不超过 0.12。
+- 不确定性 band、四条 policy 线和 phase shading 可能混色；phase alpha 不超过 0.045，band alpha 不超过 0.12。
 - 不允许插值跨越缺失 window；line 必须断开。
 
 ---
@@ -247,14 +247,14 @@ compaction 事件不在八个 panel 全部画竖线；只在 (e)/(h) 顶部用 2
 
 - **x**：write percentage：0、10、50、90，线性分类轴，标签 `100/0`、`90/10`、`50/50`、`10/90`。
 - **y**：P99 speedup `P99_naive/P99_b64`，log2；画 `1×` 水平 reference。
-- **series**：uniform `#0072B2/o/-`、burst `#D55E00/s/--`、hotspot `#E69F00/^/-.`、A→B shift `#CC79A7/P/-`，带 95% CI。
+- **series**：uniform `#0072B2/o/-`、burst `#D55E00/s/--`、hotspot `#E69F00/^/-.`、A→B shift `#CC79A7/P/-`，带 run-level 不确定性区间（n=3 为范围，n>=5 为 bootstrap 95% CI）。
 - **annotation**：只标落到 `<1×` 的 regression 和最大收益点；不能只标正结果。
 
 ### Panel (d)：安全 fallback 的读取代价
 
 - **x**：stable、schema epoch、alias/drop、high tombstone、old snapshot、reopen/rebuild。
 - **y**：fallback extra read ratio，`read_bytes_fallback/read_bytes_exact`，log2，以 `1×` 为参考。
-- **marks**：bar + CI；bar 顶同时标 `fallback=<rate>%`。仅当 mismatch=0 时着正常颜色；出现 mismatch 时该点变红叉且整组性能结论判失败。
+- **marks**：bar + run-level 不确定性区间；bar 顶同时标 `fallback=<rate>%`。仅当 mismatch=0 时着正常颜色；出现 mismatch 时该点变红叉且整组性能结论判失败。
 
 ### Caption claim
 
@@ -287,7 +287,7 @@ compaction 事件不在八个 panel 全部画竖线；只在 (e)/(h) 顶部用 2
 
 | Panel | y | scale | annotation |
 |---|---|---|---|
-| (a) | P99 latency (us) | log10 | 标 b64 相对 naive 的末端比率；CI band |
+| (a) | P99 latency (us) | log10 | 标 b64 相对 naive 的末端比率；run-level 不确定性 band |
 | (b) | body read bytes/op (MiB) | log10 | 不用 metadata proxy 代替真实执行；必要时 proxy 用空心 marker |
 | (c) | final database disk (GiB) | log10 | payload 与 control-plane breakdown 在 Figure 3；此处画 total |
 | (d) | steady-state RSS (GiB) | log10 | 固定 cache state；import peak 不进入该轴 |
@@ -325,9 +325,9 @@ compaction 事件不在八个 panel 全部画竖线；只在 (e)/(h) 顶部用 2
 每张图进入论文前必须满足：
 
 1. 图中系统、variant、数据集、并发、cache state 能由 TSV/原始结果唯一还原。
-2. 所有点有独立 run 数；CI 不是 query-level 伪重复，也不是 checkpoint-level 伪重复。
+2. 所有点有独立 run 数；范围/CI 都来自 run level，不是 query-level 或 checkpoint-level 伪重复。
 3. 绝对值、比率分母、单位与 log base 明确；N/A、timeout、OOM 与 0 明确区分。
 4. caption 只陈述图直接支持的 claim，并保留 matched-interface、single-node、prototype 等边界。
 5. 颜色、marker、线型在六张图中身份稳定；黑白打印仍能区分。
-6. 用最终 LaTeX 宽度渲染 PDF，检查 legend、长标签、CI、annotation、heatmap 数字无裁切和重叠。
+6. 用最终 LaTeX 宽度渲染 PDF，检查 legend、长标签、不确定性区间、annotation、heatmap 数字无裁切和重叠。
 7. 绘图脚本只读取冻结的 tidy data，不内嵌手抄常量；数据与脚本都记录 SHA-256。

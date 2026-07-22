@@ -36,6 +36,8 @@ from figure_common import (  # noqa: E402
 HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 CACHE_STATES = {"cold", "warm", "fixed_budget"}
+DEFAULT_MINIMUM_RUNS = 3
+BOOTSTRAP_CI_MINIMUM_RUNS = 5
 
 
 class DataContractError(RuntimeError):
@@ -48,6 +50,10 @@ class Estimate:
     low: float
     high: float
     n: int
+
+    @property
+    def interval_kind(self) -> str:
+        return "range" if self.n == DEFAULT_MINIMUM_RUNS else "bootstrap_95_ci"
 
     @property
     def lower_error(self) -> float:
@@ -386,9 +392,28 @@ def require_min_runs(
     rows: Sequence[Mapping[str, str]], minimum: int, *, label: str
 ) -> None:
     run_ids = {row["run_id"] for row in rows}
-    if len(run_ids) < minimum:
+    _require_repeat_count(len(run_ids), minimum, label=label)
+
+
+def _require_repeat_count(count: int, minimum: int, *, label: str) -> None:
+    if (
+        isinstance(minimum, bool)
+        or not isinstance(minimum, int)
+        or minimum < DEFAULT_MINIMUM_RUNS
+    ):
         raise DataContractError(
-            f"{label}: requires at least {minimum} independent run_id values, found {len(run_ids)}"
+            f"{label}: minimum_runs must be an integer >= {DEFAULT_MINIMUM_RUNS}, "
+            f"got {minimum!r}"
+        )
+    if count < minimum:
+        raise DataContractError(
+            f"{label}: requires at least {minimum} independent runs, found {count}"
+        )
+    if count == 4:
+        raise DataContractError(
+            f"{label}: found 4 independent runs, which is an incomplete adaptive repeat set; "
+            "formal points must contain exactly 3 runs (range) or at least 5 runs "
+            "(bootstrap 95% CI)"
         )
 
 
@@ -400,27 +425,36 @@ def estimate_values(
     values_by_run: Sequence[tuple[str, float]],
     *,
     label: str,
-    minimum_runs: int,
+    minimum_runs: int = DEFAULT_MINIMUM_RUNS,
     bootstrap_samples: int = 4000,
 ) -> Estimate:
     run_ids = [run_id for run_id, _ in values_by_run]
     if len(run_ids) != len(set(run_ids)):
         raise DataContractError(f"{label}: duplicate run_id in one run-level estimate")
-    if len(run_ids) < minimum_runs:
-        raise DataContractError(
-            f"{label}: requires {minimum_runs} independent runs, found {len(run_ids)}"
-        )
+    _require_repeat_count(len(run_ids), minimum_runs, label=label)
     values = np.asarray([value for _, value in values_by_run], dtype=float)
     if not np.all(np.isfinite(values)):
         raise DataContractError(f"{label}: non-finite run-level value")
     center = float(np.median(values))
-    if len(values) == 1:
-        return Estimate(center, center, center, 1)
+    if len(values) == DEFAULT_MINIMUM_RUNS:
+        return Estimate(
+            center=center,
+            low=float(np.min(values)),
+            high=float(np.max(values)),
+            n=len(values),
+        )
+    if len(values) < BOOTSTRAP_CI_MINIMUM_RUNS:
+        raise AssertionError("repeat-count gate must reject n=4")
     rng = np.random.default_rng(_stable_seed(label))
     indices = rng.integers(0, len(values), size=(bootstrap_samples, len(values)))
     medians = np.median(values[indices], axis=1)
     low, high = np.quantile(medians, [0.025, 0.975])
-    return Estimate(center, float(low), float(high), len(values))
+    return Estimate(
+        center=center,
+        low=float(low),
+        high=float(high),
+        n=len(values),
+    )
 
 
 def paired_ratio_estimate(
@@ -430,7 +464,7 @@ def paired_ratio_estimate(
     numerator_getter: Callable[[Mapping[str, str]], float],
     denominator_getter: Callable[[Mapping[str, str]], float],
     label: str,
-    minimum_runs: int,
+    minimum_runs: int = DEFAULT_MINIMUM_RUNS,
 ) -> Estimate:
     def pair_key(row: Mapping[str, str]) -> tuple[str, str]:
         return (row["repeat_index"], row["query_trace_sha256"])
@@ -446,10 +480,7 @@ def paired_ratio_estimate(
             f"{label}: variants are not paired; missing numerator={missing_left}, "
             f"missing denominator={missing_right}"
         )
-    if len(numerator) < minimum_runs:
-        raise DataContractError(
-            f"{label}: requires {minimum_runs} matched independent repeats, found {len(numerator)}"
-        )
+    _require_repeat_count(len(numerator), minimum_runs, label=label)
     matched_fields = (
         "dataset_id",
         "input_sha256",
@@ -484,7 +515,7 @@ def estimate(
     getter: Callable[[Mapping[str, str]], float | None],
     *,
     label: str,
-    minimum_runs: int,
+    minimum_runs: int = DEFAULT_MINIMUM_RUNS,
     allow_all_missing: bool = False,
     bootstrap_samples: int = 4000,
 ) -> Estimate | None:
@@ -523,7 +554,7 @@ def estimate_field(
     field: str,
     *,
     label: str,
-    minimum_runs: int,
+    minimum_runs: int = DEFAULT_MINIMUM_RUNS,
     positive: bool = False,
     nonnegative: bool = False,
     allow_all_missing: bool = False,
@@ -617,6 +648,8 @@ def report_saved(report: Mapping[str, object]) -> None:
 
 
 __all__ = [
+    "BOOTSTRAP_CI_MINIMUM_RUNS",
+    "DEFAULT_MINIMUM_RUNS",
     "DataContractError",
     "Estimate",
     "asymmetric_error",
@@ -650,5 +683,3 @@ __all__ = [
     "text",
     "warn",
 ]
-
-

@@ -24,9 +24,9 @@ COMMON	all	one row per independent run	measurement_s	float	s	yes	measure	direct	
 COMMON	all	one row per independent run	digest_pass	bool	-	yes	gate	direct	true for performance plot	False runs retained in correctness output
 COMMON	all	one row per independent run	mismatch_count	uint64	queries	yes	gate	sum	=0 for performance plot	Count/hash mismatch
 COMMON	all	one row per independent run	unsupported_reason	string	-	no	missingness	direct	required when support_state!=supported	Empty value is not zero
-F1	a	one row per run and system	latency_p50_us	float	us	yes	measure	within-run P50 then median/CI across runs	>0	Derived from raw per-query latency
-F1	a	one row per run and system	latency_p95_us	float	us	yes	measure	within-run P95 then median/CI across runs	>=P50	Do not pool runs
-F1	a	one row per run and system	latency_p99_us	float	us	no	measure	within-run P99 then median/CI across runs	>=P95 or null with reason	LiveGraph legacy missing value cannot be zero
+F1	a	one row per run and system	latency_p50_us	float	us	yes	measure	within-run P50 then median + range (n=3) / bootstrap 95% CI (n>=5)	>0	Derived from raw per-query latency
+F1	a	one row per run and system	latency_p95_us	float	us	yes	measure	within-run P95 then median + range (n=3) / bootstrap 95% CI (n>=5)	>=P50	Do not pool runs
+F1	a	one row per run and system	latency_p99_us	float	us	no	measure	within-run P99 then median + range (n=3) / bootstrap 95% CI (n>=5)	>=P95 or null with reason	LiveGraph legacy missing value cannot be zero
 F1	b	one row per run and system	completed_queries	uint64	queries	yes	raw	direct	>=0	Exclude timed-out requests
 F1	b	one row per run and system	timeout_queries	uint64	queries	yes	raw	direct	>=0	Required even when zero
 F1	b	one row per run and system	offered_qps	float	queries/s	no	context	direct	>0 for open-loop	Null for closed-loop
@@ -36,22 +36,23 @@ F1	c	one row per load run and system	final_disk_bytes	uint64	bytes	yes	measure	d
 F1	c	one row per load run and system	load_peak_rss_bytes	uint64	bytes	no	secondary	direct	>0	Reported in companion table
 F1	all	one row per run and system	interface_scope	string	-	yes	gate	direct	must equal matched scope	Expected fixed-source outgoing typed-neighbor
 F1	all	one row per run and system	system_version	string	-	yes	provenance	direct	non-empty	Exact release/commit/image
-F2	all	one row per run and stage	ablation_stage	enum	-	yes	key	direct	A0|A1|A2|A3|A4|A5|A6	Ordered categorical
-F2	all	one row per run and stage	feature_switches	string	-	yes	provenance	direct	non-empty	Machine-readable JSON preferred in raw source
-F2	a	one row per run and stage	latency_p99_us	float	us	yes	measure	within-run P99	>0	Same query trace across stages
-F2	b	one row per run and stage	candidate_segments_total	uint64	segments	yes	raw	direct	>=body_read_segments_total	Use totals to derive per-op
-F2	b	one row per run and stage	body_read_segments_total	uint64	segments	yes	raw	direct	>=0	Physical segment bodies opened
-F2	b	one row per run and stage	measured_operations	uint64	ops	yes	denominator	direct	>0	Same operation count unless timeout reported
-F2	c	one row per run and stage	body_read_bytes_total	uint64	bytes	yes	raw	direct	>=0	Logical body bytes used by main plot
-F2	c	one row per run and stage	device_read_bytes_total	uint64	bytes	no	secondary	direct	>=0	OS/device counter, not substituted silently
-F2	d	one row per run and stage	cpu_query_setup_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 only; includes signature construction and degree-directory lookup
-F2	d	one row per run and stage	cpu_admission_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
-F2	d	one row per run and stage	cpu_routing_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
-F2	d	one row per run and stage	cpu_body_decode_filter_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
-F2	d	one row per run and stage	cpu_mvcc_result_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
-F2	d	one row per run and stage	cpu_total_ns	uint64	ns	conditional	check	sum	>=sum(phases)	A0-A5 phase run; A6 closed-loop total is reported separately
-F2	all	one row per run and stage	l0_file_count	uint64	files	no	explanation	direct	>=0	Explain candidate non-monotonicity
-F2	all	one row per run and stage	compaction_write_amplification	float	ratio	no	explanation	direct	>=1 or documented definition	Same formula across stages
+F2	all	one row per run, stage, workload and cohort	ablation_stage	enum	-	yes	key	direct	A0|A1|A2|A3|A4|A5|A6	Ordered categorical
+F2	all	one row per run, stage, workload and cohort	property_cohort	enum	-	yes	key	direct	mixed_positive|zero|not_applicable	Property workload emits both cohorts; other workloads use not_applicable
+F2	all	one row per run, stage, workload and cohort	feature_switches	string	-	yes	provenance	direct	non-empty	Machine-readable JSON preferred in raw source
+F2	a	one row per run, stage, workload and cohort	latency_p99_us	float	us	yes	measure	within-run P99	>0	Same query trace across stages and cohort
+F2	b	one row per run, stage, workload and cohort	candidate_segments_total	uint64	segments	yes	raw	direct	>=body_read_segments_total	Use totals to derive per-op
+F2	b	one row per run, stage, workload and cohort	body_read_segments_total	uint64	segments	yes	raw	direct	>=0	Physical segment bodies opened
+F2	b	one row per run, stage, workload and cohort	measured_operations	uint64	ops	yes	denominator	direct	>0	Property cohorts each require 500 operations per run
+F2	c	one row per run, stage, workload and cohort	body_read_bytes_total	uint64	bytes	yes	raw	direct	>=0	Logical body bytes used by main plot
+F2	c	one row per run, stage, workload and cohort	device_read_bytes_total	uint64	bytes	no	secondary	direct	>=0	OS/device counter, not substituted silently
+F2	d	one row per run, stage, workload and cohort	cpu_query_setup_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 only; includes signature construction and degree-directory lookup
+F2	d	one row per run, stage, workload and cohort	cpu_admission_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
+F2	d	one row per run, stage, workload and cohort	cpu_routing_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
+F2	d	one row per run, stage, workload and cohort	cpu_body_decode_filter_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
+F2	d	one row per run, stage, workload and cohort	cpu_mvcc_result_ns	uint64	ns	conditional	measure	sum	>=0	A0-A5 mutually exclusive CPU phase
+F2	d	one row per run, stage, workload and cohort	cpu_total_ns	uint64	ns	conditional	check	sum	>=sum(phases)	A0-A5 phase run; A6 closed-loop total is reported separately
+F2	all	one row per run, stage, workload and cohort	l0_file_count	uint64	files	no	explanation	direct	>=0	Explain candidate non-monotonicity
+F2	all	one row per run, stage, workload and cohort	compaction_write_amplification	float	ratio	no	explanation	direct	>=1 or documented definition	Same formula across stages
 F3	all	one row per run, budget, workload and phase	semantic_budget	string	-	yes	key	direct	schema|B16|B64|B256|B1024|full	Do not infer physical file cap
 F3	all	one row per run, budget, workload and phase	workload_distribution	enum	-	yes	dimension	direct	uniform|zipf_hot|shift_A_B	Stable spelling
 F3	all	one row per run, budget, workload and phase	measurement_phase	enum	-	yes	dimension	direct	import|open|warm_read|mixed|compaction	RSS must be phase-specific

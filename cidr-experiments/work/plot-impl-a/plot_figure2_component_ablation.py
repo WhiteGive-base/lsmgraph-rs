@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from plot_support import (
+    DEFAULT_MINIMUM_RUNS,
     DataContractError,
     HERE,
     PALETTE,
@@ -30,6 +31,7 @@ from plot_support import (
 
 
 STAGES = ["A0", "A1", "A2", "A3", "A4", "A5", "A6"]
+CPU_STAGES = STAGES[:-1]
 PLOT_FIELDS = {
     "ablation_stage",
     "feature_switches",
@@ -38,7 +40,7 @@ PLOT_FIELDS = {
     "body_read_segments_total",
     "measured_operations",
     "body_read_bytes_total",
-    "cpu_signature_ns",
+    "cpu_query_setup_ns",
     "cpu_admission_ns",
     "cpu_routing_ns",
     "cpu_body_decode_filter_ns",
@@ -47,7 +49,7 @@ PLOT_FIELDS = {
 }
 
 CPU_PHASES = [
-    ("cpu_signature_ns", "Signature", "#BFD7EA"),
+    ("cpu_query_setup_ns", "Query setup", "#BFD7EA"),
     ("cpu_admission_ns", "Admission", "#84B6D7"),
     ("cpu_routing_ns", "Routing", "#4E92C4"),
     ("cpu_body_decode_filter_ns", "Body/filter", "#9CA3AF"),
@@ -353,7 +355,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True, help="Tidy TSV satisfying F2+COMMON contract")
     parser.add_argument("--out-dir", type=Path, default=HERE / "output")
     parser.add_argument("--experiment-id", default="E03")
-    parser.add_argument("--min-runs", type=int, default=5)
+    parser.add_argument(
+        "--min-runs",
+        type=int,
+        default=DEFAULT_MINIMUM_RUNS,
+        help="Independent-run floor (default: 3; n=3 uses range, n>=5 uses bootstrap 95%% CI)",
+    )
     parser.add_argument("--stem", default="fig_component_ablation")
     return parser.parse_args()
 

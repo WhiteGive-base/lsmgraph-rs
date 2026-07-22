@@ -13,6 +13,7 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter
 
 from plot_support import (
+    DEFAULT_MINIMUM_RUNS,
     DataContractError,
     HERE,
     PALETTE,
@@ -409,7 +410,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True, help="Tidy TSV satisfying F1+COMMON contract")
     parser.add_argument("--out-dir", type=Path, default=HERE / "output")
     parser.add_argument("--experiment-id", default="E01")
-    parser.add_argument("--min-runs", type=int, default=5)
+    parser.add_argument(
+        "--min-runs",
+        type=int,
+        default=DEFAULT_MINIMUM_RUNS,
+        help="Independent-run floor (default: 3; n=3 uses range, n>=5 uses bootstrap 95%% CI)",
+    )
     parser.add_argument("--stem", default="fig_e2e_matched")
     return parser.parse_args()
 

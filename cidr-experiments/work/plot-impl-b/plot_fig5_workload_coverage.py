@@ -16,6 +16,7 @@ from matplotlib.patches import Patch, Rectangle
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 from plot_support import (
+    DEFAULT_MINIMUM_RUNS,
     DataContractError,
     Estimate,
     PALETTE,
@@ -202,6 +203,7 @@ def _numeric_cell(
     *,
     label: str,
     metric: str,
+    minimum_runs: int,
 ) -> Estimate | None:
     passing = passing_rows(rows, label=label)
     by_variant = group_by(passing, lambda row: normalize_variant(row["variant"]))
@@ -233,7 +235,7 @@ def _numeric_cell(
             numerator_getter=getter,
             denominator_getter=getter,
             label=label,
-            minimum_runs=5,
+            minimum_runs=minimum_runs,
         )
     except DataContractError as exc:
         if metric == "body" and "ratio inputs must be finite and >0" in str(exc):
@@ -243,7 +245,7 @@ def _numeric_cell(
 
 
 def _build_heatmap(
-    rows: Sequence[dict[str, str]], metric: str
+    rows: Sequence[dict[str, str]], metric: str, *, minimum_runs: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, set[str]]:
     shape = (len(SEMANTICS), len(SELECTIVITIES) * len(DEGREES))
     values = np.full(shape, np.nan, dtype=float)
@@ -277,6 +279,7 @@ def _build_heatmap(
                     cell_rows,
                     label=f"F5 {metric} cell {key}",
                     metric=metric,
+                    minimum_runs=minimum_runs,
                 )
                 if estimate is None:
                     states[row_idx, col_idx] = "missing"
@@ -390,6 +393,8 @@ def _plot_heatmap(
 
 def _mix_estimates(
     rows: Sequence[dict[str, str]],
+    *,
+    minimum_runs: int,
 ) -> dict[str, list[Estimate | None]]:
     grouped = group_by(
         rows,
@@ -436,7 +441,7 @@ def _mix_estimates(
                     numerator_getter=getter,
                     denominator_getter=getter,
                     label=f"F5 mix {pattern}/{write_percent:g}% latency speedup",
-                    minimum_runs=5,
+                    minimum_runs=minimum_runs,
                 )
             )
         if not any(estimate is not None for estimate in estimates):
@@ -517,7 +522,9 @@ def _plot_mix(ax: plt.Axes, estimates: Mapping[str, Sequence[Estimate | None]]) 
     ax.legend(frameon=False, ncol=2, loc="best", handlelength=2.2)
 
 
-def _fallback_estimate(rows: Sequence[dict[str, str]], *, label: str) -> tuple[Estimate, Estimate]:
+def _fallback_estimate(
+    rows: Sequence[dict[str, str]], *, label: str, minimum_runs: int
+) -> tuple[Estimate, Estimate]:
     ratio_values: list[tuple[str, float]] = []
     rate_values: list[tuple[str, float]] = []
     for row in rows:
@@ -535,8 +542,16 @@ def _fallback_estimate(rows: Sequence[dict[str, str]], *, label: str) -> tuple[E
         ratio_values.append((row["run_id"], fallback_bytes / exact_bytes))
         rate_values.append((row["run_id"], rate))
     return (
-        estimate_values(ratio_values, label=f"{label} read ratio", minimum_runs=5),
-        estimate_values(rate_values, label=f"{label} fallback rate", minimum_runs=5),
+        estimate_values(
+            ratio_values,
+            label=f"{label} read ratio",
+            minimum_runs=minimum_runs,
+        ),
+        estimate_values(
+            rate_values,
+            label=f"{label} fallback rate",
+            minimum_runs=minimum_runs,
+        ),
     )
 
 
@@ -545,6 +560,7 @@ def _plot_fallback(
     rows: Sequence[dict[str, str]],
     *,
     selected_variant: str,
+    minimum_runs: int,
 ) -> list[str]:
     selected = [row for row in rows if normalize_variant(row["variant"]) == selected_variant]
     if not selected:
@@ -577,7 +593,9 @@ def _plot_fallback(
             )
             continue
         ratio, rate = _fallback_estimate(
-            scenario_rows, label=f"F5 fallback {scenario}"
+            scenario_rows,
+            label=f"F5 fallback {scenario}",
+            minimum_runs=minimum_runs,
         )
         centers[index] = math.log2(ratio.center)
         lows[index] = math.log2(ratio.low)
@@ -653,7 +671,10 @@ def _plot_fallback(
 
 
 def build_figure(
-    rows: Sequence[dict[str, str]], *, fallback_variant: str
+    rows: Sequence[dict[str, str]],
+    *,
+    fallback_variant: str,
+    minimum_runs: int = DEFAULT_MINIMUM_RUNS,
 ) -> tuple[plt.Figure, list[str]]:
     heatmap_rows, mix_rows, fallback_rows = _partition_rows(rows)
     _validate_heatmap_rows(heatmap_rows)
@@ -661,12 +682,12 @@ def build_figure(
     _validate_fallback_rows(fallback_rows)
 
     latency_values, latency_ratios, latency_states, latency_prototypes = _build_heatmap(
-        heatmap_rows, "latency"
+        heatmap_rows, "latency", minimum_runs=minimum_runs
     )
     body_values, body_ratios, body_states, body_prototypes = _build_heatmap(
-        heatmap_rows, "body"
+        heatmap_rows, "body", minimum_runs=minimum_runs
     )
-    mix_estimates = _mix_estimates(mix_rows)
+    mix_estimates = _mix_estimates(mix_rows, minimum_runs=minimum_runs)
 
     configure_matplotlib()
     fig, axes = plt.subplots(2, 2, figsize=(7.05, 4.45))
@@ -690,7 +711,10 @@ def build_figure(
     )
     _plot_mix(ax_mix, mix_estimates)
     failures = _plot_fallback(
-        ax_fallback, fallback_rows, selected_variant=fallback_variant
+        ax_fallback,
+        fallback_rows,
+        selected_variant=fallback_variant,
+        minimum_runs=minimum_runs,
     )
     for label, ax in zip("abcd", axes.flat):
         panel_label(ax, label)
@@ -729,6 +753,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--experiment-id", default="E06")
     parser.add_argument("--fallback-variant", default="budg-b64")
+    parser.add_argument(
+        "--min-runs",
+        type=int,
+        default=DEFAULT_MINIMUM_RUNS,
+        help="Independent-run floor (default: 3; n=3 uses range, n>=5 uses bootstrap 95%% CI)",
+    )
     return parser.parse_args(argv)
 
 
@@ -742,7 +772,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             experiment_ids=(args.experiment_id,),
         )
         fallback_variant = normalize_variant(args.fallback_variant)
-        fig, failures = build_figure(rows, fallback_variant=fallback_variant)
+        fig, failures = build_figure(
+            rows,
+            fallback_variant=fallback_variant,
+            minimum_runs=args.min_runs,
+        )
         report = save_figure(fig, args.out_dir, STEM)
         report_saved(report)
         if failures:

@@ -13,8 +13,16 @@ python plot_figure3_resource_pareto.py --input E04-results.tsv --out-dir output
 Each successful command uses `../../figures/scripts/figure_common.py` and emits
 PNG, SVG, PDF, and a `.layout.json` QA report. Figure 3 defaults to the
 `warm_read` phase and the `uniform` workload for its persistent-resource
-breakdown; those selectors and the separate 5-run performance/3-run resource
-minimums are explicit CLI options.
+breakdown; those selectors and the separate performance/resource minimums are
+explicit CLI options and both default to three runs.
+
+The frozen adaptive-repeat rule is enforced centrally: exactly three valid
+independent runs produce a median with the observed run-level range, while five
+or more produce a median with a run-level bootstrap 95% CI. Four runs are an
+incomplete adaptive set and fail closed. A stricter explicit minimum remains
+effective, but cannot lower the frozen floor below three. The estimator retains
+every supplied run ID/value; the override is a gate, not a request to truncate
+provenance.
 
 Validation is intentionally strict:
 

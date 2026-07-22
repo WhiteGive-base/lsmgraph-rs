@@ -60,7 +60,7 @@
 
 - 所有正式点先做 3 个独立进程 run；若 run-level QPS CV >3% 或 P99 CV >5%，则从预留缓冲补到 5 个。长时动态、导入和 compaction 固定至少 3 个独立 run。
 - variant 执行顺序随机化或轮换，避免固定顺序和缓存偏差。
-- 报告所有独立 run 点、run-level median/mean 和不确定性；n=3 时报告范围并标注样本数，n>=5 时再报告 bootstrap 95% CI。每个 run 内报告 P50/P95/P99。
+- 报告所有独立 run 点、run-level median/mean 和不确定性；n=3 时报告范围并标注样本数，n=4 视为未完成集合而不能封图，n>=5 时再报告 bootstrap 95% CI。每个 run 内报告 P50/P95/P99。
 - checkpoint 只用于时间序列，不视为独立重复。
 
 ---
@@ -124,11 +124,13 @@
 
 **数据/workload**：SF10 对 A0--A6 完整执行 typed one-hop、degree-stratified、property-presence；SF30 对 A0/A2/A4/A6 做三类 workload 的代表性复验。由此覆盖每个组件和每种语义，但不把 SF30 全阶梯重复一遍。
 
+`property-presence` 使用与 typed/degree 完全独立的预注册计划：1000 个唯一 source、固定 seed、所有 `edge_type=null`，其中 500 个为 mixed-positive（`0 < property result count < all-edge degree`），500 个为 zero（`property result count = 0` 且 all-edge degree > 0）。这是用于隔离 property-presence pruning 的 balanced diagnostic，不声称代表生产查询的自然正例率；正负两组必须分别报告。SF1 implementation smoke 的 3/1000 positive 计划只证明物化、reopen 与查询路径正确，标记为 `performance_eligible=false`、`formal_plan_eligible=false`，不得复用到正式曲线。
+
 **隔离约束**：A0/A1 必须使用同一 `semantic-budgeted` 物理 store，A0 仅关闭 evidence admission；真正的 naive LSM-CSR 只在端到端 Figure 1 中作为系统基线。A3/A4 的每个独立 run 必须从同一 frozen pristine store 的新 clone 和相同 cache policy 启动，重放完全相同的 training trace，并在 adaptation 发生前具有相同 compaction 前态；A3 关闭 feedback/maintenance 且不执行反馈 compaction，A4 启用 feedback 并执行其决策。因此 A3→A4 只能归因为“feedback-driven adaptation（含其触发的 compaction）”的整体增益，不能声称隔离了纯 feedback priority 或纯 compaction 算法。A4/A5 必须在各自单次 run 的同一 Engine 进程内保留 training 产生的 feedback 状态，再分别执行 global/semantic feedback compaction；feedback 状态不得跨进程假装复用。
 
 **主指标**：latency/QPS、candidates/op、body reads/op、read bytes/op。
 
-**运行/统计粒度**：每个 `stage × repeat` 将无 instrumentation 的正式 latency run 与同输入、同 clean-window sentinel 的 CPU-phase diagnostic run 配对。benchmark entry 先用原始 histogram buckets 和可加总 counter 合并成一个 run-stage 观测，再以三个独立 run 计算 CI；不得把 entry 当作重复、平均 entry P99，或用 instrumented P99 冒充正式 latency。
+**运行/统计粒度**：每个 `stage × repeat` 将无 instrumentation 的正式 latency run 与同输入、同 clean-window sentinel 的 CPU-phase diagnostic run 配对。benchmark entry 先用原始 histogram buckets 和可加总 counter 合并成一个 run-stage 观测，再以独立 run 为统计样本：n=3 报告范围，只有 n>=5 才计算 bootstrap 95% CI；不得把 entry 当作重复、平均 entry P99，或用 instrumented P99 冒充正式 latency。
 
 **代价指标**：CPU/op、metadata lookup/build time、RSS、metadata bytes、L0 files、compaction write amplification。A0--A5 做互斥 CPU phase 分解；A6 的 automatic lifecycle 会引入维护 CPU，只在 closed-loop process-tree 资源数据中报告，不伪装成同一套 query phase。
 
