@@ -4,6 +4,7 @@
 from __future__ import print_function
 
 import ast
+import argparse
 import csv
 import datetime as dt
 import importlib.util
@@ -12,6 +13,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -501,6 +503,84 @@ class GuardEvidenceTests(unittest.TestCase):
             guard_dir = write_guard_fixture(fixture, rows)
             with self.assertRaises(gate.GateError):
                 gate.validate_guard_evidence(guard_dir, fixture.lease, HEAD)
+
+
+class GuardRuntimeBoundaryTests(unittest.TestCase):
+    def test_stop_created_during_scan_gets_a_post_stop_final_sample(self):
+        with tempfile.TemporaryDirectory(prefix="guard-stop-boundary-") as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            repo.mkdir()
+            binary = root / "lsmgraph"
+            binary.write_bytes(b"formal-binary")
+            binary_stat = binary.stat()
+            stop_file = root / "COLLECTOR_STOP"
+            lease_path = root / "batch-lease.json"
+            expected_binary = {
+                "path": str(binary.resolve()),
+                "size_bytes": binary_stat.st_size,
+                "mtime_ns": binary_stat.st_mtime_ns,
+                "sha256": gate.sha256_file(binary),
+            }
+            write_json(
+                lease_path,
+                {
+                    "expires_at_utc": iso(
+                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+                    ),
+                    "identity": {"binary": expected_binary},
+                },
+            )
+            output_dir = root / "guard"
+            args = argparse.Namespace(
+                output_dir=output_dir,
+                lease=lease_path,
+                consumer="P20",
+                repo_root=repo,
+                binary=binary,
+                root_pid=os.getpid(),
+                allowed_pid=[],
+                allowed_container=[],
+                max_gap_seconds=3.0,
+                terminate_pgid_on_failure=False,
+                stop_file=stop_file,
+                interval_seconds=0.001,
+            )
+            calls = []
+            stop_created_at = []
+
+            def fake_git_facts(_repo):
+                calls.append(len(calls) + 1)
+                if len(calls) == 2:
+                    stop_created_at.append(dt.datetime.now(dt.timezone.utc))
+                    stop_file.write_text("stop\n", encoding="utf-8")
+                return {
+                    "root": str(repo.resolve()),
+                    "head": HEAD,
+                    "dirty": False,
+                    "status_lines": [],
+                }
+
+            admission = {
+                "repo_head": HEAD,
+                "lease_sha256": gate.sha256_file(lease_path),
+            }
+            with mock.patch.object(gate, "validate_lease", return_value=admission), mock.patch.object(
+                gate, "git_facts", side_effect=fake_git_facts
+            ), mock.patch.object(gate, "scan_known_interference", return_value=[]):
+                self.assertEqual(gate.run_guard(args), 0)
+
+            status = json.loads((output_dir / "status.json").read_text(encoding="utf-8"))
+            with (output_dir / "integrity-samples.tsv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(status["sample_count"], 3)
+            self.assertGreaterEqual(
+                gate.parse_timestamp(rows[-1]["timestamp_utc"], "final sample"),
+                stop_created_at[0],
+            )
 
 
 class CompatibilityTests(unittest.TestCase):

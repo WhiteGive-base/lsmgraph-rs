@@ -126,6 +126,23 @@ class BatchIntegrityV2Test(unittest.TestCase):
         self.assertEqual(result["state"], "FAILED")
         self.assertTrue(any("boundary coverage" in error for error in errors))
 
+    def test_guard_end_even_62ms_before_command_end_fails_closed(self):
+        self.execution["command_ended_at_utc"] = self.stamp(10.062)
+        errors = []
+        completed = SimpleNamespace(
+            returncode=0, stdout=json.dumps(self.admission()), stderr=""
+        )
+        with mock.patch("validate_resource_run.subprocess.run", return_value=completed):
+            result = validate_batch_integrity_guard(
+                self.root,
+                self.manifest,
+                self.execution,
+                self.collector_ready,
+                errors,
+            )
+        self.assertEqual(result["state"], "FAILED")
+        self.assertTrue(any("boundary coverage" in error for error in errors))
+
     def test_legacy_run_rejects_undeclared_guard_artifacts(self):
         errors = []
         result = validate_batch_integrity_guard(

@@ -1039,6 +1039,13 @@ def run_guard(args: argparse.Namespace) -> int:
         writer.writeheader()
         next_sample = time.monotonic()
         while True:
+            # Latch stop state before the sample begins.  A marker that appears
+            # while git/process checks are in flight must not make this
+            # in-progress row masquerade as post-command coverage.  The next
+            # iteration will observe the marker first, take one final complete
+            # sample, and only then seal the guard.
+            stop_marker_seen = args.stop_file.exists()
+            stop_signal_seen = stop_requested
             now_mono = time.monotonic()
             now_wall = dt.datetime.now(dt.timezone.utc)
             gap = 0.0 if previous_mono is None else now_mono - previous_mono
@@ -1097,8 +1104,8 @@ def run_guard(args: argparse.Namespace) -> int:
                 if args.terminate_pgid_on_failure:
                     _terminate_formal_group(args.root_pid)
                 break
-            if args.stop_file.exists() or stop_requested:
-                if stop_requested and not args.stop_file.exists():
+            if stop_marker_seen or stop_signal_seen:
+                if stop_signal_seen and not stop_marker_seen:
                     errors.append("guard_signal_without_stop_marker")
                 break
             next_sample += args.interval_seconds
