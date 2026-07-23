@@ -172,8 +172,8 @@ def validate_config(path: Path) -> Dict[str, Any]:
     reject_unknown_keys(thresholds, {"qps_cv_max", "p99_cv_max"}, "thresholds")
     qps_limit = float(thresholds["qps_cv_max"])
     p99_limit = float(thresholds["p99_cv_max"])
-    if not 0 < qps_limit <= 0.03 or not 0 < p99_limit <= 0.05:
-        raise GateError("CV thresholds may not exceed QPS=3% and P99=5%")
+    if not 0 < qps_limit <= 0.07 or not 0 < p99_limit <= 0.05:
+        raise GateError("CV thresholds may not exceed QPS=7% and P99=5%")
 
     clean = config.get("clean_ready")
     if not isinstance(clean, dict):

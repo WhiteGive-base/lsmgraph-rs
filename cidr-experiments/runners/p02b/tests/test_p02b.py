@@ -64,6 +64,19 @@ class CvTests(unittest.TestCase):
             self.assertEqual(result["state"], "HOLD")
             self.assertFalse(result["qps"]["pass"])
 
+    def test_cv_accepts_frozen_relaxed_qps7_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self.make_metric(root, 1, 88.10298720951927, 250000.0),
+                self.make_metric(root, 2, 78.8427735960189, 250000.0),
+                self.make_metric(root, 3, 79.92214642677486, 250000.0),
+            ]
+            result = calculate_cv(paths, 3, 0.07, 0.05)
+            self.assertEqual(result["state"], "PASS")
+            self.assertAlmostEqual(result["qps"]["cv"], 0.061534619905452684)
+            self.assertEqual(result["qps"]["maximum_cv"], 0.07)
+
     def test_cv_rejects_duplicate_run_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -110,22 +123,29 @@ class LineageManifestTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_legacy_and_short_v2_configs_are_both_accepted(self) -> None:
+    def test_legacy_short_v2_and_relaxed_v3_configs_are_accepted(self) -> None:
         config_dir = Path(__file__).resolve().parents[1] / "configs"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             validated = []
-            for name in ("sf10-seml0.json", "sf10-seml0-short-gate-v2.json"):
+            for name in (
+                "sf10-seml0.json",
+                "sf10-seml0-short-gate-v2.json",
+                "sf10-seml0-short-gate-v3-relaxed-qps7.json",
+            ):
                 value = json.loads((config_dir / name).read_text(encoding="utf-8"))
                 value["p31"]["data_mount"] = str(root)
                 path = root / name
                 path.write_text(json.dumps(value), encoding="utf-8")
                 validated.append(validate_config(path))
-            legacy, short = validated
+            legacy, short, relaxed = validated
             self.assertNotIn("protocol_version", legacy["clean_ready"])
             self.assertEqual(short["clean_ready"]["protocol_version"], "short-clean-window-v2")
             self.assertEqual(short["clean_ready"]["minimum_consecutive_samples"], 5)
             self.assertEqual(short["clean_ready"]["sample_interval_seconds"], 60)
+            self.assertEqual(relaxed["clean_ready"], short["clean_ready"])
+            self.assertEqual(relaxed["thresholds"]["qps_cv_max"], 0.07)
+            self.assertEqual(relaxed["thresholds"]["p99_cv_max"], 0.05)
 
     def test_short_v2_config_rejects_timing_drift(self) -> None:
         source = Path(__file__).resolve().parents[1] / "configs" / "sf10-seml0-short-gate-v2.json"
@@ -712,6 +732,27 @@ class SentinelResultTests(unittest.TestCase):
             max_age_seconds=3600,
         )
         self.assertEqual(receipt["state"], "PASS")
+
+    def test_relaxed_qps7_ceiling_is_accepted_and_above_it_is_rejected(self) -> None:
+        value = json.loads(self.result_path.read_text(encoding="utf-8"))
+        value["stability"]["qps"]["maximum_cv"] = 0.07
+        self._rewrite_result(value)
+        receipt = validate_result(
+            self.result_path,
+            "P20",
+            False,
+            expected_repo_root=self.repo,
+            expected_repo_head=self.repo_head,
+            expected_binary_sha256=self.binary_sha,
+            max_age_seconds=3600,
+        )
+        self.assertEqual(receipt["state"], "PASS")
+
+        value = json.loads(self.result_path.read_text(encoding="utf-8"))
+        value["stability"]["qps"]["maximum_cv"] = 0.070001
+        self._rewrite_result(value)
+        with self.assertRaises(GateError):
+            validate_result(self.result_path, "P20", False)
 
     def test_short_v2_gap_tamper_is_rejected_after_chain_resign(self) -> None:
         clean_ready = self._install_v2_clean_ready()

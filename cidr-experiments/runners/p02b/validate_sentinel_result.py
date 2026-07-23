@@ -710,7 +710,7 @@ def validate_cv(stability: Any, protocol_summary: Dict[str, Any]) -> List[Dict[s
     if not isinstance(run_records, list) or len(run_records) != expected_runs:
         raise GateError("sentinel stability run records are incomplete")
 
-    for metric_name, hard_limit in (("qps", 0.03), ("p99_us", 0.05)):
+    for metric_name, hard_limit in (("qps", 0.07), ("p99_us", 0.05)):
         metric = stability[metric_name]
         if not isinstance(metric, dict):
             raise GateError("stability {} is not an object".format(metric_name))

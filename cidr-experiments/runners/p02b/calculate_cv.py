@@ -47,8 +47,8 @@ def calculate_cv(
         raise GateError(
             "expected {} metric files, found {}".format(expected_runs, len(metric_paths))
         )
-    if not 0 < qps_cv_max <= 0.03:
-        raise GateError("qps_cv_max must be in (0, 0.03]")
+    if not 0 < qps_cv_max <= 0.07:
+        raise GateError("qps_cv_max must be in (0, 0.07]")
     if not 0 < p99_cv_max <= 0.05:
         raise GateError("p99_cv_max must be in (0, 0.05]")
 

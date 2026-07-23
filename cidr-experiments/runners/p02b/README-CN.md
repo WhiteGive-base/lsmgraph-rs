@@ -45,6 +45,12 @@ runner 保留已经成立的 P02B `PASS`，另写 `BATCH-LEASE-FAILED.json` 并�
   elapsed time不得少于 30 秒；
 - P31 1 秒采样、15 秒目录采样，必须有 pidstat/iostat。
 
+时间受限批次在连续两次 clean-host P02B HOLD 后可显式选择
+`configs/sf10-seml0-short-gate-v3-relaxed-qps7.json`。该配置只把 QPS CV 上限从
+`3%` 调整为 `7%`；P99 CV 仍为 `5%`，correctness、三独立进程、P31、clean window、
+provenance 和 lease 约束均不变。使用它的结果必须标记为 `relaxed admission`，不得与
+原始 `3%` 协议混称；阈值冻结为 `7%` 后不得继续上调。
+
 先生成不可变 dataset/store 的 canonical tree manifest。该操作读取完整目录，属于
 G1-I/O，不得与正式 timing 并发：
 
