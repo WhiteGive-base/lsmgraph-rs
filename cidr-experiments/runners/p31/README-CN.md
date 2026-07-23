@@ -58,6 +58,7 @@ cidr-experiments/runners/p31/run_with_resources.sh \
 - `resource-samples.tsv`：进程树 PID 集合及数量、user/sys CPU 累计量与区间 CPU%、RSS/PSS、`/proc/<pid>/io` 累计量与带宽、host load/memory/swap、`/proc/diskstats` 的 IOPS/带宽/await/util，以及数据挂载点剩余空间。
 - `disk-samples.tsv`：每个扫描轮次下的 store/temp 根目录总大小、文件数、扫描完整性，以及互斥的 payload/metadata/catalog/sidecar/manifest/WAL/temp/other 分项。
 - `iostat-samples.tsv`：从原始 iostat 流规范化的 NVMe IOPS、MiB/s、read/write/combined await、queue 和 util。
+- `iostat` 的 `%util` 原值会保留。由于一秒采样时块层计数器与 sysstat 时间窗口存在量化/读取偏移，`(100%, 101%]` 只产生可审计 warning；超过 `101%` 仍 fail-closed。正式汇总使用同时采集且封顶为 `100%` 的 `/proc/diskstats` utilization。
 - `pidstat.raw` 与 `iostat.raw`：固定 C locale 的独立审计流；pidstat 保留 root task 及其已回收子进程统计，权威的实时进程树聚合值来自 `/proc`。
 - `run-manifest.json`、`execution.json`、`collector-status.json`、`validation.json`：运行身份、命令/采集器状态、哈希和汇总值。
 

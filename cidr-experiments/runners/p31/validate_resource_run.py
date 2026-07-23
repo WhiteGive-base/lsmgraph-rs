@@ -35,6 +35,12 @@ from resource_schema import (
 
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 PROCESS_IDENTITY_SCHEMA_VERSION = "cidr-process-identity-v1"
+# sysstat 12.2 derives %util from a centisecond interval and kernel io_ticks.
+# The latter is millisecond/jiffy-accounted, so a one-second sample can cross
+# the nominal boundary by up to about one percentage point.  Keep raw values,
+# warn inside that narrow observation tolerance, and fail closed above it.
+IOSTAT_UTIL_NOMINAL_MAX_PCT = 100.0
+IOSTAT_UTIL_ROUNDING_TOLERANCE_PCT = 1.0
 
 
 def utc_now() -> str:
@@ -397,7 +403,10 @@ def validate_disk_rows(
 
 
 def validate_iostat_rows(
-    rows: list[dict[str, str]], expected_device: str, errors: list[str]
+    rows: list[dict[str, str]],
+    expected_device: str,
+    errors: list[str],
+    warnings: list[str],
 ) -> None:
     indexes: list[int] = []
     numeric_fields = [
@@ -428,8 +437,19 @@ def validate_iostat_rows(
         if finite_values and min(finite_values) < 0:
             errors.append(f"{context}: iostat counters must be non-negative")
         try:
-            if float(row["util_pct"]) > 100.5:
-                errors.append(f"{context}: util_pct is above 100%")
+            util_pct = float(row["util_pct"])
+            if util_pct > IOSTAT_UTIL_NOMINAL_MAX_PCT + IOSTAT_UTIL_ROUNDING_TOLERANCE_PCT:
+                errors.append(
+                    f"{context}: util_pct exceeds the "
+                    f"{IOSTAT_UTIL_NOMINAL_MAX_PCT + IOSTAT_UTIL_ROUNDING_TOLERANCE_PCT:.1f}% "
+                    "rounding/skew ceiling"
+                )
+            elif util_pct > IOSTAT_UTIL_NOMINAL_MAX_PCT:
+                warnings.append(
+                    f"{context}: util_pct={util_pct:g}% is above the nominal 100% "
+                    "but within the 1.0 percentage-point iostat rounding/skew tolerance; "
+                    "the raw value is preserved"
+                )
         except (KeyError, TypeError, ValueError):
             pass
     if indexes and indexes != list(range(len(rows))):
@@ -1387,7 +1407,7 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
     disk_summary = validate_disk_rows(disks, manifest, errors)
     expected_device = str(manifest.get("collector", {}).get("device", ""))
     expected_mount = str(manifest.get("collector", {}).get("data_mount", ""))
-    validate_iostat_rows(iostat_rows, expected_device, errors)
+    validate_iostat_rows(iostat_rows, expected_device, errors, warnings)
 
     expected_root_pid = execution.get("root_pid")
     for source, actual in (

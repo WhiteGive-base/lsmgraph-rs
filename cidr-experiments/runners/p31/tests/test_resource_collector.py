@@ -33,6 +33,7 @@ from validate_resource_run import (  # noqa: E402
     pidstat_has_pid_sample,
     validate_container_tracking,
     validate_formal_provenance,
+    validate_iostat_rows,
     validate_process_tracking,
 )
 
@@ -105,6 +106,78 @@ nvme1n1 0.00 0.00 0.00 0.00 0.00 0.00 2.00 0.15 37.00 94.87 0.00 78.00 0.00 0.00
 """
         rows = parse_iostat_raw(raw, "nvme1n1")
         self.assertEqual(rows[0]["timestamp_raw"], "07/22/26 00:55:28")
+
+    @staticmethod
+    def iostat_validation_row(util_pct: float) -> dict[str, str]:
+        return {
+            "schema_version": "cidr-resource-v1",
+            "sample_index": "0",
+            "timestamp_raw": "07/23/26 23:54:15",
+            "device": "nvme1n1",
+            "read_iops": "26.0",
+            "write_iops": "14098.0",
+            "read_mib_s": "0.1",
+            "write_mib_s": "3433.78",
+            "read_await_ms": "1.65",
+            "write_await_ms": "1.39",
+            "await_ms": "1.3904786179552533",
+            "aqu_sz": "9.36",
+            "util_pct": str(util_pct),
+        }
+
+    def test_iostat_util_rounding_skew_is_preserved_and_warned(self) -> None:
+        errors: list[str] = []
+        warnings: list[str] = []
+        validate_iostat_rows(
+            [self.iostat_validation_row(100.8)],
+            "nvme1n1",
+            errors,
+            warnings,
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("util_pct=100.8%", warnings[0])
+        self.assertIn("raw value is preserved", warnings[0])
+
+    def test_iostat_util_nominal_ceiling_has_no_warning(self) -> None:
+        errors: list[str] = []
+        warnings: list[str] = []
+        validate_iostat_rows(
+            [self.iostat_validation_row(100.0)],
+            "nvme1n1",
+            errors,
+            warnings,
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(warnings, [])
+
+    def test_iostat_util_rounding_skew_ceiling_is_inclusive(self) -> None:
+        errors: list[str] = []
+        warnings: list[str] = []
+        validate_iostat_rows(
+            [self.iostat_validation_row(101.0)],
+            "nvme1n1",
+            errors,
+            warnings,
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("util_pct=101%", warnings[0])
+
+    def test_iostat_util_above_rounding_skew_ceiling_fails_closed(self) -> None:
+        errors: list[str] = []
+        warnings: list[str] = []
+        validate_iostat_rows(
+            [self.iostat_validation_row(101.01)],
+            "nvme1n1",
+            errors,
+            warnings,
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            errors,
+            ["iostat-samples.tsv row 0: util_pct exceeds the 101.0% rounding/skew ceiling"],
+        )
 
     def test_pidstat_root_sample_parser_handles_12_hour_time(self) -> None:
         raw = """# Time UID PID %usr Command
