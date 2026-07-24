@@ -111,7 +111,6 @@ PAIR_SHARED = (
     "cpuset",
     "host_fingerprint_sha256",
     "git_sha",
-    "feature_switches_json",
     "pre_measurement_json",
     "warmup_runs",
     "training_runs",
@@ -222,6 +221,39 @@ class AggregateError(ValueError):
 def require(condition, message):
     if not condition:
         raise AggregateError(message)
+
+
+def require_paired_feature_switches(latency_raw, cpu_raw):
+    try:
+        latency = json.loads(latency_raw)
+        cpu = json.loads(cpu_raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AggregateError(
+            "paired-mode feature_switches_json is malformed: {}".format(exc)
+        )
+    require(
+        isinstance(latency, dict) and isinstance(cpu, dict),
+        "paired-mode feature_switches_json must contain objects",
+    )
+    require(
+        set(latency) == set(cpu),
+        "paired-mode feature-switch key set drift",
+    )
+    instrumentation = "query_cpu_phase_instrumentation"
+    require(
+        instrumentation in latency,
+        "paired-mode feature switches omit CPU instrumentation",
+    )
+    latency_instrumented = latency.pop(instrumentation)
+    cpu_instrumented = cpu.pop(instrumentation)
+    require(
+        latency_instrumented is False and cpu_instrumented is True,
+        "paired-mode CPU instrumentation polarity drift",
+    )
+    require(
+        latency == cpu,
+        "paired-mode non-instrumentation feature-switch drift",
+    )
 
 
 def sha256_file(path):
@@ -446,6 +478,10 @@ def build_run_rows(collapsed, expected_repeats):
             require(cpu["current_digest_pass"] == "1", "CPU digest gate failed")
             for field in PAIR_SHARED:
                 require(latency[field] == cpu[field], "paired-mode {} drift".format(field))
+            require_paired_feature_switches(
+                latency["feature_switches_json"],
+                cpu["feature_switches_json"],
+            )
             require(
                 latency["measured_operations"] == cpu["measured_operations"],
                 "paired-mode operation coverage drift",

@@ -56,7 +56,13 @@ def collapsed(stage, repeat, mode):
         "cpuset": "0",
         "host_fingerprint_sha256": sha,
         "git_sha": "git",
-        "feature_switches_json": json.dumps({"stage": stage}, sort_keys=True),
+        "feature_switches_json": json.dumps(
+            {
+                "stage": stage,
+                "query_cpu_phase_instrumentation": mode == "cpu-phase",
+            },
+            sort_keys=True,
+        ),
         "pre_measurement_json": json.dumps(precondition(stage), sort_keys=True),
         "warmup_runs": "0",
         "training_runs": "1" if stage in {"A3", "A4"} else "0",
@@ -148,6 +154,36 @@ class Figure2AggregatorTest(unittest.TestCase):
                 and value["mode"] == "cpu-phase"
             )
         ]
+        with self.assertRaises(MODULE.AggregateError):
+            MODULE.build_run_rows(values, 3)
+
+    def test_paired_modes_reject_non_instrumentation_feature_drift(self):
+        values = self.canonical_inputs()
+        target = next(
+            value
+            for value in values
+            if value["stage"] == "A2"
+            and value["repeat_index"] == "1"
+            and value["mode"] == "cpu-phase"
+        )
+        switches = json.loads(target["feature_switches_json"])
+        switches["stage"] = "drift"
+        target["feature_switches_json"] = json.dumps(switches, sort_keys=True)
+        with self.assertRaises(MODULE.AggregateError):
+            MODULE.build_run_rows(values, 3)
+
+    def test_paired_modes_require_expected_instrumentation_polarity(self):
+        values = self.canonical_inputs()
+        target = next(
+            value
+            for value in values
+            if value["stage"] == "A2"
+            and value["repeat_index"] == "1"
+            and value["mode"] == "cpu-phase"
+        )
+        switches = json.loads(target["feature_switches_json"])
+        switches["query_cpu_phase_instrumentation"] = False
+        target["feature_switches_json"] = json.dumps(switches, sort_keys=True)
         with self.assertRaises(MODULE.AggregateError):
             MODULE.build_run_rows(values, 3)
 
