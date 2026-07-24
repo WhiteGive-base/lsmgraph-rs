@@ -61,6 +61,7 @@ class ProcStat:
     utime_ticks: int
     stime_ticks: int
     start_ticks: int
+    state: str = "R"
 
 
 @dataclass
@@ -106,6 +107,7 @@ def parse_proc_stat_text(text: str) -> ProcStat:
         utime_ticks=int(tail[11]),
         stime_ticks=int(tail[12]),
         start_ticks=int(tail[19]),
+        state=tail[0],
     )
 
 
@@ -114,6 +116,12 @@ def read_proc_stat(pid: int) -> ProcStat | None:
         return parse_proc_stat_text(Path(f"/proc/{pid}/stat").read_text(encoding="utf-8"))
     except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, OSError):
         return None
+
+
+def proc_stat_is_live(stat: ProcStat) -> bool:
+    """Return whether /proc reports a process that can still own live resources."""
+
+    return stat.state not in {"Z", "X", "x"}
 
 
 def _read_kib_field(path: Path, key: str) -> int | None:
@@ -147,11 +155,19 @@ def read_proc_io(pid: int) -> tuple[bool, dict[str, int]]:
 
 def read_proc_counters(pid: int) -> ProcCounters | None:
     stat = read_proc_stat(pid)
-    if stat is None:
+    if stat is None or not proc_stat_is_live(stat):
         return None
     rss_value = _read_kib_field(Path(f"/proc/{pid}/status"), "VmRSS")
     pss_value = _read_kib_field(Path(f"/proc/{pid}/smaps_rollup"), "Pss")
     io_ok, io = read_proc_io(pid)
+    if rss_value is None or pss_value is None or not io_ok:
+        confirmed = read_proc_stat(pid)
+        if (
+            confirmed is None
+            or confirmed.start_ticks != stat.start_ticks
+            or not proc_stat_is_live(confirmed)
+        ):
+            return None
     return ProcCounters(
         stat=stat,
         rss_bytes=rss_value or 0,
@@ -899,7 +915,11 @@ def main() -> int:
                 sampled_external_pids = external_pids & sampled_pids
 
                 root_stat = read_proc_stat(args.root_pid)
-                root_alive = int(root_stat is not None and root_stat.start_ticks == root_start_ticks)
+                root_alive = int(
+                    root_stat is not None
+                    and root_stat.start_ticks == root_start_ticks
+                    and proc_stat_is_live(root_stat)
+                )
                 root_seen_alive = root_seen_alive or bool(root_alive)
                 current_device = read_device_counters(args.device)
                 dev_values = device_delta(previous_device, current_device, now - previous_device_mono)

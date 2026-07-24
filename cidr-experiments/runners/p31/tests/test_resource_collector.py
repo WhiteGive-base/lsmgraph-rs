@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +25,9 @@ from resource_collector import (  # noqa: E402
     device_delta,
     parse_iostat_raw,
     parse_proc_stat_text,
+    proc_stat_is_live,
+    read_proc_counters,
+    read_proc_stat,
     record_container_identity,
     resolve_container_identity,
     scan_disk_root,
@@ -49,6 +54,163 @@ class ResourceCollectorUnitTests(unittest.TestCase):
         self.assertEqual(stat.utime_ticks, 11)
         self.assertEqual(stat.stime_ticks, 12)
         self.assertEqual(stat.start_ticks, 19)
+        self.assertEqual(stat.state, "R")
+
+    def test_proc_stat_live_classification_excludes_terminal_states(self) -> None:
+        live = ProcStat(pid=1, ppid=0, pgrp=1, utime_ticks=0, stime_ticks=0, start_ticks=1, state="R")
+        self.assertTrue(proc_stat_is_live(live))
+        for state in ("Z", "X", "x"):
+            with self.subTest(state=state):
+                self.assertFalse(
+                    proc_stat_is_live(
+                        ProcStat(
+                            pid=1,
+                            ppid=0,
+                            pgrp=1,
+                            utime_ticks=0,
+                            stime_ticks=0,
+                            start_ticks=1,
+                            state=state,
+                        )
+                    )
+                )
+
+    def test_proc_counters_excludes_initial_zombie(self) -> None:
+        zombie = ProcStat(
+            pid=42,
+            ppid=1,
+            pgrp=42,
+            utime_ticks=1,
+            stime_ticks=1,
+            start_ticks=100,
+            state="Z",
+        )
+        with patch("resource_collector.read_proc_stat", return_value=zombie), patch(
+            "resource_collector._read_kib_field"
+        ) as read_kib, patch("resource_collector.read_proc_io") as read_io:
+            self.assertIsNone(read_proc_counters(42))
+        read_kib.assert_not_called()
+        read_io.assert_not_called()
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and hasattr(os, "fork"), "Linux /proc test")
+    def test_real_linux_zombie_is_not_a_live_resource_sample(self) -> None:
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            deadline = time.monotonic() + 2.0
+            stat = read_proc_stat(pid)
+            while stat is not None and stat.state != "Z" and time.monotonic() < deadline:
+                time.sleep(0.01)
+                stat = read_proc_stat(pid)
+            self.assertIsNotNone(stat)
+            assert stat is not None
+            self.assertEqual(stat.state, "Z")
+            self.assertIsNone(read_proc_counters(pid))
+        finally:
+            os.waitpid(pid, 0)
+
+    def test_proc_counters_excludes_live_to_zombie_boundary(self) -> None:
+        live = ProcStat(
+            pid=42,
+            ppid=1,
+            pgrp=42,
+            utime_ticks=1,
+            stime_ticks=1,
+            start_ticks=100,
+            state="R",
+        )
+        zombie = ProcStat(
+            pid=42,
+            ppid=1,
+            pgrp=42,
+            utime_ticks=2,
+            stime_ticks=1,
+            start_ticks=100,
+            state="Z",
+        )
+        with patch(
+            "resource_collector.read_proc_stat", side_effect=[live, zombie]
+        ), patch("resource_collector._read_kib_field", return_value=None), patch(
+            "resource_collector.read_proc_io",
+            return_value=(
+                False,
+                {
+                    "read_bytes": 0,
+                    "write_bytes": 0,
+                    "cancelled_write_bytes": 0,
+                    "rchar": 0,
+                    "wchar": 0,
+                },
+            ),
+        ):
+            self.assertIsNone(read_proc_counters(42))
+
+    def test_proc_counters_excludes_disappeared_or_reused_pid_boundary(self) -> None:
+        live = ProcStat(
+            pid=42,
+            ppid=1,
+            pgrp=42,
+            utime_ticks=1,
+            stime_ticks=1,
+            start_ticks=100,
+            state="R",
+        )
+        reused = ProcStat(
+            pid=42,
+            ppid=1,
+            pgrp=42,
+            utime_ticks=0,
+            stime_ticks=0,
+            start_ticks=200,
+            state="R",
+        )
+        empty_io = {
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0,
+            "rchar": 0,
+            "wchar": 0,
+        }
+        for terminal in (None, reused):
+            with self.subTest(terminal=terminal), patch(
+                "resource_collector.read_proc_stat", side_effect=[live, terminal]
+            ), patch("resource_collector._read_kib_field", return_value=None), patch(
+                "resource_collector.read_proc_io", return_value=(False, empty_io)
+            ):
+                self.assertIsNone(read_proc_counters(42))
+
+    def test_proc_counters_preserves_unreadable_live_process(self) -> None:
+        live = ProcStat(
+            pid=42,
+            ppid=1,
+            pgrp=42,
+            utime_ticks=1,
+            stime_ticks=1,
+            start_ticks=100,
+            state="R",
+        )
+        with patch(
+            "resource_collector.read_proc_stat", side_effect=[live, live]
+        ), patch("resource_collector._read_kib_field", return_value=None), patch(
+            "resource_collector.read_proc_io",
+            return_value=(
+                False,
+                {
+                    "read_bytes": 0,
+                    "write_bytes": 0,
+                    "cancelled_write_bytes": 0,
+                    "rchar": 0,
+                    "wchar": 0,
+                },
+            ),
+        ):
+            counters = read_proc_counters(42)
+        self.assertIsNotNone(counters)
+        assert counters is not None
+        self.assertFalse(counters.rss_readable)
+        self.assertFalse(counters.pss_readable)
+        self.assertFalse(counters.io_readable)
 
     def test_store_classification_is_mutually_exclusive(self) -> None:
         examples = {
