@@ -129,6 +129,7 @@ class Fixture:
                 "property_id": "0",
                 "performance_eligible": "false" if query_cpu else "true",
                 "concurrency": "1",
+                "warmup_runs": "1",
                 "host_fingerprint_sha256": self.host_sha,
                 "git_sha": self.git_sha,
                 "feature_switches_json": switches(stage),
@@ -300,6 +301,27 @@ class Figure2FormalNormalizerTests(unittest.TestCase):
             fixture.write_metadata(remove_warmup)
             with self.assertRaisesRegex(MODULE.NormalizeError, "common fields drift"):
                 MODULE.run(fixture.args())
+
+    def test_balanced_property_cohort_is_canonical(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+
+            def property_metadata(value):
+                value["selection"].update(
+                    {
+                        "workload": "property-presence",
+                        "property_predicate_mode": "presence",
+                        "property_id": "5",
+                    }
+                )
+                value["common"]["property_count"] = 100
+                value["property_cohort"] = "balanced_mixed_zero"
+
+            fixture.write_metadata(property_metadata)
+            loaded = MODULE.load_metadata(
+                fixture.metadata, sha256(fixture.run_input)
+            )
+            self.assertEqual(loaded["property_cohort"], "balanced_mixed_zero")
 
     def test_summary_metric_cannot_be_replaced_by_metadata_or_run_tsv(self):
         with tempfile.TemporaryDirectory() as raw:

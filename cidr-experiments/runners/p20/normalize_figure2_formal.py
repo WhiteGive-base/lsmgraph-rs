@@ -33,7 +33,12 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SCALE_RE = re.compile(r"^sf([1-9][0-9]*)$")
 CACHE_STATES = {"cold", "warm", "fixed_budget"}
-PROPERTY_COHORTS = {"mixed_positive", "zero", "not_applicable"}
+PROPERTY_COHORTS = {
+    "mixed_positive",
+    "zero",
+    "balanced_mixed_zero",
+    "not_applicable",
+}
 
 METADATA_TOP_LEVEL = {
     "schema_version",
@@ -73,6 +78,7 @@ SUMMARY_CONSTANTS = (
     "property_id",
     "performance_eligible",
     "concurrency",
+    "warmup_runs",
     "host_fingerprint_sha256",
     "git_sha",
     "feature_switches_json",
@@ -463,6 +469,7 @@ def validate_summary_identity(item, run_row, mode):
         assert_equal(first[field], value, "{} summary {}".format(mode, field))
     expected_eligible = "true" if mode == "latency" else "false"
     assert_equal(first["performance_eligible"], expected_eligible, "{} eligibility".format(mode))
+    assert_equal(first["warmup_runs"], "1", "{} warmup_runs".format(mode))
     require(first["current_digest_pass"] == "1", "{} summary current digest failed".format(mode))
     require(
         integer(first["current_digest_mismatches"], "current_digest_mismatches") == 0,
