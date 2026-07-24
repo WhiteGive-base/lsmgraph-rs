@@ -156,9 +156,53 @@ def main():
     git_sha = subprocess.check_output(
         ["git", "-C", values["--repo-root"][-1], "rev-parse", "HEAD"], text=True
     ).strip()
+    terminal_censor_policy = {
+        "version": "root-only-penultimate-v1",
+        "maximum_censored_samples": 1,
+        "required_shape": "root-only-penultimate-final-empty",
+        "process_cpu_quality": "observed-through-terminal-stat-lower-bound",
+        "process_io_quality": "tail-lower-bound",
+        "peak_rss_pss_quality": "max-readable-samples",
+    }
+    terminal_censored = os.environ.get("P20_FIXTURE_TERMINAL_CENSORED") == "1"
+    resource_quality = {
+        "policy_version": "root-only-penultimate-v1",
+        "classification_reason": (
+            "fixture exact terminal censor"
+            if terminal_censored
+            else "fixture has no unreadable resource samples"
+        ),
+        "terminal_censored": terminal_censored,
+        "terminal_censored_sample_index": 10 if terminal_censored else -1,
+        "process_cpu_tail_lower_bound": terminal_censored,
+        "process_io_tail_lower_bound": terminal_censored,
+        "rss_pss_terminal_sample_censored": terminal_censored,
+        "process_cpu_quality": (
+            "observed-through-terminal-stat-lower-bound"
+            if terminal_censored
+            else "all-samples-readable"
+        ),
+        "process_io_quality": (
+            "tail-lower-bound" if terminal_censored else "all-samples-readable"
+        ),
+        "peak_rss_pss_quality": (
+            "max-readable-samples" if terminal_censored else "all-samples-readable"
+        ),
+    }
+    terminal_censor_receipt = {
+        "schema_version": "cidr-terminal-censor-receipt-v1",
+        "policy_version": "root-only-penultimate-v1",
+        "previous_sample_index": 9,
+        "sample_index": 10,
+        "final_sample_index": 11,
+        "censored_at_utc": "2026-07-24T00:00:10.000Z",
+        "command_ended_at_utc": "2026-07-24T00:00:10.100Z",
+        "final_sample_at_utc": "2026-07-24T00:00:10.250Z",
+    }
     manifest = {
         "schema_version": "cidr-run-manifest-v1",
         "resource_schema_version": "cidr-resource-v1",
+        "terminal_censor_policy": terminal_censor_policy,
         "state": "PASS",
         "task_id": values["--task-id"][-1],
         "run_id": values["--run-id"][-1],
@@ -180,8 +224,10 @@ def main():
                 "peak_pss_bytes": 786432,
                 "peak_device_read_mib_s": 1.25,
                 "peak_device_write_mib_s": 0.5,
+                "terminal_censor_quality": resource_quality,
             },
             "disk": {"peak_store_total_bytes": 8192},
+            "resource_quality": resource_quality,
         },
     }
     validation = {
@@ -189,7 +235,11 @@ def main():
         "state": "PASS",
         "errors": [],
         "warnings": [],
+        "resource_quality": resource_quality,
     }
+    if terminal_censored:
+        manifest["summary"]["terminal_censor_receipt"] = terminal_censor_receipt
+        validation["terminal_censor_receipt"] = terminal_censor_receipt
     atomic_json(run_root / "run-manifest.json", manifest)
     atomic_json(run_root / "validation.json", validation)
     atomic_json(

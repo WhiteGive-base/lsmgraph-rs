@@ -31,6 +31,8 @@ from resource_schema import (
     MANIFEST_SCHEMA_VERSION,
     RESOURCE_COLUMNS,
     RESOURCE_SCHEMA_VERSION,
+    TERMINAL_CENSOR_POLICY,
+    TERMINAL_CENSOR_POLICY_VERSION,
 )
 
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
@@ -41,6 +43,27 @@ PROCESS_IDENTITY_SCHEMA_VERSION = "cidr-process-identity-v1"
 # warn inside that narrow observation tolerance, and fail closed above it.
 IOSTAT_UTIL_NOMINAL_MAX_PCT = 100.0
 IOSTAT_UTIL_ROUNDING_TOLERANCE_PCT = 1.0
+TERMINAL_CENSOR_RECEIPT_SCHEMA_VERSION = "cidr-terminal-censor-receipt-v1"
+TERMINAL_CENSOR_WARNING = (
+    "one penultimate root-only process sample was terminal-censored after exact "
+    "exit-boundary proof; process CPU and process I/O totals are lower bounds"
+)
+TERMINAL_CENSOR_UNREADABLE_FIELDS = (
+    "process_rss_unreadable",
+    "process_pss_unreadable",
+    "process_io_unreadable",
+)
+TERMINAL_CENSOR_INTEGER_CUMULATIVE_FIELDS = (
+    "process_read_bytes",
+    "process_write_bytes",
+    "process_cancelled_write_bytes",
+    "process_rchar",
+    "process_wchar",
+)
+TERMINAL_CENSOR_CPU_CUMULATIVE_FIELDS = (
+    "process_user_cpu_s",
+    "process_sys_cpu_s",
+)
 
 
 def utc_now() -> str:
@@ -152,13 +175,397 @@ def time_weighted_mean(rows: list[dict[str, str]], key: str) -> float:
     return weighted / elapsed_total if elapsed_total else 0.0
 
 
+def _terminal_censor_policy_enabled(manifest: dict[str, Any]) -> bool:
+    return manifest.get("terminal_censor_policy") == TERMINAL_CENSOR_POLICY
+
+
+def _terminal_censor_pid_set(row: dict[str, str]) -> set[int]:
+    raw = row.get("pids")
+    if raw is None:
+        raise ValueError("missing pids")
+    if raw == "":
+        return set()
+    parts = raw.split(",")
+    if any(not value.isdigit() for value in parts):
+        raise ValueError("malformed pids")
+    result = {int(value) for value in parts}
+    if len(result) != len(parts):
+        raise ValueError("duplicate pids")
+    return result
+
+
+def _terminal_censor_int(row: dict[str, str], key: str) -> int:
+    raw = row.get(key)
+    if raw is None:
+        raise ValueError(f"missing {key}")
+    value = int(raw)
+    if str(value) != raw and not (raw.startswith("+") and str(value) == raw[1:]):
+        raise ValueError(f"non-canonical integer {key}")
+    return value
+
+
+def _terminal_censor_float(row: dict[str, str], key: str) -> float:
+    raw = row.get(key)
+    if raw is None:
+        raise ValueError(f"missing {key}")
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite {key}")
+    return value
+
+
+def _terminal_censor_utc(value: object) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError("missing UTC timestamp")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("UTC timestamp lacks timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def classify_terminal_censor_policy(
+    manifest: dict[str, Any],
+    execution: dict[str, Any],
+    collector: dict[str, Any],
+    ready: dict[str, Any],
+    guard_status: dict[str, Any],
+    rows: list[dict[str, str]],
+) -> tuple[dict[str, Any] | None, str]:
+    """Recognize one exact, explicitly enabled root exit-boundary censor.
+
+    The classifier is intentionally independent from the generic row validator:
+    callers may suppress only the three unreadable-counter errors when this
+    function returns a receipt.  Every other validation error remains fatal.
+    """
+
+    def reject(reason: str) -> tuple[None, str]:
+        return None, reason
+
+    if not _terminal_censor_policy_enabled(manifest):
+        return reject("terminal censor policy is not explicitly enabled")
+    if manifest.get("performance_eligible_declared") is not True:
+        return reject("terminal censor policy requires a performance-eligible run")
+
+    collector_config = manifest.get("collector")
+    if not isinstance(collector_config, dict):
+        return reject("manifest collector configuration is malformed")
+    if collector_config.get("containers") != [] or collector_config.get("extra_pids") != []:
+        return reject("terminal censor policy forbids containers and extra PIDs")
+    if collector.get("containers") != [] or collector.get("extra_pids") != []:
+        return reject("collector tracked containers or extra PIDs")
+    try:
+        interval_s = float(collector_config.get("interval_s"))
+    except (TypeError, ValueError):
+        return reject("collector interval is malformed")
+    if not math.isfinite(interval_s) or interval_s <= 0:
+        return reject("collector interval is not positive and finite")
+    if collector.get("interval_s") != collector_config.get("interval_s"):
+        return reject("collector interval differs from the manifest")
+
+    if (
+        execution.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or execution.get("command_exit_code") != 0
+        or execution.get("collector_exit_code") != 0
+        or execution.get("guard_exit_code") != 0
+        or execution.get("wrapper_signal") is not None
+    ):
+        return reject("execution is not a clean command/collector/guard success")
+    if (
+        collector.get("schema_version") != RESOURCE_SCHEMA_VERSION
+        or collector.get("state") != "DONE"
+        or collector.get("errors") != []
+        or collector.get("root_seen_alive") is not True
+        or collector.get("resource_samples") != len(rows)
+    ):
+        return reject("collector status is not a clean, row-complete DONE")
+    if (
+        guard_status.get("schema_version") != "cidr-p31-integrity-guard-v2"
+        or guard_status.get("state") != "PASS"
+        or guard_status.get("errors") != []
+    ):
+        return reject("integrity guard status is not a clean PASS")
+    if len(rows) < 3:
+        return reject("resource sample stream is too short")
+
+    root_pid = execution.get("root_pid")
+    if type(root_pid) is not int or root_pid <= 0:
+        return reject("execution root PID is invalid")
+    if manifest.get("root_pid") != root_pid or collector.get("root_pid") != root_pid:
+        return reject("root PID differs across execution, manifest, and collector")
+
+    try:
+        indexes = [_terminal_censor_int(row, "sample_index") for row in rows]
+        monotonic_values = [
+            _terminal_censor_float(row, "monotonic_s") for row in rows
+        ]
+        utc_values = [_terminal_censor_utc(row.get("timestamp_utc")) for row in rows]
+        unreadable_by_row = [
+            tuple(
+                _terminal_censor_int(row, field)
+                for field in TERMINAL_CENSOR_UNREADABLE_FIELDS
+            )
+            for row in rows
+        ]
+    except (TypeError, ValueError, OverflowError) as exc:
+        return reject(f"resource sample identity/timing fields are malformed: {exc}")
+    if indexes != list(range(len(rows))):
+        return reject("sample indexes are not contiguous from zero")
+    if any(right <= left for left, right in zip(monotonic_values, monotonic_values[1:])):
+        return reject("sample monotonic timestamps are not strictly increasing")
+    if any(right <= left for left, right in zip(utc_values, utc_values[1:])):
+        return reject("sample UTC timestamps are not strictly increasing")
+
+    bad_positions = [
+        index
+        for index, values in enumerate(unreadable_by_row)
+        if any(value != 0 for value in values)
+    ]
+    if bad_positions != [len(rows) - 2]:
+        return reject("unreadable counters are not unique to the penultimate row")
+    bad_position = bad_positions[0]
+    if unreadable_by_row[bad_position] != (1, 1, 1):
+        return reject("penultimate unreadable counters are not the exact RSS/PSS/I/O triple")
+    if any(values != (0, 0, 0) for index, values in enumerate(unreadable_by_row) if index != bad_position):
+        return reject("a non-penultimate row contains an unreadable counter")
+
+    previous = rows[bad_position - 1]
+    bad = rows[bad_position]
+    final = rows[bad_position + 1]
+    expected_root = {root_pid}
+    try:
+        if (
+            _terminal_censor_pid_set(previous) != expected_root
+            or _terminal_censor_int(previous, "process_count") != 1
+            or _terminal_censor_int(previous, "root_alive") != 1
+        ):
+            return reject("row before the censor is not a readable root-only sample")
+        if (
+            _terminal_censor_pid_set(bad) != expected_root
+            or _terminal_censor_int(bad, "process_count") != 1
+            or _terminal_censor_int(bad, "root_alive") != 1
+        ):
+            return reject("censored row is not a live root-only sample")
+        if (
+            _terminal_censor_pid_set(final)
+            or _terminal_censor_int(final, "process_count") != 0
+            or _terminal_censor_int(final, "root_alive") != 0
+        ):
+            return reject("final row is not an empty process-tree sample")
+        if any(row.get("root_pid") != str(root_pid) for row in rows):
+            return reject("resource row root PID differs from execution")
+    except (TypeError, ValueError, OverflowError) as exc:
+        return reject(f"terminal root-only rows are malformed: {exc}")
+
+    identities = collector.get("process_identity_unique_set")
+    exact_identity_keys = {
+        "pid",
+        "ppid",
+        "pgrp",
+        "start_ticks",
+        "first_sample_index",
+        "last_sample_index",
+        "sample_count",
+    }
+    if (
+        collector.get("process_identity_schema_version")
+        != PROCESS_IDENTITY_SCHEMA_VERSION
+        or not isinstance(identities, list)
+        or not 1 <= len(identities) <= 2
+        or any(not isinstance(value, dict) or set(value) != exact_identity_keys for value in identities)
+    ):
+        return reject("process identity set is malformed or has unexpected members")
+    root_identities = [value for value in identities if value.get("pid") == root_pid]
+    if len(root_identities) != 1:
+        return reject("process identity set lacks one exact root")
+    root_identity = root_identities[0]
+    if (
+        any(type(root_identity[key]) is not int for key in exact_identity_keys)
+        or root_identity["pgrp"] != root_pid
+        or root_identity["start_ticks"] <= 0
+        or root_identity["first_sample_index"] != 0
+        or root_identity["last_sample_index"] != bad_position
+        or root_identity["sample_count"] != len(rows) - 1
+    ):
+        return reject("root identity does not exactly cover samples zero through the censor")
+
+    child_identities = [value for value in identities if value is not root_identity]
+    child_pid: int | None = None
+    if child_identities:
+        child = child_identities[0]
+        child_pid = child.get("pid")
+        if (
+            any(type(child[key]) is not int for key in exact_identity_keys)
+            or type(child_pid) is not int
+            or child_pid <= 0
+            or child_pid == root_pid
+            or child["ppid"] != root_pid
+            or child["pgrp"] != root_pid
+            or child["start_ticks"] <= root_identity["start_ticks"]
+            or child["first_sample_index"] != 0
+            or child["last_sample_index"] != 0
+            or child["sample_count"] != 1
+        ):
+            return reject("optional helper is not one direct sample-zero child")
+
+    expected_first_pids = {root_pid}
+    if child_pid is not None:
+        expected_first_pids.add(child_pid)
+    try:
+        for position, row in enumerate(rows):
+            expected_pids = (
+                expected_first_pids
+                if position == 0
+                else expected_root if position <= bad_position else set()
+            )
+            if (
+                _terminal_censor_pid_set(row) != expected_pids
+                or _terminal_censor_int(row, "process_count") != len(expected_pids)
+                or _terminal_censor_int(row, "root_alive")
+                != (0 if position == len(rows) - 1 else 1)
+            ):
+                return reject("resource PID sets are not root-only after the optional sample-zero helper")
+    except (TypeError, ValueError, OverflowError) as exc:
+        return reject(f"resource PID membership is malformed: {exc}")
+
+    if (
+        ready.get("schema_version") != CONTAINER_IDENTITY_SCHEMA_VERSION
+        or ready.get("state") != "READY"
+        or ready.get("root_pid") != root_pid
+        or ready.get("resource_sample_index") != 0
+        or ready.get("external_zero_baseline") is not True
+        or ready.get("containers") != {}
+        or ready.get("extra_pids") != []
+        or ready.get("external_zero_baseline_pids") != []
+        or ready.get("sample_pids") != sorted(expected_first_pids)
+        or collector.get("collector_ready") != ready
+    ):
+        return reject("collector readiness does not exactly bind the sample-zero PID set")
+
+    try:
+        released_at = _terminal_censor_utc(execution.get("command_release_at_utc"))
+        command_ended_at = _terminal_censor_utc(execution.get("command_ended_at_utc"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        return reject(f"command release/end timestamps are malformed: {exc}")
+    bad_at = utc_values[bad_position]
+    final_at = utc_values[-1]
+    if not released_at < bad_at <= command_ended_at <= final_at:
+        return reject("release/censor/command-end/final timestamps are not ordered")
+    if child_pid is not None and not utc_values[0] <= released_at < utc_values[1]:
+        return reject("optional helper was not confined to the pre-release sample")
+    bad_to_end_s = (command_ended_at - bad_at).total_seconds()
+    end_to_final_s = (final_at - command_ended_at).total_seconds()
+    if bad_to_end_s > interval_s:
+        return reject("command ended more than one collector interval after the censor")
+    if end_to_final_s > 2.0 * interval_s:
+        return reject("final empty row arrived more than two intervals after command end")
+    if monotonic_values[-1] - monotonic_values[bad_position] > 3.0 * interval_s:
+        return reject("terminal monotonic gap exceeds three collector intervals")
+    if monotonic_values[bad_position] - monotonic_values[bad_position - 1] > 2.0 * interval_s:
+        return reject("pre-censor monotonic gap exceeds two collector intervals")
+
+    try:
+        if (
+            _terminal_censor_int(bad, "process_rss_bytes") != 0
+            or _terminal_censor_int(bad, "process_pss_bytes") != 0
+            or _terminal_censor_int(final, "process_rss_bytes") != 0
+            or _terminal_censor_int(final, "process_pss_bytes") != 0
+            or _terminal_censor_int(previous, "process_rss_bytes") <= 0
+            or _terminal_censor_int(previous, "process_pss_bytes") <= 0
+        ):
+            return reject("RSS/PSS boundary values do not prove one terminal censor")
+        for field in TERMINAL_CENSOR_INTEGER_CUMULATIVE_FIELDS:
+            previous_value = _terminal_censor_int(previous, field)
+            bad_value = _terminal_censor_int(bad, field)
+            final_value = _terminal_censor_int(final, field)
+            if bad_value != previous_value or final_value != bad_value:
+                return reject(f"cumulative {field} changed across the censored boundary")
+        for field in TERMINAL_CENSOR_CPU_CUMULATIVE_FIELDS:
+            previous_value = _terminal_censor_float(previous, field)
+            bad_value = _terminal_censor_float(bad, field)
+            final_value = _terminal_censor_float(final, field)
+            if bad_value < previous_value or final_value != bad_value:
+                return reject(f"cumulative {field} is inconsistent across the censored boundary")
+    except (TypeError, ValueError, OverflowError) as exc:
+        return reject(f"terminal cumulative fields are malformed: {exc}")
+
+    receipt = {
+        "schema_version": TERMINAL_CENSOR_RECEIPT_SCHEMA_VERSION,
+        "policy_version": TERMINAL_CENSOR_POLICY_VERSION,
+        "sample_index": bad_position,
+        "root_pid": root_pid,
+        "root_start_ticks": root_identity["start_ticks"],
+        "censored_fields": list(TERMINAL_CENSOR_UNREADABLE_FIELDS),
+        "previous_sample_index": bad_position - 1,
+        "final_sample_index": len(rows) - 1,
+        "censored_at_utc": bad.get("timestamp_utc"),
+        "command_ended_at_utc": execution.get("command_ended_at_utc"),
+        "final_sample_at_utc": final.get("timestamp_utc"),
+        "collector_interval_s": interval_s,
+        "bad_to_command_end_s": bad_to_end_s,
+        "command_end_to_final_s": end_to_final_s,
+        "process_cpu_tail_lower_bound": True,
+        "process_io_tail_lower_bound": True,
+        "rss_pss_terminal_sample_censored": True,
+    }
+    return receipt, "accepted exact root-only penultimate terminal censor"
+
+
+def build_terminal_censor_quality(
+    manifest: dict[str, Any],
+    receipt: dict[str, Any] | None,
+    classification_reason: str,
+) -> dict[str, Any]:
+    censored = receipt is not None
+    return {
+        "policy_version": (
+            TERMINAL_CENSOR_POLICY_VERSION
+            if _terminal_censor_policy_enabled(manifest)
+            else ""
+        ),
+        "classification_reason": classification_reason,
+        "terminal_censored": censored,
+        "terminal_censored_sample_index": (
+            receipt["sample_index"] if receipt is not None else -1
+        ),
+        "process_cpu_tail_lower_bound": censored,
+        "process_io_tail_lower_bound": censored,
+        "rss_pss_terminal_sample_censored": censored,
+        "process_cpu_quality": (
+            TERMINAL_CENSOR_POLICY["process_cpu_quality"]
+            if censored
+            else "all-samples-readable"
+        ),
+        "process_io_quality": (
+            TERMINAL_CENSOR_POLICY["process_io_quality"]
+            if censored
+            else "all-samples-readable"
+        ),
+        "peak_rss_pss_quality": (
+            TERMINAL_CENSOR_POLICY["peak_rss_pss_quality"]
+            if censored
+            else "all-samples-readable"
+        ),
+    }
+
+
 def validate_resource_rows(
     rows: list[dict[str, str]],
     min_samples: int,
     strict: bool,
     errors: list[str],
     warnings: list[str],
+    terminal_censor_receipt: dict[str, Any] | None = None,
 ) -> None:
+    terminal_censor_applies = (
+        isinstance(terminal_censor_receipt, dict)
+        and terminal_censor_receipt.get("schema_version")
+        == TERMINAL_CENSOR_RECEIPT_SCHEMA_VERSION
+        and terminal_censor_receipt.get("policy_version")
+        == TERMINAL_CENSOR_POLICY_VERSION
+        and terminal_censor_receipt.get("sample_index") == len(rows) - 2
+        and terminal_censor_receipt.get("censored_fields")
+        == list(TERMINAL_CENSOR_UNREADABLE_FIELDS)
+    )
     if len(rows) < min_samples:
         errors.append(f"resource-samples.tsv: {len(rows)} rows < min_samples={min_samples}")
         return
@@ -276,10 +683,12 @@ def validate_resource_rows(
     ):
         if max_number(rows, field) > 0:
             message = f"one or more {description} samples were unreadable; aggregate is a lower bound"
-            if strict:
+            if strict and not terminal_censor_applies:
                 errors.append(message)
-            else:
+            elif not strict:
                 warnings.append(message)
+    if strict and terminal_censor_applies:
+        warnings.append(TERMINAL_CENSOR_WARNING)
     device_fields = [
         "device_read_iops",
         "device_write_iops",
@@ -1397,12 +1806,29 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
     resources = read_tsv(run_dir / "resource-samples.tsv", RESOURCE_COLUMNS, errors)
     disks = read_tsv(run_dir / "disk-samples.tsv", DISK_COLUMNS, errors)
     iostat_rows = read_tsv(run_dir / "iostat-samples.tsv", IOSTAT_COLUMNS, errors)
+    terminal_censor_guard_status: dict[str, Any] = {}
+    if (
+        _terminal_censor_policy_enabled(manifest)
+        and manifest.get("performance_eligible_declared") is True
+    ):
+        terminal_censor_guard_status = read_json(
+            run_dir / "integrity-guard" / "status.json", errors
+        )
+    terminal_censor_receipt, terminal_censor_reason = classify_terminal_censor_policy(
+        manifest,
+        execution,
+        collector,
+        ready,
+        terminal_censor_guard_status,
+        resources,
+    )
     validate_resource_rows(
         resources,
         min_samples,
         bool(manifest.get("performance_eligible_declared")),
         errors,
         warnings,
+        terminal_censor_receipt,
     )
     disk_summary = validate_disk_rows(disks, manifest, errors)
     expected_device = str(manifest.get("collector", {}).get("device", ""))
@@ -1496,6 +1922,9 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
         run_dir, manifest, execution, ready, errors
     )
 
+    terminal_censor_quality = build_terminal_censor_quality(
+        manifest, terminal_censor_receipt, terminal_censor_reason
+    )
     resource_summary = {
         "samples": len(resources),
         "sampled_duration_s": max_number(resources, "monotonic_s"),
@@ -1524,6 +1953,7 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
         "max_host_load1": max_number(resources, "host_load1"),
         "min_host_mem_available_bytes": int(min_number(resources, "host_mem_available_bytes")),
         "min_data_free_bytes": int(min_number(resources, "data_free_bytes")),
+        "terminal_censor_quality": terminal_censor_quality,
     }
     artifacts: dict[str, Any] = {}
     for name in ARTIFACT_FILES:
@@ -1559,16 +1989,25 @@ def validate_run(run_dir: Path, min_samples_override: int | None = None) -> tupl
         "errors": errors,
         "warnings": warnings,
         "resource_summary": resource_summary,
+        "resource_quality": terminal_censor_quality,
         "disk_summary": disk_summary,
         "iostat_samples": len(iostat_rows),
     }
+    if terminal_censor_receipt is not None:
+        validation["terminal_censor_receipt"] = terminal_censor_receipt
     if integrity_guard is not None:
         integrity_guard["state"] = "PASS" if not errors else "FAILED"
         validation["integrity_guard"] = integrity_guard
     atomic_json(run_dir / "validation.json", validation)
     manifest["state"] = "PASS" if passed else "FAILED_VALIDATION"
     manifest["artifacts"] = artifacts
-    manifest["summary"] = {"resources": resource_summary, "disk": disk_summary}
+    manifest["summary"] = {
+        "resources": resource_summary,
+        "disk": disk_summary,
+        "resource_quality": terminal_censor_quality,
+    }
+    if terminal_censor_receipt is not None:
+        manifest["summary"]["terminal_censor_receipt"] = terminal_censor_receipt
     if integrity_guard is not None:
         manifest["summary"]["integrity_guard"] = integrity_guard
     manifest["validation"] = validation

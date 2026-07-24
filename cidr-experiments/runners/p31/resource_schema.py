@@ -5,6 +5,15 @@ from __future__ import annotations
 
 RESOURCE_SCHEMA_VERSION = "cidr-resource-v1"
 MANIFEST_SCHEMA_VERSION = "cidr-run-manifest-v1"
+TERMINAL_CENSOR_POLICY_VERSION = "root-only-penultimate-v1"
+TERMINAL_CENSOR_POLICY = {
+    "version": TERMINAL_CENSOR_POLICY_VERSION,
+    "maximum_censored_samples": 1,
+    "required_shape": "root-only-penultimate-final-empty",
+    "process_cpu_quality": "observed-through-terminal-stat-lower-bound",
+    "process_io_quality": "tail-lower-bound",
+    "peak_rss_pss_quality": "max-readable-samples",
+}
 CONTAINER_IDENTITY_SCHEMA_VERSION = "cidr-container-identity-v2"
 
 RESOURCE_COLUMNS = [

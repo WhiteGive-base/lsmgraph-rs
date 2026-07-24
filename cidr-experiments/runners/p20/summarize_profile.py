@@ -19,6 +19,16 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{16}$")
 P31_MANIFEST_SCHEMA = "cidr-run-manifest-v1"
 P31_RESOURCE_SCHEMA = "cidr-resource-v1"
+P31_TERMINAL_CENSOR_POLICY_VERSION = "root-only-penultimate-v1"
+P31_TERMINAL_CENSOR_POLICY = {
+    "version": P31_TERMINAL_CENSOR_POLICY_VERSION,
+    "maximum_censored_samples": 1,
+    "required_shape": "root-only-penultimate-final-empty",
+    "process_cpu_quality": "observed-through-terminal-stat-lower-bound",
+    "process_io_quality": "tail-lower-bound",
+    "peak_rss_pss_quality": "max-readable-samples",
+}
+P31_TERMINAL_CENSOR_RECEIPT_SCHEMA = "cidr-terminal-censor-receipt-v1"
 CANONICAL_STAGES = {
     "sf10": ["A0", "A1", "A2", "A3", "A4", "A5", "A6"],
     "sf30": ["A0", "A2", "A4", "A6"],
@@ -86,6 +96,20 @@ SUMMARY_COLUMNS = [
     "process_write_bytes_total",
     "peak_rss_bytes",
     "peak_pss_bytes",
+    "terminal_censor_policy_version",
+    "terminal_censored",
+    "terminal_censored_previous_sample_index",
+    "terminal_censored_sample_index",
+    "terminal_censored_final_sample_index",
+    "terminal_censored_at_utc",
+    "terminal_censored_command_ended_at_utc",
+    "terminal_censored_final_sample_at_utc",
+    "process_cpu_quality",
+    "process_io_quality",
+    "peak_rss_pss_quality",
+    "process_cpu_tail_lower_bound",
+    "process_io_tail_lower_bound",
+    "rss_pss_terminal_sample_censored",
     "peak_store_total_bytes",
     "peak_device_read_mib_s",
     "peak_device_write_mib_s",
@@ -361,6 +385,10 @@ def validate_p31(run_root, command, inputs, invocation):
         manifest.get("resource_schema_version") == P31_RESOURCE_SCHEMA,
         "P31 resource schema drift",
     )
+    require(
+        manifest.get("terminal_censor_policy") == P31_TERMINAL_CENSOR_POLICY,
+        "P31 terminal-censor policy drift",
+    )
     require(validation.get("schema_version") == P31_MANIFEST_SCHEMA, "P31 validation schema drift")
     require(done.get("state") == "PASS", "P31 DONE state is not PASS")
     require(validation.get("state") == "PASS", "P31 validation state is not PASS")
@@ -492,8 +520,81 @@ def validate_p31(run_root, command, inputs, invocation):
         "peak_pss_bytes",
         "peak_device_read_mib_s",
         "peak_device_write_mib_s",
+        "terminal_censor_quality",
     }
     require(required_resources <= set(resources), "P31 resource summary is incomplete")
+    quality = resources.get("terminal_censor_quality")
+    require(isinstance(quality, dict), "P31 terminal-censor quality is missing")
+    require(
+        quality == validation.get("resource_quality")
+        and quality == manifest.get("summary", {}).get("resource_quality"),
+        "P31 terminal-censor quality binding drift",
+    )
+    require(
+        quality.get("policy_version") == P31_TERMINAL_CENSOR_POLICY_VERSION,
+        "P31 terminal-censor quality policy drift",
+    )
+    censored = quality.get("terminal_censored")
+    require(type(censored) is bool, "P31 terminal-censored marker is not Boolean")
+    expected_quality_keys = {
+        "policy_version",
+        "classification_reason",
+        "terminal_censored",
+        "terminal_censored_sample_index",
+        "process_cpu_tail_lower_bound",
+        "process_io_tail_lower_bound",
+        "rss_pss_terminal_sample_censored",
+        "process_cpu_quality",
+        "process_io_quality",
+        "peak_rss_pss_quality",
+    }
+    require(
+        set(quality) == expected_quality_keys,
+        "P31 terminal-censor quality schema drift",
+    )
+    receipt = manifest.get("summary", {}).get("terminal_censor_receipt")
+    require(
+        validation.get("terminal_censor_receipt") == receipt,
+        "P31 terminal-censor receipt binding drift",
+    )
+    if censored:
+        require(
+            isinstance(receipt, dict)
+            and receipt.get("schema_version")
+            == P31_TERMINAL_CENSOR_RECEIPT_SCHEMA
+            and receipt.get("policy_version")
+            == P31_TERMINAL_CENSOR_POLICY_VERSION,
+            "P31 terminal-censor receipt is missing or invalid",
+        )
+        require(
+            quality.get("terminal_censored_sample_index")
+            == receipt.get("sample_index"),
+            "P31 terminal-censor sample identity drift",
+        )
+        require(
+            quality.get("process_cpu_quality")
+            == P31_TERMINAL_CENSOR_POLICY["process_cpu_quality"]
+            and quality.get("process_io_quality")
+            == P31_TERMINAL_CENSOR_POLICY["process_io_quality"]
+            and quality.get("peak_rss_pss_quality")
+            == P31_TERMINAL_CENSOR_POLICY["peak_rss_pss_quality"]
+            and quality.get("process_cpu_tail_lower_bound") is True
+            and quality.get("process_io_tail_lower_bound") is True
+            and quality.get("rss_pss_terminal_sample_censored") is True,
+            "P31 censored resource quality is not an explicit lower bound",
+        )
+    else:
+        require(receipt is None, "uncensored P31 run contains a censor receipt")
+        require(
+            quality.get("terminal_censored_sample_index") == -1
+            and quality.get("process_cpu_tail_lower_bound") is False
+            and quality.get("process_io_tail_lower_bound") is False
+            and quality.get("rss_pss_terminal_sample_censored") is False
+            and quality.get("process_cpu_quality") == "all-samples-readable"
+            and quality.get("process_io_quality") == "all-samples-readable"
+            and quality.get("peak_rss_pss_quality") == "all-samples-readable",
+            "P31 uncensored resource quality is malformed",
+        )
     require("peak_store_total_bytes" in disk, "P31 disk summary is incomplete")
     return {
         "root": p31_root,
@@ -1145,6 +1246,12 @@ def build_rows(run_root):
     cache_after = compact_json(raw["cache_state_after"])
     resources = p31["resources"]
     disk = p31["disk"]
+    resource_quality = resources["terminal_censor_quality"]
+    terminal_censor_receipt = p31["manifest"].get("summary", {}).get(
+        "terminal_censor_receipt"
+    )
+    if terminal_censor_receipt is None:
+        terminal_censor_receipt = {}
     process_cpu_total_ns = int(
         round(
             (number(resources["process_user_cpu_s"], "P31 user CPU") + number(resources["process_sys_cpu_s"], "P31 sys CPU"))
@@ -1152,7 +1259,7 @@ def build_rows(run_root):
         )
     )
     common = {
-        "summary_schema_version": 1,
+        "summary_schema_version": 2,
         "experiment_id": resolved.get("experiment_id"),
         "task_id": command.get("task_id"),
         "run_id": command.get("run_id"),
@@ -1176,6 +1283,40 @@ def build_rows(run_root):
         "process_write_bytes_total": int(number(resources["process_write_bytes"], "P31 process write bytes")),
         "peak_rss_bytes": int(number(resources["peak_rss_bytes"], "P31 RSS")),
         "peak_pss_bytes": int(number(resources["peak_pss_bytes"], "P31 PSS")),
+        "terminal_censor_policy_version": resource_quality["policy_version"],
+        "terminal_censored": str(
+            bool(resource_quality["terminal_censored"])
+        ).lower(),
+        "terminal_censored_previous_sample_index": terminal_censor_receipt.get(
+            "previous_sample_index", -1
+        ),
+        "terminal_censored_sample_index": resource_quality[
+            "terminal_censored_sample_index"
+        ],
+        "terminal_censored_final_sample_index": terminal_censor_receipt.get(
+            "final_sample_index", -1
+        ),
+        "terminal_censored_at_utc": terminal_censor_receipt.get(
+            "censored_at_utc", ""
+        ),
+        "terminal_censored_command_ended_at_utc": terminal_censor_receipt.get(
+            "command_ended_at_utc", ""
+        ),
+        "terminal_censored_final_sample_at_utc": terminal_censor_receipt.get(
+            "final_sample_at_utc", ""
+        ),
+        "process_cpu_quality": resource_quality["process_cpu_quality"],
+        "process_io_quality": resource_quality["process_io_quality"],
+        "peak_rss_pss_quality": resource_quality["peak_rss_pss_quality"],
+        "process_cpu_tail_lower_bound": str(
+            bool(resource_quality["process_cpu_tail_lower_bound"])
+        ).lower(),
+        "process_io_tail_lower_bound": str(
+            bool(resource_quality["process_io_tail_lower_bound"])
+        ).lower(),
+        "rss_pss_terminal_sample_censored": str(
+            bool(resource_quality["rss_pss_terminal_sample_censored"])
+        ).lower(),
         "peak_store_total_bytes": int(number(disk["peak_store_total_bytes"], "P31 store bytes")),
         "peak_device_read_mib_s": number(resources["peak_device_read_mib_s"], "P31 device read rate"),
         "peak_device_write_mib_s": number(resources["peak_device_write_mib_s"], "P31 device write rate"),

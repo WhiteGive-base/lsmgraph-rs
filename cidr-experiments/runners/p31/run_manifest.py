@@ -15,7 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from resource_schema import MANIFEST_SCHEMA_VERSION, RESOURCE_SCHEMA_VERSION
+from resource_schema import (
+    MANIFEST_SCHEMA_VERSION,
+    RESOURCE_SCHEMA_VERSION,
+    TERMINAL_CENSOR_POLICY,
+)
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -278,6 +282,7 @@ def create_manifest(args: argparse.Namespace) -> int:
         "task_id": args.task_id,
         "state": "PREPARED",
         "performance_eligible_declared": args.performance_eligible == "true",
+        "terminal_censor_policy": dict(TERMINAL_CENSOR_POLICY),
         "created_at_utc": utc_now(),
         "started_at_utc": None,
         "ended_at_utc": None,

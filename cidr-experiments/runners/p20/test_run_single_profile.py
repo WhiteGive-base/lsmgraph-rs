@@ -805,6 +805,16 @@ class SingleProfileRunnerTest(unittest.TestCase):
         self.assertEqual(rows[0]["current_digest_pass"], "1")
         self.assertEqual(rows[0]["repeat_index"], "1")
         self.assertEqual(rows[0]["performance_eligible"], "false")
+        self.assertEqual(rows[0]["summary_schema_version"], "2")
+        self.assertEqual(
+            rows[0]["terminal_censor_policy_version"],
+            "root-only-penultimate-v1",
+        )
+        self.assertEqual(rows[0]["terminal_censored"], "false")
+        self.assertEqual(rows[0]["terminal_censored_sample_index"], "-1")
+        self.assertEqual(rows[0]["process_cpu_quality"], "all-samples-readable")
+        self.assertEqual(rows[0]["process_io_quality"], "all-samples-readable")
+        self.assertEqual(rows[0]["peak_rss_pss_quality"], "all-samples-readable")
         command = json.loads((self.output / "command.json").read_text(encoding="utf-8"))
         self.assertEqual(command["invocation_kind"], "argv-no-shell")
         self.assertEqual(command["p31_argv"][command["p31_argv"].index("--") + 1 :], command["benchmark_argv"])
@@ -815,6 +825,29 @@ class SingleProfileRunnerTest(unittest.TestCase):
         self.assertEqual((self.stage / "store.bin").read_bytes(), b"immutable-pristine\n")
         (self.stage / "store.bin").write_bytes(b"stage-mutated\n")
         self.assertEqual((self.pristine / "store.bin").read_bytes(), b"immutable-pristine\n")
+
+    def test_terminal_censor_quality_is_preserved_in_fixed_summary(self):
+        environment = os.environ.copy()
+        environment["P20_FIXTURE_TERMINAL_CENSORED"] = "1"
+        result = self.invoke(env=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (self.output / "summary.tsv").open(
+            "r", encoding="utf-8", newline=""
+        ) as handle:
+            row = next(csv.DictReader(handle, delimiter="\t"))
+        self.assertEqual(row["terminal_censored"], "true")
+        self.assertEqual(row["terminal_censored_previous_sample_index"], "9")
+        self.assertEqual(row["terminal_censored_sample_index"], "10")
+        self.assertEqual(row["terminal_censored_final_sample_index"], "11")
+        self.assertEqual(
+            row["process_cpu_quality"],
+            "observed-through-terminal-stat-lower-bound",
+        )
+        self.assertEqual(row["process_io_quality"], "tail-lower-bound")
+        self.assertEqual(row["peak_rss_pss_quality"], "max-readable-samples")
+        self.assertEqual(row["process_cpu_tail_lower_bound"], "true")
+        self.assertEqual(row["process_io_tail_lower_bound"], "true")
+        self.assertEqual(row["rss_pss_terminal_sample_censored"], "true")
 
     @unittest.skipUnless(os.environ.get("P20_REAL_P31_WRAPPER"), "real P31 fixture smoke not requested")
     def test_real_p31_wrapper_with_sleeping_fixture_only(self):
