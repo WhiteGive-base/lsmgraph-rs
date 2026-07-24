@@ -187,6 +187,68 @@ class Figure2AggregatorTest(unittest.TestCase):
         with self.assertRaises(MODULE.AggregateError):
             MODULE.build_run_rows(values, 3)
 
+    def test_v2_pair_accepts_distinct_per_run_guard_evidence(self):
+        values = self.canonical_inputs()
+        for index, value in enumerate(values):
+            value["admission_protocol"] = "short-clean-window-v2"
+            for field in (
+                "p02b_sentinel_result_sha256",
+                "p02b_pass_marker_sha256",
+                "p02b_provenance_sha256",
+                "p02b_validator_sha256",
+                "p02b_admission_sha256",
+            ):
+                value[field] = ""
+            value["batch_lease_sha256"] = "d" * 64
+            value["batch_gate_tool_sha256"] = "e" * 64
+            for offset, field in enumerate(
+                (
+                    "batch_lease_admission_sha256",
+                    "batch_lease_pre_p31_sha256",
+                    "p31_integrity_guard_status_sha256",
+                    "p31_integrity_guard_samples_sha256",
+                    "p31_integrity_guard_ready_sha256",
+                    "p31_command_release_sha256",
+                )
+            ):
+                value[field] = "{:064x}".format(index * 10 + offset + 1)
+        run_rows = MODULE.build_run_rows(values, 3)
+        self.assertEqual(len(run_rows), 21)
+
+    def test_v2_pair_rejects_different_batch_lease(self):
+        values = self.canonical_inputs()
+        for value in values:
+            value["admission_protocol"] = "short-clean-window-v2"
+            for field in (
+                "p02b_sentinel_result_sha256",
+                "p02b_pass_marker_sha256",
+                "p02b_provenance_sha256",
+                "p02b_validator_sha256",
+                "p02b_admission_sha256",
+            ):
+                value[field] = ""
+            for field in (
+                "batch_lease_sha256",
+                "batch_gate_tool_sha256",
+                "batch_lease_admission_sha256",
+                "batch_lease_pre_p31_sha256",
+                "p31_integrity_guard_status_sha256",
+                "p31_integrity_guard_samples_sha256",
+                "p31_integrity_guard_ready_sha256",
+                "p31_command_release_sha256",
+            ):
+                value[field] = "d" * 64
+        target = next(
+            value
+            for value in values
+            if value["stage"] == "A2"
+            and value["repeat_index"] == "1"
+            and value["mode"] == "cpu-phase"
+        )
+        target["batch_lease_sha256"] = "f" * 64
+        with self.assertRaises(MODULE.AggregateError):
+            MODULE.build_run_rows(values, 3)
+
     def test_entry_histograms_are_merged_before_run_p99(self):
         base = {field: "x" for field in MODULE.RUN_CONSTANTS}
         base.update(

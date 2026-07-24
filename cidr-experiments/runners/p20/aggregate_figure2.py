@@ -131,15 +131,8 @@ PAIR_SHARED = (
     "p02b_pass_marker_sha256",
     "p02b_provenance_sha256",
     "p02b_validator_sha256",
-    "p02b_admission_sha256",
     "batch_lease_sha256",
     "batch_gate_tool_sha256",
-    "batch_lease_admission_sha256",
-    "batch_lease_pre_p31_sha256",
-    "p31_integrity_guard_status_sha256",
-    "p31_integrity_guard_samples_sha256",
-    "p31_integrity_guard_ready_sha256",
-    "p31_command_release_sha256",
 )
 RUN_COLUMNS = [
     "figure2_schema_version",
