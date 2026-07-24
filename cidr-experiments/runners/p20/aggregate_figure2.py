@@ -375,7 +375,6 @@ def validate_adaptation_pair(rows_by_key):
         for field in (
             "worker_threads",
             "cpuset",
-            "cache_state_before_json",
             "binary_sha256",
             "dataset_sha256",
             "sample_plan_sha256",

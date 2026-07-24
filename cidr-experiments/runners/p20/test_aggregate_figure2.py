@@ -67,8 +67,12 @@ def collapsed(stage, repeat, mode):
         "warmup_runs": "0",
         "training_runs": "1" if stage in {"A3", "A4"} else "0",
         "training_feedback_compactions": "1" if stage == "A4" else "0",
-        "cache_state_before_json": "{}",
-        "cache_state_after_json": "{}",
+        "cache_state_before_json": json.dumps(
+            {"run": "{}-{}-{}".format(stage, repeat, mode)}
+        ),
+        "cache_state_after_json": json.dumps(
+            {"run": "{}-{}-{}-after".format(stage, repeat, mode)}
+        ),
         "binary_sha256": sha,
         "dataset_sha256": "b" * 64,
         "sample_plan_sha256": "c" * 64,
