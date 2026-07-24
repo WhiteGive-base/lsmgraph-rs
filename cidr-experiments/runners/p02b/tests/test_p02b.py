@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
-import statistics
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from build_lineage_manifest import build_tree_manifest
-from calculate_cv import calculate_cv
+from calculate_stability import OVERFLOW_BOUND_US, calculate_stability
+from extract_run_metrics import extract_run_metrics
 from p02b_common import GateError, sha256_file
 from run_sf10_sentinel import validate_config, validate_lineage_manifest
 from validate_clean_ready import validate_clean_ready
@@ -19,77 +21,217 @@ from validate_sentinel_result import validate_result
 import run_sf10_sentinel as sentinel_runner
 
 
-class CvTests(unittest.TestCase):
-    def make_metric(self, root: Path, index: int, qps: float, p99: float) -> Path:
+class StabilityTests(unittest.TestCase):
+    BOUNDS = [100, 150000, 250000, 500000, OVERFLOW_BOUND_US]
+
+    def make_metric(
+        self,
+        root: Path,
+        index: int,
+        qps: float,
+        tail_gt_150: int = 170,
+        tail_gt_250: int = 160,
+        overflow: int = 0,
+        mean_us: int = 1000,
+    ) -> Path:
+        count = 17000
+        self.assertGreaterEqual(tail_gt_150, tail_gt_250)
+        self.assertGreaterEqual(tail_gt_250, overflow)
+        counts = [
+            count - tail_gt_150 - 1,
+            1,
+            tail_gt_150 - tail_gt_250,
+            tail_gt_250 - overflow,
+            overflow,
+        ]
+        rank = 16830
+        cumulative = 0
+        p99_upper = None
+        for bound, bucket_count in zip(self.BOUNDS, counts):
+            cumulative += bucket_count
+            if cumulative >= rank:
+                p99_upper = float(bound)
+                break
+        self.assertIsNotNone(p99_upper)
+        boundary_sha = hashlib.sha256(
+            json.dumps(self.BOUNDS, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
         path = root / "r{}-metrics.json".format(index)
         path.write_text(
             json.dumps(
                 {
-                    "schema_version": "p02b-sentinel-run-metrics-v1",
+                    "schema_version": "p02b-sentinel-run-metrics-v2",
                     "state": "PASS",
                     "run_index": index,
                     "run_id": "fixture-r{}".format(index),
-                    "query_count": 60,
+                    "query_count": count,
                     "qps": qps,
-                    "p99_us": p99,
-                    "measured_seconds": 1.0,
+                    "p99_upper_bound_us": p99_upper,
+                    "measured_seconds": count / qps,
+                    "histogram": {
+                        "bounds_us": self.BOUNDS,
+                        "counts": counts,
+                        "boundary_sha256": boundary_sha,
+                        "count": count,
+                        "sum_us": count * mean_us,
+                        "mean_us": float(mean_us),
+                        "max_us": 400000,
+                        "overflow_count": overflow,
+                    },
                 }
             ),
             encoding="utf-8",
         )
         return path
 
-    def test_cv_passes_with_stable_independent_runs(self) -> None:
+    @staticmethod
+    def calculate(paths: list[Path], qps_cv: float = 0.07, mean_cv: float = 0.07) -> dict:
+        return calculate_stability(
+            paths, 3, qps_cv, mean_cv, 99, 100, 150000, 250000, 3, True
+        )
+
+    def test_quantized_p99_jump_is_diagnostic_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = [
-                self.make_metric(root, 1, 100.0, 1000.0),
-                self.make_metric(root, 2, 101.0, 1005.0),
-                self.make_metric(root, 3, 99.5, 995.0),
+                self.make_metric(root, 1, 100.0, 170),
+                self.make_metric(root, 2, 101.0, 170),
+                self.make_metric(root, 3, 99.5, 196),
             ]
-            result = calculate_cv(paths, 3, 0.03, 0.05)
+            result = self.calculate(paths)
             self.assertEqual(result["state"], "PASS")
             self.assertTrue(result["qps"]["pass"])
-            self.assertTrue(result["p99_us"]["pass"])
+            self.assertGreater(result["p99_upper_bound_us"]["cv"], 0.30)
+            self.assertEqual(
+                result["p99_upper_bound_us"]["admission_role"], "diagnostic_only"
+            )
+            self.assertEqual(
+                result["derived_budgets"]["within_run_jitter_budget_count"], 39
+            )
+            self.assertEqual(
+                result["derived_budgets"]["cross_run_range_budget_count"], 56
+            )
 
-    def test_cv_holds_when_qps_is_unstable(self) -> None:
+    def test_stability_holds_when_qps_is_unstable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = [
-                self.make_metric(root, 1, 100.0, 1000.0),
-                self.make_metric(root, 2, 120.0, 1000.0),
-                self.make_metric(root, 3, 80.0, 1000.0),
+                self.make_metric(root, 1, 100.0),
+                self.make_metric(root, 2, 120.0),
+                self.make_metric(root, 3, 80.0),
             ]
-            result = calculate_cv(paths, 3, 0.03, 0.05)
+            result = self.calculate(paths, qps_cv=0.03)
             self.assertEqual(result["state"], "HOLD")
             self.assertFalse(result["qps"]["pass"])
 
-    def test_cv_accepts_frozen_relaxed_qps7_boundary(self) -> None:
+    def test_stability_holds_when_mean_storage_latency_is_unstable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = [
-                self.make_metric(root, 1, 88.10298720951927, 250000.0),
-                self.make_metric(root, 2, 78.8427735960189, 250000.0),
-                self.make_metric(root, 3, 79.92214642677486, 250000.0),
+                self.make_metric(root, 1, 100.0, mean_us=1000),
+                self.make_metric(root, 2, 100.0, mean_us=1200),
+                self.make_metric(root, 3, 100.0, mean_us=800),
             ]
-            result = calculate_cv(paths, 3, 0.07, 0.05)
-            self.assertEqual(result["state"], "PASS")
-            self.assertAlmostEqual(result["qps"]["cv"], 0.061534619905452684)
-            self.assertEqual(result["qps"]["maximum_cv"], 0.07)
+            result = self.calculate(paths, mean_cv=0.03)
+            self.assertEqual(result["state"], "HOLD")
+            self.assertFalse(result["mean_storage_latency_us"]["pass"])
 
-    def test_cv_rejects_duplicate_run_identity(self) -> None:
+    def test_tail_hard_limits_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = [
-                self.make_metric(root, 1, 100.0, 1000.0),
-                self.make_metric(root, 2, 100.0, 1000.0),
-                self.make_metric(root, 3, 100.0, 1000.0),
+                self.make_metric(root, 1, 100.0, 170, 160),
+                self.make_metric(root, 2, 100.0, 170, 160),
+                self.make_metric(root, 3, 100.0, 171, 171),
+            ]
+            result = self.calculate(paths)
+            self.assertEqual(result["state"], "HOLD")
+            self.assertFalse(result["tail"]["upper_boundary"]["pass"])
+
+            paths[2] = self.make_metric(root, 3, 100.0, 210, 160)
+            result = self.calculate(paths)
+            self.assertEqual(result["state"], "HOLD")
+            self.assertFalse(result["tail"]["lower_boundary"]["pass"])
+
+    def test_cross_run_range_budget_is_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self.make_metric(root, 1, 100.0, 152, 100),
+                self.make_metric(root, 2, 100.0, 152, 100),
+                self.make_metric(root, 3, 100.0, 209, 100),
+            ]
+            result = self.calculate(paths)
+            self.assertEqual(result["tail"]["lower_boundary"]["range_count"], 57)
+            self.assertFalse(result["tail"]["lower_boundary"]["pass"])
+
+            paths = [
+                self.make_metric(root, 1, 100.0, 209, 100),
+                self.make_metric(root, 2, 100.0, 209, 100),
+                self.make_metric(root, 3, 100.0, 209, 157),
+            ]
+            result = self.calculate(paths)
+            self.assertTrue(result["tail"]["lower_boundary"]["pass"])
+            self.assertEqual(result["tail"]["upper_boundary"]["range_count"], 57)
+            self.assertFalse(result["tail"]["upper_boundary"]["pass"])
+
+    def test_overflow_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self.make_metric(root, 1, 100.0),
+                self.make_metric(root, 2, 100.0),
+                self.make_metric(root, 3, 100.0, overflow=1),
+            ]
+            self.assertEqual(self.calculate(paths)["state"], "HOLD")
+
+    def test_stability_rejects_duplicate_run_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self.make_metric(root, 1, 100.0),
+                self.make_metric(root, 2, 100.0),
+                self.make_metric(root, 3, 100.0),
             ]
             value = json.loads(paths[2].read_text(encoding="utf-8"))
             value["run_id"] = "fixture-r2"
             paths[2].write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaises(GateError):
-                calculate_cv(paths, 3, 0.03, 0.05)
+                self.calculate(paths)
+
+    def test_stability_rejects_malformed_histogram_and_schema(self) -> None:
+        mutations = (
+            ("missing histogram", lambda value: value.pop("histogram")),
+            (
+                "count mismatch",
+                lambda value: value["histogram"].__setitem__("count", 16999),
+            ),
+            (
+                "boundary SHA mismatch",
+                lambda value: value["histogram"].__setitem__(
+                    "boundary_sha256", "0" * 64
+                ),
+            ),
+            (
+                "schema mismatch",
+                lambda value: value.__setitem__(
+                    "schema_version", "p02b-sentinel-run-metrics-v1"
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                paths = [
+                    self.make_metric(root, 1, 100.0),
+                    self.make_metric(root, 2, 100.0),
+                    self.make_metric(root, 3, 100.0),
+                ]
+                value = json.loads(paths[1].read_text(encoding="utf-8"))
+                mutate(value)
+                paths[1].write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaises(GateError):
+                    self.calculate(paths)
 
 
 class LineageManifestTests(unittest.TestCase):
@@ -123,32 +265,42 @@ class LineageManifestTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_legacy_short_v2_and_relaxed_v3_configs_are_accepted(self) -> None:
+    def test_quantization_aware_v4_config_is_accepted_and_legacy_is_rejected(self) -> None:
         config_dir = Path(__file__).resolve().parents[1] / "configs"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            validated = []
-            for name in (
-                "sf10-seml0.json",
-                "sf10-seml0-short-gate-v2.json",
-                "sf10-seml0-short-gate-v3-relaxed-qps7.json",
-            ):
-                value = json.loads((config_dir / name).read_text(encoding="utf-8"))
-                value["p31"]["data_mount"] = str(root)
-                path = root / name
-                path.write_text(json.dumps(value), encoding="utf-8")
-                validated.append(validate_config(path))
-            legacy, short, relaxed = validated
-            self.assertNotIn("protocol_version", legacy["clean_ready"])
-            self.assertEqual(short["clean_ready"]["protocol_version"], "short-clean-window-v2")
-            self.assertEqual(short["clean_ready"]["minimum_consecutive_samples"], 5)
-            self.assertEqual(short["clean_ready"]["sample_interval_seconds"], 60)
-            self.assertEqual(relaxed["clean_ready"], short["clean_ready"])
-            self.assertEqual(relaxed["thresholds"]["qps_cv_max"], 0.07)
-            self.assertEqual(relaxed["thresholds"]["p99_cv_max"], 0.05)
+            source = config_dir / "sf10-seml0-short-gate-v4-quantization-aware.json"
+            value = json.loads(source.read_text(encoding="utf-8"))
+            value["p31"]["data_mount"] = str(root)
+            path = root / "v4.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            validated = validate_config(path)
+            self.assertEqual(
+                validated["clean_ready"]["protocol_version"], "short-clean-window-v2"
+            )
+            self.assertEqual(validated["thresholds"]["qps_cv_max"], 0.07)
+            self.assertEqual(validated["thresholds"]["mean_storage_latency_cv_max"], 0.07)
+            self.assertEqual(validated["thresholds"]["quantile_numerator"], 99)
+            self.assertEqual(validated["thresholds"]["lower_tail_bound_us"], 150000)
+            self.assertEqual(validated["thresholds"]["upper_tail_bound_us"], 250000)
+
+            legacy = json.loads(
+                (config_dir / "sf10-seml0-short-gate-v3-relaxed-qps7.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            legacy["p31"]["data_mount"] = str(root)
+            legacy_path = root / "legacy-v3.json"
+            legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+            with self.assertRaises(GateError):
+                validate_config(legacy_path)
 
     def test_short_v2_config_rejects_timing_drift(self) -> None:
-        source = Path(__file__).resolve().parents[1] / "configs" / "sf10-seml0-short-gate-v2.json"
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "sf10-seml0-short-gate-v4-quantization-aware.json"
+        )
         value = json.loads(source.read_text(encoding="utf-8"))
         value["clean_ready"]["sample_interval_seconds"] = 30
         with tempfile.TemporaryDirectory() as temporary:
@@ -362,7 +514,23 @@ class SentinelResultTests(unittest.TestCase):
         config = self.root / "config.json"
         p31_wrapper = self.root / "p31-wrapper.sh"
         truth.write_text("fixture truth\n", encoding="utf-8")
-        query_plan.write_text('{"plan":1}\n', encoding="utf-8")
+        self.write_json(
+            query_plan,
+            {
+                "version": 1,
+                "source": "shared-truth-tsv",
+                "semantic_degree_hint": True,
+                "force_signature": False,
+                "entries": [
+                    {
+                        "edge_type": "knows",
+                        "samples": [
+                            {"src": source, "degree": 1} for source in range(6)
+                        ],
+                    }
+                ],
+            },
+        )
         config.write_text('{"fixture":true}\n', encoding="utf-8")
         p31_wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
@@ -441,42 +609,86 @@ class SentinelResultTests(unittest.TestCase):
                 "require_aux_tools": True,
             },
         }
-        qps_values = [100.0, 101.0, 99.0]
-        p99_values = [1000.0, 1005.0, 995.0]
-        stability_runs = []
+        elapsed_values = [1000, 995, 1005]
+        histogram_bounds = [100, 150000, 250000, 500000, OVERFLOW_BOUND_US]
+        histogram_counts = [6, 0, 0, 0, 0]
+        metric_paths = []
         repeats = []
-        for index, (qps, p99) in enumerate(zip(qps_values, p99_values), start=1):
-            run_id = "fixture-r{}".format(index)
+        sentinel_run_id = self.run_dir.name
+        for index, elapsed_ms in enumerate(elapsed_values, start=1):
+            run_id = "{}-r{}".format(sentinel_run_id, index)
             repeat_root = self.run_dir / "repeats" / "r{}".format(index)
             p31_root = repeat_root / "p31"
             p31_root.mkdir(parents=True)
-            metric_path = repeat_root / "run-metrics.json"
-            metric_value = {
-                "schema_version": "p02b-sentinel-run-metrics-v1",
-                "state": "PASS",
-                "run_index": index,
-                "run_id": run_id,
-                "query_count": 6,
-                "qps": qps,
-                "p99_us": p99,
-                "measured_seconds": 1.0,
-            }
-            self.write_json(metric_path, metric_value)
-            stability_runs.append(
+            command_stdout_path = p31_root / "command.stdout.log"
+            self.write_json(
+                command_stdout_path,
                 {
-                    "path": str(metric_path),
-                    "sha256": sha256_file(metric_path),
-                    "run_index": index,
-                    "run_id": run_id,
-                    "query_count": 6,
-                    "qps": qps,
-                    "p99_us": p99,
-                    "measured_seconds": 1.0,
-                }
+                    "sample_plan_in": str(query_plan.resolve()),
+                    "sample_plan_version": 1,
+                    "warmup_runs": 1,
+                    "repeats": 1,
+                    "cache_state_before": {"fixture": "as-is"},
+                    "cache_state_after": {"fixture": "warm"},
+                    "benchmarks": [
+                        {
+                            "edge_type": "knows",
+                            "warmup_runs": 1,
+                            "repeats": 1,
+                            "warmup_rounds": [{"kind": "warmup", "round": 1}],
+                            "rounds": [
+                                {
+                                    "kind": "measured",
+                                    "round": 1,
+                                    "get_neighbors_elapsed_ms": elapsed_ms,
+                                    "neighbor_metrics": {
+                                        "storage": {
+                                            "get_neighbors_ops": 6,
+                                            "get_neighbors_latency": {
+                                                "buckets": [
+                                                    {
+                                                        "upper_bound_us": bound,
+                                                        "count": count,
+                                                    }
+                                                    for bound, count in zip(
+                                                        histogram_bounds,
+                                                        histogram_counts,
+                                                    )
+                                                ],
+                                                "count": 6,
+                                                "sum_us": 450,
+                                                "max_us": 90,
+                                            },
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
             )
+            metric_path = repeat_root / "run-metrics.json"
+            metric_value = extract_run_metrics(
+                command_stdout_path,
+                query_plan,
+                index,
+                run_id,
+                6,
+                1,
+                1,
+                0.1,
+            )
+            self.write_json(metric_path, metric_value)
+            metric_paths.append(metric_path)
             manifest_path = p31_root / "run-manifest.json"
             validation_path = p31_root / "validation.json"
             done_path = p31_root / "DONE"
+            validation_value = {
+                "schema_version": "cidr-run-manifest-v1",
+                "state": "PASS",
+                "errors": [],
+                "warnings": [],
+            }
             self.write_json(
                 manifest_path,
                 {
@@ -488,9 +700,13 @@ class SentinelResultTests(unittest.TestCase):
                     "performance_eligible_declared": False,
                     "repo": {"git_sha": self.repo_head, "dirty": False},
                     "host": self.host,
+                    "collector": {"require_aux_tools": True},
+                    "disk_roots": [{"role": "store", "path": str(store.resolve())}],
+                    "inputs": {},
+                    "validation": validation_value,
                 },
             )
-            self.write_json(validation_path, {"state": "PASS"})
+            self.write_json(validation_path, validation_value)
             self.write_json(
                 done_path,
                 {
@@ -509,33 +725,25 @@ class SentinelResultTests(unittest.TestCase):
                         "manifest": self.file_ref(manifest_path),
                         "validation": self.file_ref(validation_path),
                         "done": self.file_ref(done_path),
+                        "command_stdout": self.file_ref(command_stdout_path),
                     },
                 }
             )
 
-        def cv_metric(values: list, maximum: float) -> dict:
-            mean = statistics.mean(values)
-            stdev = statistics.stdev(values)
-            cv = stdev / mean
-            return {
-                "values": values,
-                "mean": mean,
-                "sample_stdev": stdev,
-                "cv": cv,
-                "maximum_cv": maximum,
-                "pass": True,
-            }
-
-        stability = {
-            "schema_version": "p02b-sentinel-cv-v1",
-            "state": "PASS",
-            "method": "sample_standard_deviation_over_arithmetic_mean",
-            "independent_process_runs": 3,
-            "query_count_per_run": 6,
-            "qps": cv_metric(qps_values, 0.03),
-            "p99_us": cv_metric(p99_values, 0.05),
-            "runs": stability_runs,
-        }
+        stability = calculate_stability(
+            metric_paths,
+            3,
+            0.07,
+            0.07,
+            99,
+            100,
+            150000,
+            250000,
+            3,
+            True,
+        )
+        stability_path = self.run_dir / "stability-result.json"
+        self.write_json(stability_path, stability)
         files = {
             "binary": self.file_ref(self.binary),
             "truth": self.file_ref(truth, queries=6),
@@ -593,8 +801,11 @@ class SentinelResultTests(unittest.TestCase):
         self.provenance_path = self.run_dir / "provenance.json"
         self.write_json(self.provenance_path, provenance_value)
         self.result_path = self.run_dir / "sentinel-result.json"
+        gate_contract = sentinel_runner.build_gate_contract(
+            stability["policy"], stability_path
+        )
         result_value = {
-            "schema_version": "p02b-sf10-sentinel-result-v1",
+            "schema_version": "p02b-sf10-sentinel-result-v2",
             "state": "PASS",
             "fixture_only": True,
             "performance_eligible": False,
@@ -603,10 +814,11 @@ class SentinelResultTests(unittest.TestCase):
             "consumers": ["P10", "P20"],
             "task_id": "P02B-SF10-SENTINEL",
             "scale": "sf10",
-            "run_id": "fixture-sentinel",
+            "run_id": sentinel_run_id,
             "started_at_utc": now,
             "completed_at_utc": now,
             "clean_ready": clean_ready,
+            "gate_contract": gate_contract,
             "protocol": protocol,
             "provenance": {
                 "path": str(self.provenance_path),
@@ -650,6 +862,23 @@ class SentinelResultTests(unittest.TestCase):
     def _rewrite_result(self, value: dict) -> None:
         self.write_json(self.result_path, value)
         self._resign_marker()
+
+    def _rebuild_metric_chain(self, value: dict) -> None:
+        metric_paths = [
+            Path(repeat["metrics"]["path"]).resolve() for repeat in value["repeats"]
+        ]
+        stability = calculate_stability(
+            metric_paths, 3, 0.07, 0.07, 99, 100, 150000, 250000, 3, True
+        )
+        stability_path = self.run_dir / "stability-result.json"
+        self.write_json(stability_path, stability)
+        value["stability"] = stability
+        for repeat, metric_path in zip(value["repeats"], metric_paths):
+            repeat["metrics"] = self.file_ref(metric_path)
+        value["gate_contract"] = sentinel_runner.build_gate_contract(
+            stability["policy"], stability_path
+        )
+        self._rewrite_result(value)
 
     def _install_v2_clean_ready(self) -> dict:
         artifact_names = (
@@ -733,10 +962,7 @@ class SentinelResultTests(unittest.TestCase):
         )
         self.assertEqual(receipt["state"], "PASS")
 
-    def test_relaxed_qps7_ceiling_is_accepted_and_above_it_is_rejected(self) -> None:
-        value = json.loads(self.result_path.read_text(encoding="utf-8"))
-        value["stability"]["qps"]["maximum_cv"] = 0.07
-        self._rewrite_result(value)
+    def test_quantization_gate_contract_is_returned_and_tamper_is_rejected(self) -> None:
         receipt = validate_result(
             self.result_path,
             "P20",
@@ -747,10 +973,120 @@ class SentinelResultTests(unittest.TestCase):
             max_age_seconds=3600,
         )
         self.assertEqual(receipt["state"], "PASS")
+        self.assertEqual(
+            receipt["gate_contract"]["method"], "quantization-aware-tail-v1"
+        )
+        self.assertEqual(receipt["gate_contract"]["qps_cv_max"], 0.07)
 
         value = json.loads(self.result_path.read_text(encoding="utf-8"))
-        value["stability"]["qps"]["maximum_cv"] = 0.070001
+        value["gate_contract"]["qps_cv_max"] = 0.070001
+        unsigned = dict(value["gate_contract"])
+        unsigned.pop("contract_sha256")
+        value["gate_contract"]["contract_sha256"] = sentinel_runner.canonical_sha256(
+            unsigned
+        )
         self._rewrite_result(value)
+        with self.assertRaises(GateError):
+            validate_result(self.result_path, "P20", False)
+
+    def test_gate_contract_exact_key_drift_is_rejected(self) -> None:
+        value = json.loads(self.result_path.read_text(encoding="utf-8"))
+        value["gate_contract"]["method_id"] = value["gate_contract"].pop("method")
+        unsigned = dict(value["gate_contract"])
+        unsigned.pop("contract_sha256")
+        value["gate_contract"]["contract_sha256"] = sentinel_runner.canonical_sha256(
+            unsigned
+        )
+        self._rewrite_result(value)
+        with self.assertRaises(GateError):
+            validate_result(self.result_path, "P20", False)
+
+    def test_gate_contract_tool_sha_drift_is_rejected(self) -> None:
+        value = json.loads(self.result_path.read_text(encoding="utf-8"))
+        value["gate_contract"]["tools"]["calculate_stability"]["sha256"] = "0" * 64
+        unsigned = dict(value["gate_contract"])
+        unsigned.pop("contract_sha256")
+        value["gate_contract"]["contract_sha256"] = sentinel_runner.canonical_sha256(
+            unsigned
+        )
+        self._rewrite_result(value)
+        with self.assertRaises(GateError):
+            validate_result(self.result_path, "P20", False)
+
+    def test_bench_json_must_bind_exact_p31_command_stdout(self) -> None:
+        value = json.loads(self.result_path.read_text(encoding="utf-8"))
+        metric_paths = [
+            Path(repeat["metrics"]["path"]).resolve() for repeat in value["repeats"]
+        ]
+        metric = json.loads(metric_paths[0].read_text(encoding="utf-8"))
+        decoy = metric_paths[0].parent / "decoy-command.stdout.log"
+        source_stdout = Path(metric["bench_json"]["path"])
+        decoy.write_bytes(source_stdout.read_bytes())
+        metric["bench_json"]["path"] = str(decoy.resolve())
+        self.write_json(metric_paths[0], metric)
+
+        self._rebuild_metric_chain(value)
+        with self.assertRaises(GateError):
+            validate_result(self.result_path, "P20", False)
+
+    def test_metric_numeric_tamper_is_rejected_after_full_chain_resign(self) -> None:
+        value = json.loads(self.result_path.read_text(encoding="utf-8"))
+        metric_path = Path(value["repeats"][0]["metrics"]["path"])
+        metric = json.loads(metric_path.read_text(encoding="utf-8"))
+        original_bench_ref = dict(metric["bench_json"])
+        metric["qps"] *= 1.001
+        self.write_json(metric_path, metric)
+        self._rebuild_metric_chain(value)
+        resigned_metric = json.loads(metric_path.read_text(encoding="utf-8"))
+        self.assertEqual(resigned_metric["bench_json"], original_bench_ref)
+        with self.assertRaises(GateError):
+            validate_result(self.result_path, "P20", False)
+
+    def test_foreign_copied_p31_repeat_is_rejected(self) -> None:
+        value = json.loads(self.result_path.read_text(encoding="utf-8"))
+        source = Path(value["repeats"][0]["p31"]["run_dir"])
+        foreign = self.root / "legacy-copied-p31"
+        shutil.copytree(source, foreign)
+        value["repeats"][0]["p31"] = {
+            "run_dir": str(foreign.resolve()),
+            "manifest": self.file_ref(foreign / "run-manifest.json"),
+            "validation": self.file_ref(foreign / "validation.json"),
+            "done": self.file_ref(foreign / "DONE"),
+            "command_stdout": self.file_ref(foreign / "command.stdout.log"),
+        }
+        self._rewrite_result(value)
+        with self.assertRaises(GateError):
+            validate_result(self.result_path, "P20", False)
+
+    def test_p31_warning_is_rejected_after_evidence_resign(self) -> None:
+        value = json.loads(self.result_path.read_text(encoding="utf-8"))
+        p31 = value["repeats"][0]["p31"]
+        manifest_path = Path(p31["manifest"]["path"])
+        validation_path = Path(p31["validation"]["path"])
+        done_path = Path(p31["done"]["path"])
+        validation = json.loads(validation_path.read_text(encoding="utf-8"))
+        validation["warnings"] = ["fixture warning"]
+        self.write_json(validation_path, validation)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["validation"] = validation
+        self.write_json(manifest_path, manifest)
+        done = json.loads(done_path.read_text(encoding="utf-8"))
+        done["manifest_sha256"] = sha256_file(manifest_path)
+        done["validation_sha256"] = sha256_file(validation_path)
+        self.write_json(done_path, done)
+        p31["manifest"] = self.file_ref(manifest_path)
+        p31["validation"] = self.file_ref(validation_path)
+        p31["done"] = self.file_ref(done_path)
+        self._rewrite_result(value)
+        with self.assertRaises(GateError):
+            sentinel_runner.validate_p31_run(
+                Path(p31["run_dir"]),
+                "P02B-SF10-SENTINEL-r1",
+                self.repo_head,
+                self.root / "store",
+                {},
+                True,
+            )
         with self.assertRaises(GateError):
             validate_result(self.result_path, "P20", False)
 
@@ -796,7 +1132,7 @@ class SentinelResultTests(unittest.TestCase):
 
     def test_duplicate_json_key_is_rejected_even_after_marker_resign(self) -> None:
         text = self.result_path.read_text(encoding="utf-8")
-        needle = '  "schema_version": "p02b-sf10-sentinel-result-v1",\n'
+        needle = '  "schema_version": "p02b-sf10-sentinel-result-v2",\n'
         self.result_path.write_text(text.replace(needle, needle + needle, 1), encoding="utf-8")
         self._resign_marker()
         with self.assertRaises(GateError):

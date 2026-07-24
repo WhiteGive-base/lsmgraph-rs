@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -20,6 +21,59 @@ def now():
 
 def atomic_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def host_identity():
+    def command_output(command):
+        try:
+            return (
+                True,
+                subprocess.check_output(
+                    command,
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                ).strip(),
+            )
+        except (subprocess.SubprocessError, OSError):
+            return False, ""
+
+    cpu_model = ""
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("model name"):
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    mem_total = 0
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                mem_total = int(line.split()[1]) * 1024
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    pidstat_ok, pidstat_version = command_output(["pidstat", "-V"])
+    iostat_ok, iostat_version = command_output(["iostat", "-V"])
+    facts = {
+        "hostname": platform.node(),
+        "kernel": platform.release(),
+        "machine": platform.machine(),
+        "cpu_model": cpu_model,
+        "logical_cpu_count": os.cpu_count(),
+        "mem_total_bytes": mem_total,
+        "pidstat_version_command_ok": pidstat_ok,
+        "pidstat_version": pidstat_version,
+        "iostat_version_command_ok": iostat_ok,
+        "iostat_version": iostat_version,
+    }
+    return {
+        "hostname": facts["hostname"],
+        "fingerprint_sha256": hashlib.sha256(
+            json.dumps(facts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def main():
@@ -111,7 +165,7 @@ def main():
         "ended_at_utc": now(),
         "performance_eligible_declared": values["--performance-eligible"][-1] == "true",
         "repo": {"root": values["--repo-root"][-1], "git_sha": git_sha, "dirty": False},
-        "host": {"hostname": platform.node(), "fingerprint_sha256": "f" * 64},
+        "host": host_identity(),
         "collector": {"require_aux_tools": True},
         "disk_roots": stores,
         "inputs": inputs,

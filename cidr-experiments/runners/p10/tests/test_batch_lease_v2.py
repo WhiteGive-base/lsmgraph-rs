@@ -15,6 +15,15 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def file_ref(path):
+    path = Path(path).resolve()
+    return {
+        "path": str(path),
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+    }
+
+
 class BatchLeaseV2Test(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -22,9 +31,69 @@ class BatchLeaseV2Test(unittest.TestCase):
         self.lease = self.root / "lease.json"
         self.gate = self.root / "batch_gate_v2.py"
         self.binary = self.root / "binary"
-        self.lease.write_text("{}\n", encoding="utf-8")
         self.gate.write_text("# fixture\n", encoding="utf-8")
         self.binary.write_text("binary\n", encoding="utf-8")
+        p02b_root = self.root / "p02b"
+        p02b_root.mkdir()
+        run_root = p02b_root / "P02B-fixture"
+        run_root.mkdir()
+        validator = p02b_root / "validate_sentinel_result.py"
+        extractor = p02b_root / "extract_run_metrics.py"
+        calculator = p02b_root / "calculate_stability.py"
+        for path in (validator, extractor, calculator):
+            path.write_text("# fixture\n", encoding="utf-8")
+        stability = {
+            "schema_version": "p02b-sentinel-stability-v2",
+            "state": "PASS",
+            "method": "quantization-aware-tail-v1",
+        }
+        stability_path = run_root / "stability-result.json"
+        write_json(stability_path, stability)
+        unsigned_contract = {
+            "schema_version": "p02b-gate-contract-v1",
+            "method": "quantization-aware-tail-v1",
+            "quantile": {"numerator": 99, "denominator": 100},
+            "tail_bounds_us": {"lower": 150000, "upper": 250000},
+            "sigma_multiplier": 3,
+            "qps_cv_max": 0.07,
+            "mean_storage_latency_cv_max": 0.07,
+            "require_zero_overflow": True,
+            "stability_result": file_ref(stability_path),
+            "tools": {
+                "extract_run_metrics": file_ref(extractor),
+                "calculate_stability": file_ref(calculator),
+                "validate_sentinel_result": file_ref(validator),
+            },
+        }
+        self.gate_contract = {
+            **unsigned_contract,
+            "contract_sha256": run_suite._canonical_json_sha256(unsigned_contract),
+        }
+        result_path = run_root / "sentinel-result.json"
+        write_json(
+            result_path,
+            {
+                "schema_version": "p02b-sf10-sentinel-result-v2",
+                "state": "PASS",
+                "fixture_only": False,
+                "formal_gate_eligible": True,
+                "downstream_release_eligible": True,
+                "gate_contract": self.gate_contract,
+                "stability": stability,
+            },
+        )
+        write_json(
+            self.lease,
+            {
+                "schema_version": "cidr-batch-lease-v2",
+                "p02b": {
+                    "result": file_ref(result_path),
+                    "validator": file_ref(validator),
+                    "gate_contract": self.gate_contract,
+                    "gate_contract_sha256": self.gate_contract["contract_sha256"],
+                },
+            },
+        )
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -42,6 +111,8 @@ class BatchLeaseV2Test(unittest.TestCase):
             "expires_at_utc": "2026-07-23T00:00:00Z",
             "remaining_seconds": 3600.0,
             "host": {"hostname": "fixture", "fingerprint_sha256": "2" * 64},
+            "gate_contract": self.gate_contract,
+            "gate_contract_sha256": self.gate_contract["contract_sha256"],
         }
 
     def test_receipt_identity_is_fail_closed(self):
@@ -56,6 +127,13 @@ class BatchLeaseV2Test(unittest.TestCase):
         self.assertIn("validate-lease", command)
         invalid = self.receipt()
         invalid["remaining_seconds"] = 0
+        completed.stdout = json.dumps(invalid)
+        with mock.patch("run_suite.subprocess.run", return_value=completed):
+            with self.assertRaises(ContractError):
+                run_suite.validate_batch_lease(self.lease, self.gate, self.binary)
+        invalid = self.receipt()
+        invalid["gate_contract"] = dict(invalid["gate_contract"])
+        invalid["gate_contract"]["method"] = "legacy-cv"
         completed.stdout = json.dumps(invalid)
         with mock.patch("run_suite.subprocess.run", return_value=completed):
             with self.assertRaises(ContractError):

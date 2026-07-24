@@ -130,6 +130,39 @@ class LeaseFixture(object):
             pass
         self.validator = root / "validate_sentinel_result.py"
         self.validator.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        self.extractor = root / "extract_run_metrics.py"
+        self.extractor.write_text("# fixture extractor\n", encoding="utf-8")
+        self.stability_calculator = root / "calculate_stability.py"
+        self.stability_calculator.write_text(
+            "# fixture stability calculator\n", encoding="utf-8"
+        )
+        self.stability = {
+            "schema_version": "p02b-sentinel-stability-v2",
+            "state": "PASS",
+            "method": "quantization-aware-tail-v1",
+        }
+        self.stability_result = root / "stability-result.json"
+        write_json(self.stability_result, self.stability)
+        unsigned_contract = {
+            "schema_version": gate.P02B_GATE_CONTRACT_SCHEMA,
+            "method": gate.P02B_GATE_METHOD,
+            "quantile": {"numerator": 99, "denominator": 100},
+            "tail_bounds_us": {"lower": 150000, "upper": 250000},
+            "sigma_multiplier": 3,
+            "qps_cv_max": 0.07,
+            "mean_storage_latency_cv_max": 0.07,
+            "require_zero_overflow": True,
+            "stability_result": gate.file_ref(self.stability_result),
+            "tools": {
+                "extract_run_metrics": gate.file_ref(self.extractor),
+                "calculate_stability": gate.file_ref(self.stability_calculator),
+                "validate_sentinel_result": gate.file_ref(self.validator),
+            },
+        }
+        self.gate_contract = dict(unsigned_contract)
+        self.gate_contract["contract_sha256"] = gate.canonical_sha256(
+            unsigned_contract
+        )
         clean = {
             "schema_version": clean_schema,
             "required_consecutive_samples": clean_samples,
@@ -151,12 +184,14 @@ class LeaseFixture(object):
         write_json(
             self.result,
             {
-                "schema_version": "p02b-sf10-sentinel-result-v1",
+                "schema_version": gate.P02B_RESULT_SCHEMA,
                 "state": "PASS",
                 "fixture_only": False,
                 "formal_gate_eligible": True,
                 "downstream_release_eligible": True,
                 "clean_ready": clean,
+                "gate_contract": self.gate_contract,
+                "stability": self.stability,
             },
         )
         binary_sha = gate.sha256_file(self.binary)
@@ -201,6 +236,8 @@ class LeaseFixture(object):
             "run_id": "p02b-fixture",
             "completed_at_utc": iso(BASE),
             "protocol": {"fixture": True},
+            "gate_contract": self.gate_contract,
+            "gate_contract_sha256": self.gate_contract["contract_sha256"],
             "pass_marker": str(self.pass_marker.resolve()),
             "pass_marker_sha256": gate.sha256_file(self.pass_marker),
             "provenance": str(self.provenance.resolve()),
@@ -218,6 +255,22 @@ class LeaseFixture(object):
             "status_lines": [],
         }
         self.lease = root / "batch-lease.json"
+
+    def refresh_result_bindings(self):
+        result_sha = gate.sha256_file(self.result)
+        marker = json.loads(self.pass_marker.read_text(encoding="utf-8"))
+        marker["result_sha256"] = result_sha
+        write_json(self.pass_marker, marker)
+        marker_sha = gate.sha256_file(self.pass_marker)
+        for receipt in self.admissions.values():
+            receipt["sentinel_result_sha256"] = result_sha
+            receipt["pass_marker_sha256"] = marker_sha
+
+    def refresh_lease_marker(self):
+        marker_path = self.lease.with_name(self.lease.name + ".PASS.json")
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["lease_sha256"] = gate.sha256_file(self.lease)
+        write_json(marker_path, marker)
 
     def issue(self, now=BASE):
         return gate.issue_lease_from_admissions(
@@ -363,8 +416,18 @@ class LeaseTests(unittest.TestCase):
             lease = fixture.issue()
             self.assertEqual(lease["duration_seconds"], 86400)
             self.assertEqual(lease["p02b"]["clean_window"]["mode"], "legacy-15-sample-v1")
+            self.assertEqual(lease["schema_version"], gate.LEASE_SCHEMA)
+            self.assertEqual(lease["p02b"]["gate_contract"], fixture.gate_contract)
+            self.assertEqual(
+                lease["p02b"]["gate_contract_sha256"],
+                fixture.gate_contract["contract_sha256"],
+            )
             admission = fixture.validate()
             self.assertEqual(admission["state"], "PASS")
+            self.assertEqual(
+                admission["gate_contract_sha256"],
+                fixture.gate_contract["contract_sha256"],
+            )
 
     def test_issue_accepts_gap_checked_short_v2_gate(self):
         with tempfile.TemporaryDirectory(prefix="lease-short-v2-") as raw:
@@ -441,6 +504,90 @@ class LeaseTests(unittest.TestCase):
                 fixture.provenance.read_text(encoding="utf-8") + " ", encoding="utf-8"
             )
             with self.assertRaisesRegex(gate.GateError, "provenance SHA-256 changed"):
+                fixture.validate()
+
+    def test_legacy_result_v1_cannot_issue_a_new_lease(self):
+        with tempfile.TemporaryDirectory(prefix="lease-result-v1-") as raw:
+            fixture = LeaseFixture(Path(raw))
+            result = json.loads(fixture.result.read_text(encoding="utf-8"))
+            result["schema_version"] = "p02b-sf10-sentinel-result-v1"
+            write_json(fixture.result, result)
+            fixture.refresh_result_bindings()
+            with self.assertRaisesRegex(gate.GateError, "result schema drift"):
+                fixture.issue()
+
+    def test_receipt_gate_contract_digest_tamper_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="lease-contract-digest-") as raw:
+            fixture = LeaseFixture(Path(raw))
+            fixture.admissions["P10"]["gate_contract_sha256"] = "0" * 64
+            with self.assertRaisesRegex(
+                gate.GateError, "receipt gate_contract SHA-256 drift"
+            ):
+                fixture.issue()
+
+    def test_consumer_gate_contract_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="lease-contract-consumer-") as raw:
+            fixture = LeaseFixture(Path(raw))
+            changed = dict(fixture.gate_contract)
+            changed["qps_cv_max"] = 0.06
+            unsigned = dict(changed)
+            unsigned.pop("contract_sha256")
+            changed["contract_sha256"] = gate.canonical_sha256(unsigned)
+            fixture.admissions["P20"]["gate_contract"] = changed
+            fixture.admissions["P20"]["gate_contract_sha256"] = changed[
+                "contract_sha256"
+            ]
+            with self.assertRaisesRegex(gate.GateError, "gate_contract"):
+                fixture.issue()
+
+    def test_rehashed_method_id_alias_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="lease-contract-method-id-") as raw:
+            fixture = LeaseFixture(Path(raw))
+            changed = dict(fixture.gate_contract)
+            changed["method_id"] = changed.pop("method")
+            unsigned = dict(changed)
+            unsigned.pop("contract_sha256")
+            changed["contract_sha256"] = gate.canonical_sha256(unsigned)
+            fixture.admissions["P10"]["gate_contract"] = changed
+            fixture.admissions["P10"]["gate_contract_sha256"] = changed[
+                "contract_sha256"
+            ]
+            with self.assertRaisesRegex(gate.GateError, "gate_contract keys drift"):
+                fixture.issue()
+
+    def test_lease_gate_contract_tamper_fails_after_marker_reseal(self):
+        with tempfile.TemporaryDirectory(prefix="lease-contract-lease-") as raw:
+            fixture = LeaseFixture(Path(raw))
+            fixture.issue()
+            lease = json.loads(fixture.lease.read_text(encoding="utf-8"))
+            lease["p02b"]["gate_contract_sha256"] = "0" * 64
+            write_json(fixture.lease, lease)
+            fixture.refresh_lease_marker()
+            with self.assertRaisesRegex(gate.GateError, "gate_contract SHA-256 drift"):
+                fixture.validate()
+
+    def test_stability_artifact_tamper_invalidates_issued_lease(self):
+        with tempfile.TemporaryDirectory(prefix="lease-stability-tamper-") as raw:
+            fixture = LeaseFixture(Path(raw))
+            fixture.issue()
+            fixture.stability_result.write_text(
+                fixture.stability_result.read_text(encoding="utf-8") + " ",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "stability result size changed"):
+                fixture.validate()
+
+    def test_gate_tool_tamper_invalidates_issued_lease(self):
+        with tempfile.TemporaryDirectory(prefix="lease-tool-tamper-") as raw:
+            fixture = LeaseFixture(Path(raw))
+            fixture.issue()
+            fixture.stability_calculator.write_text(
+                fixture.stability_calculator.read_text(encoding="utf-8") + " ",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                gate.GateError, "calculate_stability size changed"
+            ):
                 fixture.validate()
 
 

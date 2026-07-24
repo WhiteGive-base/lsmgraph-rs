@@ -75,6 +75,42 @@ NEO4J_LIFECYCLE = SCRIPT_DIR / "adapters" / "launch_neo4j_runtime.py"
 NEBULAGRAPH_LIFECYCLE = (
     SCRIPT_DIR / "adapters" / "nebulagraph" / "formal_cluster.py"
 )
+P02B_RESULT_SCHEMA = "p02b-sf10-sentinel-result-v2"
+P02B_GATE_CONTRACT_SCHEMA = "p02b-gate-contract-v1"
+P02B_GATE_METHOD = "quantization-aware-tail-v1"
+P02B_GATE_CONTRACT_KEYS = {
+    "schema_version",
+    "method",
+    "quantile",
+    "tail_bounds_us",
+    "sigma_multiplier",
+    "qps_cv_max",
+    "mean_storage_latency_cv_max",
+    "require_zero_overflow",
+    "stability_result",
+    "tools",
+    "contract_sha256",
+}
+P02B_GATE_TOOL_FILENAMES = {
+    "extract_run_metrics": "extract_run_metrics.py",
+    "calculate_stability": "calculate_stability.py",
+    "validate_sentinel_result": "validate_sentinel_result.py",
+}
+BATCH_LEASE_RECEIPT_KEYS = {
+    "schema_version",
+    "state",
+    "consumer",
+    "lease",
+    "lease_sha256",
+    "issued_at_utc",
+    "expires_at_utc",
+    "remaining_seconds",
+    "host",
+    "repo_head",
+    "binary_sha256",
+    "gate_contract",
+    "gate_contract_sha256",
+}
 
 
 def _nebulagraph_cluster_module() -> Any:
@@ -183,6 +219,139 @@ def artifact_ref(path: Path) -> dict[str, Any]:
     }
 
 
+def _canonical_json_sha256(value: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _require_sha256(value: object, context: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ContractError(f"{context} must be a lowercase SHA-256")
+    return value
+
+
+def _validate_current_file_ref(reference: object, context: str) -> Path:
+    if not isinstance(reference, dict) or set(reference) != {
+        "path",
+        "size_bytes",
+        "sha256",
+    }:
+        raise ContractError(f"{context} file reference drift")
+    raw_path = reference.get("path")
+    if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+        raise ContractError(f"{context} path must be absolute")
+    path = Path(raw_path).resolve()
+    if not path.is_file():
+        raise ContractError(f"{context} is not a current file: {path}")
+    if (
+        isinstance(reference.get("size_bytes"), bool)
+        or not isinstance(reference.get("size_bytes"), int)
+        or reference["size_bytes"] != path.stat().st_size
+    ):
+        raise ContractError(f"{context} size drift")
+    if sha256_file(path) != _require_sha256(reference.get("sha256"), f"{context} SHA"):
+        raise ContractError(f"{context} SHA-256 drift")
+    return path
+
+
+def _validate_p02b_gate_contract_binding(
+    receipt: dict[str, Any], lease_path: Path
+) -> dict[str, Any]:
+    contract = receipt.get("gate_contract")
+    if not isinstance(contract, dict) or set(contract) != P02B_GATE_CONTRACT_KEYS:
+        raise ContractError("batch lease P02B gate contract keys drift")
+    if (
+        contract.get("schema_version") != P02B_GATE_CONTRACT_SCHEMA
+        or contract.get("method") != P02B_GATE_METHOD
+        or contract.get("quantile") != {"numerator": 99, "denominator": 100}
+        or contract.get("tail_bounds_us") != {"lower": 150000, "upper": 250000}
+        or contract.get("sigma_multiplier") != 3
+        or contract.get("qps_cv_max") != 0.07
+        or contract.get("mean_storage_latency_cv_max") != 0.07
+        or contract.get("require_zero_overflow") is not True
+    ):
+        raise ContractError("batch lease P02B gate contract policy drift")
+    unsigned_contract = dict(contract)
+    embedded_digest = _require_sha256(
+        unsigned_contract.pop("contract_sha256"),
+        "batch lease P02B gate contract digest",
+    )
+    if _canonical_json_sha256(unsigned_contract) != embedded_digest:
+        raise ContractError("batch lease P02B gate contract canonical digest drift")
+    if (
+        _require_sha256(
+            receipt.get("gate_contract_sha256"),
+            "batch lease receipt P02B gate contract digest",
+        )
+        != embedded_digest
+    ):
+        raise ContractError("batch lease receipt P02B gate contract digest drift")
+
+    lease = read_json(lease_path.resolve(), "batch lease")
+    if lease.get("schema_version") != "cidr-batch-lease-v2":
+        raise ContractError("batch lease schema drift")
+    p02b = lease.get("p02b")
+    if not isinstance(p02b, dict):
+        raise ContractError("batch lease lacks a P02B binding")
+    if (
+        p02b.get("gate_contract") != contract
+        or p02b.get("gate_contract_sha256") != embedded_digest
+    ):
+        raise ContractError("batch lease/receipt P02B gate contract binding drift")
+
+    result_path = _validate_current_file_ref(
+        p02b.get("result"), "batch lease P02B result"
+    )
+    validator_path = _validate_current_file_ref(
+        p02b.get("validator"), "batch lease P02B validator"
+    )
+    stability_path = _validate_current_file_ref(
+        contract.get("stability_result"), "batch lease P02B stability result"
+    )
+    if stability_path != (result_path.parent / "stability-result.json").resolve():
+        raise ContractError("batch lease P02B stability-result path drift")
+
+    tools = contract.get("tools")
+    if not isinstance(tools, dict) or set(tools) != set(P02B_GATE_TOOL_FILENAMES):
+        raise ContractError("batch lease P02B gate tools drift")
+    for name, filename in P02B_GATE_TOOL_FILENAMES.items():
+        tool_path = _validate_current_file_ref(
+            tools.get(name), f"batch lease P02B gate tool {name}"
+        )
+        if tool_path != (validator_path.parent / filename).resolve():
+            raise ContractError(f"batch lease P02B gate tool {name} path drift")
+
+    result = read_json(result_path, "batch lease P02B result")
+    if (
+        result.get("schema_version") != P02B_RESULT_SCHEMA
+        or result.get("state") != "PASS"
+        or result.get("fixture_only") is not False
+        or result.get("formal_gate_eligible") is not True
+        or result.get("downstream_release_eligible") is not True
+        or result.get("gate_contract") != contract
+    ):
+        raise ContractError("batch lease does not bind a formal P02B result-v2 PASS")
+    stability = read_json(stability_path, "batch lease P02B stability result")
+    if (
+        stability.get("schema_version") != "p02b-sentinel-stability-v2"
+        or stability.get("state") != "PASS"
+        or stability.get("method") != P02B_GATE_METHOD
+        or result.get("stability") != stability
+    ):
+        raise ContractError("batch lease P02B stability evidence drift")
+    return contract
+
+
 def batch_anchor_from_lease(lease_path: Path) -> Path:
     lease = read_json(lease_path.resolve(), "batch lease")
     raw = lease.get("identity", {}).get("binary", {}).get("path")
@@ -224,6 +393,7 @@ def validate_batch_lease(
         raise ContractError("batch gate emitted invalid JSON") from exc
     if (
         not isinstance(receipt, dict)
+        or set(receipt) != BATCH_LEASE_RECEIPT_KEYS
         or receipt.get("schema_version") != "cidr-batch-lease-admission-v2"
         or receipt.get("state") != "PASS"
         or receipt.get("consumer") != "P10"
@@ -247,6 +417,7 @@ def validate_batch_lease(
         or receipt["remaining_seconds"] <= 0
     ):
         raise ContractError("batch lease admission identity/lifetime drift")
+    _validate_p02b_gate_contract_binding(receipt, lease_path)
     return receipt, command
 
 

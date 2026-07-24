@@ -178,7 +178,7 @@ def main() -> int:
     write_json(
         root / "config.json",
         {
-            "schema_version": "p02b-sf10-sentinel-config-v1",
+            "schema_version": "p02b-sf10-sentinel-config-v2",
             "task_id": "P02B-SF10-SENTINEL",
             "scale": "sf10",
             "fixture_mode": True,
@@ -207,7 +207,16 @@ def main() -> int:
                 "min_samples": 2,
                 "require_aux_tools": True,
             },
-            "thresholds": {"qps_cv_max": 0.03, "p99_cv_max": 0.05},
+            "thresholds": {
+                "qps_cv_max": 0.03,
+                "mean_storage_latency_cv_max": 0.03,
+                "quantile_numerator": 99,
+                "quantile_denominator": 100,
+                "lower_tail_bound_us": 150000,
+                "upper_tail_bound_us": 250000,
+                "sigma_multiplier": 3,
+                "require_zero_overflow": True,
+            },
             "clean_ready": {"max_age_seconds": 300, "minimum_consecutive_samples": 3},
         },
     )

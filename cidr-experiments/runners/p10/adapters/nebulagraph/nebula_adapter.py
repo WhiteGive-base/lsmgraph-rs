@@ -741,6 +741,25 @@ def docker_call(docker: Path, args: list[str], *, check: bool = True, timeout: i
     return completed
 
 
+def process_start_ticks(pid: int) -> int:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ContractError(f"cannot read process start identity for PID {pid}: {exc}") from exc
+    if ")" not in raw:
+        raise ContractError("process /proc stat is malformed")
+    fields = raw.rsplit(")", 1)[1].split()
+    if len(fields) <= 19:
+        raise ContractError("process /proc stat is malformed")
+    try:
+        value = int(fields[19])
+    except ValueError as exc:
+        raise ContractError("process start ticks are malformed") from exc
+    if value <= 0:
+        raise ContractError("process start ticks are invalid")
+    return value
+
+
 def inspect_cluster(
     docker: Path,
     runtime: dict[str, Any],
@@ -787,6 +806,7 @@ def inspect_cluster(
                 "container_id": value.get("Id"),
                 "image_id": image_id,
                 "pid": pid,
+                "process_start_ticks": process_start_ticks(pid),
                 "restart_count": restart_count,
             }
         )
@@ -1149,7 +1169,7 @@ def execute_ok(session: Any, statement: str) -> Any:
 
 
 def load_fixture(session: Any, manifest: dict[str, Any], dataset: Path, labels: dict[int, str]) -> None:
-    storage = manifest["containers"]["storaged"]
+    storage = manifest["logical_hosts"]["storaged"]
     result = session.execute(f'ADD HOSTS "{storage}":9779')
     if not result.is_succeeded() and "exist" not in str(result.error_msg()).lower():
         raise ContractError(f"ADD HOSTS failed: {result.error_msg()}")

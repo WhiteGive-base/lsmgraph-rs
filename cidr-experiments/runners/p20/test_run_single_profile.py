@@ -5,9 +5,9 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 import shutil
 import socket
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -18,6 +18,15 @@ from types import SimpleNamespace
 
 
 HERE = Path(__file__).resolve().parent
+P02B_DIR = HERE.parent / "p02b"
+if str(P02B_DIR) not in sys.path:
+    sys.path.insert(0, str(P02B_DIR))
+
+from calculate_stability import calculate_stability
+from extract_run_metrics import OVERFLOW_BOUND_US, extract_run_metrics
+import run_sf10_sentinel as P02B_SENTINEL
+
+
 RUNNER = HERE / "run_single_profile.py"
 SUMMARIZER = HERE / "summarize_profile.py"
 FIXTURES = HERE / "tests"
@@ -43,6 +52,59 @@ def canonical_inventory_sha(files):
         separators=(",", ":"),
     ) + "\n"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def p31_host_identity():
+    def command_output(command):
+        try:
+            return (
+                True,
+                subprocess.check_output(
+                    command,
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                ).strip(),
+            )
+        except (subprocess.SubprocessError, OSError):
+            return False, ""
+
+    cpu_model = ""
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("model name"):
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    mem_total = 0
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                mem_total = int(line.split()[1]) * 1024
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    pidstat_ok, pidstat_version = command_output(["pidstat", "-V"])
+    iostat_ok, iostat_version = command_output(["iostat", "-V"])
+    facts = {
+        "hostname": platform.node(),
+        "kernel": platform.release(),
+        "machine": platform.machine(),
+        "cpu_model": cpu_model,
+        "logical_cpu_count": os.cpu_count(),
+        "mem_total_bytes": mem_total,
+        "pidstat_version_command_ok": pidstat_ok,
+        "pidstat_version": pidstat_version,
+        "iostat_version_command_ok": iostat_ok,
+        "iostat_version": iostat_version,
+    }
+    return {
+        "hostname": facts["hostname"],
+        "fingerprint_sha256": hashlib.sha256(
+            json.dumps(facts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 class SingleProfileRunnerTest(unittest.TestCase):
@@ -232,6 +294,28 @@ class SingleProfileRunnerTest(unittest.TestCase):
         )
         config = self.root / "p02b-config.json"
         config.write_text('{"schema_version":"p02b-sf10-sentinel-config-v1"}\n', encoding="utf-8")
+        p02b_query_plan = self.root / "p02b-query-plan.json"
+        p02b_query_plan.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source": "shared-truth-tsv",
+                    "semantic_degree_hint": True,
+                    "force_signature": False,
+                    "entries": [
+                        {
+                            "edge_type": 1,
+                            "samples": [
+                                {"src": source, "degree": 1} for source in range(1700)
+                            ],
+                        }
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         id_map = self.root / "p02b-id-map"
         id_map.mkdir(exist_ok=True)
         dense = id_map / "dense-to-original.tsv"
@@ -267,7 +351,7 @@ class SingleProfileRunnerTest(unittest.TestCase):
         file_references = {
             "binary": file_ref(self.binary),
             "truth": file_ref(self.truth),
-            "query_plan": file_ref(self.sample_plan),
+            "query_plan": file_ref(p02b_query_plan),
             "config": file_ref(config),
             "dataset_manifest": file_ref(dataset_manifest),
             "store_manifest": file_ref(sentinel_store_manifest),
@@ -292,46 +376,93 @@ class SingleProfileRunnerTest(unittest.TestCase):
         clean_binding = self.sentinel_dir / "clean-ready-binding.json"
         clean_binding.write_text(json.dumps(clean_ready, sort_keys=True) + "\n", encoding="utf-8")
         regenerated_plan = self.sentinel_dir / "regenerated-query-plan.json"
-        regenerated_plan.write_bytes(self.sample_plan.read_bytes())
+        regenerated_plan.write_bytes(p02b_query_plan.read_bytes())
         shared_truth_result = self.sentinel_dir / "shared-truth-result.json"
         shared_truth_result.write_text('{"state":"PASS"}\n', encoding="utf-8")
-        host = {"hostname": socket.gethostname(), "fingerprint_sha256": "f" * 64}
+        host = p31_host_identity()
         repeats = []
-        stability_runs = []
-        qps_values = [100.0, 101.0, 99.0]
-        p99_values = [1000.0, 1005.0, 995.0]
-        for index, (qps, p99) in enumerate(zip(qps_values, p99_values), start=1):
-            run_id = "p02b-fixture-r{}".format(index)
+        metric_paths = []
+        sentinel_run_id = self.sentinel_dir.name
+        histogram_bounds = [100, 150000, 250000, 500000, OVERFLOW_BOUND_US]
+        histogram_counts = [1700, 0, 0, 0, 0]
+        for index, elapsed_ms in enumerate((30000, 30300, 30600), start=1):
+            run_id = "{}-r{}".format(sentinel_run_id, index)
             repeat_dir = self.sentinel_dir / "repeats" / "r{}".format(index)
             p31_dir = repeat_dir / "p31"
             p31_dir.mkdir(parents=True, exist_ok=True)
-            metrics_path = repeat_dir / "run-metrics.json"
-            metrics_value = {
-                "schema_version": "p02b-sentinel-run-metrics-v1",
-                "state": "PASS",
-                "run_index": index,
-                "run_id": run_id,
-                "query_count": 1700,
-                "qps": qps,
-                "p99_us": p99,
-                "measured_seconds": 30.0,
-            }
-            metrics_path.write_text(json.dumps(metrics_value, sort_keys=True) + "\n", encoding="utf-8")
-            stability_runs.append(
-                {
-                    "path": str(metrics_path.resolve()),
-                    "sha256": sha256(metrics_path),
-                    "run_index": index,
-                    "run_id": run_id,
-                    "query_count": 1700,
-                    "qps": qps,
-                    "p99_us": p99,
-                    "measured_seconds": 30.0,
-                }
+            command_stdout_path = p31_dir / "command.stdout.log"
+            command_stdout_path.write_text(
+                json.dumps(
+                    {
+                        "sample_plan_in": str(p02b_query_plan.resolve()),
+                        "sample_plan_version": 1,
+                        "warmup_runs": 1,
+                        "repeats": 1,
+                        "cache_state_before": {"fixture": "as-is"},
+                        "cache_state_after": {"fixture": "warm"},
+                        "benchmarks": [
+                            {
+                                "edge_type": 1,
+                                "warmup_runs": 1,
+                                "repeats": 1,
+                                "warmup_rounds": [{"kind": "warmup", "round": 1}],
+                                "rounds": [
+                                    {
+                                        "kind": "measured",
+                                        "round": 1,
+                                        "get_neighbors_elapsed_ms": elapsed_ms,
+                                        "neighbor_metrics": {
+                                            "storage": {
+                                                "get_neighbors_ops": 1700,
+                                                "get_neighbors_latency": {
+                                                    "buckets": [
+                                                        {
+                                                            "upper_bound_us": bound,
+                                                            "count": count,
+                                                        }
+                                                        for bound, count in zip(
+                                                            histogram_bounds,
+                                                            histogram_counts,
+                                                        )
+                                                    ],
+                                                    "count": 1700,
+                                                    "sum_us": 85000,
+                                                    "max_us": 90,
+                                                },
+                                            }
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
             )
+            metrics_path = repeat_dir / "run-metrics.json"
+            metrics_value = extract_run_metrics(
+                command_stdout_path,
+                p02b_query_plan,
+                index,
+                run_id,
+                1700,
+                1,
+                1,
+                30.0,
+            )
+            metrics_path.write_text(json.dumps(metrics_value, sort_keys=True) + "\n", encoding="utf-8")
+            metric_paths.append(metrics_path)
             manifest_path = p31_dir / "run-manifest.json"
             validation_path = p31_dir / "validation.json"
             done_path = p31_dir / "DONE"
+            validation_value = {
+                "schema_version": "cidr-run-manifest-v1",
+                "state": "PASS",
+                "errors": [],
+                "warnings": [],
+            }
             manifest_path.write_text(
                 json.dumps(
                     {
@@ -343,13 +474,21 @@ class SingleProfileRunnerTest(unittest.TestCase):
                         "performance_eligible_declared": False,
                         "repo": {"git_sha": self.repo_head, "dirty": False},
                         "host": host,
+                        "collector": {"require_aux_tools": True},
+                        "disk_roots": [
+                            {"role": "store", "path": str(self.pristine.resolve())}
+                        ],
+                        "inputs": {},
+                        "validation": validation_value,
                     },
                     sort_keys=True,
                 )
                 + "\n",
                 encoding="utf-8",
             )
-            validation_path.write_text('{"state":"PASS"}\n', encoding="utf-8")
+            validation_path.write_text(
+                json.dumps(validation_value, sort_keys=True) + "\n", encoding="utf-8"
+            )
             done_path.write_text(
                 json.dumps(
                     {
@@ -372,32 +511,27 @@ class SingleProfileRunnerTest(unittest.TestCase):
                         "manifest": file_ref(manifest_path),
                         "validation": file_ref(validation_path),
                         "done": file_ref(done_path),
+                        "command_stdout": file_ref(command_stdout_path),
                     },
                 }
             )
 
-        def cv_metric(values, maximum):
-            mean = statistics.mean(values)
-            stdev = statistics.stdev(values)
-            return {
-                "values": values,
-                "mean": mean,
-                "sample_stdev": stdev,
-                "cv": stdev / mean,
-                "maximum_cv": maximum,
-                "pass": True,
-            }
-
-        stability = {
-            "schema_version": "p02b-sentinel-cv-v1",
-            "state": "PASS",
-            "method": "sample_standard_deviation_over_arithmetic_mean",
-            "independent_process_runs": 3,
-            "query_count_per_run": 1700,
-            "qps": cv_metric(qps_values, 0.03),
-            "p99_us": cv_metric(p99_values, 0.05),
-            "runs": stability_runs,
-        }
+        stability = calculate_stability(
+            metric_paths,
+            3,
+            0.07,
+            0.07,
+            99,
+            100,
+            150000,
+            250000,
+            3,
+            True,
+        )
+        stability_path = self.sentinel_dir / "stability-result.json"
+        stability_path.write_text(
+            json.dumps(stability, sort_keys=True) + "\n", encoding="utf-8"
+        )
         provenance = {
             "schema_version": "p02b-sentinel-provenance-v1",
             "created_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -438,15 +572,18 @@ class SingleProfileRunnerTest(unittest.TestCase):
                 "queries": 1700,
                 "semantic_degree_hint": True,
                 "force_signature": False,
-                "sha256": sha256(self.sample_plan),
+                "sha256": sha256(p02b_query_plan),
             },
             "clean_ready_binding_sha256": sha256(clean_binding),
         }
         provenance_path = self.sentinel_dir / "provenance.json"
         provenance_path.write_text(json.dumps(provenance, sort_keys=True) + "\n", encoding="utf-8")
         fixture_only = bool(changes.get("fixture_only", False))
+        gate_contract = P02B_SENTINEL.build_gate_contract(
+            stability["policy"], stability_path
+        )
         value = {
-            "schema_version": "p02b-sf10-sentinel-result-v1",
+            "schema_version": "p02b-sf10-sentinel-result-v2",
             "state": "PASS",
             "fixture_only": fixture_only,
             "performance_eligible": False,
@@ -455,10 +592,11 @@ class SingleProfileRunnerTest(unittest.TestCase):
             "consumers": ["P10", "P20"],
             "task_id": "P02B-SF10-SENTINEL",
             "scale": "sf10",
-            "run_id": "p02b-fixture",
+            "run_id": sentinel_run_id,
             "started_at_utc": now,
             "completed_at_utc": now,
             "clean_ready": clean_ready,
+            "gate_contract": gate_contract,
             "protocol": {
                 "independent_process_runs": 3,
                 "expected_queries": 1700,
@@ -486,7 +624,7 @@ class SingleProfileRunnerTest(unittest.TestCase):
                 "repo_head": self.repo_head,
                 "binary_sha256": sha256(self.binary),
                 "truth_sha256": sha256(self.truth),
-                "query_plan_sha256": sha256(self.sample_plan),
+                "query_plan_sha256": sha256(p02b_query_plan),
                 "store_sha256": self.store_inventory_sha,
                 "dataset_sha256": dataset_content_sha,
                 "config_sha256": sha256(config),

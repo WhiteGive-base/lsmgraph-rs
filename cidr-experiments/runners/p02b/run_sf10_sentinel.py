@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -17,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from calculate_cv import calculate_cv
+from calculate_stability import calculate_stability
 from extract_run_metrics import extract_run_metrics, validate_query_plan
 from p02b_common import (
     GateError,
@@ -38,14 +39,56 @@ from p02b_common import (
 from validate_clean_ready import validate_clean_ready
 
 
-CONFIG_SCHEMA = "p02b-sf10-sentinel-config-v1"
-RESULT_SCHEMA = "p02b-sf10-sentinel-result-v1"
+CONFIG_SCHEMA = "p02b-sf10-sentinel-config-v2"
+RESULT_SCHEMA = "p02b-sf10-sentinel-result-v2"
 CACHE_POLICY = "no-drop-caches;independent-process;in-process-warmup;os-cache-as-is"
 CLEAN_PROTOCOL_V2 = "short-clean-window-v2"
 
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def canonical_sha256(value: Dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def build_gate_contract(
+    thresholds: Dict[str, Any], stability_path: Path
+) -> Dict[str, Any]:
+    runner_dir = Path(__file__).resolve().parent
+    contract: Dict[str, Any] = {
+        "schema_version": "p02b-gate-contract-v1",
+        "method": "quantization-aware-tail-v1",
+        "quantile": {
+            "numerator": int(thresholds["quantile_numerator"]),
+            "denominator": int(thresholds["quantile_denominator"]),
+        },
+        "tail_bounds_us": {
+            "lower": int(thresholds["lower_tail_bound_us"]),
+            "upper": int(thresholds["upper_tail_bound_us"]),
+        },
+        "sigma_multiplier": int(thresholds["sigma_multiplier"]),
+        "qps_cv_max": float(thresholds["qps_cv_max"]),
+        "mean_storage_latency_cv_max": float(
+            thresholds["mean_storage_latency_cv_max"]
+        ),
+        "require_zero_overflow": bool(thresholds["require_zero_overflow"]),
+        "stability_result": file_ref(stability_path),
+        "tools": {
+            "extract_run_metrics": file_ref(runner_dir / "extract_run_metrics.py"),
+            "calculate_stability": file_ref(runner_dir / "calculate_stability.py"),
+            "validate_sentinel_result": file_ref(
+                runner_dir / "validate_sentinel_result.py"
+            ),
+        },
+    }
+    contract["contract_sha256"] = canonical_sha256(contract)
+    return contract
 
 
 def validate_config(path: Path) -> Dict[str, Any]:
@@ -168,12 +211,53 @@ def validate_config(path: Path) -> Dict[str, Any]:
     thresholds = config.get("thresholds")
     if not isinstance(thresholds, dict):
         raise GateError("thresholds must be an object")
-    require_keys(thresholds, {"qps_cv_max", "p99_cv_max"}, "thresholds")
-    reject_unknown_keys(thresholds, {"qps_cv_max", "p99_cv_max"}, "thresholds")
+    threshold_keys = {
+        "qps_cv_max",
+        "mean_storage_latency_cv_max",
+        "quantile_numerator",
+        "quantile_denominator",
+        "lower_tail_bound_us",
+        "upper_tail_bound_us",
+        "sigma_multiplier",
+        "require_zero_overflow",
+    }
+    require_keys(thresholds, threshold_keys, "thresholds")
+    reject_unknown_keys(thresholds, threshold_keys, "thresholds")
+    for key in ("qps_cv_max", "mean_storage_latency_cv_max"):
+        if isinstance(thresholds[key], bool) or not isinstance(
+            thresholds[key], (int, float)
+        ):
+            raise GateError("thresholds.{} must be numeric".format(key))
     qps_limit = float(thresholds["qps_cv_max"])
-    p99_limit = float(thresholds["p99_cv_max"])
-    if not 0 < qps_limit <= 0.07 or not 0 < p99_limit <= 0.05:
-        raise GateError("CV thresholds may not exceed QPS=7% and P99=5%")
+    mean_latency_limit = float(thresholds["mean_storage_latency_cv_max"])
+    if not 0 < qps_limit <= 0.07 or not 0 < mean_latency_limit <= 0.07:
+        raise GateError("CV thresholds may not exceed QPS=7% and mean latency=7%")
+    if (
+        isinstance(thresholds["quantile_numerator"], bool)
+        or not isinstance(thresholds["quantile_numerator"], int)
+        or thresholds["quantile_numerator"] != 99
+        or isinstance(thresholds["quantile_denominator"], bool)
+        or not isinstance(thresholds["quantile_denominator"], int)
+        or thresholds["quantile_denominator"] != 100
+    ):
+        raise GateError("quantile must be frozen at 99/100")
+    if (
+        isinstance(thresholds["lower_tail_bound_us"], bool)
+        or not isinstance(thresholds["lower_tail_bound_us"], int)
+        or thresholds["lower_tail_bound_us"] != 150000
+        or isinstance(thresholds["upper_tail_bound_us"], bool)
+        or not isinstance(thresholds["upper_tail_bound_us"], int)
+        or thresholds["upper_tail_bound_us"] != 250000
+    ):
+        raise GateError("tail boundaries must be frozen at 150000us and 250000us")
+    if (
+        isinstance(thresholds["sigma_multiplier"], bool)
+        or not isinstance(thresholds["sigma_multiplier"], int)
+        or thresholds["sigma_multiplier"] != 3
+    ):
+        raise GateError("sigma_multiplier must be frozen at 3")
+    if thresholds["require_zero_overflow"] is not True:
+        raise GateError("require_zero_overflow must be true")
 
     clean = config.get("clean_ready")
     if not isinstance(clean, dict):
@@ -438,7 +522,12 @@ def validate_p31_run(
     if collector.get("require_aux_tools") is not True:
         raise GateError("P31 run did not require pidstat/iostat")
     validation = manifest.get("validation", {})
-    if validation.get("state") != "PASS" or validation.get("errors"):
+    if (
+        not isinstance(validation, dict)
+        or validation.get("state") != "PASS"
+        or validation.get("errors") != []
+        or validation.get("warnings") != []
+    ):
         raise GateError("P31 validation is not clean PASS")
     roots = manifest.get("disk_roots", [])
     matching_store = [
@@ -460,13 +549,26 @@ def validate_p31_run(
     if done.get("manifest_sha256") != sha256_file(manifest_path):
         raise GateError("P31 DONE marker does not bind run-manifest.json")
     validation_path = run_dir / "validation.json"
+    command_stdout_path = run_dir / "command.stdout.log"
+    validation_document = read_json(validation_path)
+    if (
+        validation_document.get("state") != "PASS"
+        or validation_document.get("errors") != []
+        or validation_document.get("warnings") != []
+    ):
+        raise GateError("P31 validation.json is not warning-free PASS")
+    if validation_document != validation:
+        raise GateError("P31 manifest/validation.json evidence differs")
     if done.get("validation_sha256") != sha256_file(validation_path):
         raise GateError("P31 DONE marker does not bind validation.json")
+    if not command_stdout_path.is_file():
+        raise GateError("P31 command stdout evidence is missing")
     return {
         "run_dir": str(run_dir.resolve()),
         "manifest": file_ref(manifest_path),
         "validation": file_ref(validation_path),
         "done": file_ref(done_path),
+        "command_stdout": file_ref(command_stdout_path),
     }
 
 
@@ -849,20 +951,32 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         metric_paths.append(metric_path)
         repeat_records.append({"run_index": run_index, "run_id": run_id, "metrics": file_ref(metric_path), "p31": p31_ref})
 
-    cv = calculate_cv(
+    thresholds = config["thresholds"]
+    stability = calculate_stability(
         metric_paths,
         int(config["independent_runs"]),
-        float(config["thresholds"]["qps_cv_max"]),
-        float(config["thresholds"]["p99_cv_max"]),
+        float(thresholds["qps_cv_max"]),
+        float(thresholds["mean_storage_latency_cv_max"]),
+        int(thresholds["quantile_numerator"]),
+        int(thresholds["quantile_denominator"]),
+        int(thresholds["lower_tail_bound_us"]),
+        int(thresholds["upper_tail_bound_us"]),
+        int(thresholds["sigma_multiplier"]),
+        bool(thresholds["require_zero_overflow"]),
     )
-    atomic_write_json(run_dir / "cv-result.json", cv)
-    if cv["state"] != "PASS":
+    stability_path = run_dir / "stability-result.json"
+    atomic_write_json(stability_path, stability)
+    if stability["state"] != "PASS":
         raise GateError(
-            "sentinel stability HOLD: qps_cv={:.6f}, p99_cv={:.6f}".format(
-                cv["qps"]["cv"], cv["p99_us"]["cv"]
+            "sentinel stability HOLD: qps_cv={:.6f}, mean_latency_cv={:.6f}, "
+            "tail_pass={}".format(
+                stability["qps"]["cv"],
+                stability["mean_storage_latency_us"]["cv"],
+                stability["tail"]["pass"],
             )
         )
     assert_inputs_unchanged(provenance)
+    gate_contract = build_gate_contract(thresholds, stability_path)
 
     result = {
         "schema_version": RESULT_SCHEMA,
@@ -878,6 +992,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "started_at_utc": started_at,
         "completed_at_utc": utc_now(),
         "clean_ready": clean_binding,
+        "gate_contract": gate_contract,
         "protocol": {
             "independent_process_runs": config["independent_runs"],
             "expected_queries": config["expected_queries"],
@@ -904,7 +1019,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "config_sha256": provenance["files"]["config"]["sha256"],
         },
         "correctness": correctness,
-        "stability": cv,
+        "stability": stability,
         "repeats": repeat_records,
     }
     result_path = run_dir / "sentinel-result.json"

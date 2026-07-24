@@ -38,6 +38,10 @@ LEASE_SCHEMA = "cidr-batch-lease-v2"
 LEASE_MARKER_SCHEMA = "cidr-batch-lease-marker-v2"
 P03_BINDING_SCHEMA = "p02b-clean-ready-binding-v2"
 GUARD_SCHEMA = "cidr-p31-integrity-guard-v2"
+P02B_RESULT_SCHEMA = "p02b-sf10-sentinel-result-v2"
+P02B_PROVENANCE_SCHEMA = "p02b-sentinel-provenance-v1"
+P02B_GATE_CONTRACT_SCHEMA = "p02b-gate-contract-v1"
+P02B_GATE_METHOD = "quantization-aware-tail-v1"
 LEASE_DURATION_SECONDS = 24 * 60 * 60
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_HEAD_RE = re.compile(r"^[0-9a-f]{40,64}$")
@@ -66,6 +70,24 @@ GUARD_COLUMNS = [
     "sample_pass",
     "reasons",
 ]
+P02B_GATE_CONTRACT_KEYS = {
+    "schema_version",
+    "method",
+    "quantile",
+    "tail_bounds_us",
+    "sigma_multiplier",
+    "qps_cv_max",
+    "mean_storage_latency_cv_max",
+    "require_zero_overflow",
+    "stability_result",
+    "tools",
+    "contract_sha256",
+}
+P02B_GATE_TOOL_FILENAMES = {
+    "extract_run_metrics": "extract_run_metrics.py",
+    "calculate_stability": "calculate_stability.py",
+    "validate_sentinel_result": "validate_sentinel_result.py",
+}
 
 
 class GateError(ValueError):
@@ -136,6 +158,17 @@ def require_hex64(value: Any, context: str) -> str:
     if not isinstance(value, str) or HEX64_RE.fullmatch(value) is None:
         raise GateError("{} must be a lowercase SHA-256".format(context))
     return value
+
+
+def canonical_sha256(value: Dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def canonical_file(path: Path, context: str, executable: bool = False) -> Path:
@@ -550,15 +583,92 @@ def _validate_clean_source(
     raise GateError("unsupported P02B clean_ready binding schema")
 
 
+def _validate_gate_contract(
+    contract: Any,
+    expected_contract_sha256: Any,
+    result_path: Path,
+    validator_path: Path,
+    context: str,
+) -> Dict[str, Any]:
+    """Independently bind the prospective V2 gate and its executable tools."""
+
+    if not isinstance(contract, dict) or set(contract) != P02B_GATE_CONTRACT_KEYS:
+        raise GateError("{} gate_contract keys drift".format(context))
+    if (
+        contract.get("schema_version") != P02B_GATE_CONTRACT_SCHEMA
+        or contract.get("method") != P02B_GATE_METHOD
+    ):
+        raise GateError("{} gate_contract schema/method drift".format(context))
+    if contract.get("quantile") != {"numerator": 99, "denominator": 100}:
+        raise GateError("{} gate_contract quantile drift".format(context))
+    if contract.get("tail_bounds_us") != {"lower": 150000, "upper": 250000}:
+        raise GateError("{} gate_contract tail-bound drift".format(context))
+    if contract.get("sigma_multiplier") != 3:
+        raise GateError("{} gate_contract sigma multiplier drift".format(context))
+    for key, expected in (
+        ("qps_cv_max", 0.07),
+        ("mean_storage_latency_cv_max", 0.07),
+    ):
+        value = contract.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) != expected
+        ):
+            raise GateError("{} gate_contract {} drift".format(context, key))
+    if contract.get("require_zero_overflow") is not True:
+        raise GateError("{} gate_contract overflow policy drift".format(context))
+
+    stability_path = verify_file_ref(
+        contract.get("stability_result"),
+        "{} gate stability result".format(context),
+    )
+    expected_stability = result_path.parent / "stability-result.json"
+    if stability_path != expected_stability.resolve():
+        raise GateError("{} gate stability-result path drift".format(context))
+
+    tools = contract.get("tools")
+    if not isinstance(tools, dict) or set(tools) != set(P02B_GATE_TOOL_FILENAMES):
+        raise GateError("{} gate_contract tools drift".format(context))
+    validator_dir = validator_path.resolve().parent
+    for name, filename in P02B_GATE_TOOL_FILENAMES.items():
+        tool_path = verify_file_ref(
+            tools.get(name),
+            "{} gate tool {}".format(context, name),
+        )
+        expected_path = validator_dir / filename
+        if tool_path != expected_path.resolve():
+            raise GateError("{} gate tool {} path drift".format(context, name))
+
+    unsigned = dict(contract)
+    embedded_digest = require_hex64(
+        unsigned.pop("contract_sha256"),
+        "{} gate contract SHA-256".format(context),
+    )
+    if canonical_sha256(unsigned) != embedded_digest:
+        raise GateError("{} gate_contract canonical SHA-256 drift".format(context))
+    if (
+        require_hex64(
+            expected_contract_sha256,
+            "{} receipt gate_contract_sha256".format(context),
+        )
+        != embedded_digest
+    ):
+        raise GateError("{} receipt gate_contract SHA-256 drift".format(context))
+    return contract
+
+
 def _validate_p02b_admission_receipt(
     receipt: Any,
     consumer: str,
     result_path: Path,
+    validator_path: Path,
     repo_root: Path,
     repo_head: str,
     binary_reference: Dict[str, Any],
     host: Dict[str, str],
-) -> Dict[str, Dict[str, Any]]:
+) -> Dict[str, Any]:
     """Revalidate one canonical receipt and its mutable external artifacts.
 
     The lease seals the receipt itself, but the receipt points at the P02B PASS
@@ -628,7 +738,7 @@ def _validate_p02b_admission_receipt(
     provenance_repo = provenance.get("repo")
     provenance_binary = provenance.get("files", {}).get("binary")
     if (
-        provenance.get("schema_version") != "p02b-sentinel-provenance-v1"
+        provenance.get("schema_version") != P02B_PROVENANCE_SCHEMA
         or provenance.get("fixture_mode") is not False
         or not isinstance(provenance_repo, dict)
         or Path(str(provenance_repo.get("root", ""))).resolve() != repo_root.resolve()
@@ -641,7 +751,25 @@ def _validate_p02b_admission_receipt(
         or provenance_binary.get("sha256") != binary_reference["sha256"]
     ):
         raise GateError("{} P02B provenance identity drift".format(consumer))
-    return artifacts
+
+    result = read_json(result_path, "{} P02B result".format(consumer))
+    if result.get("schema_version") != P02B_RESULT_SCHEMA:
+        raise GateError("{} P02B result schema drift".format(consumer))
+    gate_contract = _validate_gate_contract(
+        receipt.get("gate_contract"),
+        receipt.get("gate_contract_sha256"),
+        result_path,
+        validator_path,
+        "{} P02B admission".format(consumer),
+    )
+    if result.get("gate_contract") != gate_contract:
+        raise GateError("{} P02B result/receipt gate_contract drift".format(consumer))
+    stability_path = Path(str(gate_contract["stability_result"]["path"])).resolve()
+    if result.get("stability") != read_json(
+        stability_path, "{} P02B stability result".format(consumer)
+    ):
+        raise GateError("{} P02B embedded stability drift".format(consumer))
+    return gate_contract
 
 
 def issue_lease_from_admissions(
@@ -672,24 +800,30 @@ def issue_lease_from_admissions(
     if not isinstance(head, str) or GIT_HEAD_RE.fullmatch(head) is None:
         raise GateError("current repository HEAD is malformed")
 
+    gate_contracts = {}  # type: Dict[str, Dict[str, Any]]
     for consumer in ("P10", "P20"):
-        _validate_p02b_admission_receipt(
+        gate_contracts[consumer] = _validate_p02b_admission_receipt(
             admissions.get(consumer),
             consumer,
             result_path,
+            validator_path,
             repo_root,
             head,
             binary_reference,
             host,
         )
+    if gate_contracts["P10"] != gate_contracts["P20"]:
+        raise GateError("P10/P20 P02B gate_contract mismatch")
+    gate_contract = gate_contracts["P10"]
 
     result = read_json(result_path, "P02B result")
     if (
-        result.get("schema_version") != "p02b-sf10-sentinel-result-v1"
+        result.get("schema_version") != P02B_RESULT_SCHEMA
         or result.get("state") != "PASS"
         or result.get("fixture_only") is not False
         or result.get("formal_gate_eligible") is not True
         or result.get("downstream_release_eligible") is not True
+        or result.get("gate_contract") != gate_contract
     ):
         raise GateError("P02B result is not a formal PASS")
     clean_source = _validate_clean_source(result, head, host["hostname"])
@@ -724,6 +858,8 @@ def issue_lease_from_admissions(
             "result": file_ref(result_path),
             "validator": file_ref(validator_path),
             "admissions": admissions,
+            "gate_contract": gate_contract,
+            "gate_contract_sha256": gate_contract["contract_sha256"],
             "clean_window": clean_source,
         },
         "repeat_guard_policy": {
@@ -834,27 +970,41 @@ def validate_lease(
     if not isinstance(p02b, dict):
         raise GateError("batch lease P02B binding is missing")
     result_path = verify_file_ref(p02b.get("result"), "leased P02B result")
-    verify_file_ref(p02b.get("validator"), "leased P02B validator")
+    validator_path = verify_file_ref(p02b.get("validator"), "leased P02B validator")
     admissions = p02b.get("admissions")
     if not isinstance(admissions, dict) or set(admissions) != {"P10", "P20"}:
         raise GateError("batch lease P02B admissions are incomplete")
+    gate_contracts = {}  # type: Dict[str, Dict[str, Any]]
     for admitted_consumer in ("P10", "P20"):
-        _validate_p02b_admission_receipt(
+        gate_contracts[admitted_consumer] = _validate_p02b_admission_receipt(
             admissions.get(admitted_consumer),
             admitted_consumer,
             result_path,
+            validator_path,
             repo_root,
             str(repo_expected.get("head", "")),
             expected_binary,
             host,
         )
+    if gate_contracts["P10"] != gate_contracts["P20"]:
+        raise GateError("leased P10/P20 P02B gate_contract mismatch")
+    leased_gate_contract = _validate_gate_contract(
+        p02b.get("gate_contract"),
+        p02b.get("gate_contract_sha256"),
+        result_path,
+        validator_path,
+        "leased P02B",
+    )
+    if gate_contracts["P10"] != leased_gate_contract:
+        raise GateError("batch lease P02B gate_contract binding drift")
     result = read_json(result_path, "leased P02B result")
     if (
-        result.get("schema_version") != "p02b-sf10-sentinel-result-v1"
+        result.get("schema_version") != P02B_RESULT_SCHEMA
         or result.get("state") != "PASS"
         or result.get("fixture_only") is not False
         or result.get("formal_gate_eligible") is not True
         or result.get("downstream_release_eligible") is not True
+        or result.get("gate_contract") != leased_gate_contract
     ):
         raise GateError("leased P02B result is no longer a formal PASS")
     clean_source = _validate_clean_source(result, str(repo_expected.get("head", "")), host["hostname"])
@@ -875,6 +1025,8 @@ def validate_lease(
         "host": host,
         "repo_head": repo["head"],
         "binary_sha256": expected_binary["sha256"],
+        "gate_contract": leased_gate_contract,
+        "gate_contract_sha256": leased_gate_contract["contract_sha256"],
     }
 
 

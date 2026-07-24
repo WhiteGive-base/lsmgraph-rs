@@ -175,10 +175,14 @@ assert result["formal_gate_eligible"] is False
 assert result["correctness"]["checked"] == 6
 assert result["correctness"]["mismatches"] == 0
 assert result["stability"]["qps"]["cv"] <= 0.03
-assert result["stability"]["p99_us"]["cv"] <= 0.05
+assert result["stability"]["mean_storage_latency_us"]["cv"] <= 0.03
+assert result["stability"]["p99_upper_bound_us"]["admission_role"] == "diagnostic_only"
+assert result["stability"]["tail"]["pass"] is True
+assert result["gate_contract"]["method"] == "quantization-aware-tail-v1"
 assert len(result["repeats"]) == 3
 for repeat in result["repeats"]:
     assert repeat["p31"]["manifest"]["sha256"]
+    assert repeat["p31"]["command_stdout"]["sha256"]
 PY
 
 printf 'P02B fixture smoke PASS (3 fake independent runs + P31 + fail-closed consumer checks)\n'

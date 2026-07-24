@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from p02b_common import GateError, atomic_write_json, read_json, same_resolved_path, sha256_file
 
@@ -67,13 +68,21 @@ def validate_query_plan(path: Path, expected_queries: int) -> Dict[str, Any]:
     }
 
 
+OVERFLOW_BOUND_US = 2**64 - 1
+
+
 def merge_histogram(
-    merged: Dict[int, int], buckets: Any, expected_count: int, context: str
-) -> None:
+    merged: Dict[int, int],
+    buckets: Any,
+    expected_count: int,
+    context: str,
+    expected_bounds: Optional[List[int]] = None,
+) -> List[int]:
     if not isinstance(buckets, list) or not buckets:
         raise GateError("{} has no latency buckets".format(context))
     prior_bound = -1
     observed = 0
+    bounds: List[int] = []
     for index, bucket in enumerate(buckets):
         if not isinstance(bucket, dict):
             raise GateError("{} bucket {} is not an object".format(context, index))
@@ -82,12 +91,18 @@ def merge_histogram(
         if bound <= prior_bound:
             raise GateError("{} latency bucket bounds are not strictly increasing".format(context))
         prior_bound = bound
+        bounds.append(bound)
         observed += count
         merged[bound] = merged.get(bound, 0) + count
     if observed != expected_count:
         raise GateError(
             "{} bucket count {} differs from op count {}".format(context, observed, expected_count)
         )
+    if bounds[-1] != OVERFLOW_BOUND_US:
+        raise GateError("{} has no canonical unbounded overflow bucket".format(context))
+    if expected_bounds is not None and bounds != expected_bounds:
+        raise GateError("{} latency bucket boundaries differ from prior rounds".format(context))
+    return bounds
 
 
 def histogram_percentile(merged: Dict[int, int], percentile: float) -> float:
@@ -99,10 +114,33 @@ def histogram_percentile(merged: Dict[int, int], percentile: float) -> float:
     for bound, count in sorted(merged.items()):
         cumulative += count
         if cumulative >= rank:
-            if bound >= 10**12:
+            if bound == OVERFLOW_BOUND_US:
                 raise GateError("P99 fell in the unbounded overflow latency bucket")
             return float(bound)
     raise GateError("cannot locate percentile in merged histogram")
+
+
+def histogram_percentile_interval(
+    merged: Dict[int, int], percentile: float
+) -> Dict[str, Any]:
+    total = sum(merged.values())
+    if total <= 0:
+        raise GateError("merged latency histogram is empty")
+    rank = max(1, int(math.ceil(percentile * total)))
+    cumulative = 0
+    prior_bound = 0
+    for bound, count in sorted(merged.items()):
+        cumulative += count
+        if cumulative >= rank:
+            if bound == OVERFLOW_BOUND_US:
+                raise GateError("P99 fell in the unbounded overflow latency bucket")
+            return {
+                "rank": rank,
+                "lower_exclusive_us": prior_bound,
+                "upper_inclusive_us": bound,
+            }
+        prior_bound = bound
+    raise GateError("cannot locate percentile interval in merged histogram")
 
 
 def extract_run_metrics(
@@ -137,7 +175,10 @@ def extract_run_metrics(
 
     total_ops = 0
     total_elapsed_ms = 0
+    total_latency_sum_us = 0
+    maximum_latency_us = 0
     merged_histogram: Dict[int, int] = {}
+    histogram_bounds: Optional[List[int]] = None
     entry_summaries: List[Dict[str, Any]] = []
     for entry_index, entry in enumerate(benchmarks):
         if not isinstance(entry, dict):
@@ -175,9 +216,23 @@ def extract_run_metrics(
             latency_count = as_nonnegative_int(latency.get("count"), "{} latency count".format(context))
             if latency_count != ops:
                 raise GateError("{} latency count differs from operations".format(context))
-            merge_histogram(merged_histogram, latency.get("buckets"), ops, context)
+            latency_sum_us = as_nonnegative_int(
+                latency.get("sum_us"), "{} latency sum_us".format(context)
+            )
+            latency_max_us = as_nonnegative_int(
+                latency.get("max_us"), "{} latency max_us".format(context)
+            )
+            histogram_bounds = merge_histogram(
+                merged_histogram,
+                latency.get("buckets"),
+                ops,
+                context,
+                histogram_bounds,
+            )
             entry_ops += ops
             entry_elapsed_ms += elapsed_ms
+            total_latency_sum_us += latency_sum_us
+            maximum_latency_us = max(maximum_latency_us, latency_max_us)
         total_ops += entry_ops
         total_elapsed_ms += entry_elapsed_ms
         entry_summaries.append(
@@ -202,9 +257,16 @@ def extract_run_metrics(
             )
         )
     qps = total_ops / measured_seconds
-    p99_us = histogram_percentile(merged_histogram, 0.99)
+    if histogram_bounds is None:
+        raise GateError("storage-bench emitted no latency histogram boundaries")
+    p99_interval = histogram_percentile_interval(merged_histogram, 0.99)
+    p99_upper_bound_us = histogram_percentile(merged_histogram, 0.99)
+    histogram_counts = [merged_histogram.get(bound, 0) for bound in histogram_bounds]
+    boundary_sha256 = hashlib.sha256(
+        json.dumps(histogram_bounds, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
     return {
-        "schema_version": "p02b-sentinel-run-metrics-v1",
+        "schema_version": "p02b-sentinel-run-metrics-v2",
         "state": "PASS",
         "run_index": run_index,
         "run_id": run_id,
@@ -214,8 +276,19 @@ def extract_run_metrics(
         "warmup_runs": warmup_runs,
         "measured_seconds": measured_seconds,
         "qps": qps,
-        "p99_us": p99_us,
+        "p99_upper_bound_us": p99_upper_bound_us,
         "p99_source": "merged_storage_latency_histogram_upper_bound",
+        "p99_quantized_interval_us": p99_interval,
+        "histogram": {
+            "bounds_us": histogram_bounds,
+            "counts": histogram_counts,
+            "boundary_sha256": boundary_sha256,
+            "count": total_ops,
+            "sum_us": total_latency_sum_us,
+            "mean_us": total_latency_sum_us / total_ops,
+            "max_us": maximum_latency_us,
+            "overflow_count": merged_histogram.get(OVERFLOW_BOUND_US, 0),
+        },
         "bench_json": {
             "path": str(bench_path.resolve()),
             "sha256": sha256_file(bench_path),

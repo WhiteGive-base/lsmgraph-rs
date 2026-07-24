@@ -32,7 +32,7 @@ CANONICAL_STAGES = {
     "sf30": ["A0", "A2", "A4", "A6"],
 }
 P02B_MAX_AGE_SECONDS = 6 * 60 * 60
-P02B_SENTINEL_SCHEMA = "p02b-sf10-sentinel-result-v1"
+P02B_SENTINEL_SCHEMA = "p02b-sf10-sentinel-result-v2"
 P02B_ADMISSION_SCHEMA = "p20-p02b-admission-v1"
 BATCH_ADMISSION_SCHEMA = "p20-batch-lease-admission-v2"
 BATCH_PROTOCOL = "short-clean-window-v2"

@@ -1,0 +1,216 @@
+{
+  "schema_version": "p02b-quantization-gate-migration-attestation-v1",
+  "state": "DRAFT_PENDING_NEW_CANDIDATE_BINDING",
+  "created_at_utc": "2026-07-24T02:40:08.972Z",
+  "purpose": "Bind the two immutable legacy HOLD batches to a prospective quantization-aware tail-stability protocol without retroactively changing either legacy decision.",
+  "legacy_candidate": {
+    "repo_head_commit": "233dcc383bdde5f8b403cef7743c83415ea78450",
+    "repo_tree": "be4ce66e3afdbb432df3f51fc8b6d824b0cbb778",
+    "branch": "codex/p31-zombie-boundary-v1",
+    "observation_protocol": "p20-observation-protocol-v6",
+    "admission_label": "relaxed-qps7-v1",
+    "p02b_config_path": "/data/WorkSpace/lsmgraph-cidr-p31-zombie-boundary-20260724/cidr-experiments/runners/p02b/configs/sf10-seml0-short-gate-v3-relaxed-qps7.json",
+    "p02b_config_sha256": "00f0ceaa05ab30f341ccde25d18749a7ec02e11f2560fcf6f37563d370b8bc19",
+    "qps_cv_max": 0.07,
+    "p99_cv_max": 0.05,
+    "p99_cv_gate_applies_to": "immutable legacy protocol only",
+    "p99_source": "merged_storage_latency_histogram_upper_bound"
+  },
+  "legacy_holds": [
+    {
+      "hold_id": "v6-20260724T013111Z",
+      "batch_root": "/data/WorkSpace/results/P20-SF10-FORMAL-V6-233DCC3-20260724T013111Z",
+      "p03_root": "/data/WorkSpace/lsmgraph-cidr-p31-zombie-boundary-20260724/cidr-experiments/runs/P03-CLEAN-WINDOW-MONITOR/raw/P03-CLEAN-WINDOW-V6-20260724T013111Z-233dcc383bdd",
+      "p02b_root": "/data/WorkSpace/lsmgraph-cidr-p31-zombie-boundary-20260724/cidr-experiments/runs/P02B-SF10-SENTINEL/raw/P02B-SF10-SENTINEL-V6-20260724T013111Z-233dcc383bdd",
+      "failed_at_utc": "2026-07-24T01:46:41.200755Z",
+      "legacy_state": "HOLD",
+      "failed_marker_sha256": "0dd123fa81ef37fea4588114a8c205f4d83808fa31a2ac795cf3d77160cb2e98",
+      "cv_result_sha256": "6e755a4a29c4d25ad5da1a05cd3122d79f2c19b66ba00d61be7f6de46c6b635a",
+      "qps": {
+        "values": [
+          89.88573936308023,
+          90.3356767470654,
+          87.80855668558854
+        ],
+        "cv": 0.015088448350679969,
+        "legacy_pass": true
+      },
+      "p99_us": {
+        "values": [
+          250000,
+          150000,
+          250000
+        ],
+        "cv": 0.26646935501059654,
+        "legacy_pass": false
+      },
+      "p03_clean_window_state": "PASS",
+      "p31_repeat_states": [
+        "PASS",
+        "PASS",
+        "PASS"
+      ],
+      "formal_admission_eligible": false,
+      "counterfactual_replay_eligibility": "DIAGNOSTIC_ONLY"
+    },
+    {
+      "hold_id": "v6-20260724T020333Z",
+      "batch_root": "/data/WorkSpace/results/P20-SF10-FORMAL-V6-233DCC3-20260724T020333Z",
+      "p03_root": "/data/WorkSpace/lsmgraph-cidr-p31-zombie-boundary-20260724/cidr-experiments/runs/P03-CLEAN-WINDOW-MONITOR/raw/P03-CLEAN-WINDOW-V6-20260724T020333Z-233dcc383bdd",
+      "p02b_root": "/data/WorkSpace/lsmgraph-cidr-p31-zombie-boundary-20260724/cidr-experiments/runs/P02B-SF10-SENTINEL/raw/P02B-SF10-SENTINEL-V6-20260724T020333Z-233dcc383bdd",
+      "failed_at_utc": "2026-07-24T02:18:56.008569Z",
+      "legacy_state": "HOLD",
+      "failed_marker_sha256": "d5b405a6b0da7d3b8e698c84bfa47f67dcc716debb8cd26dad302e31595deaa8",
+      "cv_result_sha256": "add855e36e31bbe09f116020b4ee0e364709b2a8dfc58be469411f24a9221ee0",
+      "qps": {
+        "values": [
+          91.76243246015082,
+          89.74243919949744,
+          88.85636629730296
+        ],
+        "cv": 0.01652730160963564,
+        "legacy_pass": true
+      },
+      "p99_us": {
+        "values": [
+          150000,
+          150000,
+          250000
+        ],
+        "cv": 0.31491832864888675,
+        "legacy_pass": false
+      },
+      "p03_clean_window_state": "PASS",
+      "p31_repeat_states": [
+        "PASS",
+        "PASS",
+        "PASS"
+      ],
+      "formal_admission_eligible": false,
+      "counterfactual_replay_eligibility": "DIAGNOSTIC_ONLY"
+    }
+  ],
+  "legacy_evidence_manifest": {
+    "path_relative_to_this_file": "LEGACY-HOLD-EVIDENCE.sha256.tsv",
+    "row_count_excluding_header": 28,
+    "sha256": "dcc0e48142e4da0e9d9b73d3054c1b7cbf9fd8f9a19892aa6179a0b48f6642da"
+  },
+  "design_use_disclosure": {
+    "legacy_results_were_used_to_motivate_and_design_new_protocol": true,
+    "legacy_results_may_be_used_as_regression_fixtures": true,
+    "legacy_results_may_be_used_as_formal_confirmation": false,
+    "claim_limit": "The legacy observations demonstrate upper-bound bucket quantization and stable QPS; they do not establish stable continuous P99 latency."
+  },
+  "new_protocol": {
+    "protocol_id": "quantization-aware-tail-v1",
+    "path_relative_to_this_file": "quantization-aware-tail-v1.json",
+    "sha256": "187980f46d6dee82e36e1cd31f88505d763dfdc14528f1917e305ec6183e8c96",
+    "qps_cv_max": 0.07,
+    "mean_storage_latency_cv_max": 0.07,
+    "p99_upper_bound_cv_admission_role": "diagnostic_only",
+    "p99_upper_bound_cv_participates_in_state": false,
+    "lower_tail_bound_us": 150000,
+    "upper_tail_bound_us": 250000,
+    "tail_count_definition": "T_i(b) = sum of run i complete histogram counts whose upper_bound_us is > b",
+    "fresh_count_derivation": {
+      "n": "common fresh query_count, equal to each complete histogram count",
+      "rank": "ceil(99 * n / 100)",
+      "sigma": "sqrt(n * 0.01 * 0.99)"
+    },
+    "lower_bound_maximum_count_each_run": "n - rank + ceil(3 * sigma)",
+    "upper_bound_maximum_count_each_run": "n - rank",
+    "each_fixed_boundary_maximum_cross_run_count_range": "ceil(3 * sqrt(2) * sigma)",
+    "overflow_count_each_run": 0,
+    "fixed_n_or_precomputed_budget_forbidden": true,
+    "complete_histogram_and_identical_histogram_boundary_sha256_required": true,
+    "gate_contract_schema_version": "p02b-gate-contract-v1",
+    "gate_contract_method": "quantization-aware-tail-v1",
+    "gate_contract_must_bind_complete_policy_stability_result_and_tool_sha256": true,
+    "protocol_semantics_must_not_change_after_fresh_run_starts": true
+  },
+  "migration_decision": {
+    "kind": "VERSIONED_MEASUREMENT_PROTOCOL_CHANGE",
+    "same_protocol_second_retry": false,
+    "legacy_failed_markers_preserved": true,
+    "retroactive_pass_forbidden": true,
+    "legacy_batch_lease_issuance_forbidden": true,
+    "counterfactual_replay_can_issue_lease": false,
+    "fresh_confirmatory_batch_required": true
+  },
+  "fresh_confirmation_contract": {
+    "new_batch_root_required": true,
+    "fresh_p03_required": true,
+    "p03_minimum_consecutive_clean_samples": 5,
+    "fresh_independent_process_runs_required": 3,
+    "fresh_p31_done_and_pass_required_for_each_run": true,
+    "mixed_legacy_and_fresh_repeats_forbidden": true,
+    "selective_repeat_rerun_forbidden": true,
+    "best_of_n_selection_forbidden": true,
+    "complete_histogram_per_run_required": true,
+    "identical_histogram_boundary_sha256_across_runs_required": true,
+    "gate_contract_and_tool_sha256_binding_required": true,
+    "new_aggregate_gate_result_required": true,
+    "new_batch_lease_only_after_fresh_pass": true,
+    "new_p20_matrix_required_for_new_candidate": true,
+    "legacy_v4_v5_formal_points_cannot_be_mixed_into_new_matrix": true
+  },
+  "new_candidate_binding": {
+    "binding_state": "REQUIRES_EXTERNAL_PRE_RUN_DEPLOYMENT_ATTESTATION",
+    "reason_external": "The final Git commit cannot contain its own commit identity without a circular hash dependency. A separate immutable deployment attestation must bind the committed source before fresh execution.",
+    "external_attestation_schema": "p02b-quantization-aware-deployment-attestation-v1",
+    "required_before_fresh_p03": [
+      "pre_registration_timestamp_utc",
+      "repo_head_commit",
+      "repo_tree",
+      "branch",
+      "protocol_path_and_sha256",
+      "legacy_evidence_manifest_path_and_sha256",
+      "p02b_common_path_and_sha256",
+      "calculate_stability_path_and_sha256",
+      "extract_run_metrics_path_and_sha256",
+      "validate_clean_ready_path_and_sha256",
+      "run_sf10_sentinel_path_and_sha256",
+      "validate_sentinel_result_path_and_sha256",
+      "batch_gate_path_and_sha256",
+      "p02b_config_path_and_sha256",
+      "test_receipt_path_and_sha256",
+      "deployment_manifest_path_and_sha256",
+      "binary_reuse_attestation_path_and_sha256"
+    ],
+    "required_after_fresh_p02b_before_lease": [
+      "gate_contract_path_and_sha256",
+      "stability_result_path_and_sha256",
+      "three_fresh_run_metrics_paths_and_sha256",
+      "three_p31_validation_paths_and_sha256"
+    ],
+    "post_run_binding_mechanism": "The canonical P10 and P20 validate_sentinel_result receipts bind these outputs; batch_gate_v2 revalidates both receipts, the external file references, and the identical gate_contract before atomically issuing the lease.",
+    "separate_manual_interstitial_receipt_required": false,
+    "fresh_output_fields_cannot_exist_before_p02b": true,
+    "lease_must_fail_closed_until_post_run_bindings_validate": true
+  },
+  "prohibited_actions": [
+    "modify, delete, rename, or replace either legacy FAILED marker",
+    "write PASS, DONE, or batch-lease artifacts into either legacy P02B root",
+    "write counterfactual replay output into a legacy run root",
+    "label a counterfactual legacy replay as formal PASS",
+    "reuse one or two legacy repeats in a fresh aggregate",
+    "rerun only the legacy repeat that landed in the 250000-us bucket",
+    "select the best three runs from the six legacy runs",
+    "change either fixed 150000-us or 250000-us boundary, the three-sigma formulas, QPS CV 0.07 threshold, mean storage latency CV 0.07 threshold, zero-overflow rule, or fail-closed conditions after fresh execution begins",
+    "use P99 upper-bound CV to produce PASS or HOLD under quantization-aware-tail-v1",
+    "use a fixed n or a precomputed count budget instead of deriving n, rank, and sigma from the fresh query_count",
+    "silently retain the old protocol or config identity while changing P99 decision semantics",
+    "issue a lease when complete histogram evidence, histogram boundary SHA-256, gate_contract, stability-result binding, or bound tool SHA-256 evidence is absent, malformed, schema-mismatched, drifting, or exceeds any hard gate",
+    "merge legacy V4/V5 timing outputs with a new candidate's formal matrix"
+  ],
+  "activation_requirements": [
+    "create and hash the external pre-run deployment attestation with every required_before_fresh_p03 field",
+    "verify the new protocol and evidence-manifest SHA-256 values",
+    "pass unit tests proving P99 upper-bound CV is diagnostic_only and cannot change PASS/HOLD",
+    "pass unit tests for QPS-HOLD, mean-storage-latency-HOLD, lower-bound per-run overflow, upper-bound per-run overflow, both fixed-boundary cross-run range limits, and nonzero histogram overflow",
+    "pass unit tests for histogram-missing, histogram-count-mismatch, histogram-boundary-SHA-mismatch, gate-contract drift, tool-SHA drift, and schema-mismatch cases",
+    "record a pre-registration timestamp earlier than the fresh P03 and batch creation timestamps",
+    "after fresh P02B and before lease issuance, the canonical P10/P20 validator receipts and batch_gate_v2 must validate every required_after_fresh_p02b_before_lease output binding",
+    "create a new immutable batch root and run fresh P03 before P02B"
+  ]
+}

@@ -5,21 +5,23 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import re
-import statistics
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from calculate_stability import calculate_stability
+from extract_run_metrics import extract_run_metrics
 from p02b_common import GateError, same_resolved_path, sha256_file
 
 
-RESULT_SCHEMA = "p02b-sf10-sentinel-result-v1"
+RESULT_SCHEMA = "p02b-sf10-sentinel-result-v2"
 PROVENANCE_SCHEMA = "p02b-sentinel-provenance-v1"
-CV_SCHEMA = "p02b-sentinel-cv-v1"
-METRICS_SCHEMA = "p02b-sentinel-run-metrics-v1"
+STABILITY_SCHEMA = "p02b-sentinel-stability-v2"
+METRICS_SCHEMA = "p02b-sentinel-run-metrics-v2"
 P31_MANIFEST_SCHEMA = "cidr-run-manifest-v1"
 P31_RESOURCE_SCHEMA = "cidr-resource-v1"
 CACHE_POLICY = "no-drop-caches;independent-process;in-process-warmup;os-cache-as-is"
@@ -42,6 +44,7 @@ RESULT_KEYS = {
     "started_at_utc",
     "completed_at_utc",
     "clean_ready",
+    "gate_contract",
     "protocol",
     "provenance",
     "correctness",
@@ -240,7 +243,7 @@ def validate_protocol(protocol: Any, fixture: bool) -> Dict[str, Any]:
     require_exact_keys(protocol, PROTOCOL_KEYS, "sentinel protocol")
     runs = require_int(protocol["independent_process_runs"], "protocol runs", 3)
     expected_queries = require_int(protocol["expected_queries"], "protocol expected_queries", 1)
-    require_int(protocol["warmup_runs"], "protocol warmup_runs", 0)
+    warmups = require_int(protocol["warmup_runs"], "protocol warmup_runs", 0)
     repeats = require_int(protocol["measured_repeats"], "protocol measured_repeats", 1)
     minimum_seconds = require_number(
         protocol["minimum_measured_seconds_per_run"],
@@ -315,7 +318,9 @@ def validate_protocol(protocol: Any, fixture: bool) -> Dict[str, Any]:
     return {
         "independent_process_runs": runs,
         "expected_queries": expected_queries,
+        "warmup_runs": warmups,
         "measured_repeats": repeats,
+        "minimum_measured_seconds_per_run": minimum_seconds,
         "cpu": cpu,
         "p31": p31,
         "io_backend": protocol["io_backend"],
@@ -623,13 +628,30 @@ def validate_provenance(
     )
     validate_id_map(provenance["id_map"], files)
     plan_summary = provenance["query_plan_summary"]
+    if not isinstance(plan_summary, dict):
+        raise GateError("query plan provenance summary is not an object")
+    require_exact_keys(
+        plan_summary,
+        {
+            "version",
+            "source",
+            "entries",
+            "queries",
+            "semantic_degree_hint",
+            "force_signature",
+            "sha256",
+        },
+        "query plan provenance summary",
+    )
     if (
-        not isinstance(plan_summary, dict)
-        or plan_summary.get("version") != 1
+        plan_summary.get("version") != 1
         or plan_summary.get("source") != "shared-truth-tsv"
         or plan_summary.get("sha256") != files["query_plan"]["sha256"]
         or require_int(plan_summary.get("queries"), "query plan summary queries", 1)
         != result["protocol"]["expected_queries"]
+        or plan_summary.get("semantic_degree_hint")
+        is not result["protocol"]["semantic_degree_hint"]
+        or plan_summary.get("force_signature") is not result["protocol"]["force_signature"]
     ):
         raise GateError("query plan provenance summary drift")
     return provenance_path, provenance_sha, repo_root, repo_head
@@ -679,7 +701,9 @@ def validate_correctness(
         raise GateError("correctness regenerated query plan differs from provenance")
 
 
-def validate_cv(stability: Any, protocol_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+def validate_stability(
+    stability: Any, protocol_summary: Dict[str, Any]
+) -> List[Dict[str, Any]]:
     if not isinstance(stability, dict):
         raise GateError("sentinel stability is not an object")
     require_exact_keys(
@@ -690,107 +714,210 @@ def validate_cv(stability: Any, protocol_summary: Dict[str, Any]) -> List[Dict[s
             "method",
             "independent_process_runs",
             "query_count_per_run",
+            "histogram_boundary_sha256",
+            "histogram_bounds_us",
+            "policy",
+            "derived_budgets",
             "qps",
-            "p99_us",
+            "mean_storage_latency_us",
+            "p99_upper_bound_us",
+            "tail",
             "runs",
         },
         "sentinel stability",
     )
-    if stability["schema_version"] != CV_SCHEMA or stability["state"] != "PASS":
+    if (
+        stability["schema_version"] != STABILITY_SCHEMA
+        or stability["state"] != "PASS"
+        or stability["method"] != "quantization-aware-tail-v1"
+    ):
         raise GateError("sentinel stability schema/state drift")
-    if stability["method"] != "sample_standard_deviation_over_arithmetic_mean":
-        raise GateError("sentinel stability method drift")
     expected_runs = protocol_summary["independent_process_runs"]
     if require_int(stability["independent_process_runs"], "stability run count", 3) != expected_runs:
         raise GateError("sentinel stability run coverage drift")
     expected_query_count = protocol_summary["expected_queries"] * protocol_summary["measured_repeats"]
     if require_int(stability["query_count_per_run"], "stability query count", 1) != expected_query_count:
         raise GateError("sentinel stability query count drift")
+    policy = stability["policy"]
+    if not isinstance(policy, dict):
+        raise GateError("sentinel stability policy is not an object")
+    require_exact_keys(
+        policy,
+        {
+            "qps_cv_max",
+            "mean_storage_latency_cv_max",
+            "quantile_numerator",
+            "quantile_denominator",
+            "lower_tail_bound_us",
+            "upper_tail_bound_us",
+            "sigma_multiplier",
+            "require_zero_overflow",
+        },
+        "sentinel stability policy",
+    )
+    qps_cv_max = require_number(
+        policy["qps_cv_max"], "stability qps_cv_max", positive=True
+    )
+    mean_latency_cv_max = require_number(
+        policy["mean_storage_latency_cv_max"],
+        "stability mean_storage_latency_cv_max",
+        positive=True,
+    )
+    if qps_cv_max > 0.07 or mean_latency_cv_max > 0.07:
+        raise GateError("sentinel stability CV ceiling exceeds 7%")
+    for key, expected in (
+        ("quantile_numerator", 99),
+        ("quantile_denominator", 100),
+        ("lower_tail_bound_us", 150000),
+        ("upper_tail_bound_us", 250000),
+        ("sigma_multiplier", 3),
+    ):
+        if require_int(policy[key], "stability policy {}".format(key), 1) != expected:
+            raise GateError("sentinel stability policy {} drift".format(key))
+    if policy["require_zero_overflow"] is not True:
+        raise GateError("sentinel stability must require zero overflow")
+
     run_records = stability["runs"]
     if not isinstance(run_records, list) or len(run_records) != expected_runs:
         raise GateError("sentinel stability run records are incomplete")
-
-    for metric_name, hard_limit in (("qps", 0.07), ("p99_us", 0.05)):
-        metric = stability[metric_name]
-        if not isinstance(metric, dict):
-            raise GateError("stability {} is not an object".format(metric_name))
-        require_exact_keys(
-            metric,
-            {"values", "mean", "sample_stdev", "cv", "maximum_cv", "pass"},
-            "stability {}".format(metric_name),
-        )
-        values = metric["values"]
-        if not isinstance(values, list) or len(values) != expected_runs:
-            raise GateError("stability {} values coverage drift".format(metric_name))
-        numeric_values = [
-            require_number(item, "stability {} value".format(metric_name), positive=True)
-            for item in values
-        ]
-        expected_mean = statistics.mean(numeric_values)
-        expected_stdev = statistics.stdev(numeric_values)
-        expected_cv = expected_stdev / expected_mean
-        for field, expected in (
-            ("mean", expected_mean),
-            ("sample_stdev", expected_stdev),
-            ("cv", expected_cv),
-        ):
-            actual = require_number(metric[field], "stability {} {}".format(metric_name, field))
-            if not math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-15):
-                raise GateError("stability {} {} was not recomputed correctly".format(metric_name, field))
-        maximum = require_number(
-            metric["maximum_cv"], "stability {} maximum_cv".format(metric_name), positive=True
-        )
-        if maximum > hard_limit or expected_cv > maximum or metric["pass"] is not True:
-            raise GateError("sentinel {} CV sub-gate failed".format(metric_name))
-
-    seen_indices: Set[int] = set()
-    seen_ids: Set[str] = set()
+    metric_paths: List[Path] = []
     for index, record in enumerate(run_records, start=1):
         if not isinstance(record, dict):
             raise GateError("stability run record is not an object")
-        require_exact_keys(
-            record,
-            {"path", "sha256", "run_index", "run_id", "query_count", "qps", "p99_us", "measured_seconds"},
-            "stability run record",
-        )
         metric_path = validate_hash_ref(record, "stability run {} metrics".format(index))
-        run_index = require_int(record["run_index"], "stability run_index", 1)
-        run_id = record["run_id"]
-        if run_index != index or not isinstance(run_id, str) or not run_id:
-            raise GateError("stability run identity drift")
-        if run_index in seen_indices or run_id in seen_ids:
-            raise GateError("duplicate stability run identity")
-        seen_indices.add(run_index)
-        seen_ids.add(run_id)
-        if require_int(record["query_count"], "stability run query_count", 1) != expected_query_count:
-            raise GateError("stability run query count drift")
-        qps = require_number(record["qps"], "stability run qps", positive=True)
-        p99 = require_number(record["p99_us"], "stability run p99", positive=True)
-        require_number(record["measured_seconds"], "stability measured_seconds", positive=True)
-        if qps != float(stability["qps"]["values"][index - 1]) or p99 != float(
-            stability["p99_us"]["values"][index - 1]
-        ):
-            raise GateError("stability run/aggregate values drift")
         metric_document = read_json(metric_path, "stability run metrics")
         if (
             metric_document.get("schema_version") != METRICS_SCHEMA
             or metric_document.get("state") != "PASS"
-            or metric_document.get("run_index") != run_index
-            or metric_document.get("run_id") != run_id
-            or metric_document.get("query_count") != record["query_count"]
-            or float(metric_document.get("qps", -1)) != qps
-            or float(metric_document.get("p99_us", -1)) != p99
+            or metric_document.get("run_index") != index
         ):
             raise GateError("stability run metrics document drift")
+        metric_paths.append(metric_path)
+
+    recomputed = calculate_stability(
+        metric_paths,
+        expected_runs,
+        qps_cv_max,
+        mean_latency_cv_max,
+        int(policy["quantile_numerator"]),
+        int(policy["quantile_denominator"]),
+        int(policy["lower_tail_bound_us"]),
+        int(policy["upper_tail_bound_us"]),
+        int(policy["sigma_multiplier"]),
+        bool(policy["require_zero_overflow"]),
+    )
+    if recomputed != stability:
+        raise GateError("sentinel stability was not canonically recomputed")
     return run_records
+
+
+def canonical_sha256(value: Dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def validate_gate_contract(
+    contract: Any,
+    run_dir: Path,
+    stability: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        raise GateError("sentinel gate_contract is not an object")
+    require_exact_keys(
+        contract,
+        {
+            "schema_version",
+            "method",
+            "quantile",
+            "tail_bounds_us",
+            "sigma_multiplier",
+            "qps_cv_max",
+            "mean_storage_latency_cv_max",
+            "require_zero_overflow",
+            "stability_result",
+            "tools",
+            "contract_sha256",
+        },
+        "sentinel gate_contract",
+    )
+    if (
+        contract["schema_version"] != "p02b-gate-contract-v1"
+        or contract["method"] != "quantization-aware-tail-v1"
+    ):
+        raise GateError("sentinel gate_contract schema/method drift")
+    if not isinstance(contract["quantile"], dict):
+        raise GateError("sentinel gate_contract quantile is not an object")
+    if not isinstance(contract["tail_bounds_us"], dict):
+        raise GateError("sentinel gate_contract tail bounds are not an object")
+    require_exact_keys(contract["quantile"], {"numerator", "denominator"}, "gate quantile")
+    require_exact_keys(contract["tail_bounds_us"], {"lower", "upper"}, "gate tail bounds")
+    policy = stability["policy"]
+    expected_scalars = {
+        "sigma_multiplier": policy["sigma_multiplier"],
+        "qps_cv_max": policy["qps_cv_max"],
+        "mean_storage_latency_cv_max": policy["mean_storage_latency_cv_max"],
+        "require_zero_overflow": policy["require_zero_overflow"],
+    }
+    for key, expected in expected_scalars.items():
+        if contract[key] != expected:
+            raise GateError("sentinel gate_contract {} drift".format(key))
+    if contract["quantile"] != {
+        "numerator": policy["quantile_numerator"],
+        "denominator": policy["quantile_denominator"],
+    }:
+        raise GateError("sentinel gate_contract quantile drift")
+    if contract["tail_bounds_us"] != {
+        "lower": policy["lower_tail_bound_us"],
+        "upper": policy["upper_tail_bound_us"],
+    }:
+        raise GateError("sentinel gate_contract tail boundaries drift")
+
+    stability_path = validate_file_ref(
+        contract["stability_result"],
+        "gate stability result",
+        run_dir / "stability-result.json",
+    )
+    if read_json(stability_path, "gate stability result") != stability:
+        raise GateError("gate stability artifact differs from embedded stability")
+    tools = contract["tools"]
+    if not isinstance(tools, dict):
+        raise GateError("sentinel gate_contract tools is not an object")
+    require_exact_keys(
+        tools,
+        {"extract_run_metrics", "calculate_stability", "validate_sentinel_result"},
+        "gate tools",
+    )
+    runner_dir = Path(__file__).resolve().parent
+    for name, filename in (
+        ("extract_run_metrics", "extract_run_metrics.py"),
+        ("calculate_stability", "calculate_stability.py"),
+        ("validate_sentinel_result", "validate_sentinel_result.py"),
+    ):
+        validate_file_ref(
+            tools[name],
+            "gate tool {}".format(name),
+            runner_dir / filename,
+        )
+    unsigned = dict(contract)
+    digest = require_hex64(
+        unsigned.pop("contract_sha256"), "gate contract contract_sha256"
+    )
+    if canonical_sha256(unsigned) != digest:
+        raise GateError("sentinel gate_contract SHA-256 drift")
+    return contract
 
 
 def validate_repeats(
     result: Dict[str, Any],
+    run_dir: Path,
     protocol_summary: Dict[str, Any],
     stability_runs: List[Dict[str, Any]],
     repo_head: str,
     fixture: bool,
+    query_plan_path: Path,
 ) -> Dict[str, str]:
     repeats = result["repeats"]
     expected_runs = protocol_summary["independent_process_runs"]
@@ -798,15 +925,21 @@ def validate_repeats(
         raise GateError("sentinel repeat coverage drift")
     host: Optional[Dict[str, str]] = None
     for index, repeat in enumerate(repeats, start=1):
+        expected_repeat_root = run_dir / "repeats" / "r{}".format(index)
         if not isinstance(repeat, dict):
             raise GateError("sentinel repeat is not an object")
         require_exact_keys(repeat, {"run_index", "run_id", "metrics", "p31"}, "sentinel repeat")
         if require_int(repeat["run_index"], "repeat run_index", 1) != index:
             raise GateError("sentinel repeat index drift")
         run_id = repeat["run_id"]
-        if not isinstance(run_id, str) or not run_id:
-            raise GateError("sentinel repeat run_id is invalid")
-        metrics_path = validate_file_ref(repeat["metrics"], "repeat metrics")
+        expected_run_id = "{}-r{}".format(result["run_id"], index)
+        if run_id != expected_run_id:
+            raise GateError("sentinel repeat run_id is not fresh/canonical")
+        metrics_path = validate_file_ref(
+            repeat["metrics"],
+            "repeat metrics",
+            expected_repeat_root / "run-metrics.json",
+        )
         stability_ref = stability_runs[index - 1]
         if (
             metrics_path != Path(stability_ref["path"]).resolve()
@@ -818,8 +951,14 @@ def validate_repeats(
         p31 = repeat["p31"]
         if not isinstance(p31, dict):
             raise GateError("sentinel repeat P31 reference is not an object")
-        require_exact_keys(p31, {"run_dir", "manifest", "validation", "done"}, "repeat P31")
+        require_exact_keys(
+            p31,
+            {"run_dir", "manifest", "validation", "done", "command_stdout"},
+            "repeat P31",
+        )
         p31_root = canonical_path(p31["run_dir"], "repeat P31 run_dir", require_dir=True)
+        if p31_root != (expected_repeat_root / "p31").resolve():
+            raise GateError("sentinel repeat P31 root is not fresh/canonical")
         manifest_path = validate_file_ref(
             p31["manifest"], "repeat P31 manifest", p31_root / "run-manifest.json"
         )
@@ -827,6 +966,35 @@ def validate_repeats(
             p31["validation"], "repeat P31 validation", p31_root / "validation.json"
         )
         done_path = validate_file_ref(p31["done"], "repeat P31 DONE", p31_root / "DONE")
+        command_stdout_path = validate_file_ref(
+            p31["command_stdout"],
+            "repeat P31 command stdout",
+            p31_root / "command.stdout.log",
+        )
+        metric_document = read_json(metrics_path, "repeat metrics")
+        bench_json = metric_document.get("bench_json")
+        if not isinstance(bench_json, dict):
+            raise GateError("repeat metrics bench_json evidence is missing")
+        require_exact_keys(bench_json, {"path", "sha256"}, "repeat metrics bench_json")
+        if (
+            not same_resolved_path(bench_json["path"], command_stdout_path)
+            or bench_json["sha256"] != p31["command_stdout"]["sha256"]
+        ):
+            raise GateError("repeat metrics bench_json/P31 stdout binding drift")
+        recomputed_metric = extract_run_metrics(
+            command_stdout_path,
+            query_plan_path,
+            index,
+            run_id,
+            protocol_summary["expected_queries"],
+            protocol_summary["warmup_runs"],
+            protocol_summary["measured_repeats"],
+            protocol_summary["minimum_measured_seconds_per_run"],
+        )
+        if recomputed_metric != metric_document:
+            raise GateError(
+                "repeat run-metrics was not exactly recomputed from P31 command stdout"
+            )
         if (p31_root / "FAILED").exists():
             raise GateError("sentinel repeat P31 has a FAILED marker")
         manifest = read_json(manifest_path, "repeat P31 manifest")
@@ -862,6 +1030,18 @@ def validate_repeats(
             raise GateError("sentinel repeats were collected on different hosts")
         if validation.get("state") != "PASS":
             raise GateError("sentinel repeat P31 validation is not PASS")
+        if validation.get("errors") != [] or validation.get("warnings") != []:
+            raise GateError("sentinel repeat P31 validation is not warning-free")
+        manifest_validation = manifest.get("validation")
+        if (
+            not isinstance(manifest_validation, dict)
+            or manifest_validation.get("state") != "PASS"
+            or manifest_validation.get("errors") != []
+            or manifest_validation.get("warnings") != []
+        ):
+            raise GateError("sentinel repeat P31 manifest validation is not warning-free PASS")
+        if manifest_validation != validation:
+            raise GateError("sentinel repeat P31 manifest/validation.json evidence differs")
         if (
             done.get("state") != "PASS"
             or done.get("manifest_sha256") != sha256_file(manifest_path)
@@ -927,6 +1107,8 @@ def validate_result(
             raise GateError("sentinel result is older than max_age_seconds")
 
     run_dir = result_path.parent
+    if result["run_id"] != run_dir.name:
+        raise GateError("sentinel run_id must equal its canonical run directory name")
     marker_name = "FIXTURE-PASS" if fixture else "PASS"
     opposite_marker = run_dir / ("PASS" if fixture else "FIXTURE-PASS")
     marker_path = run_dir / marker_name
@@ -953,11 +1135,21 @@ def validate_result(
         expected_repo_head,
         expected_binary_sha256,
     )
-    validate_clean_ready(run_dir, result["clean_ready"], read_json(provenance_path, "sentinel provenance"))
+    provenance_document = read_json(provenance_path, "sentinel provenance")
+    validate_clean_ready(run_dir, result["clean_ready"], provenance_document)
     validate_correctness(run_dir, result["correctness"], protocol_summary, result)
-    stability_runs = validate_cv(result["stability"], protocol_summary)
+    stability_runs = validate_stability(result["stability"], protocol_summary)
+    gate_contract = validate_gate_contract(
+        result["gate_contract"], run_dir, result["stability"]
+    )
     host = validate_repeats(
-        result, protocol_summary, stability_runs, repo_head, fixture
+        result,
+        run_dir,
+        protocol_summary,
+        stability_runs,
+        repo_head,
+        fixture,
+        Path(provenance_document["files"]["query_plan"]["path"]).resolve(),
     )
 
     marker_sha = sha256_file(marker_path)
@@ -980,6 +1172,8 @@ def validate_result(
         "repo_root": repo_root,
         "repo_head": repo_head,
         "binary_sha256": binary_sha,
+        "gate_contract": gate_contract,
+        "gate_contract_sha256": gate_contract["contract_sha256"],
         "host": host,
         "protocol": {
             "cpu": protocol_summary["cpu"],

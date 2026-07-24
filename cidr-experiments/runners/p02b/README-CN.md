@@ -18,9 +18,11 @@ SF10 试跑和 P31 资源采集绑定成一个 fail-closed 放行门。它本身
    新 plan 必须与预先冻结的 plan 字节级 SHA-256 相同；
 4. 三个独立 `storage-bench` 进程顺序执行。每个进程使用同一个 cpuset、线程数、
    warmup、cache policy、store 和 query plan，并由自己的 P31 sidecar 采集；
-5. run-level QPS 使用总 operations / query elapsed time；P99 从所有 entry/round 的
-   storage latency histogram 合并后计算。CV 定义为 sample standard deviation / mean；
-   QPS CV `<=3%` 且 P99 CV `<=5%`。
+5. run-level QPS 使用总 operations / query elapsed time；完整 storage latency
+   histogram 在所有 entry/round 间合并。正式 v4 gate 要求 QPS CV 与平均 storage
+   latency CV 均 `<=7%`，并在固定 `150000 us`、`250000 us` 边界上检查逐 run tail
+   count、跨 run range 和零 overflow。P99 histogram upper bound 的 CV 仅作诊断，
+   不参与 PASS/HOLD。
 
 任一命令、truth、P31、hash、schema、运行时长或 CV gate 失败，只写 `FAILED`，不会留下
 `PASS`。runner 只会在超时时终止自己创建的进程组，不检查、停止或修改其他用户进程。
@@ -35,8 +37,8 @@ runner 保留已经成立的 P02B `PASS`，另写 `BATCH-LEASE-FAILED.json` 并�
 ## 正式准备
 
 正式运行必须使用已经 commit 的 clean `codex/cidr-sentinel` worktree，并在该 commit 上
-构建 release binary。legacy 配置保留在 `configs/sf10-seml0.json`；短窗口正式批次使用
-`configs/sf10-seml0-short-gate-v2.json`，冻结：
+构建 release binary。旧 v1/v2/v3 配置仅保留作历史证据；新的正式确认批次必须使用
+`configs/sf10-seml0-short-gate-v4-quantization-aware.json`，冻结：
 
 - housekeeping CPU：`0-15,64-79`；formal CPU：跨两个 NUMA 节点的 48 个物理核；
 - `RAYON_NUM_THREADS=48`，blocking I/O，schema sentinel store；
@@ -45,11 +47,17 @@ runner 保留已经成立的 P02B `PASS`，另写 `BATCH-LEASE-FAILED.json` 并�
   elapsed time不得少于 30 秒；
 - P31 1 秒采样、15 秒目录采样，必须有 pidstat/iostat。
 
-时间受限批次在连续两次 clean-host P02B HOLD 后可显式选择
-`configs/sf10-seml0-short-gate-v3-relaxed-qps7.json`。该配置只把 QPS CV 上限从
-`3%` 调整为 `7%`；P99 CV 仍为 `5%`，correctness、三独立进程、P31、clean window、
-provenance 和 lease 约束均不变。使用它的结果必须标记为 `relaxed admission`，不得与
-原始 `3%` 协议混称；阈值冻结为 `7%` 后不得继续上调。
+v4 的 tail 预算全部从 fresh run 的共同查询数 `n` 推导：
+`rank=ceil(0.99n)`、`tail_budget=n-rank`、
+`sigma=sqrt(n×0.01×0.99)`、逐 run jitter 预算 `ceil(3sigma)`、跨 run range
+预算 `ceil(3sqrt(2)sigma)`。以正式 `n=17000` 为例，对应 `rank=16830`、
+`tail_budget=170`、jitter `39`、range `56`；实现不能把这些示例值硬编码为固定预算。
+每个 run 的 metrics 还必须用 path 与 SHA-256 精确绑定自己的
+`p31/command.stdout.log`，结果中的 gate contract 同时绑定 stability artifact 和三个
+判定工具的 SHA-256。consumer 会用冻结的 query plan 和 protocol 参数从该 stdout
+重新提取完整 metrics 并逐字段比较，同时锁定当前 run root 下的 run/repeat identity
+与 canonical 路径；任何外部/旧 repeat、P31 warning 或重签后的 metrics 数值篡改都会
+fail closed。
 
 先生成不可变 dataset/store 的 canonical tree manifest。该操作读取完整目录，属于
 G1-I/O，不得与正式 timing 并发：
@@ -93,14 +101,15 @@ python3 cidr-experiments/runners/p02b/run_sf10_sentinel.py \
   --truth /data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260626/3plus3-baselines/systems/neo4j/sf10-main/workload/truth-s50-seed42.tsv \
   --query-plan /data/WorkSpace/results/P02B/sf10-shared-truth-plan.json \
   --id-map-dir /data/WorkSpace/lsmgraph-rs/cidr-experiments/artifacts/id-maps/P01-IDMAP-20260721T171325Z-187e851 \
-  --config "$PWD/cidr-experiments/runners/p02b/configs/sf10-seml0-short-gate-v2.json" \
+  --config "$PWD/cidr-experiments/runners/p02b/configs/sf10-seml0-short-gate-v4-quantization-aware.json" \
   --batch-gate-tool "$PWD/cidr-experiments/runners/batch_gate_v2.py" \
   --batch-lease-output "/ABS/BATCH/batch-lease.json"
 ```
 
 上述命令仅在 P02B `PASS` 与 batch lease 都成功时返回 `0`。退出码 `3` 表示 P02B
 仍为 `PASS`、但 lease 发行失败；此时必须修复发行问题，不能把 P02B `PASS` 直接交给
-v2 下游。旧协议仍可显式使用 legacy 配置并由 P10/P20 的 legacy CLI 消费。
+v2 下游。当前 runner 会拒绝旧 v1/v2/v3 config schema；旧结果只能由对应历史 commit
+上的 legacy validator 作诊断消费，不能在 v4 下发行新 lease。
 
 legacy P10/P20 在启动前显式消费并校验 P02B 结果：
 
@@ -127,5 +136,6 @@ cd cidr-experiments/runners/p02b
 tests/run_tests.sh
 ```
 
-测试只运行一个两秒级 fake binary，完成三次独立假 repeat、真实 P31 sidecar、CV、marker
+测试只运行一个两秒级 fake binary，完成三次独立假 repeat、真实 P31 sidecar、QPS/mean
+CV、两条 tail boundary、overflow、gate/tool SHA、bench JSON/stdout 证据绑定、marker
 tamper 和 fixture-as-formal 拒绝测试；不构建或运行 lsmgraph benchmark。

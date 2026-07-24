@@ -1,0 +1,188 @@
+{
+  "schema_version": "p02b-quantization-aware-tail-protocol-v1",
+  "protocol_id": "quantization-aware-tail-v1",
+  "status": "FROZEN_FOR_IMPLEMENTATION_AND_FRESH_CONFIRMATION",
+  "created_at_utc": "2026-07-24T02:36:42.489Z",
+  "scope": {
+    "task_id": "P02B-SF10-SENTINEL",
+    "scale": "sf10",
+    "purpose": "prospective batch admission only",
+    "legacy_replay_eligibility": "DIAGNOSTIC_ONLY",
+    "formal_admission_requires_fresh_data": true
+  },
+  "design_disclosure": {
+    "motivated_by_legacy_holds": true,
+    "legacy_p99_source": "merged_storage_latency_histogram_upper_bound",
+    "legacy_observed_p99_us": [
+      [
+        250000,
+        150000,
+        250000
+      ],
+      [
+        150000,
+        150000,
+        250000
+      ]
+    ],
+    "interpretation": "The legacy values exposed histogram quantization. They may be used to design and regression-test this protocol, but they cannot be retroactively promoted to PASS."
+  },
+  "fixed_inputs": {
+    "quantile_numerator": 99,
+    "quantile_denominator": 100,
+    "independent_process_runs": 3,
+    "equal_query_count_required": true,
+    "query_count_source": "fresh run metrics query_count",
+    "p99_source_exact": "merged_storage_latency_histogram_upper_bound",
+    "full_histogram_counts_required": true,
+    "histogram_bucket_semantics": "non-cumulative counts keyed by strictly increasing upper_bound_us",
+    "histogram_count_must_equal_query_count": true,
+    "identical_histogram_bounds_across_runs_required": true,
+    "identical_histogram_boundary_sha256_across_runs_required": true,
+    "reported_p99_must_recompute_exactly_from_histogram": true,
+    "lower_tail_bound_us": 150000,
+    "upper_tail_bound_us": 250000,
+    "overflow_bucket_upper_bound_us": 18446744073709551615,
+    "overflow_count_required": 0
+  },
+  "statistics": {
+    "n_definition": "n is the common fresh query_count; each run's complete histogram count must also equal n",
+    "rank_definition": "rank = ceil(99 * n / 100)",
+    "tail_budget_definition": "tail_budget = n - rank",
+    "tail_probability": 0.01,
+    "sigma_definition": "sigma = sqrt(n * 0.01 * 0.99)",
+    "sigma_multiplier": 3,
+    "within_run_jitter_budget_definition": "ceil(3 * sigma)",
+    "cross_run_range_budget_definition": "ceil(3 * sqrt(2) * sigma)",
+    "tail_count_definition": "T_i(b) = sum of run i histogram counts whose upper_bound_us is > b",
+    "lower_bound_per_run_max_definition": "n - rank + ceil(3 * sigma)",
+    "upper_bound_per_run_max_definition": "n - rank",
+    "cross_run_range_definition": "max_i(T_i(b)) - min_i(T_i(b))",
+    "cross_run_range_max_definition": "ceil(3 * sqrt(2) * sigma)",
+    "all_derived_values_source": "n, rank, tail_budget, sigma, and both count budgets are derived from the fresh equal query_count; no fixed-n budget is permitted",
+    "statistical_claim_limit": "The three-sigma budget is a frozen operational admission budget, not a confidence interval or a claim that query latencies are independent Bernoulli samples."
+  },
+  "hard_gates": {
+    "correctness": {
+      "required_state": "PASS",
+      "mismatches_max": 0
+    },
+    "clean_window": {
+      "protocol_version": "short-clean-window-v2",
+      "fresh_ready_required": true,
+      "minimum_consecutive_samples": 5,
+      "ready_max_age_seconds": 300
+    },
+    "process_runs": {
+      "required": 3,
+      "fresh_independent_processes": true,
+      "mixed_legacy_and_fresh_runs_forbidden": true,
+      "equal_query_counts_required": true,
+      "result_run_id_must_equal_run_directory_name": true,
+      "repeat_run_id_must_equal_result_run_id_plus_index": true,
+      "metrics_and_p31_paths_must_be_canonical_children_of_current_run": true
+    },
+    "resource_evidence": {
+      "p31_done_required_for_each_run": true,
+      "p31_validation_state_required": "PASS",
+      "p31_warnings_allowed": false,
+      "p31_command_stdout_file_ref_and_sha256_required": true,
+      "run_metrics_bench_json_must_bind_exact_p31_command_stdout": true,
+      "manifest_validation_must_exactly_equal_validation_json": true,
+      "run_metrics_must_exactly_recompute_from_command_stdout_and_frozen_query_plan": true
+    },
+    "qps": {
+      "method": "sample_standard_deviation_over_arithmetic_mean",
+      "maximum_cv": 0.07,
+      "threshold_relaxation_forbidden": true
+    },
+    "mean_storage_latency_us": {
+      "method": "sample_standard_deviation_over_arithmetic_mean",
+      "maximum_cv": 0.07,
+      "threshold_relaxation_forbidden": true
+    },
+    "p99_upper_bound_us": {
+      "method": "sample_standard_deviation_over_arithmetic_mean",
+      "admission_role": "diagnostic_only",
+      "diagnostic_output_threshold": 0.0,
+      "participates_in_state": false
+    },
+    "tail": {
+      "lower_fixed_boundary": {
+        "bound_us": 150000,
+        "count_definition": "T_i(150000) = sum of complete histogram counts whose upper_bound_us is > 150000",
+        "maximum_count_each_run": "n - rank + ceil(3 * sigma)",
+        "maximum_count_range_across_runs": "ceil(3 * sqrt(2) * sigma)"
+      },
+      "upper_fixed_boundary": {
+        "bound_us": 250000,
+        "count_definition": "T_i(250000) = sum of complete histogram counts whose upper_bound_us is > 250000",
+        "maximum_count_each_run": "n - rank",
+        "maximum_count_range_across_runs": "ceil(3 * sqrt(2) * sigma)"
+      },
+      "overflow": {
+        "maximum_count_each_run": 0
+      },
+      "all_conditions_participate_in_state": true,
+      "manual_exception_forbidden": true
+    }
+  },
+  "gate_contract_binding": {
+    "schema_version": "p02b-gate-contract-v1",
+    "method": "quantization-aware-tail-v1",
+    "canonical_contract_sha256_required": true,
+    "exact_policy_fields_required": [
+      "quantile_numerator",
+      "quantile_denominator",
+      "lower_tail_bound_us",
+      "upper_tail_bound_us",
+      "sigma_multiplier",
+      "qps_cv_max",
+      "mean_storage_latency_cv_max",
+      "require_zero_overflow"
+    ],
+    "stability_result_file_ref_and_sha256_required": true,
+    "tool_file_refs_and_sha256_required": [
+      "extract_run_metrics.py",
+      "calculate_stability.py",
+      "validate_sentinel_result.py"
+    ],
+    "contract_or_tool_sha_drift_yields": "HOLD"
+  },
+  "overall_decision": {
+    "pass_definition": "PASS iff correctness, clean-window, process-run, resource, QPS CV <= 0.07, mean storage latency CV <= 0.07, both fixed-boundary per-run count limits, both fixed-boundary cross-run range limits, and zero-overflow gates all pass. P99 upper-bound CV is diagnostic_only and never participates in state.",
+    "hold_definition": "Any failed, missing, malformed, non-finite, provenance-mismatched, or unverifiable hard-gate input yields HOLD.",
+    "lease_rule": "A batch lease may be issued only from a fresh PASS under this exact protocol and a fully bound candidate commit/tree/config."
+  },
+  "fail_closed_conditions": [
+    "missing or incomplete raw histogram counts",
+    "histogram counts do not sum to query_count",
+    "histogram bounds differ across runs",
+    "histogram_boundary_sha256 differs across runs",
+    "reported P99 does not exactly recompute from the histogram",
+    "any overflow count is nonzero",
+    "any run's count above 150000 us exceeds n - rank + ceil(3 * sigma)",
+    "any run's count above 250000 us exceeds n - rank",
+    "the cross-run count range above either 150000 us or 250000 us exceeds ceil(3 * sqrt(2) * sigma)",
+    "query counts differ across runs",
+    "QPS CV exceeds 0.07",
+    "mean storage latency CV exceeds 0.07",
+    "gate_contract is missing, malformed, or does not bind the exact frozen policy and stability result",
+    "a bound tool file reference or SHA-256 is missing or drifts",
+    "run metrics bench_json path or SHA-256 does not bind the exact P31 command stdout evidence",
+    "run metrics does not exactly recompute from P31 command stdout using the frozen query plan and protocol parameters",
+    "result/repeat identities or metrics/P31 paths are not canonical children of the current fresh run root",
+    "P31 manifest validation differs from validation.json or either contains errors or warnings",
+    "any P31 run is not DONE and PASS",
+    "any legacy repeat is mixed into the fresh confirmation batch"
+  ],
+  "protocol_change_controls": {
+    "new_schema_and_protocol_id_required": true,
+    "new_config_sha256_required": true,
+    "new_repo_commit_and_tree_required": true,
+    "pre_registration_before_fresh_run_required": true,
+    "threshold_or_formula_change_after_fresh_run_starts_forbidden": true,
+    "legacy_failed_markers_must_remain_immutable": true,
+    "legacy_counterfactual_pass_cannot_issue_lease": true
+  }
+}
