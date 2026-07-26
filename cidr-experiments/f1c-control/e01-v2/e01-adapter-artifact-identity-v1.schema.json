@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seml0.invalid/contracts/cidr-e01-adapter-artifact-identity-v1.schema.json",
+  "title": "CIDR E01 adapter artifact identity receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "state",
+    "execution_state",
+    "system_key",
+    "adapter_kind",
+    "adapter_entry",
+    "path_resolution_policy",
+    "engine_binary_sha256",
+    "store_sha256",
+    "harness_git_sha",
+    "protocol_sha256",
+    "synthetic_test_only",
+    "fixture_only",
+    "formal_eligible",
+    "performance_eligible",
+    "paper_claim_eligible"
+  ],
+  "properties": {
+    "schema_version": { "const": "cidr-e01-adapter-artifact-identity-v1" },
+    "state": { "const": "PASS" },
+    "execution_state": { "const": "NOT_IMPLEMENTED" },
+    "system_key": {
+      "enum": [
+        "seml0",
+        "seml0-naive",
+        "livegraph",
+        "aster",
+        "tugraph",
+        "nebulagraph",
+        "neo4j"
+      ]
+    },
+    "adapter_kind": { "enum": [ "binary", "python-script" ] },
+    "adapter_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [ "path", "sha256", "size_bytes" ],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 }
+      }
+    },
+    "path_resolution_policy": {
+      "const": "canonical-absolute-existing-nonsymlink-small-v1"
+    },
+    "engine_binary_sha256": { "$ref": "#/$defs/sha256" },
+    "store_sha256": { "$ref": "#/$defs/sha256" },
+    "harness_git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "protocol_sha256": { "$ref": "#/$defs/sha256" },
+    "synthetic_test_only": { "const": false },
+    "fixture_only": { "const": false },
+    "formal_eligible": { "const": false },
+    "performance_eligible": { "const": false },
+    "paper_claim_eligible": { "const": false }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

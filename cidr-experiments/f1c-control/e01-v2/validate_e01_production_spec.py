@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 import build_e01_formal_manifest as manifest_builder
 import run_e01_formal_matrix as scheduler
+import validate_e01_adapter_artifact_identity as artifact_identity
 
 
 SCHEMA_VERSION = "cidr-e01-production-command-spec-v1"
@@ -146,12 +147,32 @@ def validate_production_spec(
         key = row["system_key"]
         require(
             set(row)
-            == {"system_key", "cwd_relative", "adapter_entry", "adapter_kind", "argv"},
+            == {
+                "system_key",
+                "cwd_relative",
+                "adapter_entry",
+                "artifact_identity_receipt",
+                "adapter_kind",
+                "argv",
+            },
             f"{key}: system command keys drift",
         )
         safe_relative(row.get("cwd_relative"), f"{key}.cwd_relative")
-        small_attested_file(row.get("adapter_entry"), f"{key} adapter entry")
+        entry = small_attested_file(row.get("adapter_entry"), f"{key} adapter entry")
         require(row.get("adapter_kind") in ("binary", "python-script"), f"{key}: adapter kind drift")
+        identity_path = small_attested_file(
+            row.get("artifact_identity_receipt"), f"{key} artifact identity receipt"
+        )
+        try:
+            artifact_identity.validate_identity_receipt(
+                identity_path,
+                manifest=manifest,
+                system_key=key,
+                expected_entry=entry,
+                expected_kind=row["adapter_kind"],
+            )
+        except (artifact_identity.IdentityError, manifest_builder.BuildError) as exc:
+            raise SpecError(str(exc)) from exc
         argv = row.get("argv")
         require(type(argv) is list and argv and all(type(item) is str and item for item in argv), f"{key}: explicit argv array required")
         require(argv[0] == str(Path(row["adapter_entry"]).resolve()), f"{key}: argv[0] must be attested adapter entry")

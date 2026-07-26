@@ -109,3 +109,12 @@ batch lease、lease marker 和 cell-evidence schema，并声明还需要 fresh r
 gate。command-plan builder 会重新验证该绑定并原样写入 plan；任一 lineage/SHA
 漂移、synthetic/fixture 标记或 eligibility 提升都会拒绝。executor 状态仍被
 合同固定为 `NOT_IMPLEMENTED`，本接口不生成或续签 admission receipt。
+
+`e01-adapter-artifact-identity-v1.schema.json` 与
+`validate_e01_adapter_artifact_identity.py` 将每个真实 spec 的 adapter entry
+从裸路径提升为静态 identity receipt：必须是 canonical absolute、已存在、
+非 symlink、小文件，并绑定 entry SHA/size、formal manifest 中对应的 engine
+binary/store SHA、harness git 和 protocol SHA。production spec 与 command
+plan 会分别重新验证 receipt 及其内容；路径、文件或任一 identity 漂移都会在
+plan 输出和正式根创建前 fail-closed。receipt 本身仍固定
+`execution_state=NOT_IMPLEMENTED`、非 synthetic/fixture 且 eligibility 全 false。

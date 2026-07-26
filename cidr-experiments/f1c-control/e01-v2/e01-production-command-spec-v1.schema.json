@@ -45,6 +45,7 @@
           "system_key",
           "cwd_relative",
           "adapter_entry",
+          "artifact_identity_receipt",
           "adapter_kind",
           "argv"
         ],
@@ -52,6 +53,7 @@
           "system_key": { "type": "string" },
           "cwd_relative": { "type": "string", "minLength": 1 },
           "adapter_entry": { "type": "string", "minLength": 1 },
+          "artifact_identity_receipt": { "type": "string", "minLength": 1 },
           "adapter_kind": { "enum": [ "binary", "python-script" ] },
           "argv": {
             "type": "array",

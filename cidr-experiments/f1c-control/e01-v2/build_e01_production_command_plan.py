@@ -15,6 +15,7 @@ from typing import Any, Mapping
 import build_e01_formal_manifest as manifest_builder
 import run_e01_formal_matrix as scheduler
 import validate_e01_cell_evidence as evidence
+import validate_e01_adapter_artifact_identity as artifact_identity
 import validate_e01_production_spec as production_spec
 
 
@@ -219,18 +220,31 @@ def build_command_plan(
     system_specs: dict[str, dict[str, Any]] = {}
     for row in systems:
         require(
-            set(row) == {"system_key", "cwd_relative", "adapter_entry", "adapter_kind", "argv"},
+            set(row)
+            == {
+                "system_key",
+                "cwd_relative",
+                "adapter_entry",
+                "artifact_identity_receipt",
+                "adapter_kind",
+                "argv",
+            },
             f"{row.get('system_key')}: command spec keys drift",
         )
         key = row["system_key"]
         require(row.get("adapter_kind") in ("binary", "python-script"), f"{key}: adapter_kind unsupported")
         cwd_relative = safe_relative(row.get("cwd_relative"), f"{key}.cwd_relative")
         adapter_ref = file_ref(Path(row.get("adapter_entry", "")).resolve(), f"{key} adapter entry")
+        identity_ref = file_ref(
+            Path(row.get("artifact_identity_receipt", "")).resolve(),
+            f"{key} artifact identity receipt",
+        )
         require(type(row.get("argv")) is list, f"{key}: argv array required; shell command strings forbidden")
         system_specs[key] = {
             "cwd_relative": cwd_relative,
             "adapter_kind": row["adapter_kind"],
             "adapter_entry": adapter_ref,
+            "artifact_identity_receipt": identity_ref,
             "argv": row["argv"],
         }
 
@@ -290,6 +304,9 @@ def build_command_plan(
                 "adapter": {
                     "kind": command_spec["adapter_kind"],
                     "entry": adapter_entry,
+                    "artifact_identity_receipt": command_spec[
+                        "artifact_identity_receipt"
+                    ],
                     "engine_binary_sha256": row["binary_sha256"],
                     "store_sha256": row["store_sha256"],
                     "argv": adapter_argv,
@@ -386,6 +403,20 @@ def validate_command_plan(plan_or_path: Any, plan_path: Path | None) -> dict[str
         adapter = cell.get("adapter")
         require(type(adapter) is dict, f"{row['run_key']}: adapter object required")
         entry = verify_file_ref(adapter.get("entry"), f"{row['run_key']} adapter entry")
+        identity_ref = verify_file_ref(
+            adapter.get("artifact_identity_receipt"),
+            f"{row['run_key']} artifact identity receipt",
+        )
+        try:
+            artifact_identity.validate_identity_receipt(
+                Path(identity_ref["path"]),
+                manifest=manifest,
+                system_key=row["system_key"],
+                expected_entry=Path(entry["path"]),
+                expected_kind=adapter.get("kind"),
+            )
+        except (artifact_identity.IdentityError, manifest_builder.BuildError) as exc:
+            raise PlanError(str(exc)) from exc
         require(adapter.get("engine_binary_sha256") == row["binary_sha256"], f"{row['run_key']}: binary SHA drift")
         require(adapter.get("store_sha256") == row["store_sha256"], f"{row['run_key']}: store SHA drift")
         argv = adapter.get("argv")

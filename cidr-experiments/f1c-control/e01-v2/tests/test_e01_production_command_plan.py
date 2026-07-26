@@ -60,14 +60,49 @@ class E01ProductionCommandPlanTests(unittest.TestCase):
         self.cgroup.write_text("#!/usr/bin/env python3\n")
         self.schema_path = ROOT / "e01-cell-evidence-v1.schema.json"
         systems = []
+        manifest_systems = {
+            row["system_key"]: row for row in self.manifest["systems"]
+        }
         for key, _ in plan_builder.manifest_builder.SYSTEMS:
             entry = self.fixture.root / f"bin/{key}-adapter.py"
             entry.write_text("#!/usr/bin/env python3\n")
+            identity = self.fixture.root / f"identity/{key}.json"
+            identity.parent.mkdir(parents=True, exist_ok=True)
+            write_json(
+                identity,
+                {
+                    "schema_version": "cidr-e01-adapter-artifact-identity-v1",
+                    "state": "PASS",
+                    "execution_state": "NOT_IMPLEMENTED",
+                    "system_key": key,
+                    "adapter_kind": "python-script",
+                    "adapter_entry": {
+                        "path": str(entry.resolve()),
+                        "sha256": plan_builder.sha256_file(entry),
+                        "size_bytes": entry.stat().st_size,
+                    },
+                    "path_resolution_policy": (
+                        "canonical-absolute-existing-nonsymlink-small-v1"
+                    ),
+                    "engine_binary_sha256": manifest_systems[key][
+                        "binary_sha256"
+                    ],
+                    "store_sha256": manifest_systems[key]["store_sha256"],
+                    "harness_git_sha": self.manifest["protocol"][
+                        "harness_git_sha"
+                    ],
+                    "protocol_sha256": self.manifest["protocol_sha256"],
+                    "synthetic_test_only": False,
+                    "fixture_only": False,
+                    **FALSE,
+                },
+            )
             systems.append(
                 {
                     "system_key": key,
                     "cwd_relative": "work",
                     "adapter_entry": str(entry),
+                    "artifact_identity_receipt": str(identity),
                     "adapter_kind": "python-script",
                     "argv": [
                         str(entry),
