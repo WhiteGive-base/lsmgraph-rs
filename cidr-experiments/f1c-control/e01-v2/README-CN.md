@@ -45,3 +45,24 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 正式 21-run campaign、fresh P03/P02B gate/lease、store seal、renderer 和 QA
 均不属于本目录的命令；必须在 L8 完成并重新取得独立 formal gate/lease 后，
 由 Linux runbook 串行执行。
+
+## 21-run 正式启动 manifest 门
+
+`build_e01_formal_manifest.py` 只构建不可覆盖的启动 manifest，不执行 launcher。
+输入 spec 必须固定七个系统的顺序与三个 repeat，并提供同一 campaign 的
+fresh P03 clean-ready、P02B gate、独占 batch lease/marker，以及 dataset、
+trace、每系统 binary/store 的 immutable fresh seal。builder 只读取这些显式
+小收据（单文件上限 16 MiB），验证 P03→P02B→lease 血缘和所有协议绑定，不会
+遍历或计算 store/binary 本体的 SHA。
+
+成功输出固定 21 个 cell，并把 host、dataset、trace、cache、concurrency、
+interface、git、binary 和 store SHA 写入每个 cell。启动 manifest 仍保持
+`formal_eligible=false`、`performance_eligible=false` 和
+`paper_claim_eligible=false`；后续 launcher、fresh resource gate 及逐 run
+验证收据尚未完成前，不得提升资格或复用旧 conditional evidence。
+
+```bash
+python3 build_e01_formal_manifest.py \
+  --spec /ABS/E01-formal-launch-spec-v1.json \
+  --output /NEW/E01-formal-launch-manifest-v1.json
+```
