@@ -186,6 +186,7 @@ class E01FormalManifestBuilderTests(unittest.TestCase):
         ]
         self.assertEqual([row["run_key"] for row in manifest["runs"]], expected)
         self.assertEqual(manifest["run_count"], 21)
+        self.assertEqual(manifest["state"], "PASS")
         self.assertTrue(manifest["serial_formal_timing"])
         self.assertFalse(manifest["formal_eligible"])
         self.assertFalse(manifest["performance_eligible"])

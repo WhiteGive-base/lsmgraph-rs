@@ -410,7 +410,7 @@ def build_manifest(spec_path: Path, output: Path) -> dict[str, Any]:
 
     manifest = {
         "schema_version": "cidr-e01-formal-launch-manifest-v1",
-        "state": "FROZEN",
+        "state": "PASS",
         "campaign_id": campaign_id,
         "created_at_utc": spec["created_at_utc"],
         "source_spec": {

@@ -55,7 +55,8 @@ trace、每系统 binary/store 的 immutable fresh seal。builder 只读取这�
 小收据（单文件上限 16 MiB），验证 P03→P02B→lease 血缘和所有协议绑定，不会
 遍历或计算 store/binary 本体的 SHA。
 
-成功输出固定 21 个 cell，并把 host、dataset、trace、cache、concurrency、
+成功输出 `state=PASS` 的固定 21-cell 静态合同，并把
+host、dataset、trace、cache、concurrency、
 interface、git、binary 和 store SHA 写入每个 cell。启动 manifest 仍保持
 `formal_eligible=false`、`performance_eligible=false` 和
 `paper_claim_eligible=false`；后续 launcher、fresh resource gate 及逐 run
@@ -66,3 +67,10 @@ python3 build_e01_formal_manifest.py \
   --spec /ABS/E01-formal-launch-spec-v1.json \
   --output /NEW/E01-formal-launch-manifest-v1.json
 ```
+
+`run_e01_formal_matrix.py --synthetic-test-mode` 只验证 restart/resume、
+STRICT_SERIAL 顺序和 `CELL-DONE`/`MATRIX-DONE` 合同；它不会调用 P10 adapter，
+不会产生 timing。已完成 cell 在 resume 时重新核验 manifest/result/CELL-DONE
+SHA 后跳过，残缺或漂移 cell 会 fail-closed 且不覆盖。只有 21/21
+`CELL-DONE` 才发布 `MATRIX-DONE`。不带 synthetic 参数的生产入口有意拒绝运行，
+直到真实 fresh admission/assets 与 adapter 执行合同完成。
