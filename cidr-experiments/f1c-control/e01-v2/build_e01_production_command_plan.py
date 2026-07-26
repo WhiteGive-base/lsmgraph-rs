@@ -15,8 +15,11 @@ from typing import Any, Mapping
 import build_e01_formal_manifest as manifest_builder
 import run_e01_formal_matrix as scheduler
 import validate_e01_cell_evidence as evidence
+import validate_e01_production_spec as production_spec
 
 
+HERE = Path(__file__).resolve().parent
+PRODUCTION_SPEC_SCHEMA_PATH = HERE / "e01-production-command-spec-v1.schema.json"
 SCHEMA = "cidr-e01-production-command-plan-v1"
 SPEC_SCHEMA = "cidr-e01-production-command-spec-v1"
 ALLOWED_ENV = {"LC_ALL", "LANG", "TZ", "RUST_BACKTRACE"}
@@ -181,6 +184,7 @@ def build_command_plan(
             "p31_wrapper",
             "cgroup_wrapper",
             "systems",
+            "admission_binding",
             "classification",
         },
         "production command spec keys drift",
@@ -190,6 +194,15 @@ def build_command_plan(
     require(spec.get("campaign_id") == manifest["campaign_id"], "campaign id drift")
     require(type(spec.get("classification")) is dict, "spec classification required")
     false_eligibility(spec["classification"], "production command spec")
+    try:
+        spec_validation = production_spec.validate_production_spec(
+            spec_path,
+            manifest_path=manifest_path,
+            evidence_schema_path=evidence_schema_path,
+            contract_schema_path=PRODUCTION_SPEC_SCHEMA_PATH,
+        )
+    except (production_spec.SpecError, manifest_builder.BuildError) as exc:
+        raise PlanError(str(exc)) from exc
     environment = validate_environment(spec.get("environment"))
     root_raw = spec.get("campaign_root")
     require(type(root_raw) is str and root_raw, "absolute campaign_root required")
@@ -303,6 +316,10 @@ def build_command_plan(
         },
         "cell_evidence_schema": evidence_schema_ref,
         "source_spec": file_ref(spec_path.resolve(), "production command spec"),
+        "production_spec_schema": file_ref(
+            PRODUCTION_SPEC_SCHEMA_PATH, "production command spec schema"
+        ),
+        "admission_binding": spec_validation["admission_binding"],
         "cell_count": 21,
         "cells": cells,
         **FALSE_ELIGIBILITY,
@@ -333,6 +350,14 @@ def validate_command_plan(plan_or_path: Any, plan_path: Path | None) -> dict[str
     require(manifest_sha == manifest_ref["sha256"], "formal manifest SHA drift")
     verify_file_ref(plan.get("cell_evidence_schema"), "cell evidence schema")
     verify_file_ref(plan.get("source_spec"), "production command spec")
+    verify_file_ref(plan.get("production_spec_schema"), "production command spec schema")
+    expected_binding = production_spec.expected_admission_binding(
+        manifest,
+        manifest_sha=manifest_sha,
+        evidence_schema_sha=plan["cell_evidence_schema"]["sha256"],
+    )
+    require(plan.get("admission_binding") == expected_binding, "plan admission binding drift")
+    false_eligibility(plan["admission_binding"], "plan admission binding")
     root = Path(plan.get("campaign_root", ""))
     require(root.is_absolute(), "plan campaign_root must be absolute")
     cells = plan.get("cells")

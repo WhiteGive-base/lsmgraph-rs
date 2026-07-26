@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seml0.invalid/contracts/cidr-e01-production-command-spec-v1.schema.json",
+  "title": "CIDR E01 production command specification and admission binding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "state",
+    "campaign_id",
+    "campaign_root",
+    "environment",
+    "p31_wrapper",
+    "cgroup_wrapper",
+    "systems",
+    "admission_binding",
+    "classification"
+  ],
+  "properties": {
+    "schema_version": { "const": "cidr-e01-production-command-spec-v1" },
+    "state": { "const": "READY" },
+    "campaign_id": { "type": "string", "minLength": 1 },
+    "campaign_root": { "type": "string", "minLength": 1 },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [ "LC_ALL", "TZ" ],
+      "properties": {
+        "LC_ALL": { "const": "C" },
+        "LANG": { "type": "string" },
+        "TZ": { "const": "UTC" },
+        "RUST_BACKTRACE": { "type": "string" }
+      }
+    },
+    "p31_wrapper": { "type": "string", "minLength": 1 },
+    "cgroup_wrapper": { "type": "string", "minLength": 1 },
+    "systems": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "system_key",
+          "cwd_relative",
+          "adapter_entry",
+          "adapter_kind",
+          "argv"
+        ],
+        "properties": {
+          "system_key": { "type": "string" },
+          "cwd_relative": { "type": "string", "minLength": 1 },
+          "adapter_entry": { "type": "string", "minLength": 1 },
+          "adapter_kind": { "enum": [ "binary", "python-script" ] },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "admission_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "formal_manifest_sha256",
+        "p03_clean_ready_sha256",
+        "p02b_gate_sha256",
+        "batch_lease_sha256",
+        "lease_marker_sha256",
+        "cell_evidence_schema_sha256",
+        "fresh_resource_gate_required",
+        "production_executor_state",
+        "synthetic_test_only",
+        "fixture_only",
+        "formal_eligible",
+        "performance_eligible",
+        "paper_claim_eligible"
+      ],
+      "properties": {
+        "formal_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "p03_clean_ready_sha256": { "$ref": "#/$defs/sha256" },
+        "p02b_gate_sha256": { "$ref": "#/$defs/sha256" },
+        "batch_lease_sha256": { "$ref": "#/$defs/sha256" },
+        "lease_marker_sha256": { "$ref": "#/$defs/sha256" },
+        "cell_evidence_schema_sha256": { "$ref": "#/$defs/sha256" },
+        "fresh_resource_gate_required": { "const": true },
+        "production_executor_state": { "const": "NOT_IMPLEMENTED" },
+        "synthetic_test_only": { "const": false },
+        "fixture_only": { "const": false },
+        "formal_eligible": { "const": false },
+        "performance_eligible": { "const": false },
+        "paper_claim_eligible": { "const": false }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "formal_eligible",
+        "performance_eligible",
+        "paper_claim_eligible"
+      ],
+      "properties": {
+        "formal_eligible": { "const": false },
+        "performance_eligible": { "const": false },
+        "paper_claim_eligible": { "const": false }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

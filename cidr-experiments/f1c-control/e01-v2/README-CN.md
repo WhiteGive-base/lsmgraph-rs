@@ -101,3 +101,11 @@ production execution 入口仍在创建结果根前 fail-closed。
 timing 且 eligibility 全 false。路径逃逸、已有 receipt 目录、run/ordinal 或
 manifest SHA 漂移都会在发布前拒绝。`--production` 有意在检查/创建输出根之前
 返回 `NOT_IMPLEMENTED`，这些 fixture 不能满足 production evidence validator。
+
+`e01-production-command-spec-v1.schema.json` 与
+`validate_e01_production_spec.py` 补齐 executor 前的真实 spec/admission 接口。
+command spec 必须逐 SHA 绑定同一 formal manifest、P03 clean-ready、P02B gate、
+batch lease、lease marker 和 cell-evidence schema，并声明还需要 fresh resource
+gate。command-plan builder 会重新验证该绑定并原样写入 plan；任一 lineage/SHA
+漂移、synthetic/fixture 标记或 eligibility 提升都会拒绝。executor 状态仍被
+合同固定为 `NOT_IMPLEMENTED`，本接口不生成或续签 admission receipt。

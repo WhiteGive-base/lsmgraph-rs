@@ -58,6 +58,7 @@ class E01ProductionCommandPlanTests(unittest.TestCase):
         self.p31.parent.mkdir(parents=True)
         self.p31.write_text("#!/usr/bin/env python3\n")
         self.cgroup.write_text("#!/usr/bin/env python3\n")
+        self.schema_path = ROOT / "e01-cell-evidence-v1.schema.json"
         systems = []
         for key, _ in plan_builder.manifest_builder.SYSTEMS:
             entry = self.fixture.root / f"bin/{key}-adapter.py"
@@ -92,10 +93,14 @@ class E01ProductionCommandPlanTests(unittest.TestCase):
             "p31_wrapper": str(self.p31),
             "cgroup_wrapper": str(self.cgroup),
             "systems": systems,
+            "admission_binding": plan_builder.production_spec.expected_admission_binding(
+                self.manifest,
+                manifest_sha=plan_builder.sha256_file(self.manifest_path),
+                evidence_schema_sha=plan_builder.sha256_file(self.schema_path),
+            ),
             "classification": dict(FALSE),
         }
         self.spec_path = self.fixture.root / "command-spec.json"
-        self.schema_path = ROOT / "e01-cell-evidence-v1.schema.json"
         self.output = self.fixture.root / "command-plan.json"
         write_json(self.spec_path, self.spec)
 
