@@ -1,0 +1,345 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seml0.invalid/contracts/cidr-e01-formal-manifest-v2.schema.json",
+  "title": "CIDR E01 formal Figure 1 manifest v2",
+  "description": "The companion Python normalizer enforces fixed order and cross-record invariants.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "experiment_id",
+    "campaign_id",
+    "created_at_utc",
+    "classification",
+    "protocol",
+    "admission_epochs",
+    "runs"
+  ],
+  "properties": {
+    "schema_version": { "const": "cidr-e01-formal-manifest-v2" },
+    "experiment_id": { "const": "E01" },
+    "campaign_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$"
+    },
+    "created_at_utc": { "$ref": "#/$defs/utcTimestamp" },
+    "classification": { "$ref": "#/$defs/sourceClassification" },
+    "protocol": { "$ref": "#/$defs/protocol" },
+    "admission_epochs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/admissionEpoch" }
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 21,
+      "maxItems": 21,
+      "items": { "$ref": "#/$defs/run" }
+    }
+  },
+  "$defs": {
+    "sha1": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "positiveInt": { "type": "integer", "minimum": 1 },
+    "nonnegativeInt": { "type": "integer", "minimum": 0 },
+    "positiveNumber": { "type": "number", "exclusiveMinimum": 0 },
+    "nonnegativeNumber": { "type": "number", "minimum": 0 },
+    "assetRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [ "path", "sha256", "size_bytes" ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(^|/)\\.\\.(?:/|$)).+"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "$ref": "#/$defs/nonnegativeInt" }
+      }
+    },
+    "sourceClassification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_mode",
+        "conditional_waiver",
+        "diagnostic_only",
+        "formal_eligible",
+        "performance_eligible",
+        "paper_claim_eligible"
+      ],
+      "properties": {
+        "execution_mode": { "const": "formal" },
+        "conditional_waiver": { "const": false },
+        "diagnostic_only": { "const": false },
+        "formal_eligible": { "const": true },
+        "performance_eligible": { "const": true },
+        "paper_claim_eligible": { "const": false }
+      }
+    },
+    "systemSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [ "system_key", "display_name", "variant" ],
+      "properties": {
+        "system_key": {
+          "type": "string",
+          "enum": [
+            "seml0",
+            "seml0-naive",
+            "livegraph",
+            "aster",
+            "tugraph",
+            "nebulagraph",
+            "neo4j"
+          ]
+        },
+        "display_name": { "type": "string", "minLength": 1 },
+        "variant": { "type": "string", "minLength": 1 }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "systems",
+        "repeat_indices",
+        "dataset_id",
+        "scale_factor",
+        "vertex_count",
+        "directed_edge_count",
+        "property_count",
+        "query_count",
+        "input_sha256",
+        "workload_id",
+        "query_trace_sha256",
+        "seed",
+        "cache_state",
+        "concurrency",
+        "interface_scope",
+        "host_fingerprint",
+        "harness_git_sha"
+      ],
+      "properties": {
+        "systems": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/systemSpec" },
+            { "$ref": "#/$defs/systemSpec" },
+            { "$ref": "#/$defs/systemSpec" },
+            { "$ref": "#/$defs/systemSpec" },
+            { "$ref": "#/$defs/systemSpec" },
+            { "$ref": "#/$defs/systemSpec" },
+            { "$ref": "#/$defs/systemSpec" }
+          ],
+          "items": false,
+          "minItems": 7,
+          "maxItems": 7
+        },
+        "repeat_indices": {
+          "type": "array",
+          "prefixItems": [
+            { "const": 1 },
+            { "const": 2 },
+            { "const": 3 }
+          ],
+          "items": false,
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "dataset_id": { "type": "string", "minLength": 1 },
+        "scale_factor": { "$ref": "#/$defs/positiveNumber" },
+        "vertex_count": { "$ref": "#/$defs/positiveInt" },
+        "directed_edge_count": { "$ref": "#/$defs/positiveInt" },
+        "property_count": { "$ref": "#/$defs/nonnegativeInt" },
+        "query_count": { "$ref": "#/$defs/positiveInt" },
+        "input_sha256": { "$ref": "#/$defs/sha256" },
+        "workload_id": { "type": "string", "minLength": 1 },
+        "query_trace_sha256": { "$ref": "#/$defs/sha256" },
+        "seed": { "$ref": "#/$defs/nonnegativeInt" },
+        "cache_state": {
+          "type": "string",
+          "enum": [ "cold", "warm", "fixed_budget" ]
+        },
+        "concurrency": { "$ref": "#/$defs/positiveInt" },
+        "interface_scope": { "type": "string", "minLength": 1 },
+        "host_fingerprint": { "$ref": "#/$defs/sha256" },
+        "harness_git_sha": { "$ref": "#/$defs/sha1" }
+      }
+    },
+    "admissionEpoch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "epoch_id",
+        "run_keys",
+        "gate_result",
+        "batch_lease",
+        "batch_lease_marker"
+      ],
+      "properties": {
+        "epoch_id": { "type": "string", "minLength": 1 },
+        "run_keys": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "gate_result": { "$ref": "#/$defs/assetRef" },
+        "batch_lease": { "$ref": "#/$defs/assetRef" },
+        "batch_lease_marker": { "$ref": "#/$defs/assetRef" }
+      }
+    },
+    "runOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [ "state", "superseded", "failed_marker_present" ],
+      "properties": {
+        "state": { "const": "PASS" },
+        "superseded": { "const": false },
+        "failed_marker_present": { "const": false }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "latency_p50_us",
+        "latency_p95_us",
+        "latency_p99_us",
+        "completed_queries",
+        "timeout_queries",
+        "query_count",
+        "measurement_s",
+        "warmup_s",
+        "completed_qps",
+        "load_wall_s",
+        "final_disk_bytes",
+        "expected_digest_sha256",
+        "actual_digest_sha256",
+        "digest_pass",
+        "mismatch_count"
+      ],
+      "properties": {
+        "latency_p50_us": { "$ref": "#/$defs/positiveNumber" },
+        "latency_p95_us": { "$ref": "#/$defs/positiveNumber" },
+        "latency_p99_us": { "$ref": "#/$defs/positiveNumber" },
+        "completed_queries": { "$ref": "#/$defs/nonnegativeInt" },
+        "timeout_queries": { "$ref": "#/$defs/nonnegativeInt" },
+        "query_count": { "$ref": "#/$defs/positiveInt" },
+        "measurement_s": { "$ref": "#/$defs/positiveNumber" },
+        "warmup_s": { "$ref": "#/$defs/nonnegativeNumber" },
+        "completed_qps": { "$ref": "#/$defs/nonnegativeNumber" },
+        "offered_qps": { "$ref": "#/$defs/nonnegativeNumber" },
+        "load_wall_s": { "$ref": "#/$defs/positiveNumber" },
+        "final_disk_bytes": { "$ref": "#/$defs/positiveInt" },
+        "load_peak_rss_bytes": { "$ref": "#/$defs/positiveInt" },
+        "expected_digest_sha256": { "$ref": "#/$defs/sha256" },
+        "actual_digest_sha256": { "$ref": "#/$defs/sha256" },
+        "digest_pass": { "const": true },
+        "mismatch_count": { "const": 0 }
+      }
+    },
+    "runClassification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_mode",
+        "conditional_waiver",
+        "diagnostic_only",
+        "formal_eligible",
+        "performance_eligible",
+        "paper_claim_eligible"
+      ],
+      "properties": {
+        "execution_mode": { "const": "formal" },
+        "conditional_waiver": { "const": false },
+        "diagnostic_only": { "const": false },
+        "formal_eligible": { "const": true },
+        "performance_eligible": { "const": true },
+        "paper_claim_eligible": { "const": false }
+      }
+    },
+    "runArtifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "validated_result",
+        "adapter_request",
+        "adapter_provenance",
+        "p31_manifest",
+        "p31_validation",
+        "p31_done",
+        "batch_admission",
+        "cost_receipt"
+      ],
+      "properties": {
+        "validated_result": { "$ref": "#/$defs/assetRef" },
+        "adapter_request": { "$ref": "#/$defs/assetRef" },
+        "adapter_provenance": { "$ref": "#/$defs/assetRef" },
+        "p31_manifest": { "$ref": "#/$defs/assetRef" },
+        "p31_validation": { "$ref": "#/$defs/assetRef" },
+        "p31_done": { "$ref": "#/$defs/assetRef" },
+        "batch_admission": { "$ref": "#/$defs/assetRef" },
+        "cost_receipt": { "$ref": "#/$defs/assetRef" }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_key",
+        "run_id",
+        "system_key",
+        "display_name",
+        "variant",
+        "repeat_index",
+        "timestamp_utc",
+        "host_fingerprint",
+        "git_sha",
+        "binary_sha256",
+        "system_version",
+        "classification",
+        "outcome",
+        "metrics",
+        "artifacts"
+      ],
+      "properties": {
+        "run_key": {
+          "type": "string",
+          "pattern": "^(seml0|seml0-naive|livegraph|aster|tugraph|nebulagraph|neo4j):r[1-3]$"
+        },
+        "run_id": { "type": "string", "minLength": 1 },
+        "system_key": {
+          "type": "string",
+          "enum": [
+            "seml0",
+            "seml0-naive",
+            "livegraph",
+            "aster",
+            "tugraph",
+            "nebulagraph",
+            "neo4j"
+          ]
+        },
+        "display_name": { "type": "string", "minLength": 1 },
+        "variant": { "type": "string", "minLength": 1 },
+        "repeat_index": { "enum": [ 1, 2, 3 ] },
+        "timestamp_utc": { "$ref": "#/$defs/utcTimestamp" },
+        "host_fingerprint": { "$ref": "#/$defs/sha256" },
+        "git_sha": { "$ref": "#/$defs/sha1" },
+        "binary_sha256": { "$ref": "#/$defs/sha256" },
+        "system_version": { "type": "string", "minLength": 1 },
+        "classification": { "$ref": "#/$defs/runClassification" },
+        "outcome": { "$ref": "#/$defs/runOutcome" },
+        "metrics": { "$ref": "#/$defs/metrics" },
+        "artifacts": { "$ref": "#/$defs/runArtifacts" }
+      }
+    }
+  }
+}
