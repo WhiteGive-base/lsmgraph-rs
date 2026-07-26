@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import build_e01_formal_manifest as manifest_builder
+import produce_e01_receipt_fixtures as receipt_producer
 import validate_e01_cell_evidence as evidence_validator
 
 
@@ -253,14 +254,6 @@ def cell_name(row: Mapping[str, Any]) -> str:
     return f"{row['ordinal']:03d}-{row['system_key']}-r{row['repeat_index']}"
 
 
-def relative_ref(path: Path, root: Path) -> dict[str, Any]:
-    return {
-        "path": path.relative_to(root).as_posix(),
-        "sha256": sha256_file(path),
-        "size_bytes": path.stat().st_size,
-    }
-
-
 def validate_cell(cell: Path, row: Mapping[str, Any], manifest_sha: str) -> str:
     require(cell.is_dir(), f"{row['run_key']}: incomplete/non-directory cell")
     done_path = cell / "CELL-DONE.json"
@@ -307,64 +300,13 @@ def create_synthetic_cell(root: Path, row: Mapping[str, Any], manifest_sha: str)
             **FALSE_ELIGIBILITY,
         }
         atomic_json_exclusive(temporary / "synthetic-result.json", result)
-        receipt_root = temporary / "receipts"
-        common = {
-            "state": "PASS",
-            "mode": "synthetic",
-            "synthetic_test_only": True,
-            "run_key": row["run_key"],
-            "ordinal": row["ordinal"],
-            "launch_manifest_sha256": manifest_sha,
-            **FALSE_ELIGIBILITY,
-        }
-        receipts = {
-            "command": {
-                "schema_version": "cidr-e01-command-receipt-v1",
-                "returncode": 0,
-                "adapter_invoked": False,
-                "timing_generated": False,
-                **common,
-            },
-            "adapter": {
-                "schema_version": "cidr-e01-adapter-receipt-v1",
-                "adapter_invoked": False,
-                **common,
-            },
-            "p31": {
-                "schema_version": "cidr-e01-p31-receipt-v1",
-                "resource_validation_pass": True,
-                "timing_generated": False,
-                **common,
-            },
-            "correctness": {
-                "schema_version": "cidr-e01-correctness-receipt-v1",
-                "mismatch_count": 0,
-                **common,
-            },
-            "fairness": {
-                "schema_version": "cidr-e01-fairness-receipt-v1",
-                "fairness_pass": True,
-                "strict_serial": True,
-                **common,
-            },
-            "cgroup": {
-                "schema_version": "cidr-e01-cgroup-receipt-v1",
-                "allocation_pass": True,
-                "cpuset": "synthetic-none",
-                **common,
-            },
-            "cleanup": {
-                "schema_version": "cidr-e01-cleanup-receipt-v1",
-                "cleanup_pass": True,
-                "residual_processes": 0,
-                **common,
-            },
-        }
-        receipt_refs: dict[str, dict[str, Any]] = {}
-        for role in evidence_validator.ROLES:
-            receipt_path = receipt_root / f"{role}.json"
-            atomic_json_exclusive(receipt_path, receipts[role])
-            receipt_refs[role] = relative_ref(receipt_path, temporary)
+        receipt_refs = receipt_producer.produce_fixture_receipts(
+            temporary,
+            run_key=row["run_key"],
+            ordinal=row["ordinal"],
+            manifest_sha=manifest_sha,
+            fixture_only=True,
+        )
         done = {
             "schema_version": "cidr-e01-cell-done-v2",
             "state": "PASS",

@@ -94,3 +94,10 @@ CELL-DONE 的唯一目标路径。禁止 shell command 字符串、路径越出 
 root、重复 cell root 和 eligibility 提升。计划固定
 `execution_state=NOT_IMPLEMENTED`，构建过程不会创建 campaign root；现有
 production execution 入口仍在创建结果根前 fail-closed。
+
+`produce_e01_receipt_fixtures.py` 是七类收据的 fixture-only CLI。它只在已存在、
+非 symlink 的 cell root 内以临时目录加原子 rename 发布七张小 JSON，返回相对
+路径/size/SHA；所有收据都固定 synthetic/fixture-only、adapter 未调用、未产生
+timing 且 eligibility 全 false。路径逃逸、已有 receipt 目录、run/ordinal 或
+manifest SHA 漂移都会在发布前拒绝。`--production` 有意在检查/创建输出根之前
+返回 `NOT_IMPLEMENTED`，这些 fixture 不能满足 production evidence validator。
