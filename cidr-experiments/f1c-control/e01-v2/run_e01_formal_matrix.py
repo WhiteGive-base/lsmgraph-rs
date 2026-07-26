@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import build_e01_formal_manifest as manifest_builder
+import validate_e01_cell_evidence as evidence_validator
 
 
 SCHEMA = "cidr-e01-formal-launch-manifest-v1"
@@ -252,6 +253,14 @@ def cell_name(row: Mapping[str, Any]) -> str:
     return f"{row['ordinal']:03d}-{row['system_key']}-r{row['repeat_index']}"
 
 
+def relative_ref(path: Path, root: Path) -> dict[str, Any]:
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
 def validate_cell(cell: Path, row: Mapping[str, Any], manifest_sha: str) -> str:
     require(cell.is_dir(), f"{row['run_key']}: incomplete/non-directory cell")
     done_path = cell / "CELL-DONE.json"
@@ -259,7 +268,6 @@ def validate_cell(cell: Path, row: Mapping[str, Any], manifest_sha: str) -> str:
     require(done_path.is_file(), f"{row['run_key']}: incomplete cell lacks CELL-DONE")
     require(result_path.is_file(), f"{row['run_key']}: synthetic result missing")
     result = load_json(result_path, f"{row['run_key']} synthetic result")
-    done = load_json(done_path, f"{row['run_key']} CELL-DONE")
     require(result.get("schema_version") == "cidr-e01-synthetic-cell-result-v1", "synthetic result schema drift")
     require(result.get("state") == "PASS", "synthetic result must PASS")
     require(result.get("synthetic_test_only") is True, "real result forbidden in synthetic contract")
@@ -267,15 +275,16 @@ def validate_cell(cell: Path, row: Mapping[str, Any], manifest_sha: str) -> str:
     require(result.get("ordinal") == row["ordinal"], "synthetic result ordinal drift")
     require(result.get("launch_manifest_sha256") == manifest_sha, "synthetic result manifest drift")
     false_eligibility(result, f"{row['run_key']} synthetic result")
-    require(done.get("schema_version") == "cidr-e01-cell-done-v1", "CELL-DONE schema drift")
-    require(done.get("state") == "PASS", "CELL-DONE must PASS")
-    require(done.get("synthetic_test_only") is True, "CELL-DONE must be synthetic")
-    require(done.get("run_key") == row["run_key"], "CELL-DONE run drift")
-    require(done.get("ordinal") == row["ordinal"], "CELL-DONE ordinal drift")
-    require(done.get("launch_manifest_sha256") == manifest_sha, "CELL-DONE manifest drift")
-    require(done.get("result_sha256") == sha256_file(result_path), "CELL-DONE result SHA drift")
-    false_eligibility(done, f"{row['run_key']} CELL-DONE")
-    return sha256_file(done_path)
+    try:
+        validation = evidence_validator.validate_cell_evidence(
+            cell,
+            expected_run=row,
+            manifest_sha=manifest_sha,
+            expected_mode="synthetic",
+        )
+    except evidence_validator.EvidenceError as exc:
+        raise ContractError(str(exc)) from exc
+    return validation["cell_done_sha256"]
 
 
 def create_synthetic_cell(root: Path, row: Mapping[str, Any], manifest_sha: str) -> None:
@@ -288,6 +297,7 @@ def create_synthetic_cell(root: Path, row: Mapping[str, Any], manifest_sha: str)
         result = {
             "schema_version": "cidr-e01-synthetic-cell-result-v1",
             "state": "PASS",
+            "mode": "synthetic",
             "synthetic_test_only": True,
             "adapter_invoked": False,
             "timing_generated": False,
@@ -297,14 +307,76 @@ def create_synthetic_cell(root: Path, row: Mapping[str, Any], manifest_sha: str)
             **FALSE_ELIGIBILITY,
         }
         atomic_json_exclusive(temporary / "synthetic-result.json", result)
-        done = {
-            "schema_version": "cidr-e01-cell-done-v1",
+        receipt_root = temporary / "receipts"
+        common = {
             "state": "PASS",
+            "mode": "synthetic",
             "synthetic_test_only": True,
             "run_key": row["run_key"],
             "ordinal": row["ordinal"],
             "launch_manifest_sha256": manifest_sha,
+            **FALSE_ELIGIBILITY,
+        }
+        receipts = {
+            "command": {
+                "schema_version": "cidr-e01-command-receipt-v1",
+                "returncode": 0,
+                "adapter_invoked": False,
+                "timing_generated": False,
+                **common,
+            },
+            "adapter": {
+                "schema_version": "cidr-e01-adapter-receipt-v1",
+                "adapter_invoked": False,
+                **common,
+            },
+            "p31": {
+                "schema_version": "cidr-e01-p31-receipt-v1",
+                "resource_validation_pass": True,
+                "timing_generated": False,
+                **common,
+            },
+            "correctness": {
+                "schema_version": "cidr-e01-correctness-receipt-v1",
+                "mismatch_count": 0,
+                **common,
+            },
+            "fairness": {
+                "schema_version": "cidr-e01-fairness-receipt-v1",
+                "fairness_pass": True,
+                "strict_serial": True,
+                **common,
+            },
+            "cgroup": {
+                "schema_version": "cidr-e01-cgroup-receipt-v1",
+                "allocation_pass": True,
+                "cpuset": "synthetic-none",
+                **common,
+            },
+            "cleanup": {
+                "schema_version": "cidr-e01-cleanup-receipt-v1",
+                "cleanup_pass": True,
+                "residual_processes": 0,
+                **common,
+            },
+        }
+        receipt_refs: dict[str, dict[str, Any]] = {}
+        for role in evidence_validator.ROLES:
+            receipt_path = receipt_root / f"{role}.json"
+            atomic_json_exclusive(receipt_path, receipts[role])
+            receipt_refs[role] = relative_ref(receipt_path, temporary)
+        done = {
+            "schema_version": "cidr-e01-cell-done-v2",
+            "state": "PASS",
+            "mode": "synthetic",
+            "synthetic_test_only": True,
+            "adapter_invoked": False,
+            "timing_generated": False,
+            "run_key": row["run_key"],
+            "ordinal": row["ordinal"],
+            "launch_manifest_sha256": manifest_sha,
             "result_sha256": sha256_file(temporary / "synthetic-result.json"),
+            "receipts": receipt_refs,
             **FALSE_ELIGIBILITY,
         }
         atomic_json_exclusive(temporary / "CELL-DONE.json", done)

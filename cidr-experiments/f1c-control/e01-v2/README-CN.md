@@ -74,3 +74,14 @@ STRICT_SERIAL 顺序和 `CELL-DONE`/`MATRIX-DONE` 合同；它不会调用 P10 a
 SHA 后跳过，残缺或漂移 cell 会 fail-closed 且不覆盖。只有 21/21
 `CELL-DONE` 才发布 `MATRIX-DONE`。不带 synthetic 参数的生产入口有意拒绝运行，
 直到真实 fresh admission/assets 与 adapter 执行合同完成。
+
+`e01-cell-evidence-v1.schema.json` 与 `validate_e01_cell_evidence.py` 冻结生产
+launcher 必须交付的统一 cell 接口：command、adapter、P31、correctness、
+fairness、cgroup、cleanup 七类收据都必须逐项绑定 run/ordinal/launch
+manifest SHA，并由 `CELL-DONE.json` 记录相对路径、size 和 SHA。生产模式还
+强制 `adapter_invoked=true`、`timing_generated=true`；任一收据缺失、SHA
+漂移或 eligibility 提升都会拒绝。
+
+synthetic scheduler 使用完全相同的 `CELL-DONE v2`/七收据形状，但每层都明确
+记录 `mode=synthetic`、`synthetic_test_only=true`、
+`adapter_invoked=false`、`timing_generated=false`，因此不能冒充生产数据。

@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seml0.invalid/contracts/cidr-e01-cell-done-v2.schema.json",
+  "title": "CIDR E01 production/synthetic cell evidence interface",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "state",
+    "mode",
+    "synthetic_test_only",
+    "adapter_invoked",
+    "timing_generated",
+    "run_key",
+    "ordinal",
+    "launch_manifest_sha256",
+    "result_sha256",
+    "receipts",
+    "formal_eligible",
+    "performance_eligible",
+    "paper_claim_eligible"
+  ],
+  "properties": {
+    "schema_version": { "const": "cidr-e01-cell-done-v2" },
+    "state": { "const": "PASS" },
+    "mode": { "enum": [ "synthetic", "production" ] },
+    "synthetic_test_only": { "type": "boolean" },
+    "adapter_invoked": { "type": "boolean" },
+    "timing_generated": { "type": "boolean" },
+    "run_key": {
+      "type": "string",
+      "pattern": "^(seml0|seml0-naive|livegraph|aster|tugraph|nebulagraph|neo4j):r[1-3]$"
+    },
+    "ordinal": { "type": "integer", "minimum": 1, "maximum": 21 },
+    "launch_manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "result_sha256": { "$ref": "#/$defs/sha256" },
+    "receipts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "adapter",
+        "p31",
+        "correctness",
+        "fairness",
+        "cgroup",
+        "cleanup"
+      ],
+      "properties": {
+        "command": { "$ref": "#/$defs/ref" },
+        "adapter": { "$ref": "#/$defs/ref" },
+        "p31": { "$ref": "#/$defs/ref" },
+        "correctness": { "$ref": "#/$defs/ref" },
+        "fairness": { "$ref": "#/$defs/ref" },
+        "cgroup": { "$ref": "#/$defs/ref" },
+        "cleanup": { "$ref": "#/$defs/ref" }
+      }
+    },
+    "formal_eligible": { "const": false },
+    "performance_eligible": { "const": false },
+    "paper_claim_eligible": { "const": false }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "const": "production" } } },
+      "then": {
+        "properties": {
+          "synthetic_test_only": { "const": false },
+          "adapter_invoked": { "const": true },
+          "timing_generated": { "const": true }
+        }
+      },
+      "else": {
+        "properties": {
+          "synthetic_test_only": { "const": true },
+          "adapter_invoked": { "const": false },
+          "timing_generated": { "const": false }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [ "path", "sha256", "size_bytes" ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(^|/)\\.\\.(?:/|$)).+"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 }
+      }
+    }
+  }
+}
