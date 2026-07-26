@@ -85,3 +85,12 @@ manifest SHA，并由 `CELL-DONE.json` 记录相对路径、size 和 SHA。生�
 synthetic scheduler 使用完全相同的 `CELL-DONE v2`/七收据形状，但每层都明确
 记录 `mode=synthetic`、`synthetic_test_only=true`、
 `adapter_invoked=false`、`timing_generated=false`，因此不能冒充生产数据。
+
+`build_e01_production_command_plan.py` 与
+`validate_e01_production_command_plan.py` 只生成/复核小型生产命令计划 JSON。
+每个 21-run cell 都展开为显式 argv 数组、allowlist env、cell 内 cwd、已验 SHA
+的 adapter entry/P31/cgroup wrapper，以及 validated result、七收据和
+CELL-DONE 的唯一目标路径。禁止 shell command 字符串、路径越出 campaign
+root、重复 cell root 和 eligibility 提升。计划固定
+`execution_state=NOT_IMPLEMENTED`，构建过程不会创建 campaign root；现有
+production execution 入口仍在创建结果根前 fail-closed。
