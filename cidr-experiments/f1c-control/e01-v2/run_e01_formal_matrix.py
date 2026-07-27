@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Restart-safe STRICT_SERIAL synthetic scheduler contract for E01.
+"""Restart-safe STRICT_SERIAL scheduler contract for E01.
 
-The only executable path implemented here is ``--synthetic-test-mode``.  It
-never invokes a P10 adapter or benchmark binary.  Production execution remains
-fail-closed until real fresh admission/assets and the adapter execution
-contract are available.
+Synthetic mode is executable and never invokes a P10 adapter or benchmark
+binary.  Production mode is routed through a fail-closed orchestration
+interface which validates the frozen plan and reports blockers before result
+root creation.  It has no process-launching capability.
 """
 
 from __future__ import annotations
@@ -335,12 +335,22 @@ def run_matrix(
     *,
     synthetic_test_mode: bool,
     synthetic_fail_after: int | None = None,
+    production_command_plan: Path | None = None,
 ) -> dict[str, Any]:
     manifest, manifest_sha = validate_manifest(manifest_path)
-    require(
-        synthetic_test_mode,
-        "production launcher unavailable: real fresh gate/assets and P10 execution contract are not admitted",
-    )
+    if not synthetic_test_mode:
+        require(
+            production_command_plan is not None,
+            "production command plan required before result-root creation",
+        )
+        import execute_e01_production_plan as production
+
+        try:
+            return production.execute_production_plan(
+                manifest_path, production_command_plan, result_root
+            )
+        except production.ProductionError as exc:
+            raise ContractError(str(exc)) from exc
     require(
         synthetic_fail_after is None or synthetic_fail_after >= 0,
         "synthetic_fail_after must be nonnegative",
@@ -416,12 +426,14 @@ def main() -> None:
     parser.add_argument("--result-root", type=Path, required=True)
     parser.add_argument("--synthetic-test-mode", action="store_true")
     parser.add_argument("--synthetic-fail-after", type=int)
+    parser.add_argument("--production-command-plan", type=Path)
     args = parser.parse_args()
     result = run_matrix(
         args.manifest,
         args.result_root,
         synthetic_test_mode=args.synthetic_test_mode,
         synthetic_fail_after=args.synthetic_fail_after,
+        production_command_plan=args.production_command_plan,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
