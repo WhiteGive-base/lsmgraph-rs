@@ -1,0 +1,352 @@
+{
+  "adapter_command_plan": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-incremental-adapter-command-plan-v1.json",
+    "sha256": "fbd634b8275f0c0fbdda8cd825ce4d759a08fc1f9ce1725aaad7e3071d76221d",
+    "size_bytes": 16541
+  },
+  "adapter_invoked": false,
+  "blockers": [
+    "split prepare/run/finalize backend not implemented",
+    "fresh immutable store and ID-map content seals absent",
+    "fresh P03/P02B/lease/resource/execution gates absent",
+    "prepared binary argv receipts absent"
+  ],
+  "campaign_root": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING",
+  "cells": [
+    {
+      "cell_key": "seml0:bridge-canary",
+      "cell_root": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/01-seml0-bridge-canary",
+      "large_content_hashes_per_cell": {
+        "dataset": 0,
+        "id_map": 0,
+        "immutable_store": 0,
+        "mutable_store": 0
+      },
+      "mutable_store": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/01-seml0-bridge-canary/mutable-store",
+      "ordinal": 1,
+      "phase_order": [
+        "admission-and-small-identity",
+        "materialize-mutable-clone",
+        "prepare-binary-command",
+        "p31-binary-only",
+        "convert-and-correctness",
+        "fairness-and-cleanup",
+        "publish-cell-done"
+      ],
+      "post_timing": {
+        "adapter_output_conversion_required": true,
+        "binary_exit_zero_required": true,
+        "cleanup_receipt_required_before_cell_done": true,
+        "correctness_zero_mismatch_timeout_required": true,
+        "fairness_receipt_required": true,
+        "inside_p31": false,
+        "mutable_clone_cleanup_required": true,
+        "p31_done_and_validation_required": true
+      },
+      "pre_timing": {
+        "adapter_identity_revalidate": true,
+        "binary_file_revalidate_max_bytes": 67108864,
+        "dataset_content_hash": false,
+        "id_map_content_hash": false,
+        "immutable_store_seal_revalidate": true,
+        "inside_p31": false,
+        "mutable_clone_receipt_revalidate": true,
+        "p02b_lease_resource_gate_revalidate": true,
+        "prepared_binary_argv_receipt_required": true,
+        "store_content_hash": false
+      },
+      "state": "HOLD",
+      "timing": {
+        "asset_hash_inside_boundary": false,
+        "binary_argv": null,
+        "clone_or_cleanup_inside_boundary": false,
+        "correctness_validation_inside_boundary": false,
+        "dataset_sha256_mode": "declared-no-read-v1",
+        "inside_p31": true,
+        "p31_bridge": {
+          "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p10/run_adapter_with_p31.sh",
+          "sha256": "8179c662bcbbc29e58844549ce89f33f02784011d9d9c939318f7502d40e402a",
+          "size_bytes": 7527
+        },
+        "p31_bridge_argv": null,
+        "p31_run_dir": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/01-seml0-bridge-canary/p31",
+        "p31_wrapper": {
+          "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p31/run_with_resources.sh",
+          "sha256": "79323298441e502ddcc1eb2b725c30fe49a5465e32fc00043f7b9db9a26ef95a",
+          "size_bytes": 16504
+        },
+        "process_scope": "lsmgraph-storage-bench-only",
+        "python_adapter_process_inside_boundary": false,
+        "result_conversion_inside_boundary": false,
+        "unresolved": {
+          "fresh_batch_lease": null,
+          "fresh_p31_config": null,
+          "fresh_resource_gate": null,
+          "prepared_binary_argv_receipt": null
+        }
+      },
+      "variant": "budg-b64"
+    },
+    {
+      "cell_key": "seml0-naive:r1",
+      "cell_root": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/02-seml0-naive-r1",
+      "large_content_hashes_per_cell": {
+        "dataset": 0,
+        "id_map": 0,
+        "immutable_store": 0,
+        "mutable_store": 0
+      },
+      "mutable_store": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/02-seml0-naive-r1/mutable-store",
+      "ordinal": 2,
+      "phase_order": [
+        "admission-and-small-identity",
+        "materialize-mutable-clone",
+        "prepare-binary-command",
+        "p31-binary-only",
+        "convert-and-correctness",
+        "fairness-and-cleanup",
+        "publish-cell-done"
+      ],
+      "post_timing": {
+        "adapter_output_conversion_required": true,
+        "binary_exit_zero_required": true,
+        "cleanup_receipt_required_before_cell_done": true,
+        "correctness_zero_mismatch_timeout_required": true,
+        "fairness_receipt_required": true,
+        "inside_p31": false,
+        "mutable_clone_cleanup_required": true,
+        "p31_done_and_validation_required": true
+      },
+      "pre_timing": {
+        "adapter_identity_revalidate": true,
+        "binary_file_revalidate_max_bytes": 67108864,
+        "dataset_content_hash": false,
+        "id_map_content_hash": false,
+        "immutable_store_seal_revalidate": true,
+        "inside_p31": false,
+        "mutable_clone_receipt_revalidate": true,
+        "p02b_lease_resource_gate_revalidate": true,
+        "prepared_binary_argv_receipt_required": true,
+        "store_content_hash": false
+      },
+      "state": "HOLD",
+      "timing": {
+        "asset_hash_inside_boundary": false,
+        "binary_argv": null,
+        "clone_or_cleanup_inside_boundary": false,
+        "correctness_validation_inside_boundary": false,
+        "dataset_sha256_mode": "declared-no-read-v1",
+        "inside_p31": true,
+        "p31_bridge": {
+          "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p10/run_adapter_with_p31.sh",
+          "sha256": "8179c662bcbbc29e58844549ce89f33f02784011d9d9c939318f7502d40e402a",
+          "size_bytes": 7527
+        },
+        "p31_bridge_argv": null,
+        "p31_run_dir": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/02-seml0-naive-r1/p31",
+        "p31_wrapper": {
+          "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p31/run_with_resources.sh",
+          "sha256": "79323298441e502ddcc1eb2b725c30fe49a5465e32fc00043f7b9db9a26ef95a",
+          "size_bytes": 16504
+        },
+        "process_scope": "lsmgraph-storage-bench-only",
+        "python_adapter_process_inside_boundary": false,
+        "result_conversion_inside_boundary": false,
+        "unresolved": {
+          "fresh_batch_lease": null,
+          "fresh_p31_config": null,
+          "fresh_resource_gate": null,
+          "prepared_binary_argv_receipt": null
+        }
+      },
+      "variant": "naive"
+    },
+    {
+      "cell_key": "seml0-naive:r2",
+      "cell_root": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/03-seml0-naive-r2",
+      "large_content_hashes_per_cell": {
+        "dataset": 0,
+        "id_map": 0,
+        "immutable_store": 0,
+        "mutable_store": 0
+      },
+      "mutable_store": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/03-seml0-naive-r2/mutable-store",
+      "ordinal": 3,
+      "phase_order": [
+        "admission-and-small-identity",
+        "materialize-mutable-clone",
+        "prepare-binary-command",
+        "p31-binary-only",
+        "convert-and-correctness",
+        "fairness-and-cleanup",
+        "publish-cell-done"
+      ],
+      "post_timing": {
+        "adapter_output_conversion_required": true,
+        "binary_exit_zero_required": true,
+        "cleanup_receipt_required_before_cell_done": true,
+        "correctness_zero_mismatch_timeout_required": true,
+        "fairness_receipt_required": true,
+        "inside_p31": false,
+        "mutable_clone_cleanup_required": true,
+        "p31_done_and_validation_required": true
+      },
+      "pre_timing": {
+        "adapter_identity_revalidate": true,
+        "binary_file_revalidate_max_bytes": 67108864,
+        "dataset_content_hash": false,
+        "id_map_content_hash": false,
+        "immutable_store_seal_revalidate": true,
+        "inside_p31": false,
+        "mutable_clone_receipt_revalidate": true,
+        "p02b_lease_resource_gate_revalidate": true,
+        "prepared_binary_argv_receipt_required": true,
+        "store_content_hash": false
+      },
+      "state": "HOLD",
+      "timing": {
+        "asset_hash_inside_boundary": false,
+        "binary_argv": null,
+        "clone_or_cleanup_inside_boundary": false,
+        "correctness_validation_inside_boundary": false,
+        "dataset_sha256_mode": "declared-no-read-v1",
+        "inside_p31": true,
+        "p31_bridge": {
+          "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p10/run_adapter_with_p31.sh",
+          "sha256": "8179c662bcbbc29e58844549ce89f33f02784011d9d9c939318f7502d40e402a",
+          "size_bytes": 7527
+        },
+        "p31_bridge_argv": null,
+        "p31_run_dir": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/03-seml0-naive-r2/p31",
+        "p31_wrapper": {
+          "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p31/run_with_resources.sh",
+          "sha256": "79323298441e502ddcc1eb2b725c30fe49a5465e32fc00043f7b9db9a26ef95a",
+          "size_bytes": 16504
+        },
+        "process_scope": "lsmgraph-storage-bench-only",
+        "python_adapter_process_inside_boundary": false,
+        "result_conversion_inside_boundary": false,
+        "unresolved": {
+          "fresh_batch_lease": null,
+          "fresh_p31_config": null,
+          "fresh_resource_gate": null,
+          "prepared_binary_argv_receipt": null
+        }
+      },
+      "variant": "naive"
+    },
+    {
+      "cell_key": "seml0-naive:r3",
+      "cell_root": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/04-seml0-naive-r3",
+      "large_content_hashes_per_cell": {
+        "dataset": 0,
+        "id_map": 0,
+        "immutable_store": 0,
+        "mutable_store": 0
+      },
+      "mutable_store": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/04-seml0-naive-r3/mutable-store",
+      "ordinal": 4,
+      "phase_order": [
+        "admission-and-small-identity",
+        "materialize-mutable-clone",
+        "prepare-binary-command",
+        "p31-binary-only",
+        "convert-and-correctness",
+        "fairness-and-cleanup",
+        "publish-cell-done"
+      ],
+      "post_timing": {
+        "adapter_output_conversion_required": true,
+        "binary_exit_zero_required": true,
+        "cleanup_receipt_required_before_cell_done": true,
+        "correctness_zero_mismatch_timeout_required": true,
+        "fairness_receipt_required": true,
+        "inside_p31": false,
+        "mutable_clone_cleanup_required": true,
+        "p31_done_and_validation_required": true
+      },
+      "pre_timing": {
+        "adapter_identity_revalidate": true,
+        "binary_file_revalidate_max_bytes": 67108864,
+        "dataset_content_hash": false,
+        "id_map_content_hash": false,
+        "immutable_store_seal_revalidate": true,
+        "inside_p31": false,
+        "mutable_clone_receipt_revalidate": true,
+        "p02b_lease_resource_gate_revalidate": true,
+        "prepared_binary_argv_receipt_required": true,
+        "store_content_hash": false
+      },
+      "state": "HOLD",
+      "timing": {
+        "asset_hash_inside_boundary": false,
+        "binary_argv": null,
+        "clone_or_cleanup_inside_boundary": false,
+        "correctness_validation_inside_boundary": false,
+        "dataset_sha256_mode": "declared-no-read-v1",
+        "inside_p31": true,
+        "p31_bridge": {
+          "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p10/run_adapter_with_p31.sh",
+          "sha256": "8179c662bcbbc29e58844549ce89f33f02784011d9d9c939318f7502d40e402a",
+          "size_bytes": 7527
+        },
+        "p31_bridge_argv": null,
+        "p31_run_dir": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/04-seml0-naive-r3/p31",
+        "p31_wrapper": {
+          "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p31/run_with_resources.sh",
+          "sha256": "79323298441e502ddcc1eb2b725c30fe49a5465e32fc00043f7b9db9a26ef95a",
+          "size_bytes": 16504
+        },
+        "process_scope": "lsmgraph-storage-bench-only",
+        "python_adapter_process_inside_boundary": false,
+        "result_conversion_inside_boundary": false,
+        "unresolved": {
+          "fresh_batch_lease": null,
+          "fresh_p31_config": null,
+          "fresh_resource_gate": null,
+          "prepared_binary_argv_receipt": null
+        }
+      },
+      "variant": "naive"
+    }
+  ],
+  "execution_state": "NOT_IMPLEMENTED",
+  "formal_eligible": false,
+  "global_boundary": {
+    "adapter_monolithic_formal_path_forbidden": true,
+    "begin": "immediately before P31 execs the prepared binary argv",
+    "clock_scope": "P31 wraps only prepared lsmgraph storage-bench argv",
+    "end": "immediately after the prepared binary process exits",
+    "full_content_hash_allowed_only_in_one_time_asset_stage": true,
+    "old_known_argv_is_not_executable": true,
+    "preflight_and_postprocessing_excluded": true
+  },
+  "large_content_read_now": false,
+  "p31_bridge": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p10/run_adapter_with_p31.sh",
+    "sha256": "8179c662bcbbc29e58844549ce89f33f02784011d9d9c939318f7502d40e402a",
+    "size_bytes": 7527
+  },
+  "p31_wrapper": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p31/run_with_resources.sh",
+    "sha256": "79323298441e502ddcc1eb2b725c30fe49a5465e32fc00043f7b9db9a26ef95a",
+    "size_bytes": 16504
+  },
+  "paper_claim_eligible": false,
+  "performance_eligible": false,
+  "required_backend_interfaces": {
+    "finalize_adapter_outputs_without_timing": "NOT_IMPLEMENTED",
+    "invoke_p31_binary_only": "NOT_IMPLEMENTED",
+    "prepare_binary_argv_without_timing": "NOT_IMPLEMENTED",
+    "validate_no_repeat_hash_receipts": "NOT_IMPLEMENTED"
+  },
+  "schema_version": "cidr-e01-exact-timing-boundary-plan-v1",
+  "state": "HOLD",
+  "store_lifecycle_plan": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-store-lifecycle-plan-HOLD-v1.json",
+    "sha256": "3c0925653d0ca962373b802979e74378bfe22c0ac7ab2794917ce764eed86cee",
+    "size_bytes": 11438
+  },
+  "strict_serial": true,
+  "timing_generated": false
+}

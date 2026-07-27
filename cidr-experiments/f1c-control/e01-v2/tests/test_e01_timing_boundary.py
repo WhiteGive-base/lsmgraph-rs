@@ -145,6 +145,27 @@ class TimingBoundaryTests(unittest.TestCase):
         with self.assertRaises(boundary.BoundaryError):
             boundary.atomic_write(output, value)
 
+    def test_real_snapshot_is_pre_root_hold(self) -> None:
+        snapshot = ROOT / "E01-exact-timing-boundary-plan-HOLD-v1.json"
+        if not snapshot.exists():
+            self.skipTest("real timing-boundary snapshot is not installed")
+        value = boundary.validate(snapshot)
+        self.assertEqual(value["state"], "HOLD")
+        self.assertEqual(value["execution_state"], "NOT_IMPLEMENTED")
+        self.assertTrue(
+            all(
+                row["timing"]["process_scope"] == "lsmgraph-storage-bench-only"
+                for row in value["cells"]
+            )
+        )
+        self.assertTrue(
+            all(
+                sum(row["large_content_hashes_per_cell"].values()) == 0
+                for row in value["cells"]
+            )
+        )
+        self.assertFalse(Path(value["campaign_root"]).exists())
+
 
 if __name__ == "__main__":
     unittest.main()
