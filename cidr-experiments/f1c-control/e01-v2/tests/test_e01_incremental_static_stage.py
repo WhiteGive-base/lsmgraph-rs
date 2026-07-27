@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -24,6 +26,8 @@ import build_e01_mixed_lineage as mixed
 import evaluate_e01_bridge_canary as evaluator
 import inventory_e01_seml0_assets as inventory
 import run_e01_incremental_matrix as matrix
+import seal_e01_incremental_light_assets as light_seals
+import build_e01_incremental_command_plan as command_plan
 from test_e01_mixed_lineage import make_fixture, write_json
 
 
@@ -35,6 +39,10 @@ def write_value(path: Path, value: Dict[str, Any]) -> Path:
 
 def ref(path: Path) -> Dict[str, Any]:
     return matrix.file_ref(path, path.name)
+
+
+def file_sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def make_plan(root: Path) -> Tuple[Path, Dict[str, Any]]:
@@ -51,6 +59,7 @@ def make_asset_fixture(
     binary = root / "assets/lsmgraph"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_bytes(b"synthetic binary identity placeholder\n")
+    binary.chmod(0o555)
     binary_sha = next(
         cell["identity"]["binary_sha256"]
         for cell in plan["legacy_cells"]
@@ -260,6 +269,106 @@ def make_canary_evidence(
     return write_value(root / "canary/evidence.json", value)
 
 
+def make_light_assets(
+    root: Path,
+    plan_path: Path,
+    plan: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Path]]:
+    adapter, current_store, naive_store, binary = make_asset_fixture(
+        root, plan_path, plan
+    )
+    repo = root / "adapter-repo"
+    repo.mkdir()
+    adapter_in_repo = repo / "seml0_adapter.py"
+    shutil.copy2(adapter, adapter_in_repo)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "seml0_adapter.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture adapter"], check=True)
+    inventory_value = inventory.inventory(
+        plan_path, adapter_in_repo, current_store, naive_store
+    )
+    inventory_value["engine_binary"]["candidate_sha256"] = file_sha(binary)
+    inventory_path = write_value(root / "light/asset-inventory.json", inventory_value)
+    truth = root / "light/truth.tsv"
+    truth.parent.mkdir(parents=True, exist_ok=True)
+    truth.write_text("fixture truth\n", encoding="utf-8")
+    plan["logical_dataset_identity"]["truth_sha256"] = file_sha(truth)
+    write_value(plan_path, plan)
+    dataset_manifest = root / "lineage/sf10-dataset-manifest.json"
+    dense_summary = root / "lineage/convert-summary.json"
+    shared_plan = write_value(
+        root / "light/shared-plan.json",
+        {
+            "entries": [
+                {
+                    "edge_type": index,
+                    "samples": [{"src": sample, "degree": 1} for sample in range(50)],
+                }
+                for index in range(34)
+            ]
+        },
+    )
+    id_map_dir = root / "light/id-map"
+    id_map = write_value(
+        id_map_dir / "id-map-manifest.json",
+        {
+            "status": "PASS",
+            "vertex_count": 29987835,
+            "mapping_hash": "fixture-map",
+        },
+    )
+    preflight = write_value(
+        root / "light/preflight.json",
+        {
+            "truth_rows": 1700,
+            "truth_tsv": str(truth.resolve()),
+            "id_map_dir": str(id_map_dir.resolve()),
+            "verification": {
+                "status": "PASS",
+                "checked": 1700,
+                "mismatches": 0,
+            },
+        },
+    )
+    adapter_receipt = light_seals.adapter_identity(
+        adapter_in_repo,
+        repo,
+        plan_path,
+        "2026-07-27T00:00:00Z",
+    )
+    binary_receipt = light_seals.binary_file_seal(
+        binary,
+        inventory_path,
+        "2026-07-27T00:00:00Z",
+    )
+    lineage_receipt = light_seals.lineage_seal(
+        plan_path,
+        dataset_manifest,
+        dense_summary,
+        shared_plan,
+        preflight,
+        truth,
+        id_map,
+        "2026-07-27T00:00:00Z",
+    )
+    paths = {
+        "repo": repo,
+        "adapter": adapter_in_repo,
+        "binary": binary,
+        "inventory": inventory_path,
+        "current_store": current_store,
+        "naive_store": naive_store,
+        "p31": write_value(root / "light/p31-wrapper.sh", {"state": "fixture"}),
+        "p02b_validator": write_value(root / "light/p02b-validator.py", {"state": "fixture"}),
+        "adapter_receipt": write_value(root / "light/adapter-identity.json", adapter_receipt),
+        "binary_receipt": write_value(root / "light/binary-seal.json", binary_receipt),
+        "lineage_receipt": write_value(root / "light/lineage-seal.json", lineage_receipt),
+    }
+    return adapter_receipt, binary_receipt, lineage_receipt, paths
+
+
 class IncrementalStaticStageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="e01-incremental-static-")
@@ -426,6 +535,97 @@ class IncrementalStaticStageTests(unittest.TestCase):
         self.assertTrue(all(item is None for item in value["campaign_gates"].values()))
         self.assertIsNone(value["adapter_command_plan"])
         self.assertFalse(Path(value["campaign_root"]).exists())
+
+    def test_light_asset_seals_hash_only_binary_and_small_lineage(self) -> None:
+        adapter, binary, lineage, _ = make_light_assets(
+            self.root, self.plan_path, self.plan
+        )
+        self.assertEqual(adapter["state"], "PASS")
+        self.assertTrue(binary["content_hashed_now"])
+        self.assertLess(binary["bytes_read_now"], light_seals.MAX_BINARY_BYTES)
+        self.assertFalse(lineage["large_content_rehashed_now"])
+        self.assertEqual(
+            lineage["checks"]["dense_dataset_content_rehash"], "NOT_PERFORMED"
+        )
+        self.assertFalse(adapter["formal_eligible"])
+        self.assertFalse(binary["performance_eligible"])
+        self.assertFalse(lineage["paper_claim_eligible"])
+
+    def test_adapter_identity_requires_clean_repo(self) -> None:
+        _, _, _, paths = make_light_assets(self.root, self.plan_path, self.plan)
+        (paths["repo"] / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaises(light_seals.SealError):
+            light_seals.adapter_identity(
+                paths["adapter"],
+                paths["repo"],
+                self.plan_path,
+                "2026-07-27T00:00:00Z",
+            )
+
+    def test_binary_file_seal_rejects_declared_sha_drift(self) -> None:
+        _, _, _, paths = make_light_assets(self.root, self.plan_path, self.plan)
+        value = json.loads(paths["inventory"].read_text(encoding="utf-8"))
+        value["engine_binary"]["candidate_sha256"] = "0" * 64
+        write_value(paths["inventory"], value)
+        with self.assertRaises(light_seals.SealError):
+            light_seals.binary_file_seal(
+                paths["binary"],
+                paths["inventory"],
+                "2026-07-27T00:00:00Z",
+            )
+
+    def test_four_cell_command_plan_binds_immediate_assets_but_holds_p02b(self) -> None:
+        _, _, _, paths = make_light_assets(self.root, self.plan_path, self.plan)
+        campaign_root = self.root / "future-formal-root"
+        value = command_plan.build(
+            mixed_plan_path=self.plan_path,
+            asset_inventory_path=paths["inventory"],
+            adapter_identity_path=paths["adapter_receipt"],
+            binary_seal_path=paths["binary_receipt"],
+            lineage_seal_path=paths["lineage_receipt"],
+            p31_wrapper_path=paths["p31"],
+            p02b_validator_path=paths["p02b_validator"],
+            current_store_manifest_path=paths["current_store"],
+            naive_store_manifest_path=paths["naive_store"],
+            campaign_root=campaign_root,
+        )
+        self.assertEqual(command_plan.validate(value)["state"], "HOLD")
+        self.assertEqual([cell["cell_key"] for cell in value["cells"]], list(matrix.RUN_KEYS))
+        self.assertTrue(all(cell["command_argv"] is None for cell in value["cells"]))
+        self.assertTrue(
+            all(
+                cell["unresolved_arguments"]["--p02b-result"] is None
+                for cell in value["cells"]
+            )
+        )
+        self.assertFalse(campaign_root.exists())
+
+    def test_hold_spec_can_bind_hold_command_plan_without_enabling_execution(self) -> None:
+        _, _, _, paths = make_light_assets(self.root, self.plan_path, self.plan)
+        campaign_root = self.root / "future-formal-root"
+        command = command_plan.build(
+            mixed_plan_path=self.plan_path,
+            asset_inventory_path=paths["inventory"],
+            adapter_identity_path=paths["adapter_receipt"],
+            binary_seal_path=paths["binary_receipt"],
+            lineage_seal_path=paths["lineage_receipt"],
+            p31_wrapper_path=paths["p31"],
+            p02b_validator_path=paths["p02b_validator"],
+            current_store_manifest_path=paths["current_store"],
+            naive_store_manifest_path=paths["naive_store"],
+            campaign_root=campaign_root,
+        )
+        command_path = write_value(self.root / "light/command-plan.json", command)
+        hold = matrix.build_hold_spec(
+            self.plan_path,
+            paths["inventory"],
+            campaign_root,
+            command_path,
+        )
+        self.assertIsNotNone(hold["adapter_command_plan"])
+        self.assertEqual(hold["state"], "HOLD")
+        self.assertEqual(hold["execution_state"], "BLOCKED")
+        self.assertFalse(campaign_root.exists())
 
 
 if __name__ == "__main__":

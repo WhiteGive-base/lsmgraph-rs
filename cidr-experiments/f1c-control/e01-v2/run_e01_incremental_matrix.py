@@ -128,6 +128,7 @@ def build_hold_spec(
     mixed_plan_path: Path,
     asset_inventory_path: Path,
     campaign_root: Path,
+    adapter_command_plan_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     plan_ref = file_ref(mixed_plan_path, "mixed-lineage plan")
     plan = load_json(mixed_plan_path, "mixed-lineage plan")
@@ -137,10 +138,27 @@ def build_hold_spec(
     require(inventory.get("schema_version") == assets.SCHEMA, "asset inventory schema drift")
     require(Path(campaign_root).is_absolute(), "absolute campaign root required")
     require(not campaign_root.exists(), "campaign root must not exist during spec build")
-    blockers = list(inventory.get("blockers", [])) + [
-        "four-cell adapter command plan absent",
-        "production process invocation intentionally disabled",
-    ]
+    command_ref: Optional[Dict[str, Any]] = None
+    blockers = list(inventory.get("blockers", []))
+    if adapter_command_plan_path is None:
+        blockers.append("four-cell adapter command plan absent")
+    else:
+        command_ref = file_ref(adapter_command_plan_path, "adapter command plan")
+        command = load_json(adapter_command_plan_path, "adapter command plan")
+        require(
+            command.get("schema_version")
+            == "cidr-e01-incremental-adapter-command-plan-v1",
+            "adapter command plan schema drift",
+        )
+        require(command.get("state") == "HOLD", "adapter command plan must HOLD")
+        require(command.get("timing_generated") is False, "command plan timing drift")
+        require(
+            Path(command.get("campaign_root", "")).resolve()
+            == campaign_root.resolve(),
+            "adapter command plan campaign root drift",
+        )
+        blockers.extend(command.get("blockers", []))
+    blockers.append("production process invocation intentionally disabled")
     value = {
         "schema_version": SPEC_SCHEMA,
         "state": "HOLD",
@@ -153,7 +171,7 @@ def build_hold_spec(
         "asset_compatibility_inventory": inventory_ref,
         "cells": _planned_cells(),
         "campaign_gates": {key: None for key in GATE_KEYS},
-        "adapter_command_plan": None,
+        "adapter_command_plan": command_ref,
         "blockers": blockers,
         **FALSE_ELIGIBILITY,
     }
@@ -210,7 +228,14 @@ def validate_spec(value_or_path: Any, *, verify_assets: bool = True) -> Dict[str
         require(value.get("execution_state") == "BLOCKED", "HOLD execution must BLOCK")
         require(not synthetic, "committed HOLD spec must not be synthetic")
         require(all(item is None for item in gates.values()), "HOLD gates must be absent")
-        require(value.get("adapter_command_plan") is None, "HOLD command plan must be absent")
+        command_ref = value.get("adapter_command_plan")
+        if command_ref is not None:
+            verified = verify_ref(command_ref, "HOLD adapter command plan") if verify_assets else command_ref
+            require(type(verified) is dict, "HOLD command plan reference invalid")
+            if verify_assets:
+                command = load_json(Path(verified["path"]), "HOLD adapter command plan")
+                require(command.get("state") == "HOLD", "HOLD command plan state drift")
+                require(command.get("timing_generated") is False, "HOLD command plan timing drift")
         require(blockers, "HOLD blockers required")
         if inventory is not None:
             require(inventory.get("state") == "HOLD", "HOLD spec inventory drift")
@@ -246,8 +271,14 @@ def build_hold_spec_file(
     asset_inventory_path: Path,
     campaign_root: Path,
     output: Path,
+    adapter_command_plan_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    value = build_hold_spec(mixed_plan_path, asset_inventory_path, campaign_root)
+    value = build_hold_spec(
+        mixed_plan_path,
+        asset_inventory_path,
+        campaign_root,
+        adapter_command_plan_path,
+    )
     require(not output.exists(), f"refusing to overwrite spec: {output}")
     atomic_json(output.resolve(), value)
     return value
@@ -439,6 +470,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     build.add_argument("--asset-inventory", type=Path, required=True)
     build.add_argument("--campaign-root", type=Path, required=True)
     build.add_argument("--output", type=Path, required=True)
+    build.add_argument("--adapter-command-plan", type=Path)
     run = sub.add_parser("run")
     run.add_argument("--spec", type=Path, required=True)
     run.add_argument("--result-root", type=Path, required=True)
@@ -456,6 +488,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.asset_inventory,
                 args.campaign_root,
                 args.output,
+                args.adapter_command_plan,
             )
             print(json.dumps({"state": value["state"], "cell_count": 4}))
             return 0
