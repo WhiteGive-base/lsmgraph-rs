@@ -1,0 +1,2103 @@
+{
+  "classification": {
+    "formal_eligible": false,
+    "legacy_formal_upgrade_performed": false,
+    "lineage": "mixed_legacy_validated_plus_fresh_incremental",
+    "paper_claim_eligible": false,
+    "performance_eligible": false,
+    "strict_all_formal_claim": false
+  },
+  "composition_id": "E01-F1-MIXED-LINEAGE-INCREMENTAL-V1",
+  "created_at_utc": "2026-07-27T10:30:00Z",
+  "experiment_id": "E01",
+  "incremental_plan": {
+    "bridge_canary_comparability_contract": {
+      "candidate_cell_key": "seml0:bridge-canary",
+      "contract_sha256": "e277d373c0fb9f0ce0851defdb41e4f575708abb60f4bbc11f6748d5ed8e5a99",
+      "correctness": {
+        "completed_queries": 1700,
+        "expected_digest_equals_actual": true,
+        "mismatch_queries": 0,
+        "timeout_queries": 0
+      },
+      "failure_policy": {
+        "automatic_strict_21_rerun": false,
+        "normalizer_output": "REJECT",
+        "targeted_fallback": "fresh_seml0_r1_r2_r3_plus_seml0_naive_r1_r2_r3"
+      },
+      "frozen_before_timing": true,
+      "identity_exact_match": [
+        "logical_dataset_id",
+        "truth_sha256",
+        "query_count",
+        "interface_scope",
+        "concurrency",
+        "warmup_passes",
+        "measured_passes",
+        "clock",
+        "timing_boundary",
+        "host_fingerprint"
+      ],
+      "legacy_reference_keys": [
+        "seml0:r1",
+        "seml0:r2",
+        "seml0:r3"
+      ],
+      "performance_rule": {
+        "all_bounds_inclusive": true,
+        "baseline_statistic": "median_of_legacy_seml0_r1_r2_r3",
+        "completed_qps_max": 1.15,
+        "completed_qps_min": 0.85,
+        "latency_p50_max": 1.5,
+        "latency_p50_min": 0.67,
+        "latency_p95_max": 1.5,
+        "latency_p95_min": 0.67,
+        "latency_p99_max": 2.0,
+        "latency_p99_min": 0.5,
+        "ratio_definition": "fresh_canary_over_legacy_median"
+      },
+      "schema_version": "cidr-e01-bridge-canary-comparability-contract-v1"
+    },
+    "canary_count": 1,
+    "cells": [
+      {
+        "cell_key": "seml0:bridge-canary",
+        "included_in_figure_rows": false,
+        "repeat_index": 1,
+        "required_execution_mode": "formal",
+        "required_fresh_receipts": [
+          "asset_seal",
+          "adapter_identity",
+          "p03",
+          "p02b",
+          "batch_lease",
+          "resource_gate",
+          "validated_result",
+          "p31",
+          "cleanup"
+        ],
+        "role": "comparability_gate",
+        "system_id": "seml0"
+      },
+      {
+        "cell_key": "seml0-naive:r1",
+        "included_in_figure_rows": true,
+        "repeat_index": 1,
+        "required_execution_mode": "formal",
+        "required_fresh_receipts": [
+          "asset_seal",
+          "adapter_identity",
+          "p03",
+          "p02b",
+          "batch_lease",
+          "resource_gate",
+          "validated_result",
+          "p31",
+          "cleanup"
+        ],
+        "role": "figure_row",
+        "system_id": "seml0-naive"
+      },
+      {
+        "cell_key": "seml0-naive:r2",
+        "included_in_figure_rows": true,
+        "repeat_index": 2,
+        "required_execution_mode": "formal",
+        "required_fresh_receipts": [
+          "asset_seal",
+          "adapter_identity",
+          "p03",
+          "p02b",
+          "batch_lease",
+          "resource_gate",
+          "validated_result",
+          "p31",
+          "cleanup"
+        ],
+        "role": "figure_row",
+        "system_id": "seml0-naive"
+      },
+      {
+        "cell_key": "seml0-naive:r3",
+        "included_in_figure_rows": true,
+        "repeat_index": 3,
+        "required_execution_mode": "formal",
+        "required_fresh_receipts": [
+          "asset_seal",
+          "adapter_identity",
+          "p03",
+          "p02b",
+          "batch_lease",
+          "resource_gate",
+          "validated_result",
+          "p31",
+          "cleanup"
+        ],
+        "role": "figure_row",
+        "system_id": "seml0-naive"
+      }
+    ],
+    "figure_row_count": 3,
+    "incremental_evidence": null,
+    "pre_output_policy": {
+      "formal_root_creation": "REJECT_UNTIL_FRESH_ASSETS_AND_GATES_PASS",
+      "legacy_root_mutation": "FORBIDDEN",
+      "normalizer_output": "REJECT_UNTIL_ALL_4_CELLS_AND_CANARY_GATE_PASS",
+      "strict_all_formal_claim": "FORBIDDEN",
+      "timing_start": "REJECT_UNTIL_FRESH_ASSETS_AND_GATES_PASS"
+    },
+    "reason": "fresh assets, gates, lease, four receipts, and canary comparison are absent",
+    "required_campaign_gates": [
+      "fresh_asset_seal",
+      "adapter_identity",
+      "fresh_p03",
+      "fresh_p02b",
+      "fresh_batch_lease",
+      "fresh_resource_gate",
+      "strict_serial_scheduler",
+      "all_four_cells",
+      "bridge_canary_comparability",
+      "cleanup"
+    ],
+    "state": "HOLD",
+    "timing_cell_count": 4
+  },
+  "legacy_cells": [
+    {
+      "cell_key": "seml0:r1",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-01/adapter-output/adapter-provenance.json",
+          "sha256": "934ca4c86a2eeacafb517f4d73c0836a8c621bc8ce74a8756b9c48ca0c5d8daf",
+          "size_bytes": 7056
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-01/adapter-request.json",
+          "sha256": "33f3aad860b495f98160a9cecd1d531ae47732bd742ee79e5b35a752a7ca6555",
+          "size_bytes": 1945
+        },
+        "binary_sha256": "c7d0534cbe327eff8f7a4980a14179fef45734e8a68336b8b82acd93fff022b9",
+        "display_name": "SemL0",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "SemL0@22cb1e7-budg-b64-a6",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 212.452,
+        "latency_p95_us": 6657.774,
+        "latency_p99_us": 322999.943,
+        "measurement_s": 30.263554291,
+        "mismatch_queries": 0,
+        "qps": 56.17317726971543,
+        "timeout_queries": 0,
+        "warmup_s": 30.646462415
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "7881e729ab2ba67fdd122e8a75b3a47ba2db4325ceaf9c99ca01fb8cca18b7db",
+              "size_bytes": 277
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-01/p31/DONE",
+            "sha256": "749c931a4b28967bccc6a4a61bf465e9a5bfa14e829c3547855c716f72a4f8ec",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "9305dae4e712fb90c2c27ab3dbbc549ca5234665c81d4b40ac043a65fd120601",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-01/p31/validation.json",
+            "sha256": "9305dae4e712fb90c2c27ab3dbbc549ca5234665c81d4b40ac043a65fd120601",
+            "size_bytes": 3029
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-01/validated-result.json",
+          "sha256": "3dfdced2aa81b4dd1e222d9e1f64500dbf24be914a09178570e33a190bfd627b",
+          "size_bytes": 19666
+        }
+      },
+      "repeat_index": 1,
+      "system_id": "seml0"
+    },
+    {
+      "cell_key": "seml0:r2",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-02/adapter-output/adapter-provenance.json",
+          "sha256": "76ae6be53a787c2f11daf1a442c00292ba431511ea725cd5664008e74e313c53",
+          "size_bytes": 7056
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-02/adapter-request.json",
+          "sha256": "1f2ee2d69a0c4702f36051b6c4c728d9ac79a1e0557d07d874346059469bc797",
+          "size_bytes": 1945
+        },
+        "binary_sha256": "c7d0534cbe327eff8f7a4980a14179fef45734e8a68336b8b82acd93fff022b9",
+        "display_name": "SemL0",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "SemL0@22cb1e7-budg-b64-a6",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 205.936,
+        "latency_p95_us": 6631.258,
+        "latency_p99_us": 318032.925,
+        "measurement_s": 30.303647329,
+        "mismatch_queries": 0,
+        "qps": 56.09885772308118,
+        "timeout_queries": 0,
+        "warmup_s": 30.466942184
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "7881e729ab2ba67fdd122e8a75b3a47ba2db4325ceaf9c99ca01fb8cca18b7db",
+              "size_bytes": 277
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-02/p31/DONE",
+            "sha256": "42de6e8d9d23f1fe654254c427a488328d266762722599380f67127feb4a001b",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "ccb49580d1ad3042c88c56e1c472a63f845f9f692bf458bc537e629b7bafa03d",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-02/p31/validation.json",
+            "sha256": "ccb49580d1ad3042c88c56e1c472a63f845f9f692bf458bc537e629b7bafa03d",
+            "size_bytes": 3028
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-02/validated-result.json",
+          "sha256": "2865ff18d24f982013d5b42089689e24256d643a4e5565d93f1cb850312edb52",
+          "size_bytes": 19918
+        }
+      },
+      "repeat_index": 2,
+      "system_id": "seml0"
+    },
+    {
+      "cell_key": "seml0:r3",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-03/adapter-output/adapter-provenance.json",
+          "sha256": "d6b622660a915c9120902253cd8832c04b571f033ccf79eafd731e94e677ffc8",
+          "size_bytes": 7056
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-03/adapter-request.json",
+          "sha256": "11d264b28cee90b0553398ccdfe29b80e09041f294878094652c0d6a494429e4",
+          "size_bytes": 1945
+        },
+        "binary_sha256": "c7d0534cbe327eff8f7a4980a14179fef45734e8a68336b8b82acd93fff022b9",
+        "display_name": "SemL0",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "SemL0@22cb1e7-budg-b64-a6",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 211.07,
+        "latency_p95_us": 6857.011,
+        "latency_p99_us": 297536.793,
+        "measurement_s": 30.598604633,
+        "mismatch_queries": 0,
+        "qps": 55.558089017124104,
+        "timeout_queries": 0,
+        "warmup_s": 30.927274672
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "7881e729ab2ba67fdd122e8a75b3a47ba2db4325ceaf9c99ca01fb8cca18b7db",
+              "size_bytes": 277
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-03/p31/DONE",
+            "sha256": "f915e4fb493694fe9f9b2fe9d9bd7b2cb108aa0c69c6973ded3b1e71a9f45c7c",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "641e4623b84d68826f131fd901286ef663c1e1eeadd43fd55c9727ec8d7a3a7e",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-03/p31/validation.json",
+            "sha256": "641e4623b84d68826f131fd901286ef663c1e1eeadd43fd55c9727ec8d7a3a7e",
+            "size_bytes": 3029
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-03/validated-result.json",
+          "sha256": "bde1a4981a817b9ea304e68d414562661c3da6c849ec208e8c71ebb0692fc785",
+          "size_bytes": 19919
+        }
+      },
+      "repeat_index": 3,
+      "system_id": "seml0"
+    },
+    {
+      "cell_key": "livegraph:r1",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/remainder-attempt3/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-01/adapter-output/adapter-provenance.json",
+          "sha256": "1b169146d1952fb2054ccd4c25befe9d6a7b3edf97e7f9acea95d6b02862c9b5",
+          "size_bytes": 18544
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/remainder-attempt3/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-01/adapter-request.json",
+          "sha256": "f2b0050b66ad43931a92619fbf2f6131586de991c23e0c48eed25ecd4984324f",
+          "size_bytes": 2195
+        },
+        "binary_sha256": "2293768d594b1482780485bd551e53940206033c0ebf9427dce465a4f1985488",
+        "display_name": "LiveGraph",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "LiveGraph@eea5a40ce6ee443f901e44323c1119f59113eaf3",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": 35594678272,
+        "import_store_logical_bytes": 38654705664,
+        "import_wall_s": 563.751222005,
+        "latency_p50_us": 1.044,
+        "latency_p95_us": 53.443,
+        "latency_p99_us": 6314.837,
+        "measurement_s": 0.57653121,
+        "mismatch_queries": 0,
+        "qps": 2948.6695091493834,
+        "timeout_queries": 0,
+        "warmup_s": 0.619433017
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "fresh-import-and-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/remainder-attempt3/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "fc71052bb3c25a0d60ff3d8ec5f5c18d987e1245f6260fcfafda7c2df511d236",
+              "size_bytes": 250
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/remainder-attempt3/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-01/p31/DONE",
+            "sha256": "2c6c69542f3ec9c3dc8a3745f84f759e930eb81b69898b3138e94583d9cfaec0",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "3a59f07cc16f7bd089b155d8bf98f463de3d4fe54bd604de6d25824e78c94f98",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/remainder-attempt3/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-01/p31/validation.json",
+            "sha256": "3a59f07cc16f7bd089b155d8bf98f463de3d4fe54bd604de6d25824e78c94f98",
+            "size_bytes": 3760
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/remainder-attempt3/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-01/validated-result.json",
+          "sha256": "8887b865434abd3751cefb9a232dcc3cb2df4bdda74c8cf122d255c85f3ce6f9",
+          "size_bytes": 43804
+        }
+      },
+      "repeat_index": 1,
+      "system_id": "livegraph"
+    },
+    {
+      "cell_key": "livegraph:r2",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-02/adapter-output/adapter-provenance.json",
+          "sha256": "522bae490ec966cc0895d531d04479977e2d2d7a206ff0e2979f26fcf67244b1",
+          "size_bytes": 18609
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-02/adapter-request.json",
+          "sha256": "769c66152b3a4580ff155126dc5d9dc43b383c6931c2c4cb42c54790b9666b92",
+          "size_bytes": 2195
+        },
+        "binary_sha256": "2293768d594b1482780485bd551e53940206033c0ebf9427dce465a4f1985488",
+        "display_name": "LiveGraph",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "LiveGraph@eea5a40ce6ee443f901e44323c1119f59113eaf3",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": 35594731520,
+        "import_store_logical_bytes": 38654705664,
+        "import_wall_s": 607.655897481,
+        "latency_p50_us": 1.085,
+        "latency_p95_us": 54.318,
+        "latency_p99_us": 6370.675,
+        "measurement_s": 0.575678887,
+        "mismatch_queries": 0,
+        "qps": 2953.0351701086443,
+        "timeout_queries": 0,
+        "warmup_s": 0.613026206
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "fresh-import-and-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-02/p31/DONE",
+            "sha256": "61acc6872ca7bc4b3d5840b401ade6129de4cbd9bf6ebe399165a9511494591e",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "e7ad1e20634c835cf09649303aab44acf90c8818a9446279287670f074086da3",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-02/p31/validation.json",
+            "sha256": "e7ad1e20634c835cf09649303aab44acf90c8818a9446279287670f074086da3",
+            "size_bytes": 3652
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-02/validated-result.json",
+          "sha256": "da08f2c87632bb7584b382daa6f9cee109e8bc83b512a6fdac0c954f3f0af1bb",
+          "size_bytes": 44200
+        }
+      },
+      "repeat_index": 2,
+      "system_id": "livegraph"
+    },
+    {
+      "cell_key": "livegraph:r3",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-03/adapter-output/adapter-provenance.json",
+          "sha256": "f37234a8874b0200c28de12794c61641146049dc4a63571a109c8b5588977832",
+          "size_bytes": 18609
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-03/adapter-request.json",
+          "sha256": "b8a52f0765b28632ad8dbe38814027b19b38814c4edf20c4db5a5b3d66bf20de",
+          "size_bytes": 2195
+        },
+        "binary_sha256": "2293768d594b1482780485bd551e53940206033c0ebf9427dce465a4f1985488",
+        "display_name": "LiveGraph",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "LiveGraph@eea5a40ce6ee443f901e44323c1119f59113eaf3",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": 35594760192,
+        "import_store_logical_bytes": 38654705664,
+        "import_wall_s": 530.1013642,
+        "latency_p50_us": 1.067,
+        "latency_p95_us": 52.068,
+        "latency_p99_us": 7082.237,
+        "measurement_s": 0.586367814,
+        "mismatch_queries": 0,
+        "qps": 2899.204150383329,
+        "timeout_queries": 0,
+        "warmup_s": 0.643112694
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "fresh-import-and-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-03/p31/DONE",
+            "sha256": "d92246e783d24fdf9b9ea5a7b15a6a46ddd9bd39f8d7f24c2dfc982da4fe7c08",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "0736da9579cf1da5bb5bcb4e9ac24883fd2a49a964692b51392f2e39aa37d42c",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-03/p31/validation.json",
+            "sha256": "0736da9579cf1da5bb5bcb4e9ac24883fd2a49a964692b51392f2e39aa37d42c",
+            "size_bytes": 3430
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/livegraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/livegraph/repeat-03/validated-result.json",
+          "sha256": "e2b257bcb8c1baf104a761beda65ff3d31ae276ef98e8ca08782c9638fa023b8",
+          "size_bytes": 44231
+        }
+      },
+      "repeat_index": 3,
+      "system_id": "livegraph"
+    },
+    {
+      "cell_key": "aster:r1",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-tugraph-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-01/adapter-output/adapter-provenance.json",
+          "sha256": "04c28a2770774960bf5c93d73a6741a0c7ee89af965cb223de2c1c268ae3e98d",
+          "size_bytes": 12129
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-tugraph-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-01/adapter-request.json",
+          "sha256": "c7e7fd6ebe165b4d8d0ed1f810c5f7e73b99c8940b2e7be1c1da2cf82a535623",
+          "size_bytes": 2007
+        },
+        "binary_sha256": "12f848aa5aa7595d8626e67066280cc6dd023067b597d123fdc6caa067a6c1b8",
+        "display_name": "Aster",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "aster-rocksgraph@6abb258e577c479325092a8ac0e7691fdfd154c2",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 7.026,
+        "latency_p95_us": 107.302,
+        "latency_p99_us": 15422.111,
+        "measurement_s": 1.185381745,
+        "mismatch_queries": 0,
+        "qps": 1434.1371521627407,
+        "timeout_queries": 0,
+        "warmup_s": 1.309901935
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-tugraph-attempt1/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "2af05247bef1fae8022b049a1433732beaac3811b63c697602003fa619b3e842",
+              "size_bytes": 247
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-tugraph-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-01/p31/DONE",
+            "sha256": "2c99c57e10d31a79b836a0eb507e402d96ec590445df188df7ffbff85cd17af3",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "4399fcdf08be29475bc9853781f4b4c50788155d59c5676cfb7684b298d367a1",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-tugraph-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-01/p31/validation.json",
+            "sha256": "4399fcdf08be29475bc9853781f4b4c50788155d59c5676cfb7684b298d367a1",
+            "size_bytes": 3271
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-tugraph-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-01/validated-result.json",
+          "sha256": "2b04adb3c8a2f0843629457f7eb28288de52f485f812152b32ce9e3bbc710c62",
+          "size_bytes": 27415
+        }
+      },
+      "repeat_index": 1,
+      "system_id": "aster"
+    },
+    {
+      "cell_key": "aster:r2",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-02/adapter-output/adapter-provenance.json",
+          "sha256": "b2e8cc1f3f0decc0fcf7af97868a30c8a7ffc59910e709a200ae1032f7a38442",
+          "size_bytes": 12186
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-02/adapter-request.json",
+          "sha256": "8bae91ea6fc5ed1f365274e7f070bbb4a385ae22b890bc9df827d8044db27136",
+          "size_bytes": 2007
+        },
+        "binary_sha256": "12f848aa5aa7595d8626e67066280cc6dd023067b597d123fdc6caa067a6c1b8",
+        "display_name": "Aster",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "aster-rocksgraph@6abb258e577c479325092a8ac0e7691fdfd154c2",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 6.738,
+        "latency_p95_us": 111.542,
+        "latency_p99_us": 13170.387,
+        "measurement_s": 1.165684009,
+        "mismatch_queries": 0,
+        "qps": 1458.371211129825,
+        "timeout_queries": 0,
+        "warmup_s": 1.426929425
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-02/p31/DONE",
+            "sha256": "48a1d6063a7c3eeb741a81e37c95e33309a19a53db36b0a91eead53612bdf459",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "9873c081c60d7afb67a2bef7ffaacf4c68829b28660bc5ce7fbb5ffb68669b2d",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-02/p31/validation.json",
+            "sha256": "9873c081c60d7afb67a2bef7ffaacf4c68829b28660bc5ce7fbb5ffb68669b2d",
+            "size_bytes": 3121
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-02/validated-result.json",
+          "sha256": "12d304619ebb2f890b98ce90c74f1c2db84cbe0a4bd4b78ec98a53ee27865bcf",
+          "size_bytes": 27205
+        }
+      },
+      "repeat_index": 2,
+      "system_id": "aster"
+    },
+    {
+      "cell_key": "aster:r3",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-03/adapter-output/adapter-provenance.json",
+          "sha256": "df83a0c26064cd2c008ad92da35548000d9480b8c899931871bffe831dee74d1",
+          "size_bytes": 12258
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-03/adapter-request.json",
+          "sha256": "845b17565443c68465b4cde9f35882746be4f8043796369665004c0ba56224b5",
+          "size_bytes": 2007
+        },
+        "binary_sha256": "12f848aa5aa7595d8626e67066280cc6dd023067b597d123fdc6caa067a6c1b8",
+        "display_name": "Aster",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "aster-rocksgraph@6abb258e577c479325092a8ac0e7691fdfd154c2",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 7.872,
+        "latency_p95_us": 118.986,
+        "latency_p99_us": 13118.296,
+        "measurement_s": 1.381737963,
+        "mismatch_queries": 0,
+        "qps": 1230.334582621582,
+        "timeout_queries": 0,
+        "warmup_s": 1.37787182
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-03/p31/DONE",
+            "sha256": "cb1f543b26beafbd6fee7bb092ae9b6d0200c7a0ed29c9ad04a3f7c36a625a24",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "336c8790a8563c4b3d390751f93e8fb7cc85abde3ef229917e691dda34c22c1f",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-03/p31/validation.json",
+            "sha256": "336c8790a8563c4b3d390751f93e8fb7cc85abde3ef229917e691dda34c22c1f",
+            "size_bytes": 3127
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/aster-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/aster/repeat-03/validated-result.json",
+          "sha256": "b21c66c9dcc71032de56e26abc04202ca1e6af4adc04249cd07b3c8746e5b8c0",
+          "size_bytes": 27539
+        }
+      },
+      "repeat_index": 3,
+      "system_id": "aster"
+    },
+    {
+      "cell_key": "tugraph:r1",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-canary-attempt2/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-01/adapter-output/adapter-provenance.json",
+          "sha256": "e64500d382e5f410c277f20e8f00a31fcfa7457a337db75850d7765ed4b09675",
+          "size_bytes": 3769
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-canary-attempt2/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-01/adapter-request.json",
+          "sha256": "87b17232fb409e1de43825e61051a5096cd9980125f6ae79bf02f831c4bc6bca",
+          "size_bytes": 2177
+        },
+        "binary_sha256": "2c36738688ffe6227194032c266a018eddf9e0e4fcc3b3ea10791290ca6e103e",
+        "display_name": "TuGraph",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "TuGraph-4.5.2-native-embedded",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 16.724,
+        "latency_p95_us": 4526.955,
+        "latency_p99_us": 84449.335,
+        "measurement_s": 4.350832144,
+        "mismatch_queries": 0,
+        "qps": 390.7298520685012,
+        "timeout_queries": 0,
+        "warmup_s": 4.622594689
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-canary-attempt2/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-01/p31/DONE",
+            "sha256": "8b4debbfbb21101ab9893a4eefe56c6b751afd84a5c5cc625551f4d8693a9ea4",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "a1c8bbb8f9c63d2928707085228236c28109205a8d582930b5b54230720eeb1e",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-canary-attempt2/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-01/p31/validation.json",
+            "sha256": "a1c8bbb8f9c63d2928707085228236c28109205a8d582930b5b54230720eeb1e",
+            "size_bytes": 3069
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-canary-attempt2/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-01/validated-result.json",
+          "sha256": "5c407a6e8a1d8f6e5b48d800ed046e27826f0b2831caf4fd6632d5350cbe0d9b",
+          "size_bytes": 16993
+        }
+      },
+      "repeat_index": 1,
+      "system_id": "tugraph"
+    },
+    {
+      "cell_key": "tugraph:r2",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-02/adapter-output/adapter-provenance.json",
+          "sha256": "d4815b6acbaf86642ec691ca9cf530d479b24a344bf5a0d40c7cd09dd90befb2",
+          "size_bytes": 3767
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-02/adapter-request.json",
+          "sha256": "0132c21057a89065124bf21765a95b27cc84bcf5a3bb26e031e3234d15e11a3d",
+          "size_bytes": 2177
+        },
+        "binary_sha256": "2c36738688ffe6227194032c266a018eddf9e0e4fcc3b3ea10791290ca6e103e",
+        "display_name": "TuGraph",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "TuGraph-4.5.2-native-embedded",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 16.508,
+        "latency_p95_us": 4640.466,
+        "latency_p99_us": 84188.712,
+        "measurement_s": 4.313222078,
+        "mismatch_queries": 0,
+        "qps": 394.1369049071254,
+        "timeout_queries": 0,
+        "warmup_s": 4.605859985
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-02/p31/DONE",
+            "sha256": "0d5be91015507cd53482a5c164c8804f8bbf6634a696bc5627fc437fe04c7bf5",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "24a0c25d4fba5d1773c9d26a934c842469a7c17979237abb6ea240c608ad84f3",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-02/p31/validation.json",
+            "sha256": "24a0c25d4fba5d1773c9d26a934c842469a7c17979237abb6ea240c608ad84f3",
+            "size_bytes": 3051
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-02/validated-result.json",
+          "sha256": "0e4e7eb7edbb12e3d66701e96ecf82e63e0d2461c6c158499da399707ed09042",
+          "size_bytes": 16955
+        }
+      },
+      "repeat_index": 2,
+      "system_id": "tugraph"
+    },
+    {
+      "cell_key": "tugraph:r3",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-03/adapter-output/adapter-provenance.json",
+          "sha256": "1694b0dcd01a026a1cc3110fee6013dbdff0f80704a2990d2df363a1afeaf2f4",
+          "size_bytes": 3767
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-03/adapter-request.json",
+          "sha256": "e1d32a03ce315f7b5376e5bc7daed3214846d50126b61fad7339c710b0201fd5",
+          "size_bytes": 2177
+        },
+        "binary_sha256": "2c36738688ffe6227194032c266a018eddf9e0e4fcc3b3ea10791290ca6e103e",
+        "display_name": "TuGraph",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "TuGraph-4.5.2-native-embedded",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 16.489,
+        "latency_p95_us": 4640.29,
+        "latency_p99_us": 84654.189,
+        "measurement_s": 4.353354503,
+        "mismatch_queries": 0,
+        "qps": 390.50346091238134,
+        "timeout_queries": 0,
+        "warmup_s": 4.628498899
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [],
+        "p31_bridge": {
+          "conditional_revalidation": null,
+          "done": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-03/p31/DONE",
+            "sha256": "3a032e2ed5ff88a111c4cd6dd0d1a317437c0a82603ee140b9d142ca2da89038",
+            "size_bytes": 252
+          },
+          "embedded_validation_sha256": "3006700a1d47935053dc5102c27594288a0bc99da0d0f060c51dcd299fe124a0",
+          "mode": "direct_pass_receipts",
+          "original_artifacts_modified": false,
+          "original_failed_marker": null,
+          "original_validation": null,
+          "post_timing_revalidation": null,
+          "state": "PASS",
+          "validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-03/p31/validation.json",
+            "sha256": "3006700a1d47935053dc5102c27594288a0bc99da0d0f060c51dcd299fe124a0",
+            "size_bytes": 3016
+          }
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/tugraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/tugraph/repeat-03/validated-result.json",
+          "sha256": "4a5baf7686335d80ad5cd29911eb635294fc4c3b63380a9da6588947c98333c7",
+          "size_bytes": 16920
+        }
+      },
+      "repeat_index": 3,
+      "system_id": "tugraph"
+    },
+    {
+      "cell_key": "neo4j:r1",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-canary-attempt10/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-01/adapter-output/adapter-provenance.json",
+          "sha256": "fa8d484101ff735778dacdd55a4f3e840df13f767c36a26bf1f137af6a1b1f9d",
+          "size_bytes": 83074
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-canary-attempt10/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-01/adapter-request.json",
+          "sha256": "5ea8b72ddb4ad0eccbdf4928c50c9cb7febb1236a0c0bc343fcd8fa2bdaf62c6",
+          "size_bytes": 2116
+        },
+        "binary_sha256": "f7b4f724cf8d9414029dc6684326d9744928cd423ea9cb4c4be509c53a013ca7",
+        "display_name": "Neo4j Community",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "baa7c4b9701936253ebaeb4b3436c16403373af0b48c4276dacef780479952c5",
+        "system_version": "Neo4j Community 5.26.24",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 890.311,
+        "latency_p95_us": 116981.503,
+        "latency_p99_us": 13526123.891,
+        "measurement_s": 1322.28914088,
+        "mismatch_queries": 0,
+        "qps": 1.2856492180436636,
+        "timeout_queries": 0,
+        "warmup_s": 1402.619571954
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "external-prestarted-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-canary-attempt10/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "295f058b2dcd3182674e0dbea7fc108cfb21114707060d3d4762eb0a4f24e697",
+              "size_bytes": 1307
+            }
+          },
+          {
+            "kind": "original_p31_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-canary-attempt10/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-01/p31/FAILED",
+              "sha256": "dfbd632bbbaf5727c09ac8a0fd84b6c9ddef7fe0c80344a3a2c4d3195eeaac17",
+              "size_bytes": 248
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-canary-attempt10/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-01/conditional-p31-revalidation.json",
+            "sha256": "32ec181579d2c113031c41b0edb54dadfa02ee1a75ae13a649403e8ca0bf0bc6",
+            "size_bytes": 5669
+          },
+          "done": null,
+          "embedded_validation_sha256": "bda13fd264558bf60d73568adbc38eb195678dc96cabeb3b22f74ab3656f3a6e",
+          "mode": "read_only_post_timing_revalidation",
+          "original_artifacts_modified": false,
+          "original_failed_marker": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-canary-attempt10/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-01/p31/FAILED",
+            "sha256": "dfbd632bbbaf5727c09ac8a0fd84b6c9ddef7fe0c80344a3a2c4d3195eeaac17",
+            "size_bytes": 248
+          },
+          "original_validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-canary-attempt10/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-01/p31/validation.json",
+            "sha256": "bda13fd264558bf60d73568adbc38eb195678dc96cabeb3b22f74ab3656f3a6e",
+            "size_bytes": 3601
+          },
+          "post_timing_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-canary-attempt10/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-01/post-timing-revalidation-receipt.json",
+            "sha256": "212927bfa52880ccfb868bbf39dd207b75ec05d5ab3eacb9f0d374cd00c7719f",
+            "size_bytes": 1518
+          },
+          "state": "PASS",
+          "validation": null
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-canary-attempt10/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-01/validated-result.json",
+          "sha256": "4e5673ea0c33cc87c699c3ab7e65982bdd171d72672ea9fcf1207d65f5900583",
+          "size_bytes": 204704
+        }
+      },
+      "repeat_index": 1,
+      "system_id": "neo4j"
+    },
+    {
+      "cell_key": "neo4j:r2",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r2r3-attempt3/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-02/adapter-output/adapter-provenance.json",
+          "sha256": "ff124cf3d60d94a1d37ca74621c228c6730c63bd7970ac5de5cb5a6998f27870",
+          "size_bytes": 83056
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r2r3-attempt3/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-02/adapter-request.json",
+          "sha256": "97db84e9f3372c9d41696e2f1f8d4457af8e45b20289ea490aa0a20f62372f4f",
+          "size_bytes": 2116
+        },
+        "binary_sha256": "f7b4f724cf8d9414029dc6684326d9744928cd423ea9cb4c4be509c53a013ca7",
+        "display_name": "Neo4j Community",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "baa7c4b9701936253ebaeb4b3436c16403373af0b48c4276dacef780479952c5",
+        "system_version": "Neo4j Community 5.26.24",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 896.91,
+        "latency_p95_us": 116374.396,
+        "latency_p99_us": 13429823.53,
+        "measurement_s": 1310.431843505,
+        "mismatch_queries": 0,
+        "qps": 1.297282272577432,
+        "timeout_queries": 0,
+        "warmup_s": 1398.104098561
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "external-prestarted-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r2r3-attempt3/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "cf30f87727fb13abbe5c877f3afa77314fa096b54769fe7104cfd39be5a70af3",
+              "size_bytes": 390
+            }
+          },
+          {
+            "kind": "original_p31_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r2r3-attempt3/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-02/p31/FAILED",
+              "sha256": "c04cc246c1208fa04078dd1ca07dc35a47d664eb48cefbb2e032db731d23e553",
+              "size_bytes": 134
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r2r3-attempt3/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-02/conditional-p31-revalidation.json",
+            "sha256": "6829e0cf3047130b6d6220a53801234f4b38935ad162d7a4fb17c97cff43348d",
+            "size_bytes": 4734
+          },
+          "done": null,
+          "embedded_validation_sha256": "04dc7bacd65e59cf04cd73781a706d6446322e7bc71a3797ba3aea69b689d2ee",
+          "mode": "read_only_post_timing_revalidation",
+          "original_artifacts_modified": false,
+          "original_failed_marker": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r2r3-attempt3/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-02/p31/FAILED",
+            "sha256": "c04cc246c1208fa04078dd1ca07dc35a47d664eb48cefbb2e032db731d23e553",
+            "size_bytes": 134
+          },
+          "original_validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r2r3-attempt3/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-02/p31/validation.json",
+            "sha256": "04dc7bacd65e59cf04cd73781a706d6446322e7bc71a3797ba3aea69b689d2ee",
+            "size_bytes": 3487
+          },
+          "post_timing_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r2r3-attempt3/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-02/post-timing-revalidation-receipt.json",
+            "sha256": "712e92a63a6fe785149d6550376d47cd7865868c7a93535937f147e14f476565",
+            "size_bytes": 1505
+          },
+          "state": "PASS",
+          "validation": null
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r2r3-attempt3/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-02/validated-result.json",
+          "sha256": "dd35be97ede3668310d82d1c4714ea8d6408604d2468a92dff5796f18599ef0e",
+          "size_bytes": 202835
+        }
+      },
+      "repeat_index": 2,
+      "system_id": "neo4j"
+    },
+    {
+      "cell_key": "neo4j:r3",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-03/adapter-output/adapter-provenance.json",
+          "sha256": "cc0511e66e9aeb14c94640a755669e186cb80174c9998f6a06dbd16234e64e6b",
+          "size_bytes": 83049
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-03/adapter-request.json",
+          "sha256": "6c35457069716165ee88d8b17145875ee357836e3459331fff562f105a6069a8",
+          "size_bytes": 2116
+        },
+        "binary_sha256": "f7b4f724cf8d9414029dc6684326d9744928cd423ea9cb4c4be509c53a013ca7",
+        "display_name": "Neo4j Community",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "baa7c4b9701936253ebaeb4b3436c16403373af0b48c4276dacef780479952c5",
+        "system_version": "Neo4j Community 5.26.24",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 926.958,
+        "latency_p95_us": 120432.659,
+        "latency_p99_us": 13820835.751,
+        "measurement_s": 1343.17439639,
+        "mismatch_queries": 0,
+        "qps": 1.2656584316742687,
+        "timeout_queries": 0,
+        "warmup_s": 1431.558843908
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "external-prestarted-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r3-attempt1/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "00e49d349cba6debda007e3fd3a44d1fac53084ab552f74f90e2403ae6604b44",
+              "size_bytes": 381
+            }
+          },
+          {
+            "kind": "original_p31_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-03/p31/FAILED",
+              "sha256": "7cadacf9bddbb8c02724030df9ea166143ba68dc3a8c2ccbdd5e077f0986eeb7",
+              "size_bytes": 134
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-03/conditional-p31-revalidation.json",
+            "sha256": "4fae293bfa7ba5b9907a623611479720b916bf97403b5f8af372b962fb12d51e",
+            "size_bytes": 4712
+          },
+          "done": null,
+          "embedded_validation_sha256": "0dc8b0602c87876715671186c797318e576e3ddfe6612dad8f87da91a9c695c7",
+          "mode": "read_only_post_timing_revalidation",
+          "original_artifacts_modified": false,
+          "original_failed_marker": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-03/p31/FAILED",
+            "sha256": "7cadacf9bddbb8c02724030df9ea166143ba68dc3a8c2ccbdd5e077f0986eeb7",
+            "size_bytes": 134
+          },
+          "original_validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-03/p31/validation.json",
+            "sha256": "0dc8b0602c87876715671186c797318e576e3ddfe6612dad8f87da91a9c695c7",
+            "size_bytes": 3518
+          },
+          "post_timing_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-03/post-timing-revalidation-receipt.json",
+            "sha256": "f905622082f658f53606b779affb3cd50870eeb16a001f768341e3a3688ee4b5",
+            "size_bytes": 1497
+          },
+          "state": "PASS",
+          "validation": null
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/neo4j-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/neo4j/repeat-03/validated-result.json",
+          "sha256": "980342a73b0e667fca8513bd0098ea70d8cf0b76319c0c10c7d016eadf09aefd",
+          "size_bytes": 205036
+        }
+      },
+      "repeat_index": 3,
+      "system_id": "neo4j"
+    },
+    {
+      "cell_key": "nebulagraph:r1",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-canary-attempt15/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-01/adapter-output/adapter-provenance.json",
+          "sha256": "d293adb2b9005f239be5691cc8a66dac68ebd74583cb7c3ff600261d872bf552",
+          "size_bytes": 51640
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-canary-attempt15/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-01/adapter-request.json",
+          "sha256": "f19e76ac97ea204c278455ebdfc7c30e65311f0bbe7b21e97c8557460bce001f",
+          "size_bytes": 4822
+        },
+        "binary_sha256": "f7b4f724cf8d9414029dc6684326d9744928cd423ea9cb4c4be509c53a013ca7",
+        "display_name": "NebulaGraph",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "NebulaGraph 3.8.0",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 669.1,
+        "latency_p95_us": 91958.831,
+        "latency_p99_us": 12165000.794,
+        "measurement_s": 1193.141378563,
+        "mismatch_queries": 0,
+        "qps": 1.4248101947880245,
+        "timeout_queries": 0,
+        "warmup_s": 1221.936747199
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "external-prestarted-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-canary-attempt15/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "494064af1b0bfc95959b91258dd0e8d21e6f210895421cc4128db03761f6981c",
+              "size_bytes": 405
+            }
+          },
+          {
+            "kind": "original_p31_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-canary-attempt15/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-01/p31/FAILED",
+              "sha256": "8d9c64e824ca027f083dd29747449630db4735316e16892fc7c7cad22aa81ed3",
+              "size_bytes": 172
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-canary-attempt15/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-01/conditional-p31-revalidation.json",
+            "sha256": "fad7daea7681af19d87f370a2651889a9dc20d14fa151f6d326f716b6ca5ac6b",
+            "size_bytes": 3531
+          },
+          "done": null,
+          "embedded_validation_sha256": "a939236729156ed7f38db41eaf7c1832f3b6f5e0f3122896f85b19c1f71372b2",
+          "mode": "read_only_post_timing_revalidation",
+          "original_artifacts_modified": false,
+          "original_failed_marker": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-canary-attempt15/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-01/p31/FAILED",
+            "sha256": "8d9c64e824ca027f083dd29747449630db4735316e16892fc7c7cad22aa81ed3",
+            "size_bytes": 172
+          },
+          "original_validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-canary-attempt15/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-01/p31/validation.json",
+            "sha256": "a939236729156ed7f38db41eaf7c1832f3b6f5e0f3122896f85b19c1f71372b2",
+            "size_bytes": 3722
+          },
+          "post_timing_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-canary-attempt15/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-01/post-timing-revalidation-receipt.json",
+            "sha256": "49d078c59783073c2c76b141364d90f5128410c13f3f4dd47a960d0b63998798",
+            "size_bytes": 1571
+          },
+          "state": "PASS",
+          "validation": null
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-canary-attempt15/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-01/validated-result.json",
+          "sha256": "5bddc415dacf8e964bbcf5a80ddd613828ff2b14e8ac86f04b8d22bd8efbd50a",
+          "size_bytes": 337359
+        }
+      },
+      "repeat_index": 1,
+      "system_id": "nebulagraph"
+    },
+    {
+      "cell_key": "nebulagraph:r2",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-02/adapter-output/adapter-provenance.json",
+          "sha256": "4532d21ea9bf8086020be6ca6de4844b800583ee046f57f1e8773717b8f8a4a0",
+          "size_bytes": 51485
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-02/adapter-request.json",
+          "sha256": "5369de29c258b1b2f68891811979033b55896c9638b345336cd1a2e740a82a0b",
+          "size_bytes": 4806
+        },
+        "binary_sha256": "f7b4f724cf8d9414029dc6684326d9744928cd423ea9cb4c4be509c53a013ca7",
+        "display_name": "NebulaGraph",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "NebulaGraph 3.8.0",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 672.422,
+        "latency_p95_us": 89167.103,
+        "latency_p99_us": 11886070.213,
+        "measurement_s": 1162.376881498,
+        "mismatch_queries": 0,
+        "qps": 1.462520484585984,
+        "timeout_queries": 0,
+        "warmup_s": 1181.036408096
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "external-prestarted-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "ddaac7ff6692344afb304b578f989609845f61d70503780b90587cf04577972e",
+              "size_bytes": 409
+            }
+          },
+          {
+            "kind": "original_p31_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-02/p31/FAILED",
+              "sha256": "33525dfad94ed58ff4976341b660decbdf3d63237491d37daddc1c61f6fc1a77",
+              "size_bytes": 172
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-02/conditional-p31-revalidation.json",
+            "sha256": "296a04727bc25176986056f8756187fe35f4f829b7d313aa53e1c6784833c20a",
+            "size_bytes": 3504
+          },
+          "done": null,
+          "embedded_validation_sha256": "bb9933f138c84be72863a6c9b3802800656d4bafb10a3c3f8981aff29b6eb1ec",
+          "mode": "read_only_post_timing_revalidation",
+          "original_artifacts_modified": false,
+          "original_failed_marker": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-02/p31/FAILED",
+            "sha256": "33525dfad94ed58ff4976341b660decbdf3d63237491d37daddc1c61f6fc1a77",
+            "size_bytes": 172
+          },
+          "original_validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-02/p31/validation.json",
+            "sha256": "bb9933f138c84be72863a6c9b3802800656d4bafb10a3c3f8981aff29b6eb1ec",
+            "size_bytes": 3706
+          },
+          "post_timing_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-02/post-timing-revalidation-receipt.json",
+            "sha256": "a7389e2a3e3cd25bb22fc2e964f63fbb5d3b2520d2cf28e1dd4cf83c78ad6929",
+            "size_bytes": 1559
+          },
+          "state": "PASS",
+          "validation": null
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r2r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-02/validated-result.json",
+          "sha256": "5486247db4ea03adbab529cfa2d82ecf8d33668f1f0907d357ae40df16d16219",
+          "size_bytes": 330211
+        }
+      },
+      "repeat_index": 2,
+      "system_id": "nebulagraph"
+    },
+    {
+      "cell_key": "nebulagraph:r3",
+      "classification": {
+        "campaign_lineage": "conditional_historical",
+        "formal_eligible": false,
+        "formal_upgrade_performed": false,
+        "paper_claim_eligible": false,
+        "performance_eligible": false
+      },
+      "identity": {
+        "adapter_provenance": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-03/adapter-output/adapter-provenance.json",
+          "sha256": "009295b7bc7744d12777202af9c0a71e1d60bec26d8132cb06287b223706a149",
+          "size_bytes": 51465
+        },
+        "adapter_request": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-03/adapter-request.json",
+          "sha256": "09b266d3a85a8c14c718da0f25ce393654b66780dab2d83a08e653fb8431e549",
+          "size_bytes": 4773
+        },
+        "binary_sha256": "f7b4f724cf8d9414029dc6684326d9744928cd423ea9cb4c4be509c53a013ca7",
+        "display_name": "NebulaGraph",
+        "git_sha": "22cb1e7bae51904f9e45b03d8fe38b4ef0a20f64",
+        "host_fingerprint": "f460de3abf394d86cb8b1730a2db7e676dd75f20f045ef04a3ba26423bf11122",
+        "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "system_version": "NebulaGraph 3.8.0",
+        "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+      },
+      "lineage_class": "legacy_validated",
+      "metrics": {
+        "actual_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "completed_queries": 1700,
+        "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+        "import_store_allocated_bytes": "",
+        "import_store_logical_bytes": "",
+        "import_wall_s": "",
+        "latency_p50_us": 651.187,
+        "latency_p95_us": 90060.655,
+        "latency_p99_us": 11980659.591,
+        "measurement_s": 1160.161976235,
+        "mismatch_queries": 0,
+        "qps": 1.4653126329108819,
+        "timeout_queries": 0,
+        "warmup_s": 1191.404325115
+      },
+      "protocol": {
+        "clock": "CLOCK_MONOTONIC",
+        "concurrency": 1,
+        "interface_scope": "typed-neighbor-dense-id-v1",
+        "measured_passes": 1,
+        "process_lifetime": "external-prestarted-query-process-lifetime-v1",
+        "query_count": 1700,
+        "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+        "warmup_passes": 1
+      },
+      "receipts": {
+        "failed_marker_lineage": [
+          {
+            "kind": "source_run_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r3-attempt1/P10-NEBULA-22cb1e7-20260724/FAILED",
+              "sha256": "74d79ce0980250b8391dbe9194ad3f6945705a61a6aa1dd78daebe4720ad2e7a",
+              "size_bytes": 400
+            }
+          },
+          {
+            "kind": "original_p31_failed_marker",
+            "preserved": true,
+            "receipt": {
+              "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-03/p31/FAILED",
+              "sha256": "d2306b32fa7637810369462b0808275ca823458bb13c51fd75d271d02b5593ba",
+              "size_bytes": 172
+            }
+          }
+        ],
+        "p31_bridge": {
+          "conditional_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-03/conditional-p31-revalidation.json",
+            "sha256": "1aa92f9a971c8187d613eae6ec5bdbf7cbbf772df9f5ea15ec27e17c0d7e2db0",
+            "size_bytes": 3486
+          },
+          "done": null,
+          "embedded_validation_sha256": "e3f7afcfcd68e2dc678309380d30a51bfeaa29a78f3d26d903d5e3c436f4b4d2",
+          "mode": "read_only_post_timing_revalidation",
+          "original_artifacts_modified": false,
+          "original_failed_marker": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-03/p31/FAILED",
+            "sha256": "d2306b32fa7637810369462b0808275ca823458bb13c51fd75d271d02b5593ba",
+            "size_bytes": 172
+          },
+          "original_validation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-03/p31/validation.json",
+            "sha256": "e3f7afcfcd68e2dc678309380d30a51bfeaa29a78f3d26d903d5e3c436f4b4d2",
+            "size_bytes": 3726
+          },
+          "post_timing_revalidation": {
+            "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-03/post-timing-revalidation-receipt.json",
+            "sha256": "5e96440c5af59ac8dba50942728730944d7383326b8370ecfaaefbac231f92f1",
+            "size_bytes": 1551
+          },
+          "state": "PASS",
+          "validation": null
+        },
+        "validated_result": {
+          "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/nebulagraph-r3-attempt1/P10-NEBULA-22cb1e7-20260724/systems/nebulagraph/repeat-03/validated-result.json",
+          "sha256": "6141c834685ac2bc09b1f82e776f551aa034d72bfcbe8ae4036d8ef48e49a707",
+          "size_bytes": 331350
+        }
+      },
+      "repeat_index": 3,
+      "system_id": "nebulagraph"
+    }
+  ],
+  "legacy_source": {
+    "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/combined-l5-attempt1/L5-CONDITIONAL-COMBINED.json",
+    "sha256": "3996ab4b8d99bb192904db850e418f4d66b518be6d771cec2e8fbcc9340c9138",
+    "size_bytes": 29721
+  },
+  "logical_dataset_identity": {
+    "checks": {
+      "byte_equivalence_claimed": false,
+      "common_expected_digest_sha256": "PASS",
+      "common_host_and_timing_protocol": "PASS",
+      "common_truth_sha256": "PASS",
+      "physical_representation_disclosed": "PASS",
+      "zero_mismatch_and_timeout": "PASS"
+    },
+    "dense_conversion_summary": {
+      "path": "/data/WorkSpace/lsmgraph-rs/baseline/external-baselines-20260624/livegraph/sf10-typed-neighbor/convert-summary.json",
+      "sha256": "b577d766ae2f09116946f180c6781abc2310e49839b59533c833697d792f839d",
+      "size_bytes": 960
+    },
+    "directed_edge_count": 355185382,
+    "equivalence_scope": "query-interface-correctness-and-cardinality-v1",
+    "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+    "interface_scope": "typed-neighbor-dense-id-v1",
+    "logical_dataset_id": "ldbc-snb-sf10-typed-neighbor-logical-v1",
+    "physical_byte_identity_required": false,
+    "physical_representations": [
+      {
+        "kind": "dense_typed_edge_list",
+        "sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+        "systems": [
+          "aster",
+          "livegraph",
+          "nebulagraph",
+          "seml0",
+          "tugraph"
+        ]
+      },
+      {
+        "kind": "ldbc_source_tree",
+        "sha256": "baa7c4b9701936253ebaeb4b3436c16403373af0b48c4276dacef780479952c5",
+        "systems": [
+          "neo4j"
+        ]
+      }
+    ],
+    "query_count": 1700,
+    "scale_factor": 10,
+    "source_tree_manifest": {
+      "path": "/data/WorkSpace/results/P02B/sf10-dataset-manifest.json",
+      "sha256": "be11fd8a150af8ccd8cb88e1ad18c03b0f6e4f8279c8345be2d44e772977d51b",
+      "size_bytes": 318
+    },
+    "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788",
+    "vertex_count": 29987835
+  },
+  "output_contract": {
+    "bridge_canary_included_in_figure": false,
+    "bridge_canary_row_count": 1,
+    "expected_figure_row_count": 21,
+    "fresh_figure_row_count": 3,
+    "legacy_figure_row_count": 18,
+    "lineage_column_required": true,
+    "mixed_lineage_disclosure_required": true
+  },
+  "schema_version": "cidr-e01-mixed-lineage-composition-v1",
+  "state": "HOLD",
+  "system_import_lineage": [
+    {
+      "binary_sha256": "c7d0534cbe327eff8f7a4980a14179fef45734e8a68336b8b82acd93fff022b9",
+      "binding_scope": "frozen-request-and-adapter-provenance-v1",
+      "physical_input_kind": "dense_typed_edge_list",
+      "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+      "repeat_adapter_provenance_sha256": [
+        "934ca4c86a2eeacafb517f4d73c0836a8c621bc8ce74a8756b9c48ca0c5d8daf",
+        "76ae6be53a787c2f11daf1a442c00292ba431511ea725cd5664008e74e313c53",
+        "d6b622660a915c9120902253cd8832c04b571f033ccf79eafd731e94e677ffc8"
+      ],
+      "repeat_adapter_request_sha256": [
+        "33f3aad860b495f98160a9cecd1d531ae47732bd742ee79e5b35a752a7ca6555",
+        "1f2ee2d69a0c4702f36051b6c4c728d9ac79a1e0557d07d874346059469bc797",
+        "11d264b28cee90b0553398ccdfe29b80e09041f294878094652c0d6a494429e4"
+      ],
+      "system_id": "seml0",
+      "system_version": "SemL0@22cb1e7-budg-b64-a6"
+    },
+    {
+      "binary_sha256": "2293768d594b1482780485bd551e53940206033c0ebf9427dce465a4f1985488",
+      "binding_scope": "frozen-request-and-adapter-provenance-v1",
+      "physical_input_kind": "dense_typed_edge_list",
+      "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+      "repeat_adapter_provenance_sha256": [
+        "1b169146d1952fb2054ccd4c25befe9d6a7b3edf97e7f9acea95d6b02862c9b5",
+        "522bae490ec966cc0895d531d04479977e2d2d7a206ff0e2979f26fcf67244b1",
+        "f37234a8874b0200c28de12794c61641146049dc4a63571a109c8b5588977832"
+      ],
+      "repeat_adapter_request_sha256": [
+        "f2b0050b66ad43931a92619fbf2f6131586de991c23e0c48eed25ecd4984324f",
+        "769c66152b3a4580ff155126dc5d9dc43b383c6931c2c4cb42c54790b9666b92",
+        "b8a52f0765b28632ad8dbe38814027b19b38814c4edf20c4db5a5b3d66bf20de"
+      ],
+      "system_id": "livegraph",
+      "system_version": "LiveGraph@eea5a40ce6ee443f901e44323c1119f59113eaf3"
+    },
+    {
+      "binary_sha256": "12f848aa5aa7595d8626e67066280cc6dd023067b597d123fdc6caa067a6c1b8",
+      "binding_scope": "frozen-request-and-adapter-provenance-v1",
+      "physical_input_kind": "dense_typed_edge_list",
+      "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+      "repeat_adapter_provenance_sha256": [
+        "04c28a2770774960bf5c93d73a6741a0c7ee89af965cb223de2c1c268ae3e98d",
+        "b2e8cc1f3f0decc0fcf7af97868a30c8a7ffc59910e709a200ae1032f7a38442",
+        "df83a0c26064cd2c008ad92da35548000d9480b8c899931871bffe831dee74d1"
+      ],
+      "repeat_adapter_request_sha256": [
+        "c7e7fd6ebe165b4d8d0ed1f810c5f7e73b99c8940b2e7be1c1da2cf82a535623",
+        "8bae91ea6fc5ed1f365274e7f070bbb4a385ae22b890bc9df827d8044db27136",
+        "845b17565443c68465b4cde9f35882746be4f8043796369665004c0ba56224b5"
+      ],
+      "system_id": "aster",
+      "system_version": "aster-rocksgraph@6abb258e577c479325092a8ac0e7691fdfd154c2"
+    },
+    {
+      "binary_sha256": "2c36738688ffe6227194032c266a018eddf9e0e4fcc3b3ea10791290ca6e103e",
+      "binding_scope": "frozen-request-and-adapter-provenance-v1",
+      "physical_input_kind": "dense_typed_edge_list",
+      "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+      "repeat_adapter_provenance_sha256": [
+        "e64500d382e5f410c277f20e8f00a31fcfa7457a337db75850d7765ed4b09675",
+        "d4815b6acbaf86642ec691ca9cf530d479b24a344bf5a0d40c7cd09dd90befb2",
+        "1694b0dcd01a026a1cc3110fee6013dbdff0f80704a2990d2df363a1afeaf2f4"
+      ],
+      "repeat_adapter_request_sha256": [
+        "87b17232fb409e1de43825e61051a5096cd9980125f6ae79bf02f831c4bc6bca",
+        "0132c21057a89065124bf21765a95b27cc84bcf5a3bb26e031e3234d15e11a3d",
+        "e1d32a03ce315f7b5376e5bc7daed3214846d50126b61fad7339c710b0201fd5"
+      ],
+      "system_id": "tugraph",
+      "system_version": "TuGraph-4.5.2-native-embedded"
+    },
+    {
+      "binary_sha256": "f7b4f724cf8d9414029dc6684326d9744928cd423ea9cb4c4be509c53a013ca7",
+      "binding_scope": "frozen-request-and-adapter-provenance-v1",
+      "physical_input_kind": "ldbc_source_tree",
+      "physical_input_sha256": "baa7c4b9701936253ebaeb4b3436c16403373af0b48c4276dacef780479952c5",
+      "repeat_adapter_provenance_sha256": [
+        "fa8d484101ff735778dacdd55a4f3e840df13f767c36a26bf1f137af6a1b1f9d",
+        "ff124cf3d60d94a1d37ca74621c228c6730c63bd7970ac5de5cb5a6998f27870",
+        "cc0511e66e9aeb14c94640a755669e186cb80174c9998f6a06dbd16234e64e6b"
+      ],
+      "repeat_adapter_request_sha256": [
+        "5ea8b72ddb4ad0eccbdf4928c50c9cb7febb1236a0c0bc343fcd8fa2bdaf62c6",
+        "97db84e9f3372c9d41696e2f1f8d4457af8e45b20289ea490aa0a20f62372f4f",
+        "6c35457069716165ee88d8b17145875ee357836e3459331fff562f105a6069a8"
+      ],
+      "system_id": "neo4j",
+      "system_version": "Neo4j Community 5.26.24"
+    },
+    {
+      "binary_sha256": "f7b4f724cf8d9414029dc6684326d9744928cd423ea9cb4c4be509c53a013ca7",
+      "binding_scope": "frozen-request-and-adapter-provenance-v1",
+      "physical_input_kind": "dense_typed_edge_list",
+      "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+      "repeat_adapter_provenance_sha256": [
+        "d293adb2b9005f239be5691cc8a66dac68ebd74583cb7c3ff600261d872bf552",
+        "4532d21ea9bf8086020be6ca6de4844b800583ee046f57f1e8773717b8f8a4a0",
+        "009295b7bc7744d12777202af9c0a71e1d60bec26d8132cb06287b223706a149"
+      ],
+      "repeat_adapter_request_sha256": [
+        "f19e76ac97ea204c278455ebdfc7c30e65311f0bbe7b21e97c8557460bce001f",
+        "5369de29c258b1b2f68891811979033b55896c9638b345336cd1a2e740a82a0b",
+        "09b266d3a85a8c14c718da0f25ce393654b66780dab2d83a08e653fb8431e549"
+      ],
+      "system_id": "nebulagraph",
+      "system_version": "NebulaGraph 3.8.0"
+    }
+  ]
+}
