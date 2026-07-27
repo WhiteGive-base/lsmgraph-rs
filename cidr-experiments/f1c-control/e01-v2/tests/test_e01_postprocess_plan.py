@@ -100,6 +100,19 @@ class PostprocessPlanTests(unittest.TestCase):
         with self.assertRaises(post.PostprocessError):
             self.build()
 
+    def test_real_snapshot_keeps_renderer_and_claim_closed(self) -> None:
+        snapshot = ROOT / "E01-postprocess-interface-plan-HOLD-v1.json"
+        if not snapshot.exists():
+            self.skipTest("real postprocess snapshot is not installed")
+        value = post.validate(snapshot)
+        self.assertEqual(value["state"], "HOLD")
+        self.assertFalse(value["renderer_invoked"])
+        self.assertFalse(value["qa_invoked"])
+        self.assertFalse(
+            value["interfaces"]["claim_receipt"]["paper_claim_eligible"]
+        )
+        self.assertFalse(Path(value["output_root"]).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

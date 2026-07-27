@@ -1,0 +1,257 @@
+{
+  "blockers": [
+    "4/4 production MATRIX-DONE absent",
+    "matrix evidence adapter and PASS composition assembler not implemented",
+    "SemL0-naive cost receipt/admission absent",
+    "frozen tidy transformer not implemented",
+    "explicit Linux Poppler/Pillow QA binding absent",
+    "mixed-lineage claim receipt and user policy decision absent"
+  ],
+  "execution_state": "NOT_IMPLEMENTED",
+  "experiment_id": "E01",
+  "formal_eligible": false,
+  "interfaces": {
+    "bridge_canary_evaluator": {
+      "state": "IMPLEMENTED_NOT_RUN",
+      "tool": {
+        "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/evaluate_e01_bridge_canary.py",
+        "sha256": "b395f648b1cdf8276d86d3de56fda1644122672c5961d741e471f00ef08cfa72",
+        "size_bytes": 13723
+      }
+    },
+    "claim_receipt": {
+      "mixed_lineage_disclosure_required": true,
+      "paper_claim_eligible": false,
+      "state": "NOT_IMPLEMENTED"
+    },
+    "cost_lineage_admission": {
+      "fresh_or_explicitly_admitted_cost_receipt_required": true,
+      "historical_cost_implicit_reuse_forbidden": true,
+      "required_fields": [
+        "load_wall_s",
+        "final_disk_bytes"
+      ],
+      "state": "NOT_IMPLEMENTED"
+    },
+    "figure1_renderer": {
+      "input": "/data/WorkSpace/results/E01-F1-MIXED-POSTPROCESS-PENDING/E01-figure1-frozen-tidy.tsv",
+      "output_dir": "/data/WorkSpace/results/E01-F1-MIXED-POSTPROCESS-PENDING/figure",
+      "plot_support": {
+        "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/figures/scripts/formal/plot_support.py",
+        "sha256": "1fb8c496507961fdc0dbe30547ffb159e91c902299e849371132ee7d4bbef4b1",
+        "size_bytes": 21667
+      },
+      "state": "IMPLEMENTED_NOT_RUN",
+      "tool": {
+        "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/figures/scripts/formal/plot_figure1_end_to_end.py",
+        "sha256": "95449234b78b945840ab08a2c55d5fb3eb1506a1924f9a0caea181b1f18660cc",
+        "size_bytes": 16011
+      }
+    },
+    "frozen_tidy_transform": {
+      "eligibility_upgrade_forbidden": true,
+      "missing_after_current_normalizer": [
+        "cache_state",
+        "dataset_id",
+        "digest_pass",
+        "directed_edge_count",
+        "final_disk_bytes",
+        "input_sha256",
+        "load_wall_s",
+        "mismatch_count",
+        "property_count",
+        "query_trace_sha256",
+        "run_id",
+        "scale_factor",
+        "seed",
+        "system",
+        "system_version",
+        "timestamp_utc",
+        "variant",
+        "vertex_count",
+        "workload_id"
+      ],
+      "required_output_columns": [
+        "binary_sha256",
+        "cache_state",
+        "completed_qps",
+        "completed_queries",
+        "concurrency",
+        "dataset_id",
+        "digest_pass",
+        "directed_edge_count",
+        "experiment_id",
+        "final_disk_bytes",
+        "formal_eligible",
+        "git_sha",
+        "host_fingerprint",
+        "input_sha256",
+        "interface_scope",
+        "latency_p50_us",
+        "latency_p95_us",
+        "latency_p99_us",
+        "lineage_class",
+        "load_wall_s",
+        "measured_passes",
+        "measurement_s",
+        "mismatch_count",
+        "mismatch_queries",
+        "p31_evidence_sha256",
+        "paper_claim_eligible",
+        "performance_eligible",
+        "physical_input_sha256",
+        "plot_role",
+        "property_count",
+        "query_count",
+        "query_trace_sha256",
+        "repeat_index",
+        "run_id",
+        "run_key",
+        "scale_factor",
+        "seed",
+        "system",
+        "system_key",
+        "system_version",
+        "timeout_queries",
+        "timestamp_utc",
+        "truth_sha256",
+        "validated_result_sha256",
+        "variant",
+        "vertex_count",
+        "warmup_passes",
+        "warmup_s",
+        "workload_id"
+      ],
+      "state": "NOT_IMPLEMENTED"
+    },
+    "matrix_evidence_adapter": {
+      "input": "4/4 production MATRIX-DONE plus seven receipts per cell",
+      "output": "cidr-e01-incremental-evidence-v1",
+      "state": "NOT_IMPLEMENTED"
+    },
+    "mixed_lineage_normalizer": {
+      "output_columns": [
+        "experiment_id",
+        "run_key",
+        "system_key",
+        "repeat_index",
+        "lineage_class",
+        "plot_role",
+        "formal_eligible",
+        "performance_eligible",
+        "paper_claim_eligible",
+        "host_fingerprint",
+        "git_sha",
+        "binary_sha256",
+        "physical_input_sha256",
+        "truth_sha256",
+        "interface_scope",
+        "concurrency",
+        "query_count",
+        "warmup_passes",
+        "measured_passes",
+        "measurement_s",
+        "warmup_s",
+        "latency_p50_us",
+        "latency_p95_us",
+        "latency_p99_us",
+        "completed_qps",
+        "completed_queries",
+        "timeout_queries",
+        "mismatch_queries",
+        "validated_result_sha256",
+        "p31_evidence_sha256"
+      ],
+      "row_contract": "legacy18+fresh-naive3",
+      "row_count": 21,
+      "state": "IMPLEMENTED_NOT_RUN",
+      "tool": {
+        "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/normalize_e01_mixed_lineage.py",
+        "sha256": "f28b6832f6565e28438d12a822c6ae7340f98efaf070a301b1e162f458ee5a61",
+        "size_bytes": 18572
+      }
+    },
+    "pass_composition_assembler": {
+      "input": "frozen HOLD plan plus incremental evidence and canary PASS",
+      "output": "PASS cidr-e01-mixed-lineage-composition-v1",
+      "state": "NOT_IMPLEMENTED"
+    },
+    "rendered_figure_qa": {
+      "pdfinfo": null,
+      "pdftoppm": null,
+      "state": "IMPLEMENTED_REQUIRES_EXPLICIT_LINUX_TOOLS",
+      "tool": {
+        "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/figures/scripts/validate_rendered.py",
+        "sha256": "69d75777d2e0c509901f70ca5ac65fac4365ca0df1c4e27e7795325cab971209",
+        "size_bytes": 3686
+      },
+      "visual_qa_receipt": null
+    }
+  },
+  "large_content_read_now": false,
+  "mixed_lineage_plan": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-mixed-lineage-plan-v1.json",
+    "sha256": "21f25c170e4064478eff4047c2e344866e1da52e0964c422d8a9a73de123953d",
+    "size_bytes": 99848
+  },
+  "output_root": "/data/WorkSpace/results/E01-F1-MIXED-POSTPROCESS-PENDING",
+  "paper_claim_eligible": false,
+  "performance_eligible": false,
+  "qa_invoked": false,
+  "renderer_invoked": false,
+  "schema_version": "cidr-e01-postprocess-interface-plan-v1",
+  "stage_order": [
+    "matrix-evidence-adapter",
+    "bridge-canary-evaluator",
+    "pass-composition-assembler",
+    "mixed-lineage-normalizer",
+    "cost-lineage-admission",
+    "frozen-tidy-transform",
+    "figure1-renderer",
+    "rendered-figure-qa",
+    "claim-receipt"
+  ],
+  "state": "HOLD",
+  "timing_boundary_plan": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-exact-timing-boundary-plan-HOLD-v1.json",
+    "sha256": "2a751dc3a2d8ca4845ec4a55761f2c4b878c3a7389e38f341244be7301a14bce",
+    "size_bytes": 14462
+  },
+  "tools": {
+    "canary_evaluator": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/evaluate_e01_bridge_canary.py",
+      "sha256": "b395f648b1cdf8276d86d3de56fda1644122672c5961d741e471f00ef08cfa72",
+      "size_bytes": 13723
+    },
+    "figure1_renderer": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/figures/scripts/formal/plot_figure1_end_to_end.py",
+      "sha256": "95449234b78b945840ab08a2c55d5fb3eb1506a1924f9a0caea181b1f18660cc",
+      "size_bytes": 16011
+    },
+    "figure_data_requirements": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/plan/FIGURE-DATA-REQUIREMENTS.tsv",
+      "sha256": "e5f8717b3e6a270efbf74a8b3a959046be22b97a467b48f9dc85d5fe568c2703",
+      "size_bytes": 17573
+    },
+    "mixed_normalizer": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/normalize_e01_mixed_lineage.py",
+      "sha256": "f28b6832f6565e28438d12a822c6ae7340f98efaf070a301b1e162f458ee5a61",
+      "size_bytes": 18572
+    },
+    "plot_support": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/figures/scripts/formal/plot_support.py",
+      "sha256": "1fb8c496507961fdc0dbe30547ffb159e91c902299e849371132ee7d4bbef4b1",
+      "size_bytes": 21667
+    },
+    "production_backend": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/run_e01_incremental_production.py",
+      "sha256": "85c0e9e3ec0b354cd899a45a1ee47a554bb0cbd55e20f5be9adf830349c2545f",
+      "size_bytes": 18365
+    },
+    "render_validator": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/figures/scripts/validate_rendered.py",
+      "sha256": "69d75777d2e0c509901f70ca5ac65fac4365ca0df1c4e27e7795325cab971209",
+      "size_bytes": 3686
+    }
+  }
+}
