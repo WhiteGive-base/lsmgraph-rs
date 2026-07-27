@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""Static asset/scheduler/canary tests for the four-cell E01 increment."""
+
+from __future__ import annotations
+
+import copy
+import json
+import shutil
+import statistics
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any, Dict, Tuple
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import build_e01_mixed_lineage as mixed
+import evaluate_e01_bridge_canary as evaluator
+import inventory_e01_seml0_assets as inventory
+import run_e01_incremental_matrix as matrix
+from test_e01_mixed_lineage import make_fixture, write_json
+
+
+def write_value(path: Path, value: Dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def ref(path: Path) -> Dict[str, Any]:
+    return matrix.file_ref(path, path.name)
+
+
+def make_plan(root: Path) -> Tuple[Path, Dict[str, Any]]:
+    source, dataset, dense = make_fixture(root)
+    value = mixed.build_composition(
+        source, dataset, dense, created_at_utc="2026-07-27T00:00:00Z"
+    )
+    return write_value(root / "mixed-plan.json", value), value
+
+
+def make_asset_fixture(
+    root: Path, plan_path: Path, plan: Dict[str, Any]
+) -> Tuple[Path, Path, Path, Path]:
+    binary = root / "assets/lsmgraph"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(b"synthetic binary identity placeholder\n")
+    binary_sha = next(
+        cell["identity"]["binary_sha256"]
+        for cell in plan["legacy_cells"]
+        if cell["cell_key"] == "seml0:r1"
+    )
+    for cell in plan["legacy_cells"]:
+        if cell["system_id"] != "seml0":
+            continue
+        request_path = Path(cell["identity"]["adapter_request"]["path"])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        request["binary"] = {"path": str(binary.resolve()), "sha256": binary_sha}
+        write_value(request_path, request)
+        cell["identity"]["adapter_request"] = ref(request_path)
+    write_value(plan_path, plan)
+    adapter = root / "assets/seml0_adapter.py"
+    adapter.write_text(
+        "VARIANTS = {\n"
+        "    'naive': ('naive', False),\n"
+        "    'budg-b64': ('semantic-budgeted', True),\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    current_root = root / "stores/budg-b64"
+    naive_root = root / "stores/naive"
+    current_root.mkdir(parents=True)
+    naive_root.mkdir(parents=True)
+    current = write_value(
+        root / "manifests/current.json",
+        {
+            "schema_version": inventory.STORE_SCHEMA,
+            "store_root": str(current_root.resolve()),
+            "store_sha256": "1" * 64,
+            "file_count": 10,
+            "total_bytes": 100,
+            "hash_method": "sha256-tree-v1(relative-path,size,file-sha256)",
+        },
+    )
+    naive = write_value(
+        root / "manifests/naive.json",
+        {
+            "schema_version": inventory.STORE_SCHEMA,
+            "store_root": str(naive_root.resolve()),
+            "store_sha256": "2" * 64,
+            "file_count": 11,
+            "total_bytes": 101,
+            "hash_method": "sha256-tree-v1(relative-path,size,file-sha256)",
+        },
+    )
+    return adapter, current, naive, binary
+
+
+def make_inventory(
+    root: Path, plan_path: Path, plan: Dict[str, Any]
+) -> Tuple[Path, Dict[str, Any]]:
+    adapter, current, naive, _ = make_asset_fixture(root, plan_path, plan)
+    value = inventory.inventory(plan_path, adapter, current, naive)
+    return write_value(root / "asset-inventory.json", value), value
+
+
+def make_ready_synthetic_spec(
+    root: Path, hold: Dict[str, Any], plan_path: Path
+) -> Tuple[Path, Path]:
+    value = copy.deepcopy(hold)
+    value["state"] = "READY"
+    value["execution_state"] = "READY"
+    value["synthetic_test_only"] = True
+    value["blockers"] = []
+    synthetic_inventory = write_value(
+        root / "synthetic/inventory.json",
+        {"state": "PASS", "synthetic_test_only": True, "production_ready": False},
+    )
+    value["asset_compatibility_inventory"] = ref(synthetic_inventory)
+    command_plan = write_value(
+        root / "synthetic/command-plan.json",
+        {"state": "PASS", "synthetic_test_only": True, "adapter_invoked": False},
+    )
+    value["adapter_command_plan"] = ref(command_plan)
+    for key in matrix.GATE_KEYS:
+        gate = write_value(
+            root / f"synthetic/gates/{key}.json",
+            {
+                "state": "PASS",
+                "synthetic_test_only": True,
+                "fixture_only": True,
+                "adapter_invoked": False,
+                "timing_generated": False,
+            },
+        )
+        value["campaign_gates"][key] = ref(gate)
+    result_root = root / "synthetic-result"
+    value["campaign_root"] = str(result_root.resolve())
+    return write_value(root / "synthetic/spec.json", value), result_root
+
+
+def make_canary_evidence(
+    root: Path, plan: Dict[str, Any], plan_path: Path
+) -> Path:
+    contract = plan["incremental_plan"]["bridge_canary_comparability_contract"]
+    legacy = [
+        cell for cell in plan["legacy_cells"] if cell["system_id"] == "seml0"
+    ]
+    first = legacy[0]
+    metrics = {
+        "completed_qps": statistics.median(cell["metrics"]["qps"] for cell in legacy),
+        "latency_p50_us": statistics.median(
+            cell["metrics"]["latency_p50_us"] for cell in legacy
+        ),
+        "latency_p95_us": statistics.median(
+            cell["metrics"]["latency_p95_us"] for cell in legacy
+        ),
+        "latency_p99_us": statistics.median(
+            cell["metrics"]["latency_p99_us"] for cell in legacy
+        ),
+    }
+    request = write_value(
+        root / "canary/adapter-request.json",
+        {
+            "state": "PASS",
+            "system_id": "seml0",
+            "truth": {
+                "path": "/fixture/truth.tsv",
+                "sha256": plan["logical_dataset_identity"]["truth_sha256"],
+            },
+        },
+    )
+    validated = write_value(
+        root / "canary/validated-result.json",
+        {
+            "state": "PASS",
+            "system_id": "seml0",
+            "request": {"path": str(request.resolve()), "sha256": ref(request)["sha256"]},
+            "qps": metrics["completed_qps"],
+            "latency_p50_us": metrics["latency_p50_us"],
+            "latency_p95_us": metrics["latency_p95_us"],
+            "latency_p99_us": metrics["latency_p99_us"],
+            "completed_queries": 1700,
+            "timeout_queries": 0,
+            "mismatch_queries": 0,
+            "expected_digest_sha256": plan["logical_dataset_identity"][
+                "expected_digest_sha256"
+            ],
+            "actual_digest_sha256": plan["logical_dataset_identity"][
+                "expected_digest_sha256"
+            ],
+            **{
+                key: first["protocol"][key]
+                for key in (
+                    "query_count",
+                    "interface_scope",
+                    "concurrency",
+                    "warmup_passes",
+                    "measured_passes",
+                    "clock",
+                    "timing_boundary",
+                )
+            },
+            "p31": {
+                "host": {
+                    "fingerprint_sha256": first["identity"]["host_fingerprint"]
+                }
+            },
+        },
+    )
+    p31 = write_value(root / "canary/p31.json", {"state": "PASS"})
+    value = {
+        "schema_version": evaluator.EVIDENCE_SCHEMA,
+        "state": "PASS",
+        "cell_key": "seml0:bridge-canary",
+        "contract_sha256": contract["contract_sha256"],
+        "classification": {
+            "formal_eligible": True,
+            "performance_eligible": True,
+            "paper_claim_eligible": False,
+        },
+        "validated_result": ref(validated),
+        "p31_receipt": ref(p31),
+        "identity": {
+            "logical_dataset_id": plan["logical_dataset_identity"]["logical_dataset_id"],
+            "truth_sha256": plan["logical_dataset_identity"]["truth_sha256"],
+            "host_fingerprint": first["identity"]["host_fingerprint"],
+        },
+        "protocol": {
+            key: first["protocol"][key]
+            for key in (
+                "query_count",
+                "interface_scope",
+                "concurrency",
+                "warmup_passes",
+                "measured_passes",
+                "clock",
+                "timing_boundary",
+            )
+        },
+        "correctness": {
+            "completed_queries": 1700,
+            "timeout_queries": 0,
+            "mismatch_queries": 0,
+            "expected_digest_sha256": plan["logical_dataset_identity"][
+                "expected_digest_sha256"
+            ],
+            "actual_digest_sha256": plan["logical_dataset_identity"][
+                "expected_digest_sha256"
+            ],
+        },
+        "metrics": metrics,
+    }
+    return write_value(root / "canary/evidence.json", value)
+
+
+class IncrementalStaticStageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="e01-incremental-static-")
+        self.root = Path(self.temporary.name)
+        self.plan_path, self.plan = make_plan(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_asset_inventory_is_hold_without_hashing_binary_or_store_trees(self) -> None:
+        _, value = make_inventory(self.root, self.plan_path, self.plan)
+        self.assertEqual(value["state"], "HOLD")
+        self.assertFalse(value["production_ready"])
+        self.assertFalse(value["engine_binary"]["binary_rehashed_now"])
+        self.assertTrue(all(not item["tree_rehashed_now"] for item in value["stores"]))
+        self.assertEqual(
+            value["adapter"]["supported_variant_bindings"]["naive"]["l0_layout"],
+            "naive",
+        )
+
+    def test_asset_inventory_rejects_adapter_variant_drift(self) -> None:
+        adapter, current, naive, _ = make_asset_fixture(
+            self.root, self.plan_path, self.plan
+        )
+        adapter.write_text("VARIANTS = {'naive': ('schema', False)}\n", encoding="utf-8")
+        with self.assertRaises(inventory.InventoryError):
+            inventory.inventory(self.plan_path, adapter, current, naive)
+
+    def test_hold_production_preflight_rejects_before_root(self) -> None:
+        inventory_path, _ = make_inventory(self.root, self.plan_path, self.plan)
+        result_root = self.root / "formal-root-must-not-exist"
+        hold = matrix.build_hold_spec(
+            self.plan_path, inventory_path, result_root
+        )
+        spec = write_value(self.root / "hold-spec.json", hold)
+        preflight = matrix.production_preflight(spec, result_root)
+        self.assertEqual(preflight["state"], "BLOCKED")
+        self.assertFalse(preflight["result_root_created"])
+        self.assertFalse(result_root.exists())
+        self.assertIn("executor.process_invocation=NOT_IMPLEMENTED", preflight["blockers"])
+
+    def test_synthetic_four_cell_scheduler_resumes_strict_serial_prefix(self) -> None:
+        inventory_path, _ = make_inventory(self.root, self.plan_path, self.plan)
+        hold = matrix.build_hold_spec(
+            self.plan_path, inventory_path, self.root / "unused-root"
+        )
+        spec, result_root = make_ready_synthetic_spec(
+            self.root, hold, self.plan_path
+        )
+        partial = matrix.run_synthetic(spec, result_root, stop_after=2)
+        self.assertEqual(partial["completed_cells"], 2)
+        final = matrix.run_synthetic(spec, result_root)
+        self.assertEqual(final["completed_cells"], 4)
+        self.assertTrue((result_root / "MATRIX-DONE.json").is_file())
+        self.assertFalse(final["timing_generated"])
+
+    def test_synthetic_resume_rejects_unknown_cell(self) -> None:
+        inventory_path, _ = make_inventory(self.root, self.plan_path, self.plan)
+        hold = matrix.build_hold_spec(
+            self.plan_path, inventory_path, self.root / "unused-root"
+        )
+        spec, result_root = make_ready_synthetic_spec(
+            self.root, hold, self.plan_path
+        )
+        matrix.run_synthetic(spec, result_root, stop_after=1)
+        (result_root / "cells/unknown").mkdir()
+        with self.assertRaises(matrix.MatrixError):
+            matrix.run_synthetic(spec, result_root)
+
+    def test_synthetic_resume_rejects_corrupt_cell_done(self) -> None:
+        inventory_path, _ = make_inventory(self.root, self.plan_path, self.plan)
+        hold = matrix.build_hold_spec(
+            self.plan_path, inventory_path, self.root / "unused-root"
+        )
+        spec, result_root = make_ready_synthetic_spec(
+            self.root, hold, self.plan_path
+        )
+        matrix.run_synthetic(spec, result_root, stop_after=1)
+        done = next((result_root / "cells").glob("*/CELL-DONE.json"))
+        done.write_text("{}\n", encoding="utf-8")
+        with self.assertRaises(matrix.MatrixError):
+            matrix.run_synthetic(spec, result_root)
+
+    def test_canary_evaluator_passes_exact_legacy_median(self) -> None:
+        evidence = make_canary_evidence(self.root, self.plan, self.plan_path)
+        receipt = evaluator.evaluate(self.plan_path, evidence)
+        self.assertEqual(receipt["state"], "PASS")
+        self.assertTrue(receipt["normalizer_release"])
+        self.assertEqual(receipt["failures"], [])
+
+    def test_canary_evaluator_rejects_qps_outside_frozen_bound(self) -> None:
+        evidence = make_canary_evidence(self.root, self.plan, self.plan_path)
+        value = json.loads(evidence.read_text(encoding="utf-8"))
+        value["metrics"]["completed_qps"] *= 0.5
+        validated_path = Path(value["validated_result"]["path"])
+        validated = json.loads(validated_path.read_text(encoding="utf-8"))
+        validated["qps"] = value["metrics"]["completed_qps"]
+        write_value(validated_path, validated)
+        value["validated_result"] = ref(validated_path)
+        write_value(evidence, value)
+        receipt = evaluator.evaluate(self.plan_path, evidence)
+        self.assertEqual(receipt["state"], "FAILED")
+        self.assertIn("performance.completed_qps", receipt["failures"])
+        self.assertFalse(receipt["normalizer_release"])
+
+    def test_canary_evaluator_rejects_identity_and_digest_drift(self) -> None:
+        evidence = make_canary_evidence(self.root, self.plan, self.plan_path)
+        value = json.loads(evidence.read_text(encoding="utf-8"))
+        value["identity"]["host_fingerprint"] = "9" * 64
+        value["correctness"]["actual_digest_sha256"] = "8" * 64
+        validated_path = Path(value["validated_result"]["path"])
+        validated = json.loads(validated_path.read_text(encoding="utf-8"))
+        validated["p31"]["host"]["fingerprint_sha256"] = "9" * 64
+        validated["actual_digest_sha256"] = "8" * 64
+        write_value(validated_path, validated)
+        value["validated_result"] = ref(validated_path)
+        write_value(evidence, value)
+        receipt = evaluator.evaluate(self.plan_path, evidence)
+        self.assertEqual(receipt["state"], "FAILED")
+        self.assertIn("identity.host_fingerprint", receipt["failures"])
+        self.assertIn("correctness.expected_digest_equals_actual", receipt["failures"])
+
+    def test_canary_evaluator_rejects_wrapper_metric_not_in_validated_result(self) -> None:
+        evidence = make_canary_evidence(self.root, self.plan, self.plan_path)
+        value = json.loads(evidence.read_text(encoding="utf-8"))
+        value["metrics"]["completed_qps"] *= 0.99
+        write_value(evidence, value)
+        with self.assertRaises(evaluator.CanaryError):
+            evaluator.evaluate(self.plan_path, evidence)
+
+    def test_canary_receipt_refuses_overwrite(self) -> None:
+        evidence = make_canary_evidence(self.root, self.plan, self.plan_path)
+        receipt = evaluator.evaluate(self.plan_path, evidence)
+        output = self.root / "canary/receipt.json"
+        evaluator.atomic_write(output, receipt)
+        with self.assertRaises(evaluator.CanaryError):
+            evaluator.atomic_write(output, receipt)
+
+    def test_real_asset_inventory_snapshot_is_hold_without_tree_rehash(self) -> None:
+        snapshot = ROOT / "E01-seml0-asset-compatibility-inventory-v1.json"
+        if not snapshot.exists():
+            self.skipTest("real read-only asset snapshot is not installed")
+        value = json.loads(snapshot.read_text(encoding="utf-8"))
+        self.assertEqual(value["state"], "HOLD")
+        self.assertFalse(value["production_ready"])
+        self.assertFalse(value["engine_binary"]["binary_rehashed_now"])
+        self.assertEqual(
+            [item["candidate_tree_sha256"] for item in value["stores"]],
+            [
+                "ae77255c03c40d9d7e55071374ab3adc1dc67942f9443ad7d97dacacbe78c8b5",
+                "133e2ab535dd2c915d93e6e5ded65295151e199ec7268609f0a3e2f65387ddd2",
+            ],
+        )
+        self.assertTrue(all(not item["tree_rehashed_now"] for item in value["stores"]))
+
+    def test_real_four_cell_spec_snapshot_is_hold_and_root_unallocated(self) -> None:
+        snapshot = ROOT / "E01-incremental-4cell-production-spec-HOLD-v1.json"
+        if not snapshot.exists():
+            self.skipTest("real HOLD production spec is not installed")
+        value = json.loads(snapshot.read_text(encoding="utf-8"))
+        self.assertEqual(value["state"], "HOLD")
+        self.assertEqual(value["execution_state"], "BLOCKED")
+        self.assertEqual([cell["cell_key"] for cell in value["cells"]], list(matrix.RUN_KEYS))
+        self.assertTrue(all(item is None for item in value["campaign_gates"].values()))
+        self.assertIsNone(value["adapter_command_plan"])
+        self.assertFalse(Path(value["campaign_root"]).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,120 @@
+{
+  "adapter": {
+    "compatibility_state": "STATIC_VARIANT_MAPPING_PASS",
+    "entry": {
+      "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p10/adapters/seml0_adapter.py",
+      "sha256": "84b384281065ba2b3377cc6042a7ec16b39b981fbf21110964bf2bedb831a677",
+      "size_bytes": 28091
+    },
+    "fresh_artifact_identity_receipt": null,
+    "kind": "python-script",
+    "supported_variant_bindings": {
+      "budg-b64": {
+        "l0_layout": "semantic-budgeted",
+        "semantic_degree_hint": true
+      },
+      "naive": {
+        "l0_layout": "naive",
+        "semantic_degree_hint": false
+      }
+    }
+  },
+  "blockers": [
+    "binary fresh immutable seal absent",
+    "budg-b64 store fresh immutable seal absent",
+    "naive store fresh immutable seal absent",
+    "SemL0 adapter fresh artifact identity receipt absent",
+    "shared dataset/trace/truth fresh seal absent",
+    "fresh P03/P02B/batch lease/resource gate absent"
+  ],
+  "checks": {
+    "adapter_supports_budg_b64_and_naive": "PASS",
+    "binary_rehash": "NOT_PERFORMED",
+    "current_store_manifest_small_receipt": "PASS",
+    "fresh_formal_asset_upgrade": "NOT_PERFORMED",
+    "naive_store_manifest_small_receipt": "PASS",
+    "same_binary_candidate_for_both_variants": "PASS",
+    "store_tree_rehash": "NOT_PERFORMED"
+  },
+  "engine_binary": {
+    "binary_rehashed_now": false,
+    "candidate_path": "/data/WorkSpace/results/P20-FINAL-RELEASE-BUILD-4efc2a5-20260722T133300Z/bin/lsmgraph",
+    "candidate_sha256": "c7d0534cbe327eff8f7a4980a14179fef45734e8a68336b8b82acd93fff022b9",
+    "candidate_size_bytes": 8256256,
+    "compatibility_state": "CANDIDATE_ONLY",
+    "fresh_immutable_seal": null,
+    "source_request_receipts": [
+      {
+        "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-01/adapter-request.json",
+        "sha256": "33f3aad860b495f98160a9cecd1d531ae47732bd742ee79e5b35a752a7ca6555",
+        "size_bytes": 1945
+      },
+      {
+        "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-02/adapter-request.json",
+        "sha256": "1f2ee2d69a0c4702f36051b6c4c728d9ac79a1e0557d07d874346059469bc797",
+        "size_bytes": 1945
+      },
+      {
+        "path": "/data/WorkSpace/results/P10-L5-CONDITIONAL-22cb1e7-20260725/full/P10-NEBULA-22cb1e7-20260724/systems/seml0/repeat-03/adapter-request.json",
+        "sha256": "11d264b28cee90b0553398ccdfe29b80e09041f294878094652c0d6a494429e4",
+        "size_bytes": 1945
+      }
+    ]
+  },
+  "experiment_id": "E01",
+  "formal_eligible": false,
+  "mixed_lineage_plan": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-mixed-lineage-plan-v1.json",
+    "sha256": "21f25c170e4064478eff4047c2e344866e1da52e0964c422d8a9a73de123953d",
+    "size_bytes": 99848
+  },
+  "paper_claim_eligible": false,
+  "performance_eligible": false,
+  "production_ready": false,
+  "schema_version": "cidr-e01-seml0-asset-compatibility-inventory-v1",
+  "scope": "seml0-current-bridge-canary-plus-naive-r1-r3",
+  "shared_protocol_binding": {
+    "compatibility_state": "LEGACY_BINDING_ONLY",
+    "expected_digest_sha256": "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf",
+    "fresh_dataset_trace_truth_seal": null,
+    "interface_scope": "typed-neighbor-dense-id-v1",
+    "logical_dataset_id": "ldbc-snb-sf10-typed-neighbor-logical-v1",
+    "physical_input_sha256": "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258",
+    "truth_sha256": "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
+  },
+  "state": "HOLD",
+  "stores": [
+    {
+      "candidate_root": "/data/WorkSpace/lsmgraph-rs/store/w6-sf10-priority-20260709/budg-b64",
+      "candidate_tree_sha256": "ae77255c03c40d9d7e55071374ab3adc1dc67942f9443ad7d97dacacbe78c8b5",
+      "compatibility_state": "CANDIDATE_ONLY",
+      "fresh_immutable_seal": null,
+      "manifest": {
+        "path": "/data/WorkSpace/results/P02B/sf10-budg-b64-store-manifest.json",
+        "sha256": "b3f700573500649c4a7fd67f0560927cec0d0a1ca3910ca215638a115c3c90b5",
+        "size_bytes": 341
+      },
+      "recorded_file_count": 448,
+      "recorded_total_bytes": 14312271718,
+      "root_listing_performed": false,
+      "tree_rehashed_now": false,
+      "variant": "budg-b64"
+    },
+    {
+      "candidate_root": "/data/WorkSpace/lsmgraph-rs/store/w6-sf10-priority-20260709/naive",
+      "candidate_tree_sha256": "133e2ab535dd2c915d93e6e5ded65295151e199ec7268609f0a3e2f65387ddd2",
+      "compatibility_state": "CANDIDATE_ONLY",
+      "fresh_immutable_seal": null,
+      "manifest": {
+        "path": "/data/WorkSpace/results/P02B/sf10-naive-store-manifest.json",
+        "sha256": "56a57e1ba796fe71a7773e6bba29804b547c077956d40614c3a889694a08080f",
+        "size_bytes": 338
+      },
+      "recorded_file_count": 173,
+      "recorded_total_bytes": 14399231973,
+      "root_listing_performed": false,
+      "tree_rehashed_now": false,
+      "variant": "naive"
+    }
+  ]
+}

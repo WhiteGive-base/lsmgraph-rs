@@ -92,3 +92,51 @@ python3 -m unittest tests.test_e01_mixed_lineage -v
 
 这些测试仅使用临时 synthetic receipts，不执行 build、import、adapter 或
 timing，也不能作为任何正式实验 PASS 证据。
+
+## SemL0 资产 compatibility inventory
+
+`inventory_e01_seml0_assets.py` 只读取以下显式小文件：mixed-lineage 计划、
+SemL0 adapter 源码、budg-b64/naive 的旧 P02B store manifest，以及旧
+SemL0 adapter request。它仅对这些小文件计算 SHA；对约 14 GB 的 store
+树不遍历、不读内容、不重哈希，对 engine binary 只做路径/普通文件/size
+检查并沿用旧 receipt 声明的候选 SHA。
+
+真实 snapshot `E01-seml0-asset-compatibility-inventory-v1.json` 当前为
+`HOLD`：
+
+- adapter AST 静态确认 `budg-b64 -> semantic-budgeted + degree hint`，
+  `naive -> naive + no degree hint`；
+- 两个 variant 使用同一候选 binary SHA
+  `c7d0534cbe327eff8f7a4980a14179fef45734e8a68336b8b82acd93fff022b9`；
+- current store 候选 SHA `ae77255c...`；
+- naive store 候选 SHA `133e2ab5...`；
+- binary 与两个 store 都明确记录 `rehashed_now=false`，在 fresh immutable
+  seal 生成并验证前不可升级为 production ready。
+
+## 4-cell STRICT_SERIAL scheduler
+
+`run_e01_incremental_matrix.py` 固定且只接受以下顺序：
+
+1. `seml0:bridge-canary`
+2. `seml0-naive:r1`
+3. `seml0-naive:r2`
+4. `seml0-naive:r3`
+
+synthetic 模式只写带 `synthetic_test_only=true`、
+`adapter_invoked=false`、`timing_generated=false` 的 state-machine
+receipt；支持串行前缀 resume，并拒绝未知 cell、损坏 CELL-DONE、顺序缺口
+和 spec SHA 漂移。
+
+真实 `E01-incremental-4cell-production-spec-HOLD-v1.json` 的所有 gate 与
+adapter command plan 均为空，`state=HOLD`、`execution_state=BLOCKED`。
+production preflight 会在 campaign root 创建前列出 blockers；本静态阶段
+没有 adapter/process launch primitive，且明确报告
+`executor.process_invocation=NOT_IMPLEMENTED`。
+
+## bridge-canary evaluator
+
+`evaluate_e01_bridge_canary.py` 消费冻结 mixed plan 与一个显式小 canary
+evidence JSON，重新验证 validated-result/P31 receipt SHA，按冻结合同计算
+旧 SemL0 三次中位数和四项 ratio。它输出不可覆盖的 PASS/FAILED receipt，
+回链 mixed plan、canary evidence 与 contract SHA；任一 identity、
+correctness、QPS/P50/P95/P99 门失败时 `normalizer_release=false`。
