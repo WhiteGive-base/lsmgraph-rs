@@ -166,6 +166,25 @@ class StoreLifecycleTests(unittest.TestCase):
         with self.assertRaises(lifecycle.LifecycleError):
             lifecycle.atomic_write(output, value)
 
+    def test_real_snapshot_remains_hold_and_does_not_allocate_roots(self) -> None:
+        snapshot = ROOT / "E01-store-lifecycle-plan-HOLD-v1.json"
+        if not snapshot.exists():
+            self.skipTest("real store lifecycle snapshot is not installed")
+        value = lifecycle.validate(snapshot)
+        self.assertEqual(
+            [row["expected_tree_sha256"] for row in value["stores"]],
+            [
+                "ae77255c03c40d9d7e55071374ab3adc1dc67942f9443ad7d97dacacbe78c8b5",
+                "133e2ab535dd2c915d93e6e5ded65295151e199ec7268609f0a3e2f65387ddd2",
+            ],
+        )
+        self.assertEqual(
+            sum(row["expected_total_bytes"] for row in value["stores"]),
+            28_711_503_691,
+        )
+        self.assertFalse(Path(value["immutable_asset_root"]).exists())
+        self.assertFalse(Path(value["campaign_root"]).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

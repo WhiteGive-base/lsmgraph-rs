@@ -1,0 +1,238 @@
+{
+  "adapter_command_plan": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-incremental-adapter-command-plan-v1.json",
+    "sha256": "fbd634b8275f0c0fbdda8cd825ce4d759a08fc1f9ce1725aaad7e3071d76221d",
+    "size_bytes": 16541
+  },
+  "asset_inventory": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-seml0-asset-compatibility-inventory-v1.json",
+    "sha256": "7477979874a1b98c91dc8b4f744c463c266c48b17d4e6f0f585fac1ac418becc",
+    "size_bytes": 5107
+  },
+  "blockers": [
+    "one-time immutable copies and fresh tree hashes not executed",
+    "immutable store seals absent",
+    "per-cell clone executor not admitted",
+    "fresh P03/P02B/lease/resource/execution gates absent"
+  ],
+  "campaign_id": "E01-F1-MIXED-INCREMENTAL-V1",
+  "campaign_root": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING",
+  "cells": [
+    {
+      "cell_key": "seml0:bridge-canary",
+      "cleanup_policy": {
+        "failed_staging_root_preserved": true,
+        "immutable_source_deletion_forbidden": true,
+        "only_after_adapter_p31_correctness_fairness_pass": true,
+        "post_cleanup_absence_required": true,
+        "remove_mutable_clone_only": true
+      },
+      "cleanup_receipt": null,
+      "cleanup_receipt_target": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/01-seml0-bridge-canary/receipts/store-cleanup.json",
+      "clone_policy": {
+        "content_rehash_per_cell": false,
+        "full_copy_fallback": false,
+        "hardlinks_forbidden": true,
+        "identity_basis": "immutable-seal+reflink-copy-receipt+pre/post-stat",
+        "method": "cp-reflink-always",
+        "one_live_clone_globally": true,
+        "publish_by_atomic_rename": true,
+        "source_seal_revalidated_before_clone": true,
+        "symlinks_forbidden": true
+      },
+      "clone_receipt": null,
+      "clone_receipt_target": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/01-seml0-bridge-canary/receipts/store-clone.json",
+      "immutable_source": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/stores/budg-b64",
+      "mutable_clone": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/01-seml0-bridge-canary/mutable-store",
+      "ordinal": 1,
+      "staging_clone": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/01-seml0-bridge-canary/.mutable-store.tmp",
+      "state": "HOLD",
+      "variant": "budg-b64"
+    },
+    {
+      "cell_key": "seml0-naive:r1",
+      "cleanup_policy": {
+        "failed_staging_root_preserved": true,
+        "immutable_source_deletion_forbidden": true,
+        "only_after_adapter_p31_correctness_fairness_pass": true,
+        "post_cleanup_absence_required": true,
+        "remove_mutable_clone_only": true
+      },
+      "cleanup_receipt": null,
+      "cleanup_receipt_target": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/02-seml0-naive-r1/receipts/store-cleanup.json",
+      "clone_policy": {
+        "content_rehash_per_cell": false,
+        "full_copy_fallback": false,
+        "hardlinks_forbidden": true,
+        "identity_basis": "immutable-seal+reflink-copy-receipt+pre/post-stat",
+        "method": "cp-reflink-always",
+        "one_live_clone_globally": true,
+        "publish_by_atomic_rename": true,
+        "source_seal_revalidated_before_clone": true,
+        "symlinks_forbidden": true
+      },
+      "clone_receipt": null,
+      "clone_receipt_target": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/02-seml0-naive-r1/receipts/store-clone.json",
+      "immutable_source": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/stores/naive",
+      "mutable_clone": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/02-seml0-naive-r1/mutable-store",
+      "ordinal": 2,
+      "staging_clone": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/02-seml0-naive-r1/.mutable-store.tmp",
+      "state": "HOLD",
+      "variant": "naive"
+    },
+    {
+      "cell_key": "seml0-naive:r2",
+      "cleanup_policy": {
+        "failed_staging_root_preserved": true,
+        "immutable_source_deletion_forbidden": true,
+        "only_after_adapter_p31_correctness_fairness_pass": true,
+        "post_cleanup_absence_required": true,
+        "remove_mutable_clone_only": true
+      },
+      "cleanup_receipt": null,
+      "cleanup_receipt_target": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/03-seml0-naive-r2/receipts/store-cleanup.json",
+      "clone_policy": {
+        "content_rehash_per_cell": false,
+        "full_copy_fallback": false,
+        "hardlinks_forbidden": true,
+        "identity_basis": "immutable-seal+reflink-copy-receipt+pre/post-stat",
+        "method": "cp-reflink-always",
+        "one_live_clone_globally": true,
+        "publish_by_atomic_rename": true,
+        "source_seal_revalidated_before_clone": true,
+        "symlinks_forbidden": true
+      },
+      "clone_receipt": null,
+      "clone_receipt_target": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/03-seml0-naive-r2/receipts/store-clone.json",
+      "immutable_source": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/stores/naive",
+      "mutable_clone": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/03-seml0-naive-r2/mutable-store",
+      "ordinal": 3,
+      "staging_clone": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/03-seml0-naive-r2/.mutable-store.tmp",
+      "state": "HOLD",
+      "variant": "naive"
+    },
+    {
+      "cell_key": "seml0-naive:r3",
+      "cleanup_policy": {
+        "failed_staging_root_preserved": true,
+        "immutable_source_deletion_forbidden": true,
+        "only_after_adapter_p31_correctness_fairness_pass": true,
+        "post_cleanup_absence_required": true,
+        "remove_mutable_clone_only": true
+      },
+      "cleanup_receipt": null,
+      "cleanup_receipt_target": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/04-seml0-naive-r3/receipts/store-cleanup.json",
+      "clone_policy": {
+        "content_rehash_per_cell": false,
+        "full_copy_fallback": false,
+        "hardlinks_forbidden": true,
+        "identity_basis": "immutable-seal+reflink-copy-receipt+pre/post-stat",
+        "method": "cp-reflink-always",
+        "one_live_clone_globally": true,
+        "publish_by_atomic_rename": true,
+        "source_seal_revalidated_before_clone": true,
+        "symlinks_forbidden": true
+      },
+      "clone_receipt": null,
+      "clone_receipt_target": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/04-seml0-naive-r3/receipts/store-clone.json",
+      "immutable_source": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/stores/naive",
+      "mutable_clone": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/04-seml0-naive-r3/mutable-store",
+      "ordinal": 4,
+      "staging_clone": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING/cells/04-seml0-naive-r3/.mutable-store.tmp",
+      "state": "HOLD",
+      "variant": "naive"
+    }
+  ],
+  "execution_state": "NOT_STARTED",
+  "formal_eligible": false,
+  "immutable_asset_root": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1",
+  "large_content_read_now": false,
+  "large_copy_performed_now": false,
+  "max_live_mutable_clones": 1,
+  "paper_claim_eligible": false,
+  "performance_eligible": false,
+  "schema_version": "cidr-e01-store-lifecycle-plan-v1",
+  "source_store_modified_now": false,
+  "state": "HOLD",
+  "stores": [
+    {
+      "copy_policy": {
+        "full_copy_fallback_requires_explicit_enable": true,
+        "hardlinks_forbidden": true,
+        "preferred_method": "cp-reflink-always",
+        "source_mutation_forbidden": true,
+        "staging_then_atomic_rename": true,
+        "symlinks_forbidden": true
+      },
+      "expected_file_count": 448,
+      "expected_total_bytes": 14312271718,
+      "expected_tree_sha256": "ae77255c03c40d9d7e55071374ab3adc1dc67942f9443ad7d97dacacbe78c8b5",
+      "fresh_manifest": null,
+      "fresh_store_manifest_target": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/receipts/budg-b64-store-manifest.json",
+      "immutable_root": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/stores/budg-b64",
+      "immutable_seal": null,
+      "immutable_seal_target": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/receipts/budg-b64-immutable-seal.json",
+      "one_time_validation": {
+        "fresh_manifest_root_key": "store_path",
+        "full_content_hash_count": 1,
+        "group_or_world_writable_forbidden": true,
+        "hash_method": "sha256-tree-v1(relative-path,size,file-sha256)",
+        "post_hash_directory_mode": "0555",
+        "post_hash_file_mode": "0444",
+        "require_expected_sha_match": true,
+        "require_file_count_match": true,
+        "require_total_bytes_match": true,
+        "seal_outside_hashed_tree": true
+      },
+      "source_manifest": {
+        "path": "/data/WorkSpace/results/P02B/sf10-budg-b64-store-manifest.json",
+        "sha256": "b3f700573500649c4a7fd67f0560927cec0d0a1ca3910ca215638a115c3c90b5",
+        "size_bytes": 341
+      },
+      "source_root": "/data/WorkSpace/lsmgraph-rs/store/w6-sf10-priority-20260709/budg-b64",
+      "staging_root": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/staging/budg-b64.tmp",
+      "state": "HOLD",
+      "variant": "budg-b64"
+    },
+    {
+      "copy_policy": {
+        "full_copy_fallback_requires_explicit_enable": true,
+        "hardlinks_forbidden": true,
+        "preferred_method": "cp-reflink-always",
+        "source_mutation_forbidden": true,
+        "staging_then_atomic_rename": true,
+        "symlinks_forbidden": true
+      },
+      "expected_file_count": 173,
+      "expected_total_bytes": 14399231973,
+      "expected_tree_sha256": "133e2ab535dd2c915d93e6e5ded65295151e199ec7268609f0a3e2f65387ddd2",
+      "fresh_manifest": null,
+      "fresh_store_manifest_target": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/receipts/naive-store-manifest.json",
+      "immutable_root": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/stores/naive",
+      "immutable_seal": null,
+      "immutable_seal_target": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/receipts/naive-immutable-seal.json",
+      "one_time_validation": {
+        "fresh_manifest_root_key": "store_path",
+        "full_content_hash_count": 1,
+        "group_or_world_writable_forbidden": true,
+        "hash_method": "sha256-tree-v1(relative-path,size,file-sha256)",
+        "post_hash_directory_mode": "0555",
+        "post_hash_file_mode": "0444",
+        "require_expected_sha_match": true,
+        "require_file_count_match": true,
+        "require_total_bytes_match": true,
+        "seal_outside_hashed_tree": true
+      },
+      "source_manifest": {
+        "path": "/data/WorkSpace/results/P02B/sf10-naive-store-manifest.json",
+        "sha256": "56a57e1ba796fe71a7773e6bba29804b547c077956d40614c3a889694a08080f",
+        "size_bytes": 338
+      },
+      "source_root": "/data/WorkSpace/lsmgraph-rs/store/w6-sf10-priority-20260709/naive",
+      "staging_root": "/data/WorkSpace/immutable/cidr-e01/E01-F1-MIXED-INCREMENTAL-V1/staging/naive.tmp",
+      "state": "HOLD",
+      "variant": "naive"
+    }
+  ],
+  "strict_serial": true
+}
