@@ -1,0 +1,40 @@
+{
+  "asset_inventory": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-seml0-asset-compatibility-inventory-v1.json",
+    "sha256": "7477979874a1b98c91dc8b4f744c463c266c48b17d4e6f0f585fac1ac418becc",
+    "size_bytes": 5107
+  },
+  "binary": {
+    "path": "/data/WorkSpace/results/P20-FINAL-RELEASE-BUILD-4efc2a5-20260722T133300Z/bin/lsmgraph",
+    "sha256": "c7d0534cbe327eff8f7a4980a14179fef45734e8a68336b8b82acd93fff022b9",
+    "size_bytes": 8256256
+  },
+  "bytes_read_now": 8256256,
+  "captured_at_utc": "2026-07-27T07:05:22Z",
+  "content_hashed_now": true,
+  "formal_eligible": false,
+  "fresh_file_seal": true,
+  "identity_before_and_after": {
+    "ctime_ns": 1784727419357785217,
+    "device": 66306,
+    "gid": 1006,
+    "inode": 61211491,
+    "mode_octal": "0755",
+    "mtime_ns": 1784727419357785217,
+    "size_bytes": 8256256,
+    "uid": 1006
+  },
+  "max_light_file_bytes": 67108864,
+  "paper_claim_eligible": false,
+  "performance_eligible": false,
+  "production_blocker": "fresh store seals and admission/resource gates absent",
+  "production_ready": false,
+  "revalidate_identity_before_each_cell": true,
+  "schema_version": "cidr-e01-seml0-binary-file-seal-v1",
+  "scope": "same-engine-binary-for-budg-b64-and-naive",
+  "state": "PASS",
+  "variants": [
+    "budg-b64",
+    "naive"
+  ]
+}

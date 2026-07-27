@@ -1,0 +1,42 @@
+{
+  "adapter": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/runners/p10/adapters/seml0_adapter.py",
+    "sha256": "84b384281065ba2b3377cc6042a7ec16b39b981fbf21110964bf2bedb831a677",
+    "size_bytes": 28091
+  },
+  "adapter_kind": "python-script",
+  "captured_at_utc": "2026-07-27T07:05:22Z",
+  "formal_eligible": false,
+  "fresh_identity_captured": true,
+  "mixed_lineage_plan": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-mixed-lineage-plan-v1.json",
+    "sha256": "21f25c170e4064478eff4047c2e344866e1da52e0964c422d8a9a73de123953d",
+    "size_bytes": 99848
+  },
+  "paper_claim_eligible": false,
+  "path_group_or_world_writable": true,
+  "performance_eligible": false,
+  "production_blocker": "fresh admission/resource gates and store seals absent",
+  "production_ready": false,
+  "repo": {
+    "clean_at_capture": true,
+    "head": "84401bc4a3da3724a0eca9dcc46bcb2823ca1ee7",
+    "root": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726",
+    "status_lines": []
+  },
+  "repo_relative_path": "cidr-experiments/runners/p10/adapters/seml0_adapter.py",
+  "revalidate_path_size_sha_before_each_cell": true,
+  "schema_version": "cidr-e01-seml0-adapter-artifact-identity-v1",
+  "scope": "seml0-current-bridge-canary-plus-naive-r1-r3",
+  "state": "PASS",
+  "variant_bindings": {
+    "budg-b64": {
+      "l0_layout": "semantic-budgeted",
+      "semantic_degree_hint": true
+    },
+    "naive": {
+      "l0_layout": "naive",
+      "semantic_degree_hint": false
+    }
+  }
+}

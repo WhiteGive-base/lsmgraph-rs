@@ -1,0 +1,87 @@
+{
+  "adapter_command_plan": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-incremental-adapter-command-plan-v1.json",
+    "sha256": "fbd634b8275f0c0fbdda8cd825ce4d759a08fc1f9ce1725aaad7e3071d76221d",
+    "size_bytes": 16541
+  },
+  "asset_compatibility_inventory": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-seml0-asset-compatibility-inventory-v1.json",
+    "sha256": "7477979874a1b98c91dc8b4f744c463c266c48b17d4e6f0f585fac1ac418becc",
+    "size_bytes": 5107
+  },
+  "blockers": [
+    "binary fresh immutable seal absent",
+    "budg-b64 store fresh immutable seal absent",
+    "naive store fresh immutable seal absent",
+    "SemL0 adapter fresh artifact identity receipt absent",
+    "shared dataset/trace/truth fresh seal absent",
+    "fresh P03/P02B/batch lease/resource gate absent",
+    "budg-b64 fresh store seal absent",
+    "naive fresh store seal absent",
+    "fresh P02B result/validator admission receipt absent",
+    "fresh resource gate and execution-enable receipt absent",
+    "production process invocation intentionally disabled"
+  ],
+  "campaign_gates": {
+    "adapter_identity": null,
+    "execution_enable": null,
+    "fresh_asset_seal": null,
+    "fresh_batch_lease": null,
+    "fresh_p02b": null,
+    "fresh_p03": null,
+    "fresh_resource_gate": null
+  },
+  "campaign_id": "E01-F1-MIXED-INCREMENTAL-V1",
+  "campaign_root": "/data/WorkSpace/results/E01-F1-MIXED-INCREMENTAL-PENDING",
+  "cells": [
+    {
+      "cell_key": "seml0:bridge-canary",
+      "included_in_figure_rows": false,
+      "ordinal": 1,
+      "repeat_index": 1,
+      "role": "comparability_gate",
+      "system_id": "seml0",
+      "variant": "budg-b64"
+    },
+    {
+      "cell_key": "seml0-naive:r1",
+      "included_in_figure_rows": true,
+      "ordinal": 2,
+      "repeat_index": 1,
+      "role": "figure_row",
+      "system_id": "seml0-naive",
+      "variant": "naive"
+    },
+    {
+      "cell_key": "seml0-naive:r2",
+      "included_in_figure_rows": true,
+      "ordinal": 3,
+      "repeat_index": 2,
+      "role": "figure_row",
+      "system_id": "seml0-naive",
+      "variant": "naive"
+    },
+    {
+      "cell_key": "seml0-naive:r3",
+      "included_in_figure_rows": true,
+      "ordinal": 4,
+      "repeat_index": 3,
+      "role": "figure_row",
+      "system_id": "seml0-naive",
+      "variant": "naive"
+    }
+  ],
+  "execution_state": "BLOCKED",
+  "formal_eligible": false,
+  "mixed_lineage_plan": {
+    "path": "/data/WorkSpace/lsmgraph-cidr-f1c-static-20260726/cidr-experiments/f1c-control/e01-v2/E01-mixed-lineage-plan-v1.json",
+    "sha256": "21f25c170e4064478eff4047c2e344866e1da52e0964c422d8a9a73de123953d",
+    "size_bytes": 99848
+  },
+  "paper_claim_eligible": false,
+  "performance_eligible": false,
+  "schema_version": "cidr-e01-incremental-production-spec-v1",
+  "state": "HOLD",
+  "strict_serial": true,
+  "synthetic_test_only": false
+}

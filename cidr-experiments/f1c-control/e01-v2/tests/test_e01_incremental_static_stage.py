@@ -536,6 +536,75 @@ class IncrementalStaticStageTests(unittest.TestCase):
         self.assertIsNone(value["adapter_command_plan"])
         self.assertFalse(Path(value["campaign_root"]).exists())
 
+    def test_real_light_asset_bundle_is_fresh_small_scope_only(self) -> None:
+        bundle = ROOT / "E01-incremental-light-seals-v1"
+        if not bundle.exists():
+            self.skipTest("real incremental light-seal bundle is not installed")
+        expected = {}
+        for line in (bundle / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+            digest, name = line.split("  ", 1)
+            expected[name] = digest
+        self.assertEqual(
+            set(expected),
+            {
+                "adapter-artifact-identity.json",
+                "binary-file-seal.json",
+                "dataset-trace-truth-lineage-seal.json",
+            },
+        )
+        for name, digest in expected.items():
+            self.assertEqual(file_sha(bundle / name), digest)
+        adapter = json.loads(
+            (bundle / "adapter-artifact-identity.json").read_text(encoding="utf-8")
+        )
+        binary = json.loads(
+            (bundle / "binary-file-seal.json").read_text(encoding="utf-8")
+        )
+        lineage = json.loads(
+            (bundle / "dataset-trace-truth-lineage-seal.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(adapter["state"], "PASS")
+        self.assertTrue(adapter["fresh_identity_captured"])
+        self.assertTrue(adapter["repo"]["clean_at_capture"])
+        self.assertEqual(
+            adapter["repo"]["head"], "84401bc4a3da3724a0eca9dcc46bcb2823ca1ee7"
+        )
+        self.assertEqual(binary["bytes_read_now"], 8_256_256)
+        self.assertTrue(binary["content_hashed_now"])
+        self.assertFalse(lineage["large_content_rehashed_now"])
+        self.assertTrue(lineage["lineage_only"])
+        self.assertFalse(lineage["physical_byte_equivalence_claimed"])
+        for value in (adapter, binary, lineage):
+            self.assertFalse(value["formal_eligible"])
+            self.assertFalse(value["performance_eligible"])
+            self.assertFalse(value["paper_claim_eligible"])
+
+    def test_real_command_plan_and_v2_spec_remain_pre_root_hold(self) -> None:
+        command_path = ROOT / "E01-incremental-adapter-command-plan-v1.json"
+        spec_path = ROOT / "E01-incremental-4cell-production-spec-HOLD-v2.json"
+        if not command_path.exists() or not spec_path.exists():
+            self.skipTest("real command-plan/HOLD-v2 snapshots are not installed")
+        command = command_plan.validate(command_path)
+        self.assertEqual(command["state"], "HOLD")
+        self.assertEqual(command["execution_state"], "BLOCKED")
+        self.assertFalse(command["adapter_invoked"])
+        self.assertFalse(command["timing_generated"])
+        self.assertEqual([cell["cell_key"] for cell in command["cells"]], list(matrix.RUN_KEYS))
+        self.assertTrue(all(cell["command_argv"] is None for cell in command["cells"]))
+        self.assertTrue(
+            all(cell["unresolved_arguments"]["fresh_store_seal"] is None for cell in command["cells"])
+        )
+        spec = matrix.validate_spec(spec_path)
+        self.assertEqual(spec["state"], "HOLD")
+        self.assertEqual(spec["execution_state"], "BLOCKED")
+        self.assertEqual(
+            spec["adapter_command_plan"]["sha256"], file_sha(command_path)
+        )
+        self.assertTrue(all(value is None for value in spec["campaign_gates"].values()))
+        self.assertFalse(Path(spec["campaign_root"]).exists())
+
     def test_light_asset_seals_hash_only_binary_and_small_lineage(self) -> None:
         adapter, binary, lineage, _ = make_light_assets(
             self.root, self.plan_path, self.plan
