@@ -29,6 +29,48 @@ target = module("target_p02b", "run_e01_target_p02b.py")
 
 
 class TargetP02BTests(unittest.TestCase):
+    def test_target_configs_freeze_canonical_task_and_scale(self) -> None:
+        config_root = ROOT.parents[1] / "runners" / "p02b" / "configs"
+        for variant, filename in (
+            ("budg-b64", "sf10-seml0-f1-budg-b64-target-v1.json"),
+            ("naive", "sf10-seml0-f1-naive-target-v1.json"),
+        ):
+            value = json.loads((config_root / filename).read_text(encoding="utf-8"))
+            target.validate_config(value, target.VARIANTS[variant])
+
+    def test_config_rejects_task_id_and_scale_tamper(self) -> None:
+        value = {
+            "schema_version": "p02b-sf10-sentinel-config-v2",
+            "task_id": "P02B-SF10-SENTINEL",
+            "scale": "sf10",
+            "fixture_mode": False,
+            "expected_queries": 1700,
+            "l0_layout": "semantic-budgeted",
+            "semantic_degree_hint": True,
+        }
+        for field, bad in (("task_id", "E01-F1-BUDG"), ("scale", "sf1")):
+            changed = dict(value)
+            changed[field] = bad
+            with self.assertRaises(target.TargetError):
+                target.validate_config(changed, target.VARIANTS["budg-b64"])
+
+    def test_admission_timing_state_uses_run_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            absent = root / "absent"
+            self.assertEqual(target.admission_timing_state(absent), "NOT_STARTED")
+            failed = root / "failed"
+            failed.mkdir()
+            (failed / "FAILED").write_text("failed\n", encoding="utf-8")
+            self.assertEqual(target.admission_timing_state(failed), "NOT_STARTED")
+            started = root / "started"
+            (started / "repeats").mkdir(parents=True)
+            self.assertEqual(target.admission_timing_state(started), "STARTED")
+            unknown = root / "unknown"
+            unknown.mkdir()
+            (unknown / "mystery").write_text("x", encoding="utf-8")
+            self.assertEqual(target.admission_timing_state(unknown), "UNKNOWN")
+
     def test_naive_plan_changes_only_hint(self) -> None:
         samples = [{"src": index, "degree": index + 1} for index in range(1700)]
         source = {"version": 1, "semantic_degree_hint": True, "entries": [{"edge_type": 1, "samples": samples}]}

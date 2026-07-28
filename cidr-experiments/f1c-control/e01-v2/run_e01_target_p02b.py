@@ -153,14 +153,31 @@ def validate_lease_admission(
     require(value.get("expires_at_utc") == expires_at_utc, "canonical lease admission expiry drift")
 
 
-def validate_static(args: argparse.Namespace) -> dict[str, Any]:
-    expected = VARIANTS[args.variant]
-    config, config_ref = load(args.config, "config")
+def validate_config(config: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
     require(config.get("schema_version") == "p02b-sf10-sentinel-config-v2", "config schema drift")
+    require(config.get("task_id") == "P02B-SF10-SENTINEL", "canonical sentinel task_id drift")
+    require(config.get("scale") == "sf10", "canonical sentinel scale drift")
     require(config.get("fixture_mode") is False, "formal config required")
     require(config.get("expected_queries") == 1700, "1700 queries required")
     require(config.get("l0_layout") == expected["layout"], "target layout drift")
     require(config.get("semantic_degree_hint") is expected["hint"], "target hint drift")
+
+
+def admission_timing_state(run_dir: Path) -> str:
+    if not run_dir.exists():
+        return "NOT_STARTED"
+    if not run_dir.is_dir():
+        return "UNKNOWN"
+    if (run_dir / "stability-result.json").exists() or (run_dir / "repeats").exists():
+        return "STARTED"
+    names = {item.name for item in run_dir.iterdir()}
+    return "NOT_STARTED" if names <= {"FAILED"} else "UNKNOWN"
+
+
+def validate_static(args: argparse.Namespace) -> dict[str, Any]:
+    expected = VARIANTS[args.variant]
+    config, config_ref = load(args.config, "config")
+    validate_config(config, expected)
     store_manifest, manifest_ref = load(args.store_manifest, "store manifest")
     require(store_manifest.get("schema_version") == "p02b-store-manifest-v1", "store manifest schema drift")
     require(Path(store_manifest["store_path"]).resolve() == args.store.resolve(), "store path drift")
@@ -418,12 +435,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (TargetError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         if "args" in locals() and not args.preflight_only and not args.output.exists():
             try:
+                timing_state = admission_timing_state(args.run_dir)
                 atomic(args.output.with_name(args.output.name + ".FAILED_RETAINED.json"), {
                     "schema_version": SCHEMA,
                     "state": "FAILED_RETAINED",
                     "reason": str(exc),
                     "formal_figure_timing_generated": False,
-                    "admission_timing_generated": args.run_dir.exists(),
+                    "admission_timing_state": timing_state,
+                    "admission_timing_generated": (
+                        True if timing_state == "STARTED" else False if timing_state == "NOT_STARTED" else None
+                    ),
                     **FALSE_ELIGIBILITY,
                 })
             except BaseException:

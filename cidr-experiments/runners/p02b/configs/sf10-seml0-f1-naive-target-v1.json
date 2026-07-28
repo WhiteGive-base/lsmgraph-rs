@@ -1,6 +1,6 @@
 {
   "schema_version": "p02b-sf10-sentinel-config-v2",
-  "task_id": "E01-F1-P02B-NAIVE",
+  "task_id": "P02B-SF10-SENTINEL",
   "scale": "sf10",
   "fixture_mode": false,
   "independent_runs": 3,
