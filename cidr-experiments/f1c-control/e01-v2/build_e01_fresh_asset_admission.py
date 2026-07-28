@@ -113,6 +113,7 @@ def build(
     budg_store_seal_path: Path,
     naive_store_seal_path: Path,
     campaign_root: Path,
+    p03_output_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     legacy_ref = file_ref(legacy_inventory_path, "legacy inventory")
     old = load_json(legacy_inventory_path, "legacy inventory")
@@ -136,6 +137,19 @@ def build(
     naive, naive_ref = validate_store(naive_store_seal_path, "naive", old_stores["naive"])
     require(campaign_root.is_absolute(), "campaign root must be absolute")
     require(not campaign_root.exists(), "campaign root must remain absent")
+    require(p03_output_dir.is_absolute(), "P03 output directory must be absolute")
+    require(not p03_output_dir.exists(), "P03 output directory must remain absent at plan build")
+    repo_root = Path(adapter["repo"]["root"])
+    monitor_path = repo_root / "cidr-experiments/runs/P03-CLEAN-WINDOW-MONITOR/monitor_clean_window.sh"
+    batch_gate_path = repo_root / "cidr-experiments/runners/batch_gate_v2.py"
+    p02b_runner_path = repo_root / "cidr-experiments/runners/p02b/run_sf10_sentinel.py"
+    p02b_validator_path = repo_root / "cidr-experiments/runners/p02b/validate_sentinel_result.py"
+    p02b_config_path = repo_root / "cidr-experiments/runners/p02b/configs/sf10-seml0-short-gate-v4-quantization-aware.json"
+    monitor_ref = file_ref(monitor_path, "P03 monitor")
+    batch_gate_ref = file_ref(batch_gate_path, "batch gate")
+    p02b_runner_ref = file_ref(p02b_runner_path, "P02B runner")
+    p02b_validator_ref = file_ref(p02b_validator_path, "P02B validator")
+    p02b_config_ref = file_ref(p02b_config_path, "P02B config")
 
     stores = []
     for value, ref in ((budg, budg_ref), (naive, naive_ref)):
@@ -188,6 +202,22 @@ def build(
         "resource_gate_receipt": None,
         "runtime_backend_receipt": None,
     }
+    p03_environment = {
+        "ROOT": str(repo_root),
+        "RUN_ID": p03_output_dir.name,
+        "OUT_DIR": str(p03_output_dir),
+        "GATE_MODE": "seml0",
+        "SAMPLE_INTERVAL_SECONDS": "60",
+        "MEASURE_SECONDS": "1",
+        "READY_SAMPLES": "5",
+        "DEVICE": "nvme1n1",
+        "LOAD_MAX": "5",
+        "CPU_IDLE_MIN_PCT": "95",
+        "MEM_AVAILABLE_MIN_KIB": "419430400",
+        "DATA_FREE_MIN_KIB": "209715200",
+        "DISK_UTIL_MAX_PCT": "5",
+        "DISK_AWAIT_MAX_MS": "5",
+    }
     plan = {
         "schema_version": PLAN_SCHEMA,
         "state": "READY_FOR_ADMISSION_GATES",
@@ -204,6 +234,27 @@ def build(
             "dataset_trace_truth_lineage_seal": lineage_ref,
             "budg_b64_store_seal": budg_ref,
             "naive_store_seal": naive_ref,
+        },
+        "p03_contract": {
+            "policy": "f1-data-retention-200gib-v1",
+            "data_free_min_bytes": 214748364800,
+            "data_free_min_kib": 209715200,
+            "default_monitor_threshold_overridden_explicitly": True,
+            "monitor": monitor_ref,
+            "batch_gate_validator": batch_gate_ref,
+            "environment": p03_environment,
+            "argv": [monitor_ref["path"]],
+            "receipt_must_bind_environment_and_monitor_sha": True,
+            "timing_generated": False,
+        },
+        "p02b_next_unique_task": {
+            "state": "BLOCKED_UNTIL_P03_PASS",
+            "estimated_minutes": [13, 25],
+            "runner": p02b_runner_ref,
+            "validator": p02b_validator_ref,
+            "config": p02b_config_ref,
+            "requires_real_p31": True,
+            "auto_start": False,
         },
         "remaining_admission_gates": remaining,
         "large_content_rehashed_now": False,
@@ -236,6 +287,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--budg-store-seal", type=Path, required=True)
     parser.add_argument("--naive-store-seal", type=Path, required=True)
     parser.add_argument("--campaign-root", type=Path, required=True)
+    parser.add_argument("--p03-output-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args(argv)
 
@@ -251,6 +303,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             budg_store_seal_path=args.budg_store_seal,
             naive_store_seal_path=args.naive_store_seal,
             campaign_root=args.campaign_root,
+            p03_output_dir=args.p03_output_dir,
         )
         output = args.output_dir.resolve()
         require(not output.exists(), f"refusing to overwrite output directory: {output}")
