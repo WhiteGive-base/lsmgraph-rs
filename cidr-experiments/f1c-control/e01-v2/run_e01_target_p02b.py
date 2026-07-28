@@ -136,6 +136,23 @@ def validate_tree_contract(tree: Mapping[str, Any], manifest: Mapping[str, Any])
     require(tree.get("immutable_permissions_pass") is True, "target store contains writable entries")
 
 
+def validate_lease_admission(
+    value: Mapping[str, Any],
+    *,
+    consumer: str,
+    lease_ref: Mapping[str, Any],
+    repo_head: str,
+    binary_sha256: str,
+    expires_at_utc: str,
+) -> None:
+    require(value.get("schema_version") == "cidr-batch-lease-admission-v2", "canonical lease admission schema drift")
+    require(value.get("state") == "PASS" and value.get("consumer") == consumer, "canonical lease admission consumer drift")
+    require(value.get("lease") == lease_ref["path"] and value.get("lease_sha256") == lease_ref["sha256"], "canonical lease admission lease drift")
+    require(value.get("repo_head") == repo_head, "canonical lease admission repo HEAD drift")
+    require(value.get("binary_sha256") == binary_sha256, "canonical lease admission binary SHA drift")
+    require(value.get("expires_at_utc") == expires_at_utc, "canonical lease admission expiry drift")
+
+
 def validate_static(args: argparse.Namespace) -> dict[str, Any]:
     expected = VARIANTS[args.variant]
     config, config_ref = load(args.config, "config")
@@ -329,7 +346,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         lease_checked = subprocess.run(lease_argv, cwd=args.repo_root, check=False, capture_output=True, text=True, timeout=120)
         require(lease_checked.returncode == 0, f"{consumer} canonical lease validation failed: {lease_checked.stderr.strip()}")
         lease_validation = json.loads(lease_checked.stdout)
-        require(lease_validation.get("state") == "PASS", f"{consumer} canonical lease validation drift")
+        validate_lease_admission(
+            lease_validation,
+            consumer=consumer,
+            lease_ref=lease_ref,
+            repo_head=static["repo_head"],
+            binary_sha256=sha256_file(args.binary),
+            expires_at_utc=lease["expires_at_utc"],
+        )
         atomic(lease_validation_path, lease_validation)
         lease_validations[consumer] = file_ref(lease_validation_path, f"{consumer} lease validation")
     after = tree_manifest(args.store)

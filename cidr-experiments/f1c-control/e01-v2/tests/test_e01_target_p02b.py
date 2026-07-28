@@ -117,6 +117,42 @@ class TargetP02BTests(unittest.TestCase):
             else:
                 self.fail("grandchild survived process-group timeout cleanup")
 
+    def test_canonical_lease_admission_rejects_consumer_swap(self) -> None:
+        lease_ref = {"path": "/lease.json", "sha256": "a" * 64, "size_bytes": 1}
+        value = {
+            "schema_version": "cidr-batch-lease-admission-v2",
+            "state": "PASS",
+            "consumer": "P20",
+            "lease": lease_ref["path"],
+            "lease_sha256": lease_ref["sha256"],
+            "repo_head": "b" * 40,
+            "binary_sha256": "c" * 64,
+            "expires_at_utc": "2026-07-29T00:00:00Z",
+        }
+        with self.assertRaisesRegex(target.TargetError, "consumer drift"):
+            target.validate_lease_admission(
+                value, consumer="P10", lease_ref=lease_ref, repo_head="b" * 40,
+                binary_sha256="c" * 64, expires_at_utc="2026-07-29T00:00:00Z",
+            )
+
+    def test_canonical_lease_admission_rejects_lease_sha_drift(self) -> None:
+        lease_ref = {"path": "/lease.json", "sha256": "a" * 64, "size_bytes": 1}
+        value = {
+            "schema_version": "cidr-batch-lease-admission-v2",
+            "state": "PASS",
+            "consumer": "P10",
+            "lease": lease_ref["path"],
+            "lease_sha256": "f" * 64,
+            "repo_head": "b" * 40,
+            "binary_sha256": "c" * 64,
+            "expires_at_utc": "2026-07-29T00:00:00Z",
+        }
+        with self.assertRaisesRegex(target.TargetError, "lease drift"):
+            target.validate_lease_admission(
+                value, consumer="P10", lease_ref=lease_ref, repo_head="b" * 40,
+                binary_sha256="c" * 64, expires_at_utc="2026-07-29T00:00:00Z",
+            )
+
     def test_static_contract_rejects_layout_hint_mismatch(self) -> None:
         args = type("Args", (), {})()
         args.variant = "naive"

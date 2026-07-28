@@ -274,6 +274,15 @@ def revalidate_target(cell: Mapping[str, Any]) -> dict[str, Any]:
     lease = load_json(Path(lease_ref["path"]), "target lease")
     expires = lease.get("expires_at_utc") or lease.get("expires_at")
     require(type(expires) is str and _iso(expires) > dt.datetime.now(dt.timezone.utc), "target lease expired")
+    for consumer in ("P10", "P20"):
+        validation_ref = verify_ref(bundle.get("official_lease_validations", {}).get(consumer), f"{consumer} canonical lease validation")
+        validation = load_json(Path(validation_ref["path"]), f"{consumer} canonical lease validation")
+        require(validation.get("schema_version") == "cidr-batch-lease-admission-v2", "canonical lease validation schema drift")
+        require(validation.get("state") == "PASS" and validation.get("consumer") == consumer, "canonical lease validation consumer drift")
+        require(validation.get("lease") == lease_ref["path"] and validation.get("lease_sha256") == lease_ref["sha256"], "canonical lease validation ref drift")
+        require(validation.get("repo_head") == bundle["static_inputs"]["repo_head"], "canonical lease validation repo drift")
+        require(validation.get("binary_sha256") == bundle["static_inputs"]["bound_inputs"]["binary"]["sha256"], "canonical lease validation binary drift")
+        require(validation.get("expires_at_utc") == expires, "canonical lease validation expiry drift")
     return ref
 
 
