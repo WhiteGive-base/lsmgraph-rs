@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 
-BACKEND_SCHEMA = "cidr-e01-incremental-backend-plan-v1"
+BACKEND_SCHEMA = "cidr-e01-incremental-backend-plan-v3"
 START_SCHEMA = "cidr-e01-incremental-production-matrix-start-v1"
 CELL_SCHEMA = "cidr-e01-incremental-production-cell-done-v1"
 DONE_SCHEMA = "cidr-e01-incremental-production-matrix-done-v1"
@@ -112,19 +112,32 @@ def _absolute_argv(value: Any, label: str) -> list[str]:
     return list(value)
 
 
-def _verify_external_ref(value: Any, label: str) -> Dict[str, Any]:
+def verify_external_file_ref(value: Any, label: str) -> Dict[str, Any]:
     require(type(value) is dict and set(value) == {"path", "sha256", "size_bytes"}, f"{label}: exact ref required")
     path = Path(value["path"]).resolve()
     require(path.is_file() and not path.is_symlink(), f"{label}: regular file required")
     actual = {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
     require(actual == value, f"{label}: path/size/SHA drift")
+    return actual
+
+
+def _verify_external_ref(value: Any, label: str) -> Dict[str, Any]:
+    actual = verify_external_file_ref(value, label)
+    path = Path(actual["path"])
     return load_json(path, label)
 
 
+def external_file_ref(path: Path) -> Dict[str, Any]:
+    path = path.resolve()
+    require(path.is_file() and not path.is_symlink(), "external reference file required")
+    return {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
+
+
 def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
+    plan_path = value_or_path.resolve() if isinstance(value_or_path, Path) else None
     value = (
-        load_json(value_or_path.resolve(), "backend plan")
-        if isinstance(value_or_path, Path)
+        load_json(plan_path, "backend plan")
+        if plan_path is not None
         else value_or_path
     )
     require(type(value) is dict, "backend plan object required")
@@ -134,6 +147,8 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
     require(value.get("synthetic_test_only") is False, "production backend cannot be synthetic")
     root = Path(str(value.get("campaign_root", "")))
     require(root.is_absolute(), "absolute campaign root required")
+    executor_ref = value.get("phase_executor")
+    verify_external_file_ref(executor_ref, "phase executor")
     cells = value.get("cells")
     require(type(cells) is list and len(cells) == 4, "exactly four backend cells required")
     require([row.get("cell_key") for row in cells] == list(CELL_ORDER), "cell order drift")
@@ -158,10 +173,26 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
             require(bundle.get("static_inputs", {}).get("query_plan") == runtime.get("target_query_plan"), f"cell {ordinal}: query-plan ref drift")
             require(bundle.get("lease") == runtime.get("target_lease"), f"cell {ordinal}: lease ref drift")
         phases = row.get("phase_commands")
-        require(type(phases) is dict and tuple(phases) == PHASE_ORDER, f"cell {ordinal}: phase order drift")
+        require(
+            type(phases) is dict and set(phases) == set(PHASE_ORDER),
+            f"cell {ordinal}: phase key set drift",
+        )
         if value["state"] == "READY":
             for phase in PHASE_ORDER:
-                _absolute_argv(phases[phase], f"cell {ordinal}.{phase}")
+                argv = _absolute_argv(phases[phase], f"cell {ordinal}.{phase}")
+                require(
+                    len(argv) == 9
+                    and argv[:3] == ["/usr/bin/python3", "-B", executor_ref["path"]]
+                    and argv[3] == "--backend-plan"
+                    and Path(argv[4]).is_absolute()
+                    and argv[5:] == ["--cell-key", row["cell_key"], "--phase", phase],
+                    f"cell {ordinal}.{phase}: phase executor dispatch drift",
+                )
+                if plan_path is not None:
+                    require(
+                        Path(argv[4]).resolve() == plan_path,
+                        f"cell {ordinal}.{phase}: backend plan dispatch drift",
+                    )
         else:
             require(all(phases[phase] is None for phase in PHASE_ORDER), "HOLD argv must be absent")
     gates = value.get("campaign_gates")
@@ -170,11 +201,18 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
         require(value.get("execution_state") == "READY", "READY execution state required")
         require(not value.get("blockers"), "READY backend cannot have blockers")
         for name, descriptor in gates.items():
-            require(type(descriptor) is dict, f"{name}: gate reference required")
+            require(type(descriptor) is dict and set(descriptor) == {"path"}, f"{name}: gate path required")
             gate = load_json(Path(descriptor["path"]), f"{name} gate")
             require(gate.get("state") == "PASS", f"{name}: gate must PASS")
             require(gate.get("synthetic_test_only") is False, f"{name}: synthetic gate forbidden")
             require(gate.get("fixture_only") is False, f"{name}: fixture gate forbidden")
+            require(gate.get("phase_executor") == executor_ref, f"{name}: phase executor backlink drift")
+            require(type(gate.get("backend_plan")) is dict, f"{name}: backend plan backlink required")
+            if plan_path is not None:
+                require(
+                    gate["backend_plan"] == external_file_ref(plan_path),
+                    f"{name}: backend plan backlink drift",
+                )
     else:
         require(value.get("execution_state") == "BLOCKED", "HOLD backend must BLOCK")
         require(type(value.get("blockers")) is list and value["blockers"], "HOLD blockers required")
@@ -214,7 +252,10 @@ def _validate_receipt(
         require(value.get("mutable_clone_removed") is True, "mutable clone cleanup required")
         clone = value.get("mutable_clone")
         require(type(clone) is str and Path(clone).is_absolute(), "cleanup clone path required")
-        require(not Path(clone).exists(), "cleanup claims removed clone that still exists")
+        require(
+            not os.path.lexists(clone),
+            "cleanup claims removed clone that still lexists, including dangling symlink",
+        )
     if expected_mode == "production" and role in {"store_clone", "p31", "validated_result", "cleanup"}:
         require(value.get("target_p02b") == target_p02b, f"{role}: target P02B backlink drift")
     return value

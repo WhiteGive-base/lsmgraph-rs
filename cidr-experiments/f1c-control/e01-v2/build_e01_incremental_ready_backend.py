@@ -196,6 +196,7 @@ def validate_clone_bootstrap_contract(
     target_refs: Mapping[str, Any],
     stores: Mapping[str, Mapping[str, Any]],
     failed_clone_ref: Mapping[str, Any],
+    executor_ref: Mapping[str, Any],
 ) -> None:
     require(dryrun.get("backend_plan_sha256") == hold_ref["sha256"], "clone dry-run backend SHA drift")
     require(hold_plan.get("schema_version") == SCHEMA, "clone predecessor backend schema drift")
@@ -207,6 +208,10 @@ def validate_clone_bootstrap_contract(
     )
     require(hold_plan.get("admission_bundle") == admission_ref, "clone predecessor admission drift")
     require(hold_plan.get("target_p02b") == target_refs, "clone predecessor target P02B drift")
+    require(
+        hold_plan.get("phase_executor") == executor_ref,
+        "clone predecessor phase executor ref drift",
+    )
     cells = hold_plan.get("cells")
     require(type(cells) is list and [row.get("cell_key") for row in cells] == list(CELL_ORDER), "clone predecessor cell order drift")
     expected_variants = ("budg-b64", "naive", "naive", "naive")
@@ -238,6 +243,7 @@ def validate_clone_bootstrap_contract(
     require(type(verification) is dict, "clone dry-run unified verification missing")
     require(
         verification.get("copy") == clone
+        and verification.get("capacity_evidence") == dryrun.get("capacity_evidence")
         and verification.get("source_tree_pre") == dryrun.get("source_tree_pre")
         and verification.get("source_tree_post") == dryrun.get("source_tree_post")
         and verification.get("source_identity_pre") == dryrun.get("source_identity_pre")
@@ -252,6 +258,13 @@ def validate_clone_bootstrap_contract(
         and verification.get("full_content_hash_performed") is True
         and verification.get("hash_outside_p31") is True,
         "clone dry-run unified verification/top-level drift",
+    )
+    require(
+        dryrun.get("capacity_evidence", {}).get("state") == "PASS"
+        and dryrun["capacity_evidence"].get("reserve_bytes") == 14_400_000_000
+        and dryrun["capacity_evidence"].get("free_bytes_before", 0)
+        >= dryrun["capacity_evidence"].get("minimum_bytes", 1),
+        "clone dry-run capacity reserve drift",
     )
     require(clone.get("source") == str(Path(policy["source_root"]).resolve()), "clone dry-run source root drift")
     require(clone.get("target") == str(Path(clone["target"]).resolve()), "clone dry-run target root not canonical")
@@ -407,6 +420,15 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "clone dry-run did not PASS exact cleanup",
         )
         require(dryrun.get("timing_generated") is False, "clone dry-run generated timing")
+        lifecycle, lifecycle_ref = load(
+            Path(clone_ref["path"]).resolve().parent / "STATE.json",
+            "clone dry-run lifecycle",
+        )
+        require(
+            lifecycle.get("state") == "PASS"
+            and lifecycle.get("terminal_receipt") == clone_ref,
+            "clone dry-run RUNNING state was not terminalized",
+        )
         hold_plan, hold_ref = verify_ref(dryrun.get("backend_plan"), "clone dry-run backend plan")
         validate_clone_bootstrap_contract(
             dryrun=dryrun,
@@ -416,6 +438,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             target_refs=target_refs,
             stores=stores,
             failed_clone_ref=failed_clone_ref,
+            executor_ref=executor_ref,
         )
         expected_dryrun_target = (Path(clone_ref["path"]).resolve().parent / "mutable-store").absolute()
         require(
@@ -544,8 +567,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
     state = "HOLD" if blockers else "READY"
     gate_path = args.output.with_name(args.output.stem + ".ARMING-GATE.json")
+    require(not os.path.lexists(gate_path), "arming gate path must be absent")
     gate = {
-        "schema_version": "cidr-e01-incremental-backend-arming-gate-v1",
+        "schema_version": "cidr-e01-incremental-backend-arming-gate-v2",
         "state": "PASS" if not blockers else "HOLD",
         "synthetic_test_only": False,
         "fixture_only": False,
@@ -623,9 +647,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         value = build(args)
         validate(value)
         gate = value.pop("_arming_gate")
-        if value["state"] == "READY":
-            atomic(Path(value["campaign_gates"]["backend_arming"]["path"]), gate)
         atomic(args.output, value)
+        if value["state"] == "READY":
+            gate["backend_plan"] = file_ref(args.output, "READY backend plan")
+            atomic(Path(value["campaign_gates"]["backend_arming"]["path"]), gate)
         print(json.dumps({"state": value["state"], "blockers": value["blockers"]}, sort_keys=True))
         return 0
     except (BuildError, OSError, ValueError, KeyError) as exc:

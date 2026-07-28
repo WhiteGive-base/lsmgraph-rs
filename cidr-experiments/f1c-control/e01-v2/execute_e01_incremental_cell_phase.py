@@ -33,6 +33,7 @@ FALSE_ELIGIBILITY = {
     "paper_claim_eligible": False,
 }
 MAX_SMALL_FILE_BYTES = 16 * 1024 * 1024
+FULL_COPY_RESERVE_BYTES = 14_400_000_000
 TARGET_P02B_SCHEMA = "cidr-e01-target-specific-p02b-v1"
 TARGETS = {
     "budg-b64": {"layout": "semantic-budgeted", "hint": True},
@@ -91,6 +92,22 @@ def atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def replace_state_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Atomically replace the sole lifecycle marker after RUNNING."""
+    require(path.name == "STATE.json" and path.is_file(), "active STATE marker missing")
+    current = load_json(path, "active lifecycle state")
+    require(current.get("state") == "RUNNING", "lifecycle state is not RUNNING")
+    temporary = path.with_name(f".STATE.{os.getpid()}.tmp")
+    require(not os.path.lexists(temporary), "state temporary path exists")
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
 
 
 def verify_ref(value: Any, label: str) -> dict[str, Any]:
@@ -319,6 +336,25 @@ def tree_space(root: Path) -> dict[str, Any]:
     }
 
 
+def full_copy_capacity_evidence(source: Path, target_parent: Path) -> dict[str, Any]:
+    source_space = tree_space(source)
+    fs_stat = os.statvfs(target_parent)
+    free_bytes = fs_stat.f_bavail * fs_stat.f_frsize
+    minimum_bytes = source_space["allocated_bytes"] + FULL_COPY_RESERVE_BYTES
+    require(
+        free_bytes >= minimum_bytes,
+        f"full-copy capacity below source-allocated+14.4GB reserve: {free_bytes} < {minimum_bytes}",
+    )
+    return {
+        "free_bytes_before": free_bytes,
+        "source_allocated_bytes": source_space["allocated_bytes"],
+        "source_logical_bytes": source_space["logical_file_bytes"],
+        "reserve_bytes": FULL_COPY_RESERVE_BYTES,
+        "minimum_bytes": minimum_bytes,
+        "state": "PASS",
+    }
+
+
 def filesystem_evidence(source: Path, target_parent: Path) -> dict[str, Any]:
     rows = {}
     for label, path in (("source", source.resolve()), ("target_parent", target_parent.resolve())):
@@ -490,6 +526,7 @@ def verified_full_copy_and_thaw(
     require(type(expected_tree) is str and len(expected_tree) == 64, "sealed tree SHA required")
     expanded_argv = full_copy_argv(policy, source, target)
     fs = filesystem_evidence(source, allowed_parent)
+    capacity = full_copy_capacity_evidence(source, allowed_parent)
     source_tree_pre = content_tree_manifest(source)
     require(source_tree_pre["sha256"] == expected_tree, "source pre-copy tree SHA drift")
     source_identity_pre = identity_permission_manifest(source)
@@ -534,6 +571,7 @@ def verified_full_copy_and_thaw(
         "copy": clone,
         "copy_argv": expanded_argv,
         "filesystem_evidence": fs,
+        "capacity_evidence": capacity,
         "source_tree_pre": source_tree_pre,
         "source_tree_post": source_tree_post,
         "source_identity_pre": source_identity_pre,
@@ -962,7 +1000,7 @@ def clone_dry_run(
     full_copy_argv(policy, Path(policy["source_root"]), target)
     output.mkdir(parents=True)
     atomic_json(
-        output / "RUNNING.json",
+        output / "STATE.json",
         {
             "schema_version": DRYRUN_SCHEMA,
             "state": "RUNNING",
@@ -983,9 +1021,7 @@ def clone_dry_run(
         exact_cleanup(target, output, clone["target_dev"], clone["target_inode"])
         target_ref_post = revalidate_target(cell)
         require(target_ref_pre == target_ref_post, "target P02B ref drift across clone dry-run")
-        atomic_json(
-            output / "CLONE-DRYRUN.json",
-            {
+        pass_receipt = {
                 "schema_version": DRYRUN_SCHEMA,
                 "state": "PASS",
                 "synthetic_test_only": False,
@@ -996,6 +1032,7 @@ def clone_dry_run(
                 "copy_mode": policy["copy_mode"],
                 "filesystem_contract": policy["filesystem_contract"],
                 "filesystem_evidence": verification["filesystem_evidence"],
+                "capacity_evidence": verification["capacity_evidence"],
                 "failed_reflink_predecessor": predecessor,
                 "target_p02b": target_ref_pre,
                 "source_seal": policy["source_seal"],
@@ -1018,16 +1055,43 @@ def clone_dry_run(
                 "clone_root_absent_after_cleanup": not os.path.lexists(target),
                 "timing_generated": False,
                 **FALSE_ELIGIBILITY,
+            }
+        atomic_json(output / "CLONE-DRYRUN.json", pass_receipt)
+        replace_state_json(
+            output / "STATE.json",
+            {
+                "schema_version": DRYRUN_SCHEMA,
+                "state": "PASS",
+                "terminal_receipt": {
+                    "path": str((output / "CLONE-DRYRUN.json").resolve()),
+                    "sha256": sha256_file(output / "CLONE-DRYRUN.json"),
+                    "size_bytes": (output / "CLONE-DRYRUN.json").stat().st_size,
+                },
+                "timing_generated": False,
+                **FALSE_ELIGIBILITY,
             },
         )
     except BaseException as exc:
         if not (output / "FAILED.json").exists():
-            atomic_json(
-                output / "FAILED.json",
-                {
+            failed_receipt = {
                     "schema_version": DRYRUN_SCHEMA,
                     "state": "FAILED_RETAINED",
                     "reason": str(exc),
+                    "timing_generated": False,
+                    **FALSE_ELIGIBILITY,
+                }
+            atomic_json(output / "FAILED.json", failed_receipt)
+        if (output / "STATE.json").is_file():
+            replace_state_json(
+                output / "STATE.json",
+                {
+                    "schema_version": DRYRUN_SCHEMA,
+                    "state": "FAILED_RETAINED",
+                    "terminal_receipt": {
+                        "path": str((output / "FAILED.json").resolve()),
+                        "sha256": sha256_file(output / "FAILED.json"),
+                        "size_bytes": (output / "FAILED.json").stat().st_size,
+                    },
                     "timing_generated": False,
                     **FALSE_ELIGIBILITY,
                 },

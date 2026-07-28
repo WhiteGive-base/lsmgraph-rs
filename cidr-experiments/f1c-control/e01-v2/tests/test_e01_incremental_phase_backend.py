@@ -83,6 +83,20 @@ class PhaseBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(phase.PhaseError, "inode overlap"):
             phase.validate_file_identity_separation(source, clone)
 
+    def test_full_copy_capacity_requires_source_allocation_plus_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "x").write_bytes(b"abc")
+            original = phase.os.statvfs
+            phase.os.statvfs = lambda unused: type(
+                "StatVfs", (), {"f_bavail": 1, "f_frsize": 4096}
+            )()
+            try:
+                with self.assertRaisesRegex(phase.PhaseError, "14.4GB reserve"):
+                    phase.full_copy_capacity_evidence(root, root)
+            finally:
+                phase.os.statvfs = original
+
     def test_thaw_manifest_requires_complete_unique_owner_write_only(self) -> None:
         source = {"entries": [
             {"path": ".", "kind": "directory", "uid": 1, "gid": 2, "mode": "0555"},
@@ -210,6 +224,62 @@ class PhaseBackendTests(unittest.TestCase):
             self.assertTrue(receipt["thaw_manifest"])
             self.assertGreater(receipt["clone_space"]["allocated_bytes"], 0)
             self.assertTrue(receipt["clone_root_absent_after_cleanup"])
+            lifecycle = phase.load_json(output / "STATE.json", "lifecycle")
+            self.assertEqual(lifecycle["state"], "PASS")
+            self.assertFalse((output / "RUNNING.json").exists())
+
+    def test_clone_dry_run_failure_terminalizes_running_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            output = root / "dryrun"
+            source.mkdir()
+            (source / "x").write_bytes(b"abc")
+            os.chmod(source / "x", 0o444)
+            os.chmod(source, 0o555)
+            failed = write_json(root / "failed.json", {"state": "FAILED_RETAINED"})
+            failed_ref = {
+                "path": str(failed.resolve()),
+                "sha256": phase.sha256_file(failed),
+                "size_bytes": failed.stat().st_size,
+            }
+            plan_path = write_json(root / "plan.json", {})
+            plan_ref = {
+                "path": str(plan_path.resolve()),
+                "sha256": phase.sha256_file(plan_path),
+                "size_bytes": plan_path.stat().st_size,
+            }
+            plan = {
+                "campaign_root": str(root / "campaign"),
+                "clone_fallback_predecessor": failed_ref,
+            }
+            cell = {
+                "cell_key": "seml0:bridge-canary",
+                "runtime": {
+                    "clone_policy": {
+                        "source_root": str(source),
+                        "source_seal": failed_ref,
+                        "tree_sha256": "0" * 64,
+                        "copy_mode": "explicit-full-copy-ext4-v1",
+                        "filesystem_contract": {
+                            "filesystem_type": "ext4", "reflink_supported": False,
+                        },
+                        "copy_argv": list(phase.FULL_COPY_ARGV_TEMPLATE),
+                    }
+                },
+            }
+            original = phase.revalidate_target
+            phase.revalidate_target = lambda unused: failed_ref
+            try:
+                with self.assertRaisesRegex(phase.PhaseError, "source pre-copy tree SHA drift"):
+                    phase.clone_dry_run(plan, cell, plan_ref, output)
+            finally:
+                phase.revalidate_target = original
+                os.chmod(source, 0o755)
+                os.chmod(source / "x", 0o644)
+            self.assertTrue((output / "FAILED.json").is_file())
+            self.assertEqual(phase.load_json(output / "STATE.json", "state")["state"], "FAILED_RETAINED")
+            self.assertFalse((output / "RUNNING.json").exists())
 
     def test_clone_dry_run_allows_only_exact_clone_receipt_hold(self) -> None:
         cells = [
@@ -326,6 +396,7 @@ class PhaseBackendTests(unittest.TestCase):
         }
         source_seal = {"path": "/evidence/seal.json", "sha256": "d" * 64, "size_bytes": 1}
         failed_ref = {"path": "/evidence/failed.json", "sha256": "8" * 64, "size_bytes": 1}
+        executor_ref = {"path": "/evidence/executor.py", "sha256": "6" * 64, "size_bytes": 1}
         stores = {
             "budg-b64": {"fresh_store_seal": source_seal, "tree_sha256": "e" * 64},
             "naive": {"fresh_store_seal": {}, "tree_sha256": "f" * 64},
@@ -348,6 +419,7 @@ class PhaseBackendTests(unittest.TestCase):
             "admission_bundle": admission,
             "target_p02b": targets,
             "clone_fallback_predecessor": failed_ref,
+            "phase_executor": executor_ref,
             "cells": [
                 {
                     "cell_key": key,
@@ -423,6 +495,14 @@ class PhaseBackendTests(unittest.TestCase):
                 "full_tree_hash_performed": True,
             },
             "clone_space": {"logical_file_bytes": 3, "allocated_bytes": 4096},
+            "capacity_evidence": {
+                "state": "PASS",
+                "free_bytes_before": 20_000_000_000,
+                "source_allocated_bytes": 4096,
+                "source_logical_bytes": 3,
+                "reserve_bytes": 14_400_000_000,
+                "minimum_bytes": 14_400_004_096,
+            },
             "thaw_manifest": [
                 {
                     "path": ".",
@@ -438,6 +518,7 @@ class PhaseBackendTests(unittest.TestCase):
         }
         dryrun["verification"] = {
             "copy": dryrun["clone"],
+            "capacity_evidence": dryrun["capacity_evidence"],
             "source_tree_pre": dryrun["source_tree_pre"],
             "source_tree_post": dryrun["source_tree_post"],
             "source_identity_pre": dryrun["source_identity_pre"],
@@ -460,6 +541,7 @@ class PhaseBackendTests(unittest.TestCase):
             target_refs=targets,
             stores=stores,
             failed_clone_ref=failed_ref,
+            executor_ref=executor_ref,
         )
         changed = json.loads(json.dumps(dryrun))
         changed["backend_plan_sha256"] = "2" * 64
@@ -472,6 +554,7 @@ class PhaseBackendTests(unittest.TestCase):
                 target_refs=targets,
                 stores=stores,
                 failed_clone_ref=failed_ref,
+                executor_ref=executor_ref,
             )
         changed = json.loads(json.dumps(hold))
         changed["target_p02b"]["naive"]["sha256"] = "9" * 64
@@ -484,6 +567,20 @@ class PhaseBackendTests(unittest.TestCase):
                 target_refs=targets,
                 stores=stores,
                 failed_clone_ref=failed_ref,
+                executor_ref=executor_ref,
+            )
+        changed = json.loads(json.dumps(hold))
+        changed["phase_executor"]["sha256"] = "9" * 64
+        with self.assertRaisesRegex(builder.BuildError, "phase executor ref drift"):
+            builder.validate_clone_bootstrap_contract(
+                dryrun=dryrun,
+                hold_plan=changed,
+                hold_ref=hold_ref,
+                admission_ref=admission,
+                target_refs=targets,
+                stores=stores,
+                failed_clone_ref=failed_ref,
+                executor_ref=executor_ref,
             )
         changed = json.loads(json.dumps(dryrun))
         changed["clone"]["copy_argv"][0] = "/bin/false"
@@ -497,6 +594,7 @@ class PhaseBackendTests(unittest.TestCase):
                 target_refs=targets,
                 stores=stores,
                 failed_clone_ref=failed_ref,
+                executor_ref=executor_ref,
             )
 
     def test_builder_validator_requires_hold_commands_null(self) -> None:
@@ -528,6 +626,54 @@ class PhaseBackendTests(unittest.TestCase):
         value["cells"][0]["phase_commands"]["prepare"] = ["/bin/false"]
         with self.assertRaises(builder.BuildError):
             builder.validate(value)
+
+    def test_builder_ready_arming_gate_binds_written_plan_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "ready.json"
+            gate_path = root / "ready.ARMING-GATE.json"
+            executor = write_json(root / "executor.json", {})
+            executor_ref = {
+                "path": str(executor.resolve()),
+                "sha256": phase.sha256_file(executor),
+                "size_bytes": executor.stat().st_size,
+            }
+            value = {
+                "schema_version": builder.SCHEMA,
+                "state": "READY",
+                "execution_state": "READY",
+                "blockers": [],
+                "campaign_gates": {"backend_arming": {"path": str(gate_path)}},
+                "_arming_gate": {
+                    "state": "PASS",
+                    "phase_executor": executor_ref,
+                },
+            }
+            original_build = builder.build
+            original_validate = builder.validate
+            builder.build = lambda unused: value
+            builder.validate = lambda unused: None
+            try:
+                result = builder.main([
+                    "--admission-bundle", str(root / "admission"),
+                    "--phase-executor", str(executor),
+                    "--failed-clone-attempt", str(root / "failed"),
+                    "--campaign-root", str(root / "campaign"),
+                    "--output", str(output),
+                ])
+            finally:
+                builder.build = original_build
+                builder.validate = original_validate
+            self.assertEqual(result, 0)
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                gate["backend_plan"],
+                {
+                    "path": str(output.resolve()),
+                    "sha256": phase.sha256_file(output),
+                    "size_bytes": output.stat().st_size,
+                },
+            )
 
     def test_direct_phase_rejects_non_ready_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
