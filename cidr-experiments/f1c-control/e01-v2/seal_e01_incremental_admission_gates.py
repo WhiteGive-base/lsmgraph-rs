@@ -124,6 +124,19 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     require(p03.get("state") == "PASS", "P03 did not PASS")
     require(p03.get("required_consecutive_samples") == 5, "P03 five samples required")
     require(p03.get("observed_consecutive_samples") >= 5, "P03 observed sample drift")
+    planned_p03 = plan.get("p03_contract")
+    require(type(planned_p03) is dict, "frozen P03 policy missing")
+    require(planned_p03.get("policy") == "f1-data-retention-200gib-v1", "P03 retention policy drift")
+    require(planned_p03.get("data_free_min_bytes") == MIN_DATA_FREE_BYTES, "P03 retention bytes drift")
+    ready_ref = p03.get("artifacts", {}).get("READY")
+    require(type(ready_ref) is dict, "P03 READY artifact missing")
+    actual_p03_root = str(Path(ready_ref["path"]).resolve().parent)
+    planned_p03_root = planned_p03.get("environment", {}).get("OUT_DIR")
+    p03_path_state = (
+        "MATCH"
+        if planned_p03_root == actual_p03_root
+        else "SUPERSEDED_BY_VALIDATED_STANDARD_LAYOUT"
+    )
 
     sentinel, sentinel_ref = load(args.sentinel_result, "P02B sentinel")
     require(sentinel.get("schema_version") == "p02b-sf10-sentinel-result-v2", "P02B schema drift")
@@ -173,6 +186,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "asset_plan": plan_ref,
         "asset_inventory": inventory_ref,
         "p03": p03_ref,
+        "p03_contract_binding": {
+            "policy": planned_p03["policy"],
+            "planned_output_root": planned_p03_root,
+            "validated_output_root": actual_p03_root,
+            "path_state": p03_path_state,
+            "validated_binding_is_authoritative": True,
+        },
         "p02b": {
             "sentinel": sentinel_ref,
             "validations": validations,
