@@ -17,14 +17,15 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping, Optional, Sequence
 
 
-PLAN_SCHEMA = "cidr-e01-incremental-backend-plan-v1"
-DRYRUN_SCHEMA = "cidr-e01-mutable-clone-dry-run-v1"
+PLAN_SCHEMA = "cidr-e01-incremental-backend-plan-v2"
+DRYRUN_SCHEMA = "cidr-e01-mutable-clone-dry-run-v2"
 PHASES = ("prepare", "p31", "finalize", "cleanup")
 FALSE_ELIGIBILITY = {
     "formal_eligible": False,
@@ -133,6 +134,167 @@ def metadata_manifest(root: Path) -> dict[str, Any]:
         "total_bytes": total,
         "content_hashed": False,
     }
+
+
+def content_tree_manifest(root: Path) -> dict[str, Any]:
+    """Recompute the sealed store content tree contract."""
+    root = root.resolve()
+    require(root.is_dir() and not root.is_symlink(), f"invalid content tree root: {root}")
+    files: list[Path] = []
+    directory_count = 0
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(directory)
+        directory_count += 1
+        dirnames.sort()
+        filenames.sort()
+        for name in dirnames:
+            require(not (base / name).is_symlink(), "symlink directory forbidden")
+        for name in filenames:
+            path = base / name
+            require(path.is_file() and not path.is_symlink(), f"non-regular file: {path}")
+            files.append(path)
+    files.sort(key=lambda path: path.relative_to(root).as_posix().encode())
+    require(files, "content tree is empty")
+    digest = hashlib.sha256()
+    total = 0
+    for path in files:
+        relative = path.relative_to(root).as_posix()
+        size = path.stat().st_size
+        total += size
+        digest.update(f"file\0{relative}\0{size}\0{sha256_file(path)}\n".encode())
+    root_stat = os.stat(root, follow_symlinks=False)
+    return {
+        "method": "sha256-tree-v1(relative-path,size,content)",
+        "sha256": digest.hexdigest(),
+        "file_count": len(files),
+        "directory_count": directory_count,
+        "total_bytes": total,
+        "dev": root_stat.st_dev,
+        "inode": root_stat.st_ino,
+        "full_tree_hash_performed": True,
+    }
+
+
+def identity_permission_manifest(root: Path) -> dict[str, Any]:
+    root = root.resolve()
+    require(root.is_dir() and not root.is_symlink(), f"invalid identity root: {root}")
+    digest = hashlib.sha256()
+    files = directories = 0
+    writable: list[str] = []
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(directory)
+        dirnames.sort()
+        filenames.sort()
+        for path, kind in [(base, "d"), *[(base / name, "f") for name in filenames]]:
+            require(not path.is_symlink(), f"symlink forbidden: {path}")
+            entry_stat = os.stat(path, follow_symlinks=False)
+            relative = path.relative_to(root).as_posix() or "."
+            mode = stat.S_IMODE(entry_stat.st_mode)
+            if mode & 0o222:
+                writable.append(relative)
+            digest.update(
+                f"{kind}\0{relative}\0{entry_stat.st_dev}\0{entry_stat.st_ino}\0"
+                f"{entry_stat.st_uid}\0{entry_stat.st_gid}\0{mode:o}\n".encode()
+            )
+            if kind == "d":
+                directories += 1
+            else:
+                files += 1
+        for name in dirnames:
+            require(not (base / name).is_symlink(), "symlink directory forbidden")
+    root_stat = os.stat(root, follow_symlinks=False)
+    return {
+        "method": "sha256-tree-identity-permissions-v1(path,type,dev,inode,uid,gid,mode)",
+        "sha256": digest.hexdigest(),
+        "root_dev": root_stat.st_dev,
+        "root_inode": root_stat.st_ino,
+        "root_uid": root_stat.st_uid,
+        "root_gid": root_stat.st_gid,
+        "root_mode": f"{stat.S_IMODE(root_stat.st_mode):04o}",
+        "file_count": files,
+        "directory_count": directories,
+        "writable_entries": writable,
+    }
+
+
+def tree_space(root: Path) -> dict[str, Any]:
+    root = root.resolve()
+    logical = allocated = entries = 0
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(directory)
+        for path in [base, *[base / name for name in filenames]]:
+            entry_stat = os.stat(path, follow_symlinks=False)
+            logical += entry_stat.st_size if path.is_file() else 0
+            allocated += entry_stat.st_blocks * 512
+            entries += 1
+        for name in dirnames:
+            require(not (base / name).is_symlink(), "symlink directory forbidden")
+    return {
+        "logical_file_bytes": logical,
+        "allocated_bytes": allocated,
+        "entry_count": entries,
+    }
+
+
+def filesystem_evidence(source: Path, target_parent: Path) -> dict[str, Any]:
+    rows = {}
+    for label, path in (("source", source.resolve()), ("target_parent", target_parent.resolve())):
+        completed = subprocess.run(
+            ["/usr/bin/findmnt", "-n", "-o", "TARGET,SOURCE,FSTYPE", "-T", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        require(completed.returncode == 0 and completed.stdout.strip(), f"{label}: findmnt failed")
+        fields = completed.stdout.strip().split()
+        require(len(fields) == 3, f"{label}: unexpected findmnt output")
+        entry_stat = os.stat(path, follow_symlinks=False)
+        rows[label] = {
+            "path": str(path),
+            "mount_target": fields[0],
+            "mount_source": fields[1],
+            "filesystem_type": fields[2],
+            "dev": entry_stat.st_dev,
+        }
+    require(rows["source"]["filesystem_type"] == "ext4", "source filesystem is not ext4")
+    require(rows["target_parent"]["filesystem_type"] == "ext4", "target filesystem is not ext4")
+    require(rows["source"]["dev"] == rows["target_parent"]["dev"], "source/target device drift")
+    return rows
+
+
+def thaw_owner_writable(root: Path) -> list[dict[str, Any]]:
+    root = root.resolve()
+    require(root.is_dir() and not root.is_symlink(), "thaw root invalid")
+    paths: list[Path] = [root]
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(directory)
+        dirnames.sort()
+        filenames.sort()
+        paths.extend(base / name for name in dirnames)
+        paths.extend(base / name for name in filenames)
+    unique = sorted(set(paths), key=lambda path: path.relative_to(root).as_posix().encode())
+    rows: list[dict[str, Any]] = []
+    for path in unique:
+        require(not path.is_symlink(), f"thaw symlink forbidden: {path}")
+        before_stat = os.stat(path, follow_symlinks=False)
+        require(before_stat.st_uid == os.geteuid(), f"thaw owner drift: {path}")
+        before = stat.S_IMODE(before_stat.st_mode)
+        after = before | stat.S_IWUSR
+        os.chmod(path, after)
+        actual = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
+        require(actual == after, f"thaw mode apply failed: {path}")
+        require(actual & 0o022 == before & 0o022, f"thaw widened group/other write: {path}")
+        rows.append(
+            {
+                "path": path.relative_to(root).as_posix() or ".",
+                "kind": "directory" if path.is_dir() else "file",
+                "uid": before_stat.st_uid,
+                "gid": before_stat.st_gid,
+                "mode_before": f"{before:04o}",
+                "mode_after": f"{after:04o}",
+            }
+        )
+    return rows
 
 
 def _safe_clone_roots(source: Path, target: Path, allowed_parent: Path) -> tuple[Path, Path]:
@@ -505,14 +667,32 @@ def clone_dry_run(
     output.mkdir(parents=True)
     target_ref_pre = revalidate_target(cell)
     policy = cell["runtime"]["clone_policy"]
+    require(policy.get("copy_mode") == "explicit-full-copy-ext4-v1", "full-copy mode required")
+    predecessor = plan.get("clone_fallback_predecessor")
+    verify_ref(predecessor, "failed reflink predecessor")
     target = output / "mutable-store"
     try:
+        source = Path(policy["source_root"])
+        fs_evidence = filesystem_evidence(source, output)
+        source_tree_pre = content_tree_manifest(source)
+        require(source_tree_pre["sha256"] == policy["tree_sha256"], "source pre-copy tree SHA drift")
+        source_identity_pre = identity_permission_manifest(source)
+        require(not source_identity_pre["writable_entries"], "source became writable before copy")
         clone = copy_clone(
-            Path(policy["source_root"]),
+            source,
             target,
             output,
             list(policy["copy_argv"]),
         )
+        thaw_manifest = thaw_owner_writable(target)
+        clone_tree = content_tree_manifest(target)
+        require(clone_tree["sha256"] == policy["tree_sha256"], "clone content tree SHA drift")
+        clone_space = tree_space(target)
+        source_tree_post = content_tree_manifest(source)
+        source_identity_post = identity_permission_manifest(source)
+        require(source_tree_pre == source_tree_post, "source tree drift across full copy")
+        require(source_identity_pre == source_identity_post, "source permissions/inode drift across full copy")
+        require(not source_identity_post["writable_entries"], "source became writable after copy")
         exact_cleanup(target, output, clone["target_dev"], clone["target_inode"])
         target_ref_post = revalidate_target(cell)
         require(target_ref_pre == target_ref_post, "target P02B ref drift across clone dry-run")
@@ -526,11 +706,23 @@ def clone_dry_run(
                 "backend_plan": dict(plan_ref),
                 "backend_plan_sha256": plan_ref["sha256"],
                 "cell_key": cell["cell_key"],
+                "copy_mode": policy["copy_mode"],
+                "filesystem_contract": policy["filesystem_contract"],
+                "filesystem_evidence": fs_evidence,
+                "failed_reflink_predecessor": predecessor,
                 "target_p02b": target_ref_pre,
                 "source_seal": policy["source_seal"],
                 "source_tree_sha256": policy["tree_sha256"],
+                "source_tree_pre": source_tree_pre,
+                "source_tree_post": source_tree_post,
+                "source_identity_pre": source_identity_pre,
+                "source_identity_post": source_identity_post,
                 "clone": clone,
+                "clone_tree": clone_tree,
+                "clone_space": clone_space,
+                "thaw_manifest": thaw_manifest,
                 "mutable_clone_removed": True,
+                "clone_root_absent_after_cleanup": not target.exists(),
                 "timing_generated": False,
                 **FALSE_ELIGIBILITY,
             },

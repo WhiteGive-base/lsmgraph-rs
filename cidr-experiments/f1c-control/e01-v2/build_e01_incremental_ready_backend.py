@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 
-SCHEMA = "cidr-e01-incremental-backend-plan-v1"
+SCHEMA = "cidr-e01-incremental-backend-plan-v2"
 CELL_ORDER = (
     "seml0:bridge-canary",
     "seml0-naive:r1",
@@ -195,6 +195,7 @@ def validate_clone_bootstrap_contract(
     admission_ref: Mapping[str, Any],
     target_refs: Mapping[str, Any],
     stores: Mapping[str, Mapping[str, Any]],
+    failed_clone_ref: Mapping[str, Any],
 ) -> None:
     require(dryrun.get("backend_plan_sha256") == hold_ref["sha256"], "clone dry-run backend SHA drift")
     require(hold_plan.get("schema_version") == SCHEMA, "clone predecessor backend schema drift")
@@ -215,7 +216,19 @@ def validate_clone_bootstrap_contract(
     )
     bridge = cells[0]
     policy = bridge["runtime"]["clone_policy"]
+    require(
+        hold_plan.get("clone_fallback_predecessor") == failed_clone_ref,
+        "clone predecessor failure ref drift",
+    )
     require(dryrun.get("cell_key") == "seml0:bridge-canary", "clone dry-run cell drift")
+    require(dryrun.get("failed_reflink_predecessor") == failed_clone_ref, "clone dry-run failed-ref drift")
+    require(dryrun.get("copy_mode") == "explicit-full-copy-ext4-v1", "clone dry-run copy mode drift")
+    require(
+        dryrun.get("filesystem_contract") == policy.get("filesystem_contract")
+        and policy.get("filesystem_contract", {}).get("filesystem_type") == "ext4"
+        and policy.get("filesystem_contract", {}).get("reflink_supported") is False,
+        "clone dry-run filesystem contract drift",
+    )
     require(dryrun.get("target_p02b") == target_refs["budg-b64"], "clone dry-run target P02B drift")
     require(dryrun.get("source_seal") == stores["budg-b64"]["fresh_store_seal"], "clone dry-run source seal drift")
     require(dryrun.get("source_tree_sha256") == stores["budg-b64"]["tree_sha256"], "clone dry-run source tree drift")
@@ -234,6 +247,36 @@ def validate_clone_bootstrap_contract(
         clone.get("metadata_manifest", {}).get("content_hashed") is False,
         "clone dry-run unexpectedly hashed content",
     )
+    require(dryrun.get("source_tree_pre") == dryrun.get("source_tree_post"), "clone dry-run source tree changed")
+    require(
+        dryrun.get("source_tree_pre", {}).get("sha256") == stores["budg-b64"]["tree_sha256"],
+        "clone dry-run source tree SHA drift",
+    )
+    require(
+        dryrun.get("source_identity_pre") == dryrun.get("source_identity_post")
+        and not dryrun.get("source_identity_post", {}).get("writable_entries"),
+        "clone dry-run source identity/permissions drift",
+    )
+    require(
+        dryrun.get("clone_tree", {}).get("sha256") == stores["budg-b64"]["tree_sha256"]
+        and dryrun.get("clone_tree", {}).get("full_tree_hash_performed") is True,
+        "clone dry-run clone tree SHA drift",
+    )
+    require(
+        type(dryrun.get("thaw_manifest")) is list
+        and dryrun["thaw_manifest"]
+        and all(
+            int(row["mode_after"], 8) & 0o200
+            and int(row["mode_after"], 8) & 0o022 == int(row["mode_before"], 8) & 0o022
+            for row in dryrun["thaw_manifest"]
+        ),
+        "clone dry-run thaw manifest drift",
+    )
+    require(
+        dryrun.get("clone_space", {}).get("logical_file_bytes", 0) > 0
+        and dryrun.get("clone_space", {}).get("allocated_bytes", 0) > 0,
+        "clone dry-run space evidence missing",
+    )
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
@@ -251,6 +294,18 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     require(os.access(args.phase_executor, os.X_OK), "phase executor must be executable")
     require(args.campaign_root.is_absolute() and not args.campaign_root.exists(), "campaign root must be absolute and absent")
     require(args.output.is_absolute(), "absolute output path required")
+    failed_clone, failed_clone_ref = load(args.failed_clone_attempt, "failed reflink clone attempt")
+    require(
+        failed_clone.get("schema_version") == "cidr-e01-mutable-clone-dry-run-v1"
+        and failed_clone.get("state") == "FAILED_RETAINED"
+        and failed_clone.get("timing_generated") is False,
+        "failed reflink predecessor state drift",
+    )
+    require(
+        "Operation not supported" in str(failed_clone.get("reason"))
+        and "--reflink=always" not in str(failed_clone.get("reason")),
+        "failed predecessor does not prove reflink unsupported",
+    )
 
     stores = {row["variant"]: row for row in inventory.get("stores", [])}
     require(set(stores) == {"budg-b64", "naive"}, "exact two stores required")
@@ -270,8 +325,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         blockers.append("mutable clone lifecycle dry-run receipt absent")
     else:
         dryrun, clone_ref = load(args.clone_dry_run, "clone dry-run")
-        require(dryrun.get("schema_version") == "cidr-e01-mutable-clone-dry-run-v1", "clone dry-run schema drift")
-        require(dryrun.get("state") == "PASS" and dryrun.get("mutable_clone_removed") is True, "clone dry-run did not PASS")
+        require(dryrun.get("schema_version") == "cidr-e01-mutable-clone-dry-run-v2", "clone dry-run schema drift")
+        require(
+            dryrun.get("state") == "PASS"
+            and dryrun.get("mutable_clone_removed") is True
+            and dryrun.get("clone_root_absent_after_cleanup") is True,
+            "clone dry-run did not PASS exact cleanup",
+        )
         require(dryrun.get("timing_generated") is False, "clone dry-run generated timing")
         hold_plan, hold_ref = verify_ref(dryrun.get("backend_plan"), "clone dry-run backend plan")
         validate_clone_bootstrap_contract(
@@ -281,6 +341,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             admission_ref=admission_ref,
             target_refs=target_refs,
             stores=stores,
+            failed_clone_ref=failed_clone_ref,
         )
 
     binary = inventory["binary"]
@@ -373,7 +434,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     "source_seal": source_seal,
                     "tree_sha256": store["tree_sha256"],
                     "mutable_clone": str(staging / "mutable-store"),
-                    "copy_argv": ["/bin/cp", "--archive", "--reflink=always", "--one-file-system", "--", "{SOURCE}", "{TARGET}"],
+                    "copy_mode": "explicit-full-copy-ext4-v1",
+                    "filesystem_contract": {
+                        "mount": "/data",
+                        "filesystem_type": "ext4",
+                        "reflink_supported": False,
+                        "evidence": failed_clone_ref,
+                    },
+                    "copy_argv": ["/bin/cp", "--archive", "--sparse=always", "--one-file-system", "--", "{SOURCE}", "{TARGET}"],
                     "full_content_hash_per_cell": False,
                 },
             },
@@ -390,6 +458,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "phase_executor": executor_ref,
         "clone_dry_run": clone_ref,
         "target_p02b": target_refs,
+        "clone_fallback_predecessor": failed_clone_ref,
         "timing_generated": False,
         **FALSE_ELIGIBILITY,
     }
@@ -445,6 +514,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--clone-dry-run", type=Path)
     parser.add_argument("--budg-target-p02b", type=Path)
     parser.add_argument("--naive-target-p02b", type=Path)
+    parser.add_argument("--failed-clone-attempt", type=Path, required=True)
     parser.add_argument("--campaign-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)

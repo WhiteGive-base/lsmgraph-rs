@@ -64,10 +64,28 @@ class PhaseBackendTests(unittest.TestCase):
             output = root / "dryrun"
             source.mkdir()
             (source / "x").write_bytes(b"abc")
+            os.chmod(source / "x", 0o444)
+            os.chmod(source, 0o555)
+            source_tree_sha = phase.content_tree_manifest(source)["sha256"]
+            failed = write_json(
+                root / "FAILED.json",
+                {
+                    "schema_version": "cidr-e01-mutable-clone-dry-run-v1",
+                    "state": "FAILED_RETAINED",
+                    "reason": "Operation not supported",
+                    "timing_generated": False,
+                },
+            )
+            failed_ref = {
+                "path": str(failed.resolve()),
+                "sha256": phase.sha256_file(failed),
+                "size_bytes": failed.stat().st_size,
+            }
             plan_path = root / "plan.json"
             plan = {
                 "schema_version": phase.PLAN_SCHEMA,
                 "synthetic_test_only": False,
+                "clone_fallback_predecessor": failed_ref,
                 "cells": [{
                     "cell_key": "seml0:bridge-canary",
                     "runtime": {"clone_policy": {
@@ -77,8 +95,15 @@ class PhaseBackendTests(unittest.TestCase):
                             "sha256": "c" * 64,
                             "size_bytes": 1,
                         },
-                        "tree_sha256": "a" * 64,
-                        "copy_argv": ["/bin/cp", "--archive", "--", "{SOURCE}", "{TARGET}"],
+                        "tree_sha256": source_tree_sha,
+                        "copy_mode": "explicit-full-copy-ext4-v1",
+                        "filesystem_contract": {
+                            "mount": "/data",
+                            "filesystem_type": "ext4",
+                            "reflink_supported": False,
+                            "evidence": failed_ref,
+                        },
+                        "copy_argv": ["/bin/cp", "--archive", "--sparse=always", "--", "{SOURCE}", "{TARGET}"],
                     }},
                 }],
             }
@@ -104,6 +129,11 @@ class PhaseBackendTests(unittest.TestCase):
             self.assertFalse((output / "mutable-store").exists())
             self.assertFalse(receipt["performance_eligible"])
             self.assertEqual(receipt["backend_plan"], plan_ref)
+            self.assertEqual(receipt["source_tree_pre"], receipt["source_tree_post"])
+            self.assertEqual(receipt["clone_tree"]["sha256"], source_tree_sha)
+            self.assertTrue(receipt["thaw_manifest"])
+            self.assertGreater(receipt["clone_space"]["allocated_bytes"], 0)
+            self.assertTrue(receipt["clone_root_absent_after_cleanup"])
 
     def test_clone_dry_run_allows_only_exact_clone_receipt_hold(self) -> None:
         cells = [
@@ -131,13 +161,20 @@ class PhaseBackendTests(unittest.TestCase):
             "naive": {"path": "/evidence/naive.json", "sha256": "c" * 64, "size_bytes": 1},
         }
         source_seal = {"path": "/evidence/seal.json", "sha256": "d" * 64, "size_bytes": 1}
+        failed_ref = {"path": "/evidence/failed.json", "sha256": "8" * 64, "size_bytes": 1}
         stores = {
             "budg-b64": {"fresh_store_seal": source_seal, "tree_sha256": "e" * 64},
             "naive": {"fresh_store_seal": {}, "tree_sha256": "f" * 64},
         }
         source = "/immutable/budg"
         target = "/results/clone-dry-run/mutable-store"
-        copy_argv = ["/bin/cp", "--archive", "--reflink=always", "--", "{SOURCE}", "{TARGET}"]
+        copy_argv = ["/bin/cp", "--archive", "--sparse=always", "--", "{SOURCE}", "{TARGET}"]
+        filesystem_contract = {
+            "mount": "/data",
+            "filesystem_type": "ext4",
+            "reflink_supported": False,
+            "evidence": failed_ref,
+        }
         variants = ("budg-b64", "naive", "naive", "naive")
         hold = {
             "schema_version": builder.SCHEMA,
@@ -146,6 +183,7 @@ class PhaseBackendTests(unittest.TestCase):
             "blockers": ["mutable clone lifecycle dry-run receipt absent"],
             "admission_bundle": admission,
             "target_p02b": targets,
+            "clone_fallback_predecessor": failed_ref,
             "cells": [
                 {
                     "cell_key": key,
@@ -153,6 +191,8 @@ class PhaseBackendTests(unittest.TestCase):
                         "variant": variant,
                         "clone_policy": {
                             "source_root": source,
+                            "copy_mode": "explicit-full-copy-ext4-v1",
+                            "filesystem_contract": filesystem_contract,
                             "copy_argv": copy_argv,
                         },
                     },
@@ -164,6 +204,9 @@ class PhaseBackendTests(unittest.TestCase):
         dryrun = {
             "backend_plan_sha256": hold_ref["sha256"],
             "cell_key": "seml0:bridge-canary",
+            "failed_reflink_predecessor": failed_ref,
+            "copy_mode": "explicit-full-copy-ext4-v1",
+            "filesystem_contract": filesystem_contract,
             "target_p02b": targets["budg-b64"],
             "source_seal": source_seal,
             "source_tree_sha256": stores["budg-b64"]["tree_sha256"],
@@ -173,13 +216,35 @@ class PhaseBackendTests(unittest.TestCase):
                 "copy_argv": [
                     "/bin/cp",
                     "--archive",
-                    "--reflink=always",
+                    "--sparse=always",
                     "--",
                     source + "/.",
                     target,
                 ],
                 "metadata_manifest": {"content_hashed": False},
             },
+            "source_tree_pre": {
+                "sha256": stores["budg-b64"]["tree_sha256"],
+                "full_tree_hash_performed": True,
+            },
+            "source_tree_post": {
+                "sha256": stores["budg-b64"]["tree_sha256"],
+                "full_tree_hash_performed": True,
+            },
+            "source_identity_pre": {"sha256": "7" * 64, "writable_entries": []},
+            "source_identity_post": {"sha256": "7" * 64, "writable_entries": []},
+            "clone_tree": {
+                "sha256": stores["budg-b64"]["tree_sha256"],
+                "full_tree_hash_performed": True,
+            },
+            "clone_space": {"logical_file_bytes": 3, "allocated_bytes": 4096},
+            "thaw_manifest": [
+                {
+                    "path": ".",
+                    "mode_before": "0555",
+                    "mode_after": "0755",
+                }
+            ],
         }
         builder.validate_clone_bootstrap_contract(
             dryrun=dryrun,
@@ -188,6 +253,7 @@ class PhaseBackendTests(unittest.TestCase):
             admission_ref=admission,
             target_refs=targets,
             stores=stores,
+            failed_clone_ref=failed_ref,
         )
         changed = json.loads(json.dumps(dryrun))
         changed["backend_plan_sha256"] = "2" * 64
@@ -199,6 +265,7 @@ class PhaseBackendTests(unittest.TestCase):
                 admission_ref=admission,
                 target_refs=targets,
                 stores=stores,
+                failed_clone_ref=failed_ref,
             )
         changed = json.loads(json.dumps(hold))
         changed["target_p02b"]["naive"]["sha256"] = "9" * 64
@@ -210,6 +277,7 @@ class PhaseBackendTests(unittest.TestCase):
                 admission_ref=admission,
                 target_refs=targets,
                 stores=stores,
+                failed_clone_ref=failed_ref,
             )
         changed = json.loads(json.dumps(dryrun))
         changed["clone"]["copy_argv"][0] = "/bin/false"
@@ -221,6 +289,7 @@ class PhaseBackendTests(unittest.TestCase):
                 admission_ref=admission,
                 target_refs=targets,
                 stores=stores,
+                failed_clone_ref=failed_ref,
             )
 
     def test_builder_validator_requires_hold_commands_null(self) -> None:
