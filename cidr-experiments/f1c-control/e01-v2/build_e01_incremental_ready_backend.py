@@ -174,6 +174,8 @@ def _target_p02b(path: Optional[Path], variant: str, store: Mapping[str, Any]) -
     for consumer in ("P10", "P20"):
         validation, _ = verify_ref(value.get("official_validations", {}).get(consumer), f"{variant} {consumer} validation")
         require(validation.get("state") == "PASS" and validation.get("consumer") == consumer, f"{variant}: {consumer} validation drift")
+        lease_validation, _ = verify_ref(value.get("official_lease_validations", {}).get(consumer), f"{variant} {consumer} lease validation")
+        require(lease_validation.get("state") == "PASS", f"{variant}: {consumer} lease validation drift")
     verify_ref(value.get("lease_marker"), f"{variant} lease marker")
     verify_ref(value.get("batch_lease_issuance"), f"{variant} lease issuance")
     require(value.get("formal_eligible") is False and value.get("performance_eligible") is False, f"{variant}: eligibility drift")

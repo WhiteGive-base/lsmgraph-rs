@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import stat
+import signal
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -107,20 +108,25 @@ def file_ref(path: Path, label: str) -> dict[str, Any]:
 def permission_evidence(root: Path) -> dict[str, Any]:
     root = root.resolve()
     writable = []
+    mode_drift = []
     files = directories = 0
     for directory, _, filenames in os.walk(root, followlinks=False):
         base = Path(directory)
         directories += 1
         if os.stat(base, follow_symlinks=False).st_mode & 0o222:
             writable.append(base.relative_to(root).as_posix() or ".")
+        if stat.S_IMODE(os.stat(base, follow_symlinks=False).st_mode) != 0o555:
+            mode_drift.append(base.relative_to(root).as_posix() or ".")
         for name in filenames:
             path = base / name
             require(path.is_file() and not path.is_symlink(), f"non-regular store file: {path}")
             files += 1
             if os.stat(path, follow_symlinks=False).st_mode & 0o222:
                 writable.append(path.relative_to(root).as_posix())
-    require(files > 0 and not writable, "immutable store permission drift")
-    return {"state": "PASS", "directory_count": directories, "file_count": files, "writable_entries": writable}
+            if stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode) != 0o444:
+                mode_drift.append(path.relative_to(root).as_posix())
+    require(files > 0 and not writable and not mode_drift, "immutable store permission drift")
+    return {"state": "PASS", "directory_count": directories, "file_count": files, "writable_entries": writable, "mode_drift": mode_drift, "directory_mode": "0555", "file_mode": "0444"}
 
 
 def validate_tree_contract(tree: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
@@ -152,6 +158,7 @@ def validate_static(args: argparse.Namespace) -> dict[str, Any]:
     store_stat = os.stat(args.store.resolve(), follow_symlinks=False)
     require(store_stat.st_dev == seal.get("immutable_dev") and store_stat.st_ino == seal.get("immutable_inode"), "store dev/inode drift")
     require(store_stat.st_mode & 0o222 == 0, "store root is writable")
+    require(seal.get("immutable_directory_mode") == "0555" and seal.get("immutable_file_mode") == "0444", "immutable seal mode contract drift")
     permissions = permission_evidence(args.store)
     require(permissions["file_count"] == store_manifest.get("file_count"), "permission inventory/file_count drift")
     plan, plan_ref = load(args.query_plan, "query plan")
@@ -207,8 +214,33 @@ def atomic(path: Path, value: Mapping[str, Any]) -> None:
         os.fsync(stream.fileno())
 
 
+def run_process_group(command: Sequence[str], cwd: Path, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        list(command),
+        cwd=cwd,
+        stdout=None,
+        stderr=None,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+        raise TargetError(f"target P02B timed out after {timeout_seconds}s; process group terminated") from exc
+    return subprocess.CompletedProcess(list(command), returncode)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     static = validate_static(args)
+    config = load(args.config, "config")[0]
+    minimum_timeout = int(config["correctness_timeout_seconds"]) + int(config["independent_runs"]) * int(config["repeat_timeout_seconds"]) + 600
+    require(args.timeout_seconds >= minimum_timeout, f"outer timeout must be >= {minimum_timeout}s")
     require(not args.output.exists(), "target P02B output already exists")
     require(not args.run_dir.exists(), "P02B run root already exists")
     require(not args.lease_output.exists(), "lease output already exists")
@@ -231,7 +263,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "--batch-gate-tool", str(args.batch_gate_tool.resolve()),
         "--batch-lease-output", str(args.lease_output.resolve()),
     ]
-    completed = subprocess.run(command, cwd=args.repo_root, check=False, timeout=args.timeout_seconds)
+    completed = run_process_group(command, args.repo_root, args.timeout_seconds)
     require(completed.returncode == 0, f"target P02B runner exited {completed.returncode}")
     result, result_ref = load(args.run_dir / "sentinel-result.json", "sentinel result")
     require(result.get("state") == "PASS", "target P02B did not PASS")
@@ -269,6 +301,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for item in clean.get("artifacts", {}).values():
         require(file_ref(Path(item["path"]), "P03 artifact") == item, "P03 artifact ref drift")
     validations = {}
+    lease_validations = {}
     for consumer in ("P10", "P20"):
         validation_path = args.run_dir / f"VALIDATION-{consumer}.json"
         validator_argv = [
@@ -288,8 +321,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         require(admission.get("repo_root") == str(args.repo_root.resolve()) and admission.get("repo_head") == static["repo_head"], f"{consumer} lease/repo drift")
         require(admission.get("sentinel_result") == str((args.run_dir / "sentinel-result.json").resolve()), f"{consumer} lease/sentinel drift")
         require(admission.get("pass_marker") == pass_ref["path"] and admission.get("pass_marker_sha256") == pass_ref["sha256"], f"{consumer} lease/PASS drift")
+        lease_validation_path = args.run_dir / f"LEASE-VALIDATION-{consumer}.json"
+        lease_argv = [
+            str(args.batch_gate_tool.resolve()), "validate-lease", "--lease", str(args.lease_output.resolve()),
+            "--consumer", consumer, "--repo-root", str(args.repo_root.resolve()), "--binary", str(args.binary.resolve()),
+        ]
+        lease_checked = subprocess.run(lease_argv, cwd=args.repo_root, check=False, capture_output=True, text=True, timeout=120)
+        require(lease_checked.returncode == 0, f"{consumer} canonical lease validation failed: {lease_checked.stderr.strip()}")
+        lease_validation = json.loads(lease_checked.stdout)
+        require(lease_validation.get("state") == "PASS", f"{consumer} canonical lease validation drift")
+        atomic(lease_validation_path, lease_validation)
+        lease_validations[consumer] = file_ref(lease_validation_path, f"{consumer} lease validation")
     after = tree_manifest(args.store)
     require(after == before, "target store changed across P02B")
+    after_permissions = permission_evidence(args.store)
+    require(after_permissions == static["immutable_permissions"], "target permissions changed across P02B")
     done = {
         "schema_version": SCHEMA,
         "state": "PASS",
@@ -299,6 +345,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "clean_ready": {"path": str(args.clean_ready.resolve()), "sha256": sha256_file(args.clean_ready)},
         "store_pre": before,
         "store_post": after,
+        "store_permissions_post": after_permissions,
         "store_unchanged": True,
         "sentinel_result": result_ref,
         "lease": lease_ref,
@@ -306,6 +353,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "batch_lease_issuance": issuance_ref,
         "sentinel_pass_marker": pass_ref,
         "official_validations": validations,
+        "official_lease_validations": lease_validations,
         "clean_ready": clean_ref,
         "runner_argv": command,
         "query_count": 1700,
@@ -329,7 +377,7 @@ def parser() -> argparse.ArgumentParser:
         value.add_argument("--" + name.replace("_", "-"), type=Path, required=True)
     value.add_argument("--preflight-only", action="store_true")
     value.add_argument("--plan-equivalence", type=Path)
-    value.add_argument("--timeout-seconds", type=int, default=1800)
+    value.add_argument("--timeout-seconds", type=int, default=9600)
     return value
 
 

@@ -203,6 +203,12 @@ def _replace_tokens(argv: list[str], tokens: Mapping[str, str]) -> list[str]:
     return result
 
 
+def _expected_request(cell: Mapping[str, Any], mutable_clone: Path) -> dict[str, Any]:
+    return json.loads(
+        json.dumps(cell["runtime"]["request"]).replace("{MUTABLE_CLONE}", str(mutable_clone.resolve()))
+    )
+
+
 def _base_receipt(cell: Mapping[str, Any], plan_sha: str, role: str) -> dict[str, Any]:
     return {
         "schema_version": f"cidr-e01-incremental-{role}-receipt-v1",
@@ -297,9 +303,7 @@ def prepare(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
             **clone,
         },
     )
-    request = json.loads(
-        json.dumps(runtime["request"]).replace("{MUTABLE_CLONE}", clone["target"])
-    )
+    request = _expected_request(cell, Path(clone["target"]))
     request_path = cwd / "adapter-request.json"
     atomic_json(request_path, request)
     tokens = {
@@ -332,6 +336,8 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
     prepared = load_json(cwd / "receipts/prepared-command.json", "prepared command")
     require(prepared.get("backend_plan_sha256") == plan_sha, "prepared plan SHA drift")
     request_ref = verify_ref(prepared.get("request"), "prepared adapter request")
+    request_value = load_json(Path(request_ref["path"]), "prepared adapter request")
+    require(request_value == _expected_request(cell, cwd / "mutable-store"), "prepared adapter request drift")
     tokens = {
         "{STAGING}": str(cwd),
         "{MUTABLE_CLONE}": str(cwd / "mutable-store"),
@@ -376,6 +382,10 @@ def finalize(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cw
     adapter = _load_module(Path(adapter_ref["path"]))
     request_path = cwd / "adapter-request.json"
     request = load_json(request_path, "adapter request")
+    prepared = load_json(cwd / "receipts/prepared-command.json", "prepared command")
+    request_ref = verify_ref(prepared.get("request"), "prepared adapter request")
+    require(Path(request_ref["path"]).resolve() == request_path.resolve(), "prepared request path drift")
+    require(request == _expected_request(cell, cwd / "mutable-store"), "finalize adapter request drift")
     truth = Path(runtime["truth"]["path"]).resolve()
     truth_rows = adapter.read_truth(truth, request["truth"]["query_count"])
     output = cwd / "adapter-output"

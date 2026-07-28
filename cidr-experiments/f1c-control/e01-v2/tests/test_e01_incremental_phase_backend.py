@@ -155,13 +155,14 @@ class PhaseBackendTests(unittest.TestCase):
     def test_p31_recomputes_and_rejects_prepared_argv_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cwd = Path(temporary)
-            request = write_json(cwd / "adapter-request.json", {"state": "PASS"})
+            request = write_json(cwd / "adapter-request.json", {})
             request_ref = {
                 "path": str(request.resolve()),
                 "sha256": phase.sha256_file(request),
                 "size_bytes": request.stat().st_size,
             }
             runtime = {
+                "request": {},
                 "binary_argv": ["/bin/true", "--store", "{MUTABLE_CLONE}"],
                 "p31_argv": ["/bin/true", "--request", "{REQUEST}"],
             }
@@ -176,6 +177,31 @@ class PhaseBackendTests(unittest.TestCase):
             phase.revalidate_target = lambda unused: {"path": "/fixture", "sha256": "b" * 64, "size_bytes": 1}
             try:
                 with self.assertRaisesRegex(phase.PhaseError, "prepared binary argv drift"):
+                    phase.run_p31({}, cell, "a" * 64, cwd)
+            finally:
+                phase.revalidate_target = original
+
+    def test_p31_rejects_adapter_request_content_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cwd = Path(temporary)
+            request = write_json(cwd / "adapter-request.json", {"truth": {"query_count": 1}})
+            request_ref = {"path": str(request.resolve()), "sha256": phase.sha256_file(request), "size_bytes": request.stat().st_size}
+            runtime = {
+                "request": {"truth": {"query_count": 1700}},
+                "binary_argv": ["/bin/true"],
+                "p31_argv": ["/bin/true", "--request", "{REQUEST}"],
+            }
+            cell = {"cell_key": "seml0:bridge-canary", "ordinal": 1, "runtime": runtime}
+            write_json(cwd / "receipts/prepared-command.json", {
+                "backend_plan_sha256": "a" * 64,
+                "request": request_ref,
+                "binary_argv": ["/bin/true"],
+                "p31_argv": ["/bin/true", "--request", str(request.resolve())],
+            })
+            original = phase.revalidate_target
+            phase.revalidate_target = lambda unused: {"path": "/fixture", "sha256": "b" * 64, "size_bytes": 1}
+            try:
+                with self.assertRaisesRegex(phase.PhaseError, "adapter request drift"):
                     phase.run_p31({}, cell, "a" * 64, cwd)
             finally:
                 phase.revalidate_target = original

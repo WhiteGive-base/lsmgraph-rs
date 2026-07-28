@@ -189,6 +189,7 @@ def _validate_receipt(
     ordinal: int,
     plan_sha: str,
     expected_mode: str,
+    target_p02b: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     path = staging / RECEIPT_PATHS[role]
     value = load_json(path, f"{cell_key} {role}")
@@ -214,6 +215,8 @@ def _validate_receipt(
         clone = value.get("mutable_clone")
         require(type(clone) is str and Path(clone).is_absolute(), "cleanup clone path required")
         require(not Path(clone).exists(), "cleanup claims removed clone that still exists")
+    if expected_mode == "production" and role in {"store_clone", "p31", "validated_result", "cleanup"}:
+        require(value.get("target_p02b") == target_p02b, f"{role}: target P02B backlink drift")
     return value
 
 
@@ -225,6 +228,9 @@ def finalize_staging_cell(
     ordinal: int,
     plan_sha: str,
     expected_mode: str,
+    target_p02b: Optional[Mapping[str, Any]] = None,
+    target_query_plan: Optional[Mapping[str, Any]] = None,
+    target_lease: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     require(staging.is_dir() and not staging.is_symlink(), "staging cell missing/invalid")
     require(not final.exists(), "final cell already exists")
@@ -240,6 +246,7 @@ def finalize_staging_cell(
             ordinal=ordinal,
             plan_sha=plan_sha,
             expected_mode=expected_mode,
+            target_p02b=target_p02b,
         )
         refs[role] = file_ref(staging / RECEIPT_PATHS[role], staging, role)
     done = {
@@ -254,6 +261,9 @@ def finalize_staging_cell(
         "adapter_invoked": expected_mode == "production",
         "timing_generated": expected_mode == "production",
         "receipts": refs,
+        "target_p02b": target_p02b,
+        "target_query_plan": target_query_plan,
+        "target_lease": target_lease,
         **FALSE_ELIGIBILITY,
     }
     atomic_json(staging / "CELL-DONE.json", done)
@@ -269,6 +279,9 @@ def validate_final_cell(
     ordinal: int,
     plan_sha: str,
     expected_mode: str,
+    target_p02b: Optional[Mapping[str, Any]] = None,
+    target_query_plan: Optional[Mapping[str, Any]] = None,
+    target_lease: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     require(final.is_dir() and not final.is_symlink(), f"{cell_key}: final cell invalid")
     done = load_json(final / "CELL-DONE.json", f"{cell_key} CELL-DONE")
@@ -277,6 +290,10 @@ def validate_final_cell(
     require(done.get("mode") == expected_mode, f"{cell_key}: mode drift")
     require(done.get("cell_key") == cell_key and done.get("ordinal") == ordinal, f"{cell_key}: identity drift")
     require(done.get("backend_plan_sha256") == plan_sha, f"{cell_key}: plan SHA drift")
+    if expected_mode == "production":
+        require(done.get("target_p02b") == target_p02b, f"{cell_key}: target P02B backlink drift")
+        require(done.get("target_query_plan") == target_query_plan, f"{cell_key}: target query-plan backlink drift")
+        require(done.get("target_lease") == target_lease, f"{cell_key}: target lease backlink drift")
     refs = done.get("receipts")
     require(type(refs) is dict and set(refs) == set(RECEIPT_PATHS), f"{cell_key}: receipt set drift")
     for role, descriptor in refs.items():
@@ -290,6 +307,7 @@ def validate_final_cell(
             ordinal=ordinal,
             plan_sha=plan_sha,
             expected_mode=expected_mode,
+            target_p02b=target_p02b,
         )
     return done
 
@@ -330,6 +348,9 @@ def inspect_resume_root(
             ordinal=row["ordinal"],
             plan_sha=plan_sha,
             expected_mode=expected_mode,
+            target_p02b=row.get("runtime", {}).get("target_p02b"),
+            target_query_plan=row.get("runtime", {}).get("target_query_plan"),
+            target_lease=row.get("runtime", {}).get("target_lease"),
         )
         completed += 1
     done_path = root / "MATRIX-DONE.json"
@@ -401,6 +422,9 @@ def execute_production(
                 ordinal=row["ordinal"],
                 plan_sha=plan_sha,
                 expected_mode="production",
+                target_p02b=row["runtime"]["target_p02b"],
+                target_query_plan=row["runtime"]["target_query_plan"],
+                target_lease=row["runtime"]["target_lease"],
             )
         except BaseException as exc:
             if staging.exists() and not (staging / "FAILED.json").exists():

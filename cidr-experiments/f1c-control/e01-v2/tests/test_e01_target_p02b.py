@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import tempfile
+import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -90,6 +93,29 @@ class TargetP02BTests(unittest.TestCase):
                 "file_count": 1,
                 "total_bytes": 3,
             })
+
+    @unittest.skipUnless(os.name == "posix", "process-group semantics require POSIX")
+    def test_timeout_terminates_runner_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file = root / "child.pid"
+            script = (
+                "import subprocess,sys,time;"
+                "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+                f"open({str(pid_file)!r},'w').write(str(p.pid));"
+                "time.sleep(60)"
+            )
+            with self.assertRaisesRegex(target.TargetError, "process group terminated"):
+                target.run_process_group([sys.executable, "-c", script], root, 1)
+            child_pid = int(pid_file.read_text())
+            for _ in range(20):
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("grandchild survived process-group timeout cleanup")
 
     def test_static_contract_rejects_layout_hint_mismatch(self) -> None:
         args = type("Args", (), {})()
