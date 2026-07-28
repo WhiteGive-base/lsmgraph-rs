@@ -197,6 +197,41 @@ class IncrementalProductionTests(unittest.TestCase):
                 self.campaign, self.plan, self.plan_sha, expected_mode="synthetic"
             )
 
+    def test_production_target_backlink_tamper_blocks_final_validation(self) -> None:
+        self.initialize_root()
+        row = self.plan["cells"][0]
+        staging = Path(row["staging_cell_root"])
+        final = Path(row["final_cell_root"])
+        staging.mkdir()
+        self.make_receipts(staging, row["cell_key"], row["ordinal"])
+        target_ref = {"path": "/target.json", "sha256": "b" * 64, "size_bytes": 1}
+        query_ref = {"path": "/plan.json", "sha256": "c" * 64, "size_bytes": 1}
+        lease_ref = {"path": "/lease.json", "sha256": "d" * 64, "size_bytes": 1}
+        for role, relative in production.RECEIPT_PATHS.items():
+            path = staging / relative
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value.update(mode="production", synthetic_test_only=False, fixture_only=False)
+            if role == "p31":
+                value["timing_generated"] = True
+            if role in {"store_clone", "p31", "validated_result", "cleanup"}:
+                value["target_p02b"] = target_ref
+            write_json(path, value)
+        production.finalize_staging_cell(
+            staging, final, cell_key=row["cell_key"], ordinal=row["ordinal"],
+            plan_sha=self.plan_sha, expected_mode="production",
+            target_p02b=target_ref, target_query_plan=query_ref, target_lease=lease_ref,
+        )
+        done_path = final / "CELL-DONE.json"
+        done = json.loads(done_path.read_text(encoding="utf-8"))
+        done["target_lease"] = {"path": "/wrong", "sha256": "e" * 64, "size_bytes": 1}
+        write_json(done_path, done)
+        with self.assertRaisesRegex(production.BackendError, "target lease backlink drift"):
+            production.validate_final_cell(
+                final, cell_key=row["cell_key"], ordinal=row["ordinal"],
+                plan_sha=self.plan_sha, expected_mode="production",
+                target_p02b=target_ref, target_query_plan=query_ref, target_lease=lease_ref,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
