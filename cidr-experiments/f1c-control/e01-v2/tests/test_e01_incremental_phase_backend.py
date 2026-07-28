@@ -303,6 +303,11 @@ class PhaseBackendTests(unittest.TestCase):
             "adapter_invoked": False,
             "timing_generated": False,
             "blockers": ["P02B binding mismatch"],
+            "clone_fallback_predecessor": {
+                "path": "/fixture/failed.json",
+                "sha256": "a" * 64,
+                "size_bytes": 1,
+            },
             "cells": [
                 {
                     "cell_key": key,

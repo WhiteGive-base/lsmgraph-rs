@@ -480,6 +480,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "phase_executor": executor_ref,
         "clone_dry_run": clone_ref,
         "target_p02b": target_refs,
+        "clone_fallback_predecessor": failed_clone_ref,
         "cells": cells,
         "blockers": blockers,
         "large_content_rehashed_now": False,
@@ -496,6 +497,11 @@ def validate(value: Mapping[str, Any]) -> None:
     require(value.get("synthetic_test_only") is False, "synthetic backend forbidden")
     require(value.get("large_content_rehashed_now") is False, "large hash forbidden")
     require(value.get("adapter_invoked") is False and value.get("timing_generated") is False, "execution occurred during build")
+    require(
+        type(value.get("clone_fallback_predecessor")) is dict
+        and set(value["clone_fallback_predecessor"]) == {"path", "sha256", "size_bytes"},
+        "clone fallback predecessor ref required",
+    )
     require([row.get("cell_key") for row in value.get("cells", [])] == list(CELL_ORDER), "cell order drift")
     for key in FALSE_ELIGIBILITY:
         require(value.get(key) is False, f"{key} must remain false")
