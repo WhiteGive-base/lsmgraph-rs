@@ -19,6 +19,25 @@ FALSE_ELIGIBILITY = {
     "performance_eligible": False,
     "paper_claim_eligible": False,
 }
+RUNNER_TOP_LEVEL_FIELDS = (
+    "version",
+    "source",
+    "samples_per_edge_type",
+    "semantic_degree_hint",
+    "force_signature",
+    "src_label",
+    "dst_label",
+    "entries",
+)
+RUNNER_ENTRY_FIELDS = (
+    "edge_type",
+    "src_label",
+    "dst_label",
+    "candidate_edges_for_sampling",
+    "candidate_sources_for_sampling",
+    "samples",
+)
+RUNNER_SAMPLE_FIELDS = ("src", "degree")
 
 
 class PlanError(RuntimeError):
@@ -81,6 +100,56 @@ def sequence_sha(rows: list[dict[str, Any]]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def ordered_object(
+    value: Mapping[str, Any], field_order: Sequence[str], context: str
+) -> dict[str, Any]:
+    require(
+        set(value) == set(field_order),
+        f"{context}: fields differ from runner canonical schema",
+    )
+    return {field: value[field] for field in field_order}
+
+
+def runner_plan_payload(value: Mapping[str, Any]) -> bytes:
+    """Serialize exactly like the Rust shared-truth plan writer.
+
+    The runtime compares the frozen plan and its independently regenerated
+    counterpart byte-for-byte.  Therefore semantic JSON equality is not
+    sufficient: object field order, two-space indentation, and the final
+    line breaks and absence of a trailing newline are part of the frozen
+    contract.
+    """
+
+    plan = ordered_object(value, RUNNER_TOP_LEVEL_FIELDS, "plan")
+    entries = value.get("entries")
+    require(type(entries) is list, "plan: entries array required")
+    ordered_entries: list[dict[str, Any]] = []
+    for entry_index, entry in enumerate(entries):
+        require(type(entry) is dict, f"entry {entry_index}: object required")
+        ordered_entry = ordered_object(
+            entry, RUNNER_ENTRY_FIELDS, f"entry {entry_index}"
+        )
+        samples = entry.get("samples")
+        require(type(samples) is list, f"entry {entry_index}: samples required")
+        ordered_samples: list[dict[str, Any]] = []
+        for sample_index, sample in enumerate(samples):
+            require(
+                type(sample) is dict,
+                f"entry {entry_index} sample {sample_index}: object required",
+            )
+            ordered_samples.append(
+                ordered_object(
+                    sample,
+                    RUNNER_SAMPLE_FIELDS,
+                    f"entry {entry_index} sample {sample_index}",
+                )
+            )
+        ordered_entry["samples"] = ordered_samples
+        ordered_entries.append(ordered_entry)
+    plan["entries"] = ordered_entries
+    return json.dumps(plan, indent=2).encode()
+
+
 def build(source_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     source_path = source_path.resolve()
     require(sha256_file(source_path) == SOURCE_PLAN_SHA256, "source plan SHA drift")
@@ -137,7 +206,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         plan, receipt = build(args.source_plan)
-        plan_payload = (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode()
+        plan_payload = runner_plan_payload(plan)
         receipt["target_plan"] = {
             "path": str(args.output_plan.resolve()),
             "sha256": hashlib.sha256(plan_payload).hexdigest(),

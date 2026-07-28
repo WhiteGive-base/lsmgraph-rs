@@ -63,6 +63,22 @@ class TargetP02BTests(unittest.TestCase):
             failed.mkdir()
             (failed / "FAILED").write_text("failed\n", encoding="utf-8")
             self.assertEqual(target.admission_timing_state(failed), "NOT_STARTED")
+            correctness_failed = root / "correctness-failed"
+            correctness_failed.mkdir()
+            for name in (
+                "FAILED",
+                "clean-ready-binding.json",
+                "correctness-command.json",
+                "correctness.stderr.log",
+                "correctness.stdout.log",
+                "provenance.json",
+                "regenerated-query-plan.json",
+                "shared-truth-result.json",
+            ):
+                (correctness_failed / name).write_text("{}\n", encoding="utf-8")
+            self.assertEqual(
+                target.admission_timing_state(correctness_failed), "NOT_STARTED"
+            )
             started = root / "started"
             (started / "repeats").mkdir(parents=True)
             self.assertEqual(target.admission_timing_state(started), "STARTED")
@@ -86,6 +102,36 @@ class TargetP02BTests(unittest.TestCase):
         self.assertFalse(result["semantic_degree_hint"])
         self.assertEqual(result["entries"], source["entries"])
         self.assertEqual(receipt["source_sequence_sha256"], receipt["target_sequence_sha256"])
+
+    def test_naive_plan_uses_runner_byte_order_not_sorted_json(self) -> None:
+        value = {
+            "entries": [
+                {
+                    "samples": [{"degree": 9, "src": 7}],
+                    "candidate_sources_for_sampling": 1,
+                    "candidate_edges_for_sampling": 1,
+                    "dst_label": None,
+                    "src_label": None,
+                    "edge_type": -1,
+                }
+            ],
+            "dst_label": None,
+            "src_label": None,
+            "force_signature": False,
+            "semantic_degree_hint": False,
+            "samples_per_edge_type": 1,
+            "source": "shared-truth-tsv",
+            "version": 1,
+        }
+        payload = plan_tool.runner_plan_payload(value)
+        sorted_payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+        self.assertEqual(json.loads(payload), json.loads(sorted_payload))
+        self.assertNotEqual(payload, sorted_payload)
+        text = payload.decode()
+        self.assertLess(text.index('"version"'), text.index('"entries"'))
+        self.assertLess(text.index('"edge_type"'), text.index('"samples"'))
+        self.assertLess(text.index('"src"'), text.index('"degree"'))
+        self.assertFalse(text.endswith("\n"))
 
     def test_naive_plan_rejects_non_1700(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

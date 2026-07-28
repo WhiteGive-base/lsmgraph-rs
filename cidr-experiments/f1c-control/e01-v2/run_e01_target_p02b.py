@@ -171,7 +171,17 @@ def admission_timing_state(run_dir: Path) -> str:
     if (run_dir / "stability-result.json").exists() or (run_dir / "repeats").exists():
         return "STARTED"
     names = {item.name for item in run_dir.iterdir()}
-    return "NOT_STARTED" if names <= {"FAILED"} else "UNKNOWN"
+    pre_timing_evidence = {
+        "FAILED",
+        "clean-ready-binding.json",
+        "correctness-command.json",
+        "correctness.stderr.log",
+        "correctness.stdout.log",
+        "provenance.json",
+        "regenerated-query-plan.json",
+        "shared-truth-result.json",
+    }
+    return "NOT_STARTED" if names <= pre_timing_evidence else "UNKNOWN"
 
 
 def validate_static(args: argparse.Namespace) -> dict[str, Any]:
