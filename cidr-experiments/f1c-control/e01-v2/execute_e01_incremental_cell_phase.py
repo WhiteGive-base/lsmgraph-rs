@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import hashlib
 import importlib.util
 import json
@@ -31,6 +32,17 @@ FALSE_ELIGIBILITY = {
     "paper_claim_eligible": False,
 }
 MAX_SMALL_FILE_BYTES = 16 * 1024 * 1024
+TARGET_P02B_SCHEMA = "cidr-e01-target-specific-p02b-v1"
+TARGETS = {
+    "budg-b64": {"layout": "semantic-budgeted", "hint": True},
+    "naive": {"layout": "naive", "hint": False},
+}
+CELL_VARIANTS = {
+    "seml0:bridge-canary": "budg-b64",
+    "seml0-naive:r1": "naive",
+    "seml0-naive:r2": "naive",
+    "seml0-naive:r3": "naive",
+}
 
 
 class PhaseError(RuntimeError):
@@ -213,7 +225,54 @@ def _cell(plan: Mapping[str, Any], key: str) -> dict[str, Any]:
     return cell
 
 
+def _iso(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+
+
+def revalidate_target(cell: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = cell["runtime"]
+    variant = runtime.get("variant")
+    require(variant in TARGETS, "target variant drift")
+    ref = verify_ref(runtime.get("target_p02b"), f"{variant} target P02B")
+    bundle = load_json(Path(ref["path"]), f"{variant} target P02B")
+    require(bundle.get("schema_version") == TARGET_P02B_SCHEMA, "target P02B schema drift")
+    require(bundle.get("state") == "PASS" and bundle.get("variant") == variant, "target P02B state/variant drift")
+    require(bundle.get("target") == TARGETS[variant], "target layout/hint drift")
+    require(bundle.get("store_unchanged") is True and bundle.get("store_pre") == bundle.get("store_post"), "target store integrity drift")
+    require(bundle["store_pre"].get("full_tree_hash_performed") is True, "full-tree P02B seal required")
+    policy = runtime["clone_policy"]
+    require(bundle["store_pre"].get("sha256") == policy["tree_sha256"], "target P02B/store SHA mismatch")
+    seal_ref = verify_ref(policy["source_seal"], "source store seal")
+    seal = load_json(Path(seal_ref["path"]), "source store seal")
+    source = Path(policy["source_root"]).resolve()
+    stat_now = os.stat(source, follow_symlinks=False)
+    require(stat_now.st_dev == seal.get("immutable_dev") and stat_now.st_ino == seal.get("immutable_inode"), "immutable root dev/inode drift")
+    require(stat_now.st_mode & 0o222 == 0, "immutable root became writable")
+    for directory, _, filenames in os.walk(source, followlinks=False):
+        base = Path(directory)
+        require(os.stat(base, follow_symlinks=False).st_mode & 0o222 == 0, "immutable directory became writable")
+        for name in filenames:
+            path = base / name
+            require(path.is_file() and not path.is_symlink(), "immutable non-regular file")
+            require(os.stat(path, follow_symlinks=False).st_mode & 0o222 == 0, "immutable file became writable")
+    require(bundle.get("static_inputs", {}).get("query_plan") == runtime.get("target_query_plan"), "target query-plan ref drift")
+    require(bundle.get("lease") == runtime.get("target_lease"), "target lease ref drift")
+    verify_ref(runtime["target_query_plan"], "target query plan")
+    verify_ref(bundle["static_inputs"]["config"], "target P02B config")
+    if variant == "naive":
+        equivalence_ref = verify_ref(bundle["static_inputs"].get("naive_plan_equivalence"), "naive plan equivalence")
+        equivalence = load_json(Path(equivalence_ref["path"]), "naive plan equivalence")
+        require(equivalence.get("source_plan", {}).get("sha256") == "4520c88eb594903eb6e3f282838e6cd885e205ee5b0b1790565112d5940f8ea3", "naive source-plan SHA drift")
+        require(equivalence.get("target_plan") == runtime["target_query_plan"], "naive equivalence target drift")
+    lease_ref = verify_ref(runtime["target_lease"], "target lease")
+    lease = load_json(Path(lease_ref["path"]), "target lease")
+    expires = lease.get("expires_at_utc") or lease.get("expires_at")
+    require(type(expires) is str and _iso(expires) > dt.datetime.now(dt.timezone.utc), "target lease expired")
+    return ref
+
+
 def prepare(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd: Path) -> None:
+    target_ref = revalidate_target(cell)
     runtime = cell["runtime"]
     policy = runtime["clone_policy"]
     seal_ref = verify_ref(policy["source_seal"], "source store seal")
@@ -232,6 +291,7 @@ def prepare(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
         {
             **_base_receipt(cell, plan_sha, "store-clone"),
             "source_seal": seal_ref,
+            "target_p02b": target_ref,
             "source_tree_sha256": policy["tree_sha256"],
             "full_content_hash_performed": False,
             **clone,
@@ -268,8 +328,22 @@ def prepare(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
 
 
 def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd: Path) -> None:
+    target_ref = revalidate_target(cell)
     prepared = load_json(cwd / "receipts/prepared-command.json", "prepared command")
     require(prepared.get("backend_plan_sha256") == plan_sha, "prepared plan SHA drift")
+    request_ref = verify_ref(prepared.get("request"), "prepared adapter request")
+    tokens = {
+        "{STAGING}": str(cwd),
+        "{MUTABLE_CLONE}": str(cwd / "mutable-store"),
+        "{REQUEST}": request_ref["path"],
+    }
+    expected_binary = _replace_tokens(list(cell["runtime"]["binary_argv"]), tokens)
+    expected_p31 = _replace_tokens(
+        list(cell["runtime"]["p31_argv"]),
+        {**tokens, "{BINARY_ARGV_JSON}": json.dumps(expected_binary)},
+    )
+    require(prepared.get("binary_argv") == expected_binary, "prepared binary argv drift")
+    require(prepared.get("p31_argv") == expected_p31, "prepared P31 argv drift")
     argv = prepared.get("p31_argv")
     require(type(argv) is list and argv and Path(argv[0]).is_absolute(), "prepared P31 argv invalid")
     completed = subprocess.run(argv, cwd=cwd, check=False)
@@ -282,6 +356,7 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
         {
             **_base_receipt(cell, plan_sha, "p31"),
             "timing_generated": True,
+            "target_p02b": target_ref,
             "binary_only_boundary": True,
             "p31_done": {
                 "path": str(done_path.resolve()),
@@ -293,6 +368,7 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
 
 
 def finalize(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd: Path) -> None:
+    target_ref = revalidate_target(cell)
     p31 = load_json(cwd / "receipts/p31.json", "P31 receipt")
     require(p31.get("state") == "PASS" and p31.get("binary_only_boundary") is True, "P31 receipt invalid")
     runtime = cell["runtime"]
@@ -331,6 +407,7 @@ def finalize(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cw
     require(mismatch == 0 and timeout == 0, "finalized observations contain mismatch/timeout")
     validated = {
         **_base_receipt(cell, plan_sha, "validated-result"),
+        "target_p02b": target_ref,
         "adapter_result": {
             "path": str((output / "adapter-result.json").resolve()),
             "sha256": sha256_file(output / "adapter-result.json"),
@@ -360,6 +437,7 @@ def finalize(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cw
 
 
 def cleanup(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd: Path) -> None:
+    target_ref = revalidate_target(cell)
     for relative in ("validated-result.json", "receipts/correctness.json", "receipts/fairness.json"):
         require((cwd / relative).is_file(), f"cleanup blocked: {relative} missing")
     clone_receipt = load_json(cwd / "receipts/store-clone.json", "store clone receipt")
@@ -369,6 +447,7 @@ def cleanup(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
         cwd / "receipts/cleanup.json",
         {
             **_base_receipt(cell, plan_sha, "cleanup"),
+            "target_p02b": target_ref,
             "mutable_clone_removed": True,
             "mutable_clone": str(target),
             "released_dev": clone_receipt["target_dev"],
@@ -432,7 +511,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plan_path = args.backend_plan.resolve()
         plan = load_json(plan_path, "backend plan")
         require(plan.get("schema_version") == PLAN_SCHEMA, "backend plan schema drift")
+        require(plan.get("state") == "READY" and plan.get("execution_state") == "READY", "backend plan is not READY")
+        require(plan.get("strict_serial") is True, "STRICT_SERIAL required")
         require(plan.get("synthetic_test_only") is False, "synthetic backend forbidden")
+        require(
+            [row.get("cell_key") for row in plan.get("cells", [])] == list(CELL_VARIANTS),
+            "exact four-cell order required",
+        )
+        for row in plan["cells"]:
+            require(row.get("runtime", {}).get("variant") == CELL_VARIANTS[row["cell_key"]], "cell/variant mapping drift")
         plan_sha = sha256_file(plan_path)
         cell = _cell(plan, args.cell_key)
         if args.phase == "clone-dry-run":

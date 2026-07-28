@@ -30,6 +30,11 @@ FALSE_ELIGIBILITY = {
     "paper_claim_eligible": False,
 }
 MAX_SMALL_FILE_BYTES = 16 * 1024 * 1024
+TARGET_P02B_SCHEMA = "cidr-e01-target-specific-p02b-v1"
+TARGETS = {
+    "budg-b64": {"layout": "semantic-budgeted", "hint": True},
+    "naive": {"layout": "naive", "hint": False},
+}
 
 
 class BuildError(RuntimeError):
@@ -139,6 +144,42 @@ def _request(
     }
 
 
+def _target_p02b(path: Optional[Path], variant: str, store: Mapping[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], Optional[str]]:
+    if path is None:
+        return None, None, f"{variant}: fresh target-specific P02B bundle absent"
+    value, ref = load(path, f"{variant} target P02B")
+    expected = TARGETS[variant]
+    require(value.get("schema_version") == TARGET_P02B_SCHEMA, f"{variant}: target P02B schema drift")
+    require(value.get("state") == "PASS" and value.get("variant") == variant, f"{variant}: target P02B did not PASS")
+    require(value.get("target") == expected, f"{variant}: target layout/hint drift")
+    require(value.get("store_unchanged") is True, f"{variant}: store changed across P02B")
+    require(value.get("store_pre") == value.get("store_post"), f"{variant}: pre/post tree receipt drift")
+    require(value["store_pre"].get("full_tree_hash_performed") is True, f"{variant}: full-tree hash required")
+    require(value["store_pre"].get("sha256") == store["tree_sha256"], f"{variant}: target store SHA drift")
+    static = value.get("static_inputs")
+    require(type(static) is dict, f"{variant}: static inputs required")
+    for name in ("store_manifest", "store_seal", "query_plan"):
+        verify_ref(static.get(name), f"{variant} {name}")
+    if variant == "naive":
+        equivalence, _ = verify_ref(static.get("naive_plan_equivalence"), "naive plan equivalence")
+        require(equivalence.get("source_plan", {}).get("sha256") == "4520c88eb594903eb6e3f282838e6cd885e205ee5b0b1790565112d5940f8ea3", "naive source-plan SHA drift")
+        require(equivalence.get("target_plan") == static["query_plan"], "naive target-plan equivalence drift")
+    result, _ = verify_ref(value.get("sentinel_result"), f"{variant} sentinel result")
+    require(result.get("state") == "PASS", f"{variant}: sentinel did not PASS")
+    require(result.get("provenance", {}).get("store_sha256") == store["tree_sha256"], f"{variant}: sentinel store SHA drift")
+    lease, _ = verify_ref(value.get("lease"), f"{variant} lease")
+    require(lease.get("schema_version") == "cidr-batch-lease-v2", f"{variant}: lease schema drift")
+    expires = lease.get("expires_at_utc") or lease.get("expires_at")
+    require(type(expires) is str and _iso(expires) > dt.datetime.now(dt.timezone.utc), f"{variant}: lease expired")
+    for consumer in ("P10", "P20"):
+        validation, _ = verify_ref(value.get("official_validations", {}).get(consumer), f"{variant} {consumer} validation")
+        require(validation.get("state") == "PASS" and validation.get("consumer") == consumer, f"{variant}: {consumer} validation drift")
+    verify_ref(value.get("lease_marker"), f"{variant} lease marker")
+    verify_ref(value.get("batch_lease_issuance"), f"{variant} lease issuance")
+    require(value.get("formal_eligible") is False and value.get("performance_eligible") is False, f"{variant}: eligibility drift")
+    return value, ref, None
+
+
 def build(args: argparse.Namespace) -> dict[str, Any]:
     admission, admission_ref = load(args.admission_bundle, "admission bundle")
     require(admission.get("schema_version") == "cidr-e01-incremental-admission-bundle-v1", "admission schema drift")
@@ -149,7 +190,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     asset_plan, asset_plan_ref = verify_ref(admission["asset_plan"], "asset plan")
     lineage, lineage_ref = verify_ref(inventory["dataset_trace_truth_lineage_seal"], "lineage seal")
     dataset_manifest, dataset_manifest_ref = verify_ref(lineage["logical_dataset"]["dataset_manifest"], "dataset manifest")
-    sentinel, sentinel_ref = verify_ref(admission["p02b"]["sentinel"], "P02B sentinel")
+    sentinel, sentinel_ref = verify_ref(admission["p02b"]["sentinel"], "legacy P02B sentinel")
     executor_ref = file_ref(args.phase_executor, "phase executor")
     require(os.access(args.phase_executor, os.X_OK), "phase executor must be executable")
     require(args.campaign_root.is_absolute() and not args.campaign_root.exists(), "campaign root must be absolute and absent")
@@ -158,22 +199,15 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     stores = {row["variant"]: row for row in inventory.get("stores", [])}
     require(set(stores) == {"budg-b64", "naive"}, "exact two stores required")
     blockers: list[str] = []
-    p02b_store_sha = sentinel.get("provenance", {}).get("store_sha256")
-    target_store_shas = {row["tree_sha256"] for row in stores.values()}
-    if p02b_store_sha not in target_store_shas:
-        blockers.append(
-            "P02B store binding mismatch: sentinel is schema-store host/protocol evidence, "
-            "while current adapter contract requires exact target-store SHA"
-        )
-    policy_ref = None
-    if args.p02b_store_policy is None:
-        blockers.append("versioned P02B host/protocol-only policy receipt absent")
-    else:
-        policy, policy_ref = load(args.p02b_store_policy, "P02B store policy")
-        require(policy.get("state") == "PASS", "P02B store policy did not PASS")
-        require(policy.get("binding_mode") == "host-protocol-only-v1", "P02B policy mode drift")
-        require(policy.get("synthetic_test_only") is False and policy.get("fixture_only") is False, "real P02B policy required")
-        blockers = [item for item in blockers if not item.startswith("P02B store binding mismatch")]
+    target_values: dict[str, dict[str, Any]] = {}
+    target_refs: dict[str, dict[str, Any]] = {}
+    for variant, path in (("budg-b64", args.budg_target_p02b), ("naive", args.naive_target_p02b)):
+        bundle, ref, blocker = _target_p02b(path, variant, stores[variant])
+        if blocker:
+            blockers.append(blocker)
+        else:
+            target_values[variant] = bundle
+            target_refs[variant] = ref
 
     clone_ref = None
     if args.clone_dry_run is None:
@@ -192,7 +226,6 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     if p31 is None:
         provenance = load(Path(sentinel["provenance"]["path"]), "P02B provenance")[0]
         p31 = provenance["files"]["p31_wrapper"]
-    lease = admission["lease"]["receipt"]
     batch_gate = asset_plan["p03_contract"]["batch_gate_validator"]
 
     cells = []
@@ -204,7 +237,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         staging = args.campaign_root / "staging" / f"{ordinal:02d}-{safe}"
         final = args.campaign_root / "cells" / f"{ordinal:02d}-{safe}"
         store = stores[variant]
+        target_bundle = target_values.get(variant)
+        target_ref = target_refs.get(variant)
         source_seal = store["fresh_store_seal"]
+        target_plan = target_bundle["static_inputs"]["query_plan"] if target_bundle else plan
+        target_lease = target_bundle["lease"] if target_bundle else admission["lease"]["receipt"]
         request = _request(
             cell_key=key,
             repeat=repeat,
@@ -218,7 +255,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             binary["path"], "--io-backend", "blocking",
             "--csr-metadata-cache-entries", "4096", "storage-bench",
             "--data-dir", "{MUTABLE_CLONE}", "--warmup-runs", "1", "--repeats", "10",
-            "--sample-plan-in", plan["path"], "--p10-raw-output-dir", "{STAGING}/adapter-output/seml0-raw",
+            "--sample-plan-in", target_plan["path"], "--p10-raw-output-dir", "{STAGING}/adapter-output/seml0-raw",
             "--p10-truth-tsv", truth["path"], "--p10-id-map-dir", str(Path(id_map["path"]).parent),
             "--p10-per-query-timeout-ms", "1000", "--l0-layout", layout,
             "--query-control-stage", "a6",
@@ -232,12 +269,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "--device", "nvme1n1", "--data-mount", "/data", "--interval", "1",
             "--disk-interval", "15", "--min-samples", "10",
             "--store", f"{variant}={{MUTABLE_CLONE}}",
-            "--batch-lease", lease["path"], "--batch-gate-tool", batch_gate["path"],
+            "--batch-lease", target_lease["path"], "--batch-gate-tool", batch_gate["path"],
             "--batch-consumer", "P10", "--batch-anchor-binary", binary["path"],
             "--binary", binary["path"], "--binary-sha256", binary["sha256"],
             "--dataset", dataset_manifest_ref["path"], "--dataset-sha256", dataset_manifest_ref["sha256"],
             "--truth", truth["path"], "--truth-sha256", truth["sha256"],
-            "--query-or-trace", plan["path"], "--query-or-trace-sha256", plan["sha256"],
+            "--query-or-trace", target_plan["path"], "--query-or-trace-sha256", target_plan["sha256"],
             "--config", "{REQUEST}", "--", *binary_argv,
         ]
         phase_commands = {
@@ -256,6 +293,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "prospective_phase_commands": phase_commands,
             "runtime": {
                 "variant": variant,
+                "target_p02b": target_ref,
+                "target_p02b_expected": TARGETS[variant],
+                "target_query_plan": target_plan,
+                "target_lease": target_lease,
                 "request": request,
                 "adapter_tool": inventory["adapter"],
                 "truth": truth,
@@ -283,7 +324,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "admission_bundle": admission_ref,
         "phase_executor": executor_ref,
         "clone_dry_run": clone_ref,
-        "p02b_store_policy": policy_ref,
+        "target_p02b": target_refs,
         "timing_generated": False,
         **FALSE_ELIGIBILITY,
     }
@@ -304,7 +345,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "p02b_sentinel": sentinel_ref,
         "phase_executor": executor_ref,
         "clone_dry_run": clone_ref,
-        "p02b_store_policy": policy_ref,
+        "target_p02b": target_refs,
         "cells": cells,
         "blockers": blockers,
         "large_content_rehashed_now": False,
@@ -337,7 +378,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--admission-bundle", type=Path, required=True)
     parser.add_argument("--phase-executor", type=Path, required=True)
     parser.add_argument("--clone-dry-run", type=Path)
-    parser.add_argument("--p02b-store-policy", type=Path)
+    parser.add_argument("--budg-target-p02b", type=Path)
+    parser.add_argument("--naive-target-p02b", type=Path)
     parser.add_argument("--campaign-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)

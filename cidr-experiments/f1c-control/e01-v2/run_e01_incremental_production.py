@@ -45,6 +45,8 @@ FALSE_ELIGIBILITY = {
     "performance_eligible": False,
     "paper_claim_eligible": False,
 }
+TARGET_P02B_SCHEMA = "cidr-e01-target-specific-p02b-v1"
+CELL_VARIANTS = ("budg-b64", "naive", "naive", "naive")
 
 
 class BackendError(RuntimeError):
@@ -110,6 +112,15 @@ def _absolute_argv(value: Any, label: str) -> list[str]:
     return list(value)
 
 
+def _verify_external_ref(value: Any, label: str) -> Dict[str, Any]:
+    require(type(value) is dict and set(value) == {"path", "sha256", "size_bytes"}, f"{label}: exact ref required")
+    path = Path(value["path"]).resolve()
+    require(path.is_file() and not path.is_symlink(), f"{label}: regular file required")
+    actual = {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
+    require(actual == value, f"{label}: path/size/SHA drift")
+    return load_json(path, label)
+
+
 def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
     value = (
         load_json(value_or_path.resolve(), "backend plan")
@@ -133,6 +144,19 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
         require(final.is_absolute() and staging.is_absolute(), "absolute cell roots required")
         require(final.parent == root / "cells", f"cell {ordinal}: final parent drift")
         require(staging.parent == root / "staging", f"cell {ordinal}: staging parent drift")
+        runtime = row.get("runtime")
+        if value["state"] == "HOLD" and runtime is None:
+            runtime = {}
+        require(type(runtime) is dict, f"cell {ordinal}: runtime required")
+        variant = CELL_VARIANTS[ordinal - 1]
+        if value["state"] == "READY":
+            require(runtime.get("variant") == variant, f"cell {ordinal}: target variant drift")
+        if value["state"] == "READY":
+            bundle = _verify_external_ref(runtime.get("target_p02b"), f"cell {ordinal} target P02B")
+            require(bundle.get("schema_version") == TARGET_P02B_SCHEMA, f"cell {ordinal}: target P02B schema drift")
+            require(bundle.get("state") == "PASS" and bundle.get("variant") == variant, f"cell {ordinal}: target P02B state/variant drift")
+            require(bundle.get("static_inputs", {}).get("query_plan") == runtime.get("target_query_plan"), f"cell {ordinal}: query-plan ref drift")
+            require(bundle.get("lease") == runtime.get("target_lease"), f"cell {ordinal}: lease ref drift")
         phases = row.get("phase_commands")
         require(type(phases) is dict and tuple(phases) == PHASE_ORDER, f"cell {ordinal}: phase order drift")
         if value["state"] == "READY":

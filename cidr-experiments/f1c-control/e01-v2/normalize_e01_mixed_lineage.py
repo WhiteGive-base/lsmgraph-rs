@@ -70,6 +70,8 @@ REQUIRED_GATES = (
     "strict_serial_scheduler",
     "cleanup",
 )
+TARGET_P02B_SCHEMA = "cidr-e01-target-specific-p02b-v1"
+TARGET_VARIANTS = {"budg-b64", "naive"}
 
 
 def _asset_ref(value: Any, label: str, *, verify: bool = True) -> Dict[str, Any]:
@@ -206,6 +208,27 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
         if type(item) is not dict or item.get("state") != "PASS":
             raise CompositionError(f"pre-output gate: {gate} is not PASS")
         _asset_ref(item.get("receipt"), f"campaign_gates.{gate}")
+    p02b_ref = _asset_ref(gates["fresh_p02b"]["receipt"], "campaign_gates.fresh_p02b")
+    p02b_gate = read_json(Path(p02b_ref["path"]), "campaign_gates.fresh_p02b")
+    target_refs = p02b_gate.get("target_p02b")
+    if type(target_refs) is not dict or set(target_refs) != TARGET_VARIANTS:
+        raise CompositionError("fresh_p02b: exact budg-b64/naive target map required")
+    target_bundles = {}
+    for variant in sorted(TARGET_VARIANTS):
+        ref = _asset_ref(target_refs[variant], f"fresh_p02b.{variant}")
+        bundle = read_json(Path(ref["path"]), f"fresh_p02b.{variant}")
+        if (
+            bundle.get("schema_version") != TARGET_P02B_SCHEMA
+            or bundle.get("state") != "PASS"
+            or bundle.get("variant") != variant
+            or bundle.get("store_unchanged") is not True
+            or bundle.get("store_pre") != bundle.get("store_post")
+            or bundle.get("store_pre", {}).get("full_tree_hash_performed") is not True
+        ):
+            raise CompositionError(f"fresh_p02b.{variant}: target bundle drift")
+        _asset_ref(bundle.get("lease"), f"fresh_p02b.{variant}.lease")
+        _asset_ref(bundle.get("static_inputs", {}).get("query_plan"), f"fresh_p02b.{variant}.query_plan")
+        target_bundles[variant] = bundle
     cells = evidence.get("cells")
     expected_keys = [item[0] for item in INCREMENTAL_CELLS]
     if type(cells) is not list or [cell.get("cell_key") for cell in cells] != expected_keys:
@@ -236,9 +259,20 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
         validated = _asset_ref(cell.get("validated_result"), f"{key}.validated_result")
         p31 = _asset_ref(cell.get("p31_receipt"), f"{key}.p31_receipt")
         _asset_ref(cell.get("cleanup_receipt"), f"{key}.cleanup_receipt")
+        identity = cell.get("identity")
+        expected_variant = "budg-b64" if key == "seml0:bridge-canary" else "naive"
+        expected_bundle_ref = target_refs[expected_variant]
+        expected_bundle = target_bundles[expected_variant]
+        if cell.get("target_p02b") != expected_bundle_ref:
+            raise CompositionError(f"{key}: target P02B backlink drift")
+        if cell.get("target_query_plan") != expected_bundle["static_inputs"]["query_plan"]:
+            raise CompositionError(f"{key}: target query-plan backlink drift")
+        if cell.get("target_lease") != expected_bundle["lease"]:
+            raise CompositionError(f"{key}: target lease backlink drift")
+        if type(identity) is not dict or identity.get("physical_input_sha256") != target_bundles[expected_variant]["store_pre"]["sha256"]:
+            raise CompositionError(f"{key}: target P02B/store identity drift")
         if included:
             metrics = cell.get("metrics")
-            identity = cell.get("identity")
             protocol = cell.get("protocol")
             if not all(type(item) is dict for item in (metrics, identity, protocol)):
                 raise CompositionError(f"{key}: metrics/identity/protocol required")

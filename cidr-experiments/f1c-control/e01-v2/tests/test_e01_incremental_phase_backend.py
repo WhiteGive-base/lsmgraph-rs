@@ -110,6 +110,76 @@ class PhaseBackendTests(unittest.TestCase):
         with self.assertRaises(builder.BuildError):
             builder.validate(value)
 
+    def test_direct_phase_rejects_non_ready_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan_path = root / "plan.json"
+            write_json(plan_path, {
+                "schema_version": phase.PLAN_SCHEMA,
+                "state": "HOLD",
+                "execution_state": "BLOCKED",
+                "strict_serial": True,
+                "synthetic_test_only": False,
+                "cells": [
+                    {"cell_key": key, "runtime": {"variant": variant}, "staging_cell_root": str(root / key.replace(":", "-"))}
+                    for key, variant in phase.CELL_VARIANTS.items()
+                ],
+            })
+            self.assertEqual(
+                phase.main(["--backend-plan", str(plan_path), "--cell-key", "seml0:bridge-canary", "--phase", "prepare"]),
+                2,
+            )
+
+    def test_direct_phase_rejects_cell_variant_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan_path = root / "plan.json"
+            cells = [
+                {"cell_key": key, "runtime": {"variant": variant}, "staging_cell_root": str(root / key.replace(":", "-"))}
+                for key, variant in phase.CELL_VARIANTS.items()
+            ]
+            cells[0]["runtime"]["variant"] = "naive"
+            write_json(plan_path, {
+                "schema_version": phase.PLAN_SCHEMA,
+                "state": "READY",
+                "execution_state": "READY",
+                "strict_serial": True,
+                "synthetic_test_only": False,
+                "cells": cells,
+            })
+            self.assertEqual(
+                phase.main(["--backend-plan", str(plan_path), "--cell-key", "seml0:bridge-canary", "--phase", "prepare"]),
+                2,
+            )
+
+    def test_p31_recomputes_and_rejects_prepared_argv_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cwd = Path(temporary)
+            request = write_json(cwd / "adapter-request.json", {"state": "PASS"})
+            request_ref = {
+                "path": str(request.resolve()),
+                "sha256": phase.sha256_file(request),
+                "size_bytes": request.stat().st_size,
+            }
+            runtime = {
+                "binary_argv": ["/bin/true", "--store", "{MUTABLE_CLONE}"],
+                "p31_argv": ["/bin/true", "--request", "{REQUEST}"],
+            }
+            cell = {"cell_key": "seml0:bridge-canary", "ordinal": 1, "runtime": runtime}
+            write_json(cwd / "receipts/prepared-command.json", {
+                "backend_plan_sha256": "a" * 64,
+                "request": request_ref,
+                "binary_argv": ["/bin/false"],
+                "p31_argv": ["/bin/false"],
+            })
+            original = phase.revalidate_target
+            phase.revalidate_target = lambda unused: {"path": "/fixture", "sha256": "b" * 64, "size_bytes": 1}
+            try:
+                with self.assertRaisesRegex(phase.PhaseError, "prepared binary argv drift"):
+                    phase.run_p31({}, cell, "a" * 64, cwd)
+            finally:
+                phase.revalidate_target = original
+
 
 if __name__ == "__main__":
     unittest.main()

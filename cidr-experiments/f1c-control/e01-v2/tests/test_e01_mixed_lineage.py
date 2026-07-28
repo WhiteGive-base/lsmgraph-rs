@@ -22,6 +22,7 @@ import normalize_e01_mixed_lineage as normalizer
 
 
 DENSE_SHA = "9727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258"
+NAIVE_SHA = "1727fed3d710a3f0897b1ee7379411a091e0568bef05902de8b1787efc39d258"
 SOURCE_SHA = "baa7c4b9701936253ebaeb4b3436c16403373af0b48c4276dacef780479952c5"
 TRUTH_SHA = "876ec4be45bb7c220ce595b8d8efd5c79d13db285569cc0d6ae3e8bc19a1c788"
 DIGEST_SHA = "67ed60fd93ac69e52675a8f89311b4413d88797b240376868e6109a3828539cf"
@@ -226,8 +227,40 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
     result["state"] = "PASS"
     result["incremental_plan"]["state"] = "PASS"
     gates = {}
+    target_refs = {}
+    target_bundles = {}
+    for variant, tree_sha, hint in (
+        ("budg-b64", DENSE_SHA, True),
+        ("naive", NAIVE_SHA, False),
+    ):
+        lease = write_json(root, f"fresh/p02b/{variant}-lease.json", {"schema_version": "cidr-batch-lease-v2", "state": "PASS"})
+        query = write_json(root, f"fresh/p02b/{variant}-plan.json", {"semantic_degree_hint": hint})
+        tree = {
+            "sha256": tree_sha,
+            "full_tree_hash_performed": True,
+            "file_count": 1,
+            "total_bytes": 1,
+        }
+        target_bundles[variant] = {
+            "schema_version": normalizer.TARGET_P02B_SCHEMA,
+            "state": "PASS",
+            "variant": variant,
+            "store_unchanged": True,
+            "store_pre": tree,
+            "store_post": tree,
+            "lease": lease,
+            "static_inputs": {"query_plan": query},
+        }
+        target_refs[variant] = write_json(
+            root,
+            f"fresh/p02b/{variant}.json",
+            target_bundles[variant],
+        )
     for gate in normalizer.REQUIRED_GATES:
-        receipt = write_json(root, f"fresh/gates/{gate}.json", {"state": "PASS", "gate": gate})
+        body = {"state": "PASS", "gate": gate}
+        if gate == "fresh_p02b":
+            body["target_p02b"] = target_refs
+        receipt = write_json(root, f"fresh/gates/{gate}.json", body)
         gates[gate] = {"state": "PASS", "receipt": receipt}
     cells = []
     for key, system, repeat, role, included in builder.INCREMENTAL_CELLS:
@@ -235,6 +268,7 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
         validated = write_json(root, f"fresh/{safe}/validated-result.json", {"state": "PASS"})
         p31 = write_json(root, f"fresh/{safe}/p31.json", {"state": "PASS"})
         cleanup = write_json(root, f"fresh/{safe}/cleanup.json", {"state": "PASS"})
+        target_variant = "budg-b64" if key == "seml0:bridge-canary" else "naive"
         cells.append(
             {
                 "cell_key": key,
@@ -255,11 +289,14 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "validated_result": validated,
                 "p31_receipt": p31,
                 "cleanup_receipt": cleanup,
+                "target_p02b": target_refs[target_variant],
+                "target_query_plan": target_bundles[target_variant]["static_inputs"]["query_plan"],
+                "target_lease": target_bundles[target_variant]["lease"],
                 "identity": {
                     "host_fingerprint": HOST_SHA,
                     "git_sha": "a" * 40,
                     "binary_sha256": "b" * 64,
-                    "physical_input_sha256": DENSE_SHA,
+                    "physical_input_sha256": DENSE_SHA if key == "seml0:bridge-canary" else NAIVE_SHA,
                     "truth_sha256": TRUTH_SHA,
                 },
                 "protocol": {
@@ -392,6 +429,15 @@ class MixedLineageTests(unittest.TestCase):
         del completed["incremental_plan"]["incremental_evidence"]["campaign_gates"][
             "fresh_batch_lease"
         ]
+        path = self.write_composition(completed)
+        with self.assertRaises(builder.CompositionError):
+            normalizer.normalize(path, None)
+
+    def test_target_p02b_cell_backlink_tamper_is_rejected(self) -> None:
+        completed = attach_completed_evidence(self.root, self.value)
+        completed["incremental_plan"]["incremental_evidence"]["cells"][1]["target_lease"] = (
+            completed["incremental_plan"]["incremental_evidence"]["cells"][0]["target_lease"]
+        )
         path = self.write_composition(completed)
         with self.assertRaises(builder.CompositionError):
             normalizer.normalize(path, None)
