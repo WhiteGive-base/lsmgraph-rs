@@ -166,13 +166,14 @@ class StoreLifecycleTests(unittest.TestCase):
         with self.assertRaises(lifecycle.LifecycleError):
             lifecycle.atomic_write(output, value)
 
-    def test_real_snapshot_remains_hold_and_targets_stay_unpublished(self) -> None:
+    def test_real_snapshot_remains_hold_without_claiming_publication(self) -> None:
         snapshot = ROOT / "E01-store-lifecycle-plan-HOLD-v1.json"
         if not snapshot.exists():
             self.skipTest("real store lifecycle snapshot is not installed")
-        # A failed materialization attempt may retain staging under the frozen
-        # top-level immutable root.  Validate the snapshot structurally while
-        # checking that no final immutable target was published.
+        # The frozen v1 snapshot remains a pre-materialization HOLD record.
+        # Final immutable targets may now exist under separately versioned,
+        # receipt-bound v2 materialization, so live target absence is no longer
+        # a valid invariant of this historical snapshot.
         value = lifecycle.validate(snapshot, verify_live_absence=False)
         self.assertEqual(
             [row["expected_tree_sha256"] for row in value["stores"]],
@@ -186,7 +187,7 @@ class StoreLifecycleTests(unittest.TestCase):
             28_711_503_691,
         )
         self.assertTrue(
-            all(not Path(row["immutable_root"]).exists() for row in value["stores"])
+            all("fresh_store_seal" not in row for row in value["stores"])
         )
         self.assertFalse(Path(value["campaign_root"]).exists())
 
