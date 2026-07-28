@@ -187,6 +187,55 @@ def _target_p02b(path: Optional[Path], variant: str, store: Mapping[str, Any]) -
     return value, ref, None
 
 
+def validate_clone_bootstrap_contract(
+    *,
+    dryrun: Mapping[str, Any],
+    hold_plan: Mapping[str, Any],
+    hold_ref: Mapping[str, Any],
+    admission_ref: Mapping[str, Any],
+    target_refs: Mapping[str, Any],
+    stores: Mapping[str, Mapping[str, Any]],
+) -> None:
+    require(dryrun.get("backend_plan_sha256") == hold_ref["sha256"], "clone dry-run backend SHA drift")
+    require(hold_plan.get("schema_version") == SCHEMA, "clone predecessor backend schema drift")
+    require(
+        hold_plan.get("state") == "HOLD"
+        and hold_plan.get("execution_state") == "BLOCKED"
+        and hold_plan.get("blockers") == ["mutable clone lifecycle dry-run receipt absent"],
+        "clone predecessor was not exact clone-only HOLD",
+    )
+    require(hold_plan.get("admission_bundle") == admission_ref, "clone predecessor admission drift")
+    require(hold_plan.get("target_p02b") == target_refs, "clone predecessor target P02B drift")
+    cells = hold_plan.get("cells")
+    require(type(cells) is list and [row.get("cell_key") for row in cells] == list(CELL_ORDER), "clone predecessor cell order drift")
+    expected_variants = ("budg-b64", "naive", "naive", "naive")
+    require(
+        tuple(row.get("runtime", {}).get("variant") for row in cells) == expected_variants,
+        "clone predecessor cell/variant mapping drift",
+    )
+    bridge = cells[0]
+    policy = bridge["runtime"]["clone_policy"]
+    require(dryrun.get("cell_key") == "seml0:bridge-canary", "clone dry-run cell drift")
+    require(dryrun.get("target_p02b") == target_refs["budg-b64"], "clone dry-run target P02B drift")
+    require(dryrun.get("source_seal") == stores["budg-b64"]["fresh_store_seal"], "clone dry-run source seal drift")
+    require(dryrun.get("source_tree_sha256") == stores["budg-b64"]["tree_sha256"], "clone dry-run source tree drift")
+    clone = dryrun.get("clone")
+    require(type(clone) is dict, "clone dry-run clone evidence missing")
+    require(clone.get("source") == str(Path(policy["source_root"]).resolve()), "clone dry-run source root drift")
+    require(clone.get("target") == str(Path(clone["target"]).resolve()), "clone dry-run target root not canonical")
+    expected_argv = [
+        str(Path(policy["source_root"]).resolve()) + "/." if item == "{SOURCE}"
+        else clone["target"] if item == "{TARGET}"
+        else item
+        for item in policy["copy_argv"]
+    ]
+    require(clone.get("copy_argv") == expected_argv, "clone dry-run copy argv drift")
+    require(
+        clone.get("metadata_manifest", {}).get("content_hashed") is False,
+        "clone dry-run unexpectedly hashed content",
+    )
+
+
 def build(args: argparse.Namespace) -> dict[str, Any]:
     admission, admission_ref = load(args.admission_bundle, "admission bundle")
     require(admission.get("schema_version") == "cidr-e01-incremental-admission-bundle-v1", "admission schema drift")
@@ -224,6 +273,15 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         require(dryrun.get("schema_version") == "cidr-e01-mutable-clone-dry-run-v1", "clone dry-run schema drift")
         require(dryrun.get("state") == "PASS" and dryrun.get("mutable_clone_removed") is True, "clone dry-run did not PASS")
         require(dryrun.get("timing_generated") is False, "clone dry-run generated timing")
+        hold_plan, hold_ref = verify_ref(dryrun.get("backend_plan"), "clone dry-run backend plan")
+        validate_clone_bootstrap_contract(
+            dryrun=dryrun,
+            hold_plan=hold_plan,
+            hold_ref=hold_ref,
+            admission_ref=admission_ref,
+            target_refs=target_refs,
+            stores=stores,
+        )
 
     binary = inventory["binary"]
     truth = lineage["truth"]["receipt"]

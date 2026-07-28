@@ -72,6 +72,11 @@ class PhaseBackendTests(unittest.TestCase):
                     "cell_key": "seml0:bridge-canary",
                     "runtime": {"clone_policy": {
                         "source_root": str(source),
+                        "source_seal": {
+                            "path": "/fixture/source-seal.json",
+                            "sha256": "c" * 64,
+                            "size_bytes": 1,
+                        },
                         "tree_sha256": "a" * 64,
                         "copy_argv": ["/bin/cp", "--archive", "--", "{SOURCE}", "{TARGET}"],
                     }},
@@ -79,11 +84,144 @@ class PhaseBackendTests(unittest.TestCase):
             }
             write_json(plan_path, plan)
             value = phase.load_json(plan_path, "plan")
-            phase.clone_dry_run(value, value["cells"][0], phase.sha256_file(plan_path), output)
+            plan_ref = {
+                "path": str(plan_path.resolve()),
+                "sha256": phase.sha256_file(plan_path),
+                "size_bytes": plan_path.stat().st_size,
+            }
+            original = phase.revalidate_target
+            phase.revalidate_target = lambda unused: {
+                "path": "/fixture/target.json",
+                "sha256": "b" * 64,
+                "size_bytes": 1,
+            }
+            try:
+                phase.clone_dry_run(value, value["cells"][0], plan_ref, output)
+            finally:
+                phase.revalidate_target = original
             receipt = phase.load_json(output / "CLONE-DRYRUN.json", "receipt")
             self.assertEqual(receipt["state"], "PASS")
             self.assertFalse((output / "mutable-store").exists())
             self.assertFalse(receipt["performance_eligible"])
+            self.assertEqual(receipt["backend_plan"], plan_ref)
+
+    def test_clone_dry_run_allows_only_exact_clone_receipt_hold(self) -> None:
+        cells = [
+            {
+                "cell_key": key,
+                "phase_commands": {phase_name: None for phase_name in phase.PHASES},
+            }
+            for key in phase.CELL_VARIANTS
+        ]
+        value = {
+            "state": "HOLD",
+            "execution_state": "BLOCKED",
+            "blockers": list(phase.CLONE_DRY_RUN_BLOCKERS),
+            "cells": cells,
+        }
+        phase.validate_clone_dry_run_plan(value)
+        value["blockers"] = ["another production gate missing"]
+        with self.assertRaisesRegex(phase.PhaseError, "blockers beyond"):
+            phase.validate_clone_dry_run_plan(value)
+
+    def test_clone_bootstrap_contract_binds_plan_targets_and_copy_argv(self) -> None:
+        admission = {"path": "/evidence/admission.json", "sha256": "a" * 64, "size_bytes": 1}
+        targets = {
+            "budg-b64": {"path": "/evidence/budg.json", "sha256": "b" * 64, "size_bytes": 1},
+            "naive": {"path": "/evidence/naive.json", "sha256": "c" * 64, "size_bytes": 1},
+        }
+        source_seal = {"path": "/evidence/seal.json", "sha256": "d" * 64, "size_bytes": 1}
+        stores = {
+            "budg-b64": {"fresh_store_seal": source_seal, "tree_sha256": "e" * 64},
+            "naive": {"fresh_store_seal": {}, "tree_sha256": "f" * 64},
+        }
+        source = "/immutable/budg"
+        target = "/results/clone-dry-run/mutable-store"
+        copy_argv = ["/bin/cp", "--archive", "--reflink=always", "--", "{SOURCE}", "{TARGET}"]
+        variants = ("budg-b64", "naive", "naive", "naive")
+        hold = {
+            "schema_version": builder.SCHEMA,
+            "state": "HOLD",
+            "execution_state": "BLOCKED",
+            "blockers": ["mutable clone lifecycle dry-run receipt absent"],
+            "admission_bundle": admission,
+            "target_p02b": targets,
+            "cells": [
+                {
+                    "cell_key": key,
+                    "runtime": {
+                        "variant": variant,
+                        "clone_policy": {
+                            "source_root": source,
+                            "copy_argv": copy_argv,
+                        },
+                    },
+                }
+                for key, variant in zip(builder.CELL_ORDER, variants)
+            ],
+        }
+        hold_ref = {"path": "/evidence/hold.json", "sha256": "1" * 64, "size_bytes": 1}
+        dryrun = {
+            "backend_plan_sha256": hold_ref["sha256"],
+            "cell_key": "seml0:bridge-canary",
+            "target_p02b": targets["budg-b64"],
+            "source_seal": source_seal,
+            "source_tree_sha256": stores["budg-b64"]["tree_sha256"],
+            "clone": {
+                "source": source,
+                "target": target,
+                "copy_argv": [
+                    "/bin/cp",
+                    "--archive",
+                    "--reflink=always",
+                    "--",
+                    source + "/.",
+                    target,
+                ],
+                "metadata_manifest": {"content_hashed": False},
+            },
+        }
+        builder.validate_clone_bootstrap_contract(
+            dryrun=dryrun,
+            hold_plan=hold,
+            hold_ref=hold_ref,
+            admission_ref=admission,
+            target_refs=targets,
+            stores=stores,
+        )
+        changed = json.loads(json.dumps(dryrun))
+        changed["backend_plan_sha256"] = "2" * 64
+        with self.assertRaisesRegex(builder.BuildError, "backend SHA drift"):
+            builder.validate_clone_bootstrap_contract(
+                dryrun=changed,
+                hold_plan=hold,
+                hold_ref=hold_ref,
+                admission_ref=admission,
+                target_refs=targets,
+                stores=stores,
+            )
+        changed = json.loads(json.dumps(hold))
+        changed["target_p02b"]["naive"]["sha256"] = "9" * 64
+        with self.assertRaisesRegex(builder.BuildError, "target P02B drift"):
+            builder.validate_clone_bootstrap_contract(
+                dryrun=dryrun,
+                hold_plan=changed,
+                hold_ref=hold_ref,
+                admission_ref=admission,
+                target_refs=targets,
+                stores=stores,
+            )
+        changed = json.loads(json.dumps(dryrun))
+        changed["clone"]["copy_argv"][0] = "/bin/false"
+        with self.assertRaisesRegex(builder.BuildError, "copy argv drift"):
+            builder.validate_clone_bootstrap_contract(
+                dryrun=changed,
+                hold_plan=hold,
+                hold_ref=hold_ref,
+                admission_ref=admission,
+                target_refs=targets,
+                stores=stores,
+            )
 
     def test_builder_validator_requires_hold_commands_null(self) -> None:
         value = {

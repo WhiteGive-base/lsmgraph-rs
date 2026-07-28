@@ -43,6 +43,7 @@ CELL_VARIANTS = {
     "seml0-naive:r2": "naive",
     "seml0-naive:r3": "naive",
 }
+CLONE_DRY_RUN_BLOCKERS = ["mutable clone lifecycle dry-run receipt absent"]
 
 
 class PhaseError(RuntimeError):
@@ -475,9 +476,34 @@ def cleanup(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
     )
 
 
-def clone_dry_run(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, output: Path) -> None:
+def validate_clone_dry_run_plan(plan: Mapping[str, Any]) -> None:
+    if plan.get("state") == "READY":
+        require(plan.get("execution_state") == "READY", "READY execution state required")
+        return
+    require(plan.get("state") == "HOLD", "clone dry-run plan must be HOLD or READY")
+    require(plan.get("execution_state") == "BLOCKED", "HOLD execution state required")
+    require(
+        plan.get("blockers") == CLONE_DRY_RUN_BLOCKERS,
+        "HOLD plan has blockers beyond clone dry-run receipt",
+    )
+    for cell in plan.get("cells", []):
+        commands = cell.get("phase_commands")
+        require(
+            type(commands) is dict
+            and all(commands.get(phase) is None for phase in PHASES),
+            "HOLD plan phase commands must remain unarmed",
+        )
+
+
+def clone_dry_run(
+    plan: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    plan_ref: Mapping[str, Any],
+    output: Path,
+) -> None:
     require(not output.exists(), "dry-run output already exists")
     output.mkdir(parents=True)
+    target_ref_pre = revalidate_target(cell)
     policy = cell["runtime"]["clone_policy"]
     target = output / "mutable-store"
     try:
@@ -488,6 +514,8 @@ def clone_dry_run(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: st
             list(policy["copy_argv"]),
         )
         exact_cleanup(target, output, clone["target_dev"], clone["target_inode"])
+        target_ref_post = revalidate_target(cell)
+        require(target_ref_pre == target_ref_post, "target P02B ref drift across clone dry-run")
         atomic_json(
             output / "CLONE-DRYRUN.json",
             {
@@ -495,8 +523,11 @@ def clone_dry_run(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: st
                 "state": "PASS",
                 "synthetic_test_only": False,
                 "fixture_only": False,
-                "backend_plan_sha256": plan_sha,
+                "backend_plan": dict(plan_ref),
+                "backend_plan_sha256": plan_ref["sha256"],
                 "cell_key": cell["cell_key"],
+                "target_p02b": target_ref_pre,
+                "source_seal": policy["source_seal"],
                 "source_tree_sha256": policy["tree_sha256"],
                 "clone": clone,
                 "mutable_clone_removed": True,
@@ -530,7 +561,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plan_path = args.backend_plan.resolve()
         plan = load_json(plan_path, "backend plan")
         require(plan.get("schema_version") == PLAN_SCHEMA, "backend plan schema drift")
-        require(plan.get("state") == "READY" and plan.get("execution_state") == "READY", "backend plan is not READY")
         require(plan.get("strict_serial") is True, "STRICT_SERIAL required")
         require(plan.get("synthetic_test_only") is False, "synthetic backend forbidden")
         require(
@@ -540,11 +570,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for row in plan["cells"]:
             require(row.get("runtime", {}).get("variant") == CELL_VARIANTS[row["cell_key"]], "cell/variant mapping drift")
         plan_sha = sha256_file(plan_path)
+        plan_ref = {
+            "path": str(plan_path),
+            "sha256": plan_sha,
+            "size_bytes": plan_path.stat().st_size,
+        }
         cell = _cell(plan, args.cell_key)
         if args.phase == "clone-dry-run":
             require(args.dry_run_output is not None and args.dry_run_output.is_absolute(), "absolute dry-run output required")
-            clone_dry_run(plan, cell, plan_sha, args.dry_run_output)
+            validate_clone_dry_run_plan(plan)
+            clone_dry_run(plan, cell, plan_ref, args.dry_run_output)
         else:
+            require(plan.get("state") == "READY" and plan.get("execution_state") == "READY", "backend plan is not READY")
             cwd = Path(cell["staging_cell_root"]).resolve()
             require(cwd == Path.cwd().resolve(), "phase cwd/staging drift")
             {"prepare": prepare, "p31": run_p31, "finalize": finalize, "cleanup": cleanup}[args.phase](
