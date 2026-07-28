@@ -24,8 +24,8 @@ from types import ModuleType
 from typing import Any, Mapping, Optional, Sequence
 
 
-PLAN_SCHEMA = "cidr-e01-incremental-backend-plan-v2"
-DRYRUN_SCHEMA = "cidr-e01-mutable-clone-dry-run-v2"
+PLAN_SCHEMA = "cidr-e01-incremental-backend-plan-v3"
+DRYRUN_SCHEMA = "cidr-e01-mutable-clone-dry-run-v3"
 PHASES = ("prepare", "p31", "finalize", "cleanup")
 FALSE_ELIGIBILITY = {
     "formal_eligible": False,
@@ -45,6 +45,15 @@ CELL_VARIANTS = {
     "seml0-naive:r3": "naive",
 }
 CLONE_DRY_RUN_BLOCKERS = ["mutable clone lifecycle dry-run receipt absent"]
+FULL_COPY_ARGV_TEMPLATE = (
+    "/bin/cp",
+    "--archive",
+    "--reflink=never",
+    "--one-file-system",
+    "--",
+    "{SOURCE}",
+    "{TARGET}",
+)
 
 
 class PhaseError(RuntimeError):
@@ -181,6 +190,7 @@ def identity_permission_manifest(root: Path) -> dict[str, Any]:
     digest = hashlib.sha256()
     files = directories = 0
     writable: list[str] = []
+    entries: list[dict[str, Any]] = []
     for directory, dirnames, filenames in os.walk(root, followlinks=False):
         base = Path(directory)
         dirnames.sort()
@@ -195,6 +205,17 @@ def identity_permission_manifest(root: Path) -> dict[str, Any]:
             digest.update(
                 f"{kind}\0{relative}\0{entry_stat.st_dev}\0{entry_stat.st_ino}\0"
                 f"{entry_stat.st_uid}\0{entry_stat.st_gid}\0{mode:o}\n".encode()
+            )
+            entries.append(
+                {
+                    "path": relative,
+                    "kind": "directory" if kind == "d" else "file",
+                    "dev": entry_stat.st_dev,
+                    "inode": entry_stat.st_ino,
+                    "uid": entry_stat.st_uid,
+                    "gid": entry_stat.st_gid,
+                    "mode": f"{mode:04o}",
+                }
             )
             if kind == "d":
                 directories += 1
@@ -214,7 +235,69 @@ def identity_permission_manifest(root: Path) -> dict[str, Any]:
         "file_count": files,
         "directory_count": directories,
         "writable_entries": writable,
+        "entries": entries,
     }
+
+
+def regular_file_identity_manifest(root: Path) -> dict[str, Any]:
+    root = root.resolve()
+    require(root.is_dir() and not root.is_symlink(), f"invalid file identity root: {root}")
+    rows: list[dict[str, Any]] = []
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(directory)
+        dirnames.sort()
+        filenames.sort()
+        for name in dirnames:
+            require(not (base / name).is_symlink(), "symlink directory forbidden")
+        for name in filenames:
+            path = base / name
+            require(path.is_file() and not path.is_symlink(), f"non-regular file: {path}")
+            entry_stat = os.stat(path, follow_symlinks=False)
+            rows.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "dev": entry_stat.st_dev,
+                    "inode": entry_stat.st_ino,
+                    "size_bytes": entry_stat.st_size,
+                }
+            )
+    rows.sort(key=lambda row: row["path"].encode())
+    require(rows, "regular file identity manifest is empty")
+    digest = hashlib.sha256(
+        "".join(
+            f'{row["path"]}\0{row["dev"]}\0{row["inode"]}\0{row["size_bytes"]}\n'
+            for row in rows
+        ).encode()
+    ).hexdigest()
+    return {
+        "method": "sha256-regular-file-identity-v1(path,dev,inode,size)",
+        "sha256": digest,
+        "file_count": len(rows),
+        "files": rows,
+    }
+
+
+def validate_file_identity_separation(
+    source: Mapping[str, Any], clone: Mapping[str, Any]
+) -> None:
+    source_rows = source.get("files")
+    clone_rows = clone.get("files")
+    require(type(source_rows) is list and type(clone_rows) is list, "file identity rows required")
+    source_by_path = {row["path"]: row for row in source_rows}
+    clone_by_path = {row["path"]: row for row in clone_rows}
+    require(len(source_by_path) == len(source_rows), "duplicate source file path")
+    require(len(clone_by_path) == len(clone_rows), "duplicate clone file path")
+    require(set(source_by_path) == set(clone_by_path), "source/clone relative file paths differ")
+    for path in source_by_path:
+        require(
+            source_by_path[path]["size_bytes"] == clone_by_path[path]["size_bytes"],
+            f"source/clone file size differs: {path}",
+        )
+    source_inodes = {(row["dev"], row["inode"]) for row in source_rows}
+    clone_inodes = {(row["dev"], row["inode"]) for row in clone_rows}
+    require(len(source_inodes) == len(source_rows), "duplicate source dev/inode")
+    require(len(clone_inodes) == len(clone_rows), "duplicate clone dev/inode")
+    require(not source_inodes.intersection(clone_inodes), "source/clone inode overlap")
 
 
 def tree_space(root: Path) -> dict[str, Any]:
@@ -283,13 +366,15 @@ def thaw_owner_writable(root: Path) -> list[dict[str, Any]]:
         os.chmod(path, after)
         actual = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
         require(actual == after, f"thaw mode apply failed: {path}")
-        require(actual & 0o022 == before & 0o022, f"thaw widened group/other write: {path}")
+        require(actual ^ before == stat.S_IWUSR, f"thaw changed bits beyond owner write: {path}")
         rows.append(
             {
                 "path": path.relative_to(root).as_posix() or ".",
                 "kind": "directory" if path.is_dir() else "file",
                 "uid": before_stat.st_uid,
                 "gid": before_stat.st_gid,
+                "dev": before_stat.st_dev,
+                "inode": before_stat.st_ino,
                 "mode_before": f"{before:04o}",
                 "mode_after": f"{after:04o}",
             }
@@ -297,28 +382,80 @@ def thaw_owner_writable(root: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def validate_thaw_manifest(
+    source_identity: Mapping[str, Any],
+    clone_identity: Mapping[str, Any],
+    thaw_manifest: Sequence[Mapping[str, Any]],
+) -> None:
+    source_entries = source_identity.get("entries")
+    clone_entries = clone_identity.get("entries")
+    require(type(source_entries) is list and type(clone_entries) is list, "identity entries required")
+    source_by_path = {row["path"]: row for row in source_entries}
+    clone_by_path = {row["path"]: row for row in clone_entries}
+    thaw_by_path = {row["path"]: row for row in thaw_manifest}
+    require(len(source_by_path) == len(source_entries), "duplicate source identity path")
+    require(len(clone_by_path) == len(clone_entries), "duplicate clone identity path")
+    require(len(thaw_by_path) == len(thaw_manifest), "duplicate thaw path")
+    require(
+        set(source_by_path) == set(clone_by_path) == set(thaw_by_path),
+        "thaw manifest does not cover every file and directory",
+    )
+    for path, thaw in thaw_by_path.items():
+        source = source_by_path[path]
+        clone = clone_by_path[path]
+        before = int(thaw["mode_before"], 8)
+        after = int(thaw["mode_after"], 8)
+        require(thaw["kind"] == source["kind"] == clone["kind"], f"thaw kind drift: {path}")
+        require(thaw["uid"] == source["uid"] == clone["uid"], f"thaw uid drift: {path}")
+        require(thaw["gid"] == source["gid"] == clone["gid"], f"thaw gid drift: {path}")
+        require(before == int(source["mode"], 8), f"thaw before-mode drift: {path}")
+        require(after == int(clone["mode"], 8), f"thaw after-mode drift: {path}")
+        require(after ^ before == stat.S_IWUSR, f"thaw changed bits beyond owner write: {path}")
+        require(
+            thaw["dev"] == clone["dev"] and thaw["inode"] == clone["inode"],
+            f"thaw clone identity drift: {path}",
+        )
+
+
+def full_copy_argv(policy: Mapping[str, Any], source: Path, target: Path) -> list[str]:
+    configured = policy.get("copy_argv")
+    require(
+        type(configured) is list and tuple(configured) == FULL_COPY_ARGV_TEMPLATE,
+        "full-copy argv contract drift",
+    )
+    return [
+        str(source.resolve()) + "/." if item == "{SOURCE}"
+        else str(target.absolute()) if item == "{TARGET}"
+        else item
+        for item in FULL_COPY_ARGV_TEMPLATE
+    ]
+
+
 def _safe_clone_roots(source: Path, target: Path, allowed_parent: Path) -> tuple[Path, Path]:
     source = source.resolve()
     target = target.absolute()
     allowed_parent = allowed_parent.resolve()
     require(source.is_dir() and not source.is_symlink(), "clone source invalid")
-    require(not target.exists(), "clone target already exists")
+    require(not os.path.lexists(target), "clone target already exists, including dangling symlink")
     require(target.parent.resolve() == allowed_parent, "clone target parent drift")
     require(not os.path.ismount(source), "clone source must not be a mount point")
     require(not os.path.ismount(target.parent), "clone target parent must not be a mount point")
-    require(source != target and source not in target.parents, "clone overlap")
+    require(
+        source != target and source not in target.parents and target not in source.parents,
+        "clone overlap",
+    )
     return source, target
 
 
-def copy_clone(source: Path, target: Path, allowed_parent: Path, copy_argv: list[str]) -> dict[str, Any]:
+def copy_clone(
+    source: Path,
+    target: Path,
+    allowed_parent: Path,
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
     source, target = _safe_clone_roots(source, target, allowed_parent)
-    require(copy_argv and Path(copy_argv[0]).is_absolute(), "absolute clone command required")
-    require("{SOURCE}" in copy_argv and "{TARGET}" in copy_argv, "clone tokens required")
+    command = full_copy_argv(policy, source, target)
     source_meta = metadata_manifest(source)
-    command = [
-        str(source) + "/." if item == "{SOURCE}" else str(target) if item == "{TARGET}" else item
-        for item in copy_argv
-    ]
     completed = subprocess.run(command, check=False, capture_output=True, text=True)
     require(completed.returncode == 0, f"clone command failed rc={completed.returncode}: {completed.stderr.strip()}")
     require(target.is_dir() and not target.is_symlink(), "clone target missing")
@@ -335,16 +472,142 @@ def copy_clone(source: Path, target: Path, allowed_parent: Path, copy_argv: list
     }
 
 
+def verified_full_copy_and_thaw(
+    source: Path,
+    target: Path,
+    allowed_parent: Path,
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create and fully verify an inode-independent mutable clone outside timing."""
+    source, target = _safe_clone_roots(source, target, allowed_parent)
+    require(policy.get("copy_mode") == "explicit-full-copy-ext4-v1", "full-copy mode required")
+    require(
+        policy.get("filesystem_contract", {}).get("filesystem_type") == "ext4"
+        and policy.get("filesystem_contract", {}).get("reflink_supported") is False,
+        "full-copy filesystem contract drift",
+    )
+    expected_tree = policy.get("tree_sha256")
+    require(type(expected_tree) is str and len(expected_tree) == 64, "sealed tree SHA required")
+    expanded_argv = full_copy_argv(policy, source, target)
+    fs = filesystem_evidence(source, allowed_parent)
+    source_tree_pre = content_tree_manifest(source)
+    require(source_tree_pre["sha256"] == expected_tree, "source pre-copy tree SHA drift")
+    source_identity_pre = identity_permission_manifest(source)
+    require(not source_identity_pre["writable_entries"], "source became writable before copy")
+    source_files_pre = regular_file_identity_manifest(source)
+
+    clone = copy_clone(source, target, allowed_parent, policy)
+    require(clone["copy_argv"] == expanded_argv, "executed copy argv drift")
+    clone_files = regular_file_identity_manifest(target)
+    validate_file_identity_separation(source_files_pre, clone_files)
+    clone_identity_before_thaw = identity_permission_manifest(target)
+    require(
+        set(source_identity_pre["writable_entries"])
+        == set(clone_identity_before_thaw["writable_entries"]),
+        "clone permissions differ before thaw",
+    )
+    thaw = thaw_owner_writable(target)
+    clone_identity_after_thaw = identity_permission_manifest(target)
+    validate_thaw_manifest(source_identity_pre, clone_identity_after_thaw, thaw)
+    clone_tree = content_tree_manifest(target)
+    require(clone_tree["sha256"] == expected_tree, "clone content tree SHA drift")
+    require(
+        clone_tree["file_count"] == source_tree_pre["file_count"]
+        and clone_tree["total_bytes"] == source_tree_pre["total_bytes"],
+        "clone count/byte drift",
+    )
+    clone_space = tree_space(target)
+    require(
+        clone_space["logical_file_bytes"] == clone_tree["total_bytes"]
+        and clone_space["allocated_bytes"] > 0,
+        "clone space evidence drift",
+    )
+
+    source_tree_post = content_tree_manifest(source)
+    source_identity_post = identity_permission_manifest(source)
+    source_files_post = regular_file_identity_manifest(source)
+    require(source_tree_pre == source_tree_post, "source tree drift across full copy")
+    require(source_identity_pre == source_identity_post, "source identity/permissions drift across full copy")
+    require(source_files_pre == source_files_post, "source regular-file identity drift across full copy")
+    require(not source_identity_post["writable_entries"], "source became writable after copy")
+    return {
+        "copy": clone,
+        "copy_argv": expanded_argv,
+        "filesystem_evidence": fs,
+        "source_tree_pre": source_tree_pre,
+        "source_tree_post": source_tree_post,
+        "source_identity_pre": source_identity_pre,
+        "source_identity_post": source_identity_post,
+        "source_files_pre": source_files_pre,
+        "source_files_post": source_files_post,
+        "clone_files": clone_files,
+        "clone_identity_before_thaw": clone_identity_before_thaw,
+        "clone_identity_after_thaw": clone_identity_after_thaw,
+        "clone_tree": clone_tree,
+        "clone_space": clone_space,
+        "thaw_manifest": thaw,
+        "full_content_hash_performed": True,
+        "hash_outside_p31": True,
+    }
+
+
+def revalidate_prepared_clone(
+    cell: Mapping[str, Any],
+    cwd: Path,
+) -> dict[str, Any]:
+    receipt = load_json(cwd / "receipts/store-clone.json", "store clone receipt")
+    policy = cell["runtime"]["clone_policy"]
+    source = Path(policy["source_root"]).resolve()
+    target = Path(policy["mutable_clone"]).absolute()
+    require(target == (cwd / "mutable-store").absolute(), "prepared clone target drift")
+    require(receipt.get("source") == str(source), "prepared clone source drift")
+    require(receipt.get("target") == str(target), "prepared clone receipt target drift")
+    require(target.is_dir() and not target.is_symlink(), "prepared clone missing")
+    target_stat = os.stat(target, follow_symlinks=False)
+    require(
+        target_stat.st_dev == receipt.get("target_dev")
+        and target_stat.st_ino == receipt.get("target_inode"),
+        "prepared clone root identity drift",
+    )
+    verification = receipt.get("verification")
+    require(type(verification) is dict, "prepared clone verification missing")
+    require(
+        verification.get("copy_argv") == full_copy_argv(policy, source, target),
+        "prepared clone copy argv drift",
+    )
+    source_tree = content_tree_manifest(source)
+    source_identity = identity_permission_manifest(source)
+    source_files = regular_file_identity_manifest(source)
+    clone_tree = content_tree_manifest(target)
+    clone_identity = identity_permission_manifest(target)
+    clone_files = regular_file_identity_manifest(target)
+    require(source_tree == verification.get("source_tree_post"), "prepared source tree drift")
+    require(source_identity == verification.get("source_identity_post"), "prepared source identity drift")
+    require(source_files == verification.get("source_files_post"), "prepared source files drift")
+    require(clone_tree == verification.get("clone_tree"), "prepared clone tree drift")
+    require(clone_identity == verification.get("clone_identity_after_thaw"), "prepared clone identity drift")
+    require(clone_files == verification.get("clone_files"), "prepared clone files drift")
+    validate_file_identity_separation(source_files, clone_files)
+    validate_thaw_manifest(source_identity, clone_identity, verification.get("thaw_manifest", []))
+    require(clone_tree["sha256"] == policy["tree_sha256"], "prepared clone sealed SHA drift")
+    return receipt
+
+
 def exact_cleanup(target: Path, allowed_parent: Path, expected_dev: int, expected_inode: int) -> None:
-    target = target.resolve()
+    target = target.absolute()
     allowed_parent = allowed_parent.resolve()
-    require(target.parent == allowed_parent, "cleanup parent drift")
+    require(os.path.lexists(target), "cleanup target absent")
+    require(not target.is_symlink(), "cleanup target symlink forbidden")
+    require(target.parent.resolve() == allowed_parent, "cleanup parent drift")
     require(target.is_dir() and not target.is_symlink(), "cleanup target invalid")
     require(not os.path.ismount(target), "cleanup target is a mount point")
-    stat = os.stat(target, follow_symlinks=False)
-    require(stat.st_dev == expected_dev and stat.st_ino == expected_inode, "cleanup dev/inode drift")
+    target_stat = os.stat(target, follow_symlinks=False)
+    require(
+        target_stat.st_dev == expected_dev and target_stat.st_ino == expected_inode,
+        "cleanup dev/inode drift",
+    )
     shutil.rmtree(target)
-    require(not target.exists(), "cleanup target still exists")
+    require(not os.path.lexists(target), "cleanup target still exists, including dangling symlink")
 
 
 def _load_module(path: Path) -> ModuleType:
@@ -453,17 +716,22 @@ def prepare(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
     target_ref = revalidate_target(cell)
     runtime = cell["runtime"]
     policy = runtime["clone_policy"]
+    require(
+        Path(policy["mutable_clone"]).absolute() == (cwd / "mutable-store").absolute(),
+        "mutable clone target/cell staging drift",
+    )
     seal_ref = verify_ref(policy["source_seal"], "source store seal")
     seal = load_json(Path(seal_ref["path"]), "source store seal")
     require(seal.get("state") == "PASS", "source store seal is not PASS")
     require(seal.get("tree_sha256") == policy["tree_sha256"], "source tree SHA drift")
     require(Path(seal["immutable_root"]).resolve() == Path(policy["source_root"]).resolve(), "source root/seal drift")
-    clone = copy_clone(
+    verification = verified_full_copy_and_thaw(
         Path(policy["source_root"]),
         Path(policy["mutable_clone"]),
         cwd,
-        list(policy["copy_argv"]),
+        policy,
     )
+    clone = verification["copy"]
     atomic_json(
         cwd / "receipts/store-clone.json",
         {
@@ -471,8 +739,13 @@ def prepare(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
             "source_seal": seal_ref,
             "target_p02b": target_ref,
             "source_tree_sha256": policy["tree_sha256"],
-            "full_content_hash_performed": False,
-            **clone,
+            "source": clone["source"],
+            "target": clone["target"],
+            "target_dev": clone["target_dev"],
+            "target_inode": clone["target_inode"],
+            "full_content_hash_performed": True,
+            "hash_outside_p31": True,
+            "verification": verification,
         },
     )
     request = _expected_request(cell, Path(clone["target"]))
@@ -522,6 +795,7 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
     )
     require(prepared.get("binary_argv") == expected_binary, "prepared binary argv drift")
     require(prepared.get("p31_argv") == expected_p31, "prepared P31 argv drift")
+    clone_receipt = revalidate_prepared_clone(cell, cwd)
     argv = prepared.get("p31_argv")
     require(type(argv) is list and argv and Path(argv[0]).is_absolute(), "prepared P31 argv invalid")
     completed = subprocess.run(argv, cwd=cwd, check=False)
@@ -536,6 +810,9 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
             "timing_generated": True,
             "target_p02b": target_ref,
             "binary_only_boundary": True,
+            "prepared_clone_receipt_sha256": sha256_file(cwd / "receipts/store-clone.json"),
+            "prepared_clone_dev": clone_receipt["target_dev"],
+            "prepared_clone_inode": clone_receipt["target_inode"],
             "p31_done": {
                 "path": str(done_path.resolve()),
                 "sha256": sha256_file(done_path),
@@ -624,6 +901,7 @@ def cleanup(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
         require((cwd / relative).is_file(), f"cleanup blocked: {relative} missing")
     clone_receipt = load_json(cwd / "receipts/store-clone.json", "store clone receipt")
     target = Path(clone_receipt["target"])
+    require(target.absolute() == (cwd / "mutable-store").absolute(), "cleanup receipt target drift")
     exact_cleanup(target, cwd, clone_receipt["target_dev"], clone_receipt["target_inode"])
     atomic_json(
         cwd / "receipts/cleanup.json",
@@ -631,6 +909,7 @@ def cleanup(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
             **_base_receipt(cell, plan_sha, "cleanup"),
             "target_p02b": target_ref,
             "mutable_clone_removed": True,
+            "mutable_clone_lexists_after": os.path.lexists(target),
             "mutable_clone": str(target),
             "released_dev": clone_receipt["target_dev"],
             "released_inode": clone_receipt["target_inode"],
@@ -663,36 +942,44 @@ def clone_dry_run(
     plan_ref: Mapping[str, Any],
     output: Path,
 ) -> None:
-    require(not output.exists(), "dry-run output already exists")
-    output.mkdir(parents=True)
+    require(cell.get("cell_key") == "seml0:bridge-canary", "clone dry-run is bridge-only")
+    output = output.absolute()
+    require(not os.path.lexists(output), "dry-run output already exists, including dangling symlink")
+    campaign_root = Path(plan["campaign_root"]).absolute()
+    require(not os.path.lexists(campaign_root), "campaign root must remain absent during dry-run")
+    require(
+        output != campaign_root
+        and output not in campaign_root.parents
+        and campaign_root not in output.parents,
+        "dry-run output/campaign root overlap",
+    )
     target_ref_pre = revalidate_target(cell)
     policy = cell["runtime"]["clone_policy"]
     require(policy.get("copy_mode") == "explicit-full-copy-ext4-v1", "full-copy mode required")
     predecessor = plan.get("clone_fallback_predecessor")
     verify_ref(predecessor, "failed reflink predecessor")
     target = output / "mutable-store"
+    full_copy_argv(policy, Path(policy["source_root"]), target)
+    output.mkdir(parents=True)
+    atomic_json(
+        output / "RUNNING.json",
+        {
+            "schema_version": DRYRUN_SCHEMA,
+            "state": "RUNNING",
+            "cell_key": cell["cell_key"],
+            "timing_generated": False,
+            **FALSE_ELIGIBILITY,
+        },
+    )
     try:
         source = Path(policy["source_root"])
-        fs_evidence = filesystem_evidence(source, output)
-        source_tree_pre = content_tree_manifest(source)
-        require(source_tree_pre["sha256"] == policy["tree_sha256"], "source pre-copy tree SHA drift")
-        source_identity_pre = identity_permission_manifest(source)
-        require(not source_identity_pre["writable_entries"], "source became writable before copy")
-        clone = copy_clone(
+        verification = verified_full_copy_and_thaw(
             source,
             target,
             output,
-            list(policy["copy_argv"]),
+            policy,
         )
-        thaw_manifest = thaw_owner_writable(target)
-        clone_tree = content_tree_manifest(target)
-        require(clone_tree["sha256"] == policy["tree_sha256"], "clone content tree SHA drift")
-        clone_space = tree_space(target)
-        source_tree_post = content_tree_manifest(source)
-        source_identity_post = identity_permission_manifest(source)
-        require(source_tree_pre == source_tree_post, "source tree drift across full copy")
-        require(source_identity_pre == source_identity_post, "source permissions/inode drift across full copy")
-        require(not source_identity_post["writable_entries"], "source became writable after copy")
+        clone = verification["copy"]
         exact_cleanup(target, output, clone["target_dev"], clone["target_inode"])
         target_ref_post = revalidate_target(cell)
         require(target_ref_pre == target_ref_post, "target P02B ref drift across clone dry-run")
@@ -708,21 +995,27 @@ def clone_dry_run(
                 "cell_key": cell["cell_key"],
                 "copy_mode": policy["copy_mode"],
                 "filesystem_contract": policy["filesystem_contract"],
-                "filesystem_evidence": fs_evidence,
+                "filesystem_evidence": verification["filesystem_evidence"],
                 "failed_reflink_predecessor": predecessor,
                 "target_p02b": target_ref_pre,
                 "source_seal": policy["source_seal"],
                 "source_tree_sha256": policy["tree_sha256"],
-                "source_tree_pre": source_tree_pre,
-                "source_tree_post": source_tree_post,
-                "source_identity_pre": source_identity_pre,
-                "source_identity_post": source_identity_post,
+                "source_tree_pre": verification["source_tree_pre"],
+                "source_tree_post": verification["source_tree_post"],
+                "source_identity_pre": verification["source_identity_pre"],
+                "source_identity_post": verification["source_identity_post"],
+                "source_files_pre": verification["source_files_pre"],
+                "source_files_post": verification["source_files_post"],
                 "clone": clone,
-                "clone_tree": clone_tree,
-                "clone_space": clone_space,
-                "thaw_manifest": thaw_manifest,
+                "clone_files": verification["clone_files"],
+                "clone_identity_before_thaw": verification["clone_identity_before_thaw"],
+                "clone_identity_after_thaw": verification["clone_identity_after_thaw"],
+                "clone_tree": verification["clone_tree"],
+                "clone_space": verification["clone_space"],
+                "thaw_manifest": verification["thaw_manifest"],
+                "verification": verification,
                 "mutable_clone_removed": True,
-                "clone_root_absent_after_cleanup": not target.exists(),
+                "clone_root_absent_after_cleanup": not os.path.lexists(target),
                 "timing_generated": False,
                 **FALSE_ELIGIBILITY,
             },
@@ -742,6 +1035,33 @@ def clone_dry_run(
         raise
 
 
+def verify_executor_binding(plan: Mapping[str, Any]) -> dict[str, Any]:
+    ref = verify_ref(plan.get("phase_executor"), "phase executor")
+    actual = Path(__file__).resolve()
+    require(Path(ref["path"]).resolve() == actual, "runtime executor path differs from plan")
+    require(ref["sha256"] == sha256_file(actual), "runtime executor self SHA drift")
+    return ref
+
+
+def write_phase_failure(cwd: Path, phase_name: str, reason: str) -> None:
+    if not cwd.is_dir():
+        return
+    path = cwd / "receipts" / f"{phase_name}-FAILED.json"
+    if os.path.lexists(path):
+        return
+    atomic_json(
+        path,
+        {
+            "schema_version": "cidr-e01-incremental-phase-failure-v1",
+            "state": "FAILED_RETAINED",
+            "phase": phase_name,
+            "reason": reason,
+            "timing_generated": phase_name in {"p31", "finalize", "cleanup"},
+            **FALSE_ELIGIBILITY,
+        },
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend-plan", type=Path, required=True)
@@ -749,6 +1069,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--phase", choices=(*PHASES, "clone-dry-run"), required=True)
     parser.add_argument("--dry-run-output", type=Path)
     args = parser.parse_args(argv)
+    failure_cwd: Optional[Path] = None
     try:
         plan_path = args.backend_plan.resolve()
         plan = load_json(plan_path, "backend plan")
@@ -761,6 +1082,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         for row in plan["cells"]:
             require(row.get("runtime", {}).get("variant") == CELL_VARIANTS[row["cell_key"]], "cell/variant mapping drift")
+        verify_executor_binding(plan)
         plan_sha = sha256_file(plan_path)
         plan_ref = {
             "path": str(plan_path),
@@ -775,12 +1097,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             require(plan.get("state") == "READY" and plan.get("execution_state") == "READY", "backend plan is not READY")
             cwd = Path(cell["staging_cell_root"]).resolve()
+            failure_cwd = cwd
             require(cwd == Path.cwd().resolve(), "phase cwd/staging drift")
             {"prepare": prepare, "p31": run_p31, "finalize": finalize, "cleanup": cleanup}[args.phase](
                 plan, cell, plan_sha, cwd
             )
         return 0
     except (PhaseError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        if failure_cwd is not None:
+            try:
+                write_phase_failure(failure_cwd, args.phase, str(exc))
+            except (PhaseError, OSError):
+                pass
         print(f"ERROR: {exc}")
         return 2
 

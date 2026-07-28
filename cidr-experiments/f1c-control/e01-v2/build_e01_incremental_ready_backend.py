@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 
-SCHEMA = "cidr-e01-incremental-backend-plan-v2"
+SCHEMA = "cidr-e01-incremental-backend-plan-v3"
 CELL_ORDER = (
     "seml0:bridge-canary",
     "seml0-naive:r1",
@@ -234,13 +234,40 @@ def validate_clone_bootstrap_contract(
     require(dryrun.get("source_tree_sha256") == stores["budg-b64"]["tree_sha256"], "clone dry-run source tree drift")
     clone = dryrun.get("clone")
     require(type(clone) is dict, "clone dry-run clone evidence missing")
+    verification = dryrun.get("verification")
+    require(type(verification) is dict, "clone dry-run unified verification missing")
+    require(
+        verification.get("copy") == clone
+        and verification.get("source_tree_pre") == dryrun.get("source_tree_pre")
+        and verification.get("source_tree_post") == dryrun.get("source_tree_post")
+        and verification.get("source_identity_pre") == dryrun.get("source_identity_pre")
+        and verification.get("source_identity_post") == dryrun.get("source_identity_post")
+        and verification.get("source_files_pre") == dryrun.get("source_files_pre")
+        and verification.get("source_files_post") == dryrun.get("source_files_post")
+        and verification.get("clone_files") == dryrun.get("clone_files")
+        and verification.get("clone_identity_after_thaw") == dryrun.get("clone_identity_after_thaw")
+        and verification.get("clone_tree") == dryrun.get("clone_tree")
+        and verification.get("clone_space") == dryrun.get("clone_space")
+        and verification.get("thaw_manifest") == dryrun.get("thaw_manifest")
+        and verification.get("full_content_hash_performed") is True
+        and verification.get("hash_outside_p31") is True,
+        "clone dry-run unified verification/top-level drift",
+    )
     require(clone.get("source") == str(Path(policy["source_root"]).resolve()), "clone dry-run source root drift")
     require(clone.get("target") == str(Path(clone["target"]).resolve()), "clone dry-run target root not canonical")
+    require(
+        policy.get("copy_argv")
+        == ["/bin/cp", "--archive", "--reflink=never", "--one-file-system", "--", "{SOURCE}", "{TARGET}"],
+        "clone dry-run policy argv drift",
+    )
     expected_argv = [
-        str(Path(policy["source_root"]).resolve()) + "/." if item == "{SOURCE}"
-        else clone["target"] if item == "{TARGET}"
-        else item
-        for item in policy["copy_argv"]
+        "/bin/cp",
+        "--archive",
+        "--reflink=never",
+        "--one-file-system",
+        "--",
+        str(Path(policy["source_root"]).resolve()) + "/.",
+        clone["target"],
     ]
     require(clone.get("copy_argv") == expected_argv, "clone dry-run copy argv drift")
     require(
@@ -257,6 +284,32 @@ def validate_clone_bootstrap_contract(
         and not dryrun.get("source_identity_post", {}).get("writable_entries"),
         "clone dry-run source identity/permissions drift",
     )
+    source_files = dryrun.get("source_files_pre", {}).get("files")
+    source_files_post = dryrun.get("source_files_post", {}).get("files")
+    clone_files = dryrun.get("clone_files", {}).get("files")
+    require(
+        type(source_files) is list
+        and source_files == source_files_post
+        and type(clone_files) is list
+        and len(source_files) == len(clone_files) > 0,
+        "clone dry-run regular-file identity evidence missing",
+    )
+    source_by_path = {row["path"]: row for row in source_files}
+    clone_by_path = {row["path"]: row for row in clone_files}
+    require(
+        len(source_by_path) == len(source_files)
+        and len(clone_by_path) == len(clone_files)
+        and set(source_by_path) == set(clone_by_path),
+        "clone dry-run file path identity drift",
+    )
+    source_inodes = {(row["dev"], row["inode"]) for row in source_files}
+    clone_inodes = {(row["dev"], row["inode"]) for row in clone_files}
+    require(
+        len(source_inodes) == len(source_files)
+        and len(clone_inodes) == len(clone_files)
+        and not source_inodes.intersection(clone_inodes),
+        "clone dry-run source/target inode overlap",
+    )
     require(
         dryrun.get("clone_tree", {}).get("sha256") == stores["budg-b64"]["tree_sha256"]
         and dryrun.get("clone_tree", {}).get("full_tree_hash_performed") is True,
@@ -266,11 +319,18 @@ def validate_clone_bootstrap_contract(
         type(dryrun.get("thaw_manifest")) is list
         and dryrun["thaw_manifest"]
         and all(
-            int(row["mode_after"], 8) & 0o200
-            and int(row["mode_after"], 8) & 0o022 == int(row["mode_before"], 8) & 0o022
+            int(row["mode_after"], 8) ^ int(row["mode_before"], 8) == 0o200
             for row in dryrun["thaw_manifest"]
         ),
         "clone dry-run thaw manifest drift",
+    )
+    clone_entries = dryrun.get("clone_identity_after_thaw", {}).get("entries")
+    require(type(clone_entries) is list, "clone dry-run clone identity evidence missing")
+    require(
+        len({row["path"] for row in dryrun["thaw_manifest"]}) == len(dryrun["thaw_manifest"])
+        and {row["path"] for row in dryrun["thaw_manifest"]}
+        == {row["path"] for row in clone_entries},
+        "clone dry-run thaw coverage drift",
     )
     require(
         dryrun.get("clone_space", {}).get("logical_file_bytes", 0) > 0
@@ -292,8 +352,22 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     sentinel, sentinel_ref = verify_ref(admission["p02b"]["sentinel"], "legacy P02B sentinel")
     executor_ref = file_ref(args.phase_executor, "phase executor")
     require(os.access(args.phase_executor, os.X_OK), "phase executor must be executable")
-    require(args.campaign_root.is_absolute() and not args.campaign_root.exists(), "campaign root must be absolute and absent")
-    require(args.output.is_absolute(), "absolute output path required")
+    require(
+        args.campaign_root.is_absolute() and not os.path.lexists(args.campaign_root),
+        "campaign root must be absolute and absent, including dangling symlink",
+    )
+    require(
+        args.output.is_absolute() and not os.path.lexists(args.output),
+        "output must be absolute and absent, including dangling symlink",
+    )
+    campaign_absolute = args.campaign_root.absolute()
+    output_absolute = args.output.absolute()
+    require(
+        campaign_absolute != output_absolute
+        and campaign_absolute not in output_absolute.parents
+        and output_absolute not in campaign_absolute.parents,
+        "output/campaign root overlap",
+    )
     failed_clone, failed_clone_ref = load(args.failed_clone_attempt, "failed reflink clone attempt")
     require(
         failed_clone.get("schema_version") == "cidr-e01-mutable-clone-dry-run-v1"
@@ -325,7 +399,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         blockers.append("mutable clone lifecycle dry-run receipt absent")
     else:
         dryrun, clone_ref = load(args.clone_dry_run, "clone dry-run")
-        require(dryrun.get("schema_version") == "cidr-e01-mutable-clone-dry-run-v2", "clone dry-run schema drift")
+        require(dryrun.get("schema_version") == "cidr-e01-mutable-clone-dry-run-v3", "clone dry-run schema drift")
         require(
             dryrun.get("state") == "PASS"
             and dryrun.get("mutable_clone_removed") is True
@@ -342,6 +416,15 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             target_refs=target_refs,
             stores=stores,
             failed_clone_ref=failed_clone_ref,
+        )
+        expected_dryrun_target = (Path(clone_ref["path"]).resolve().parent / "mutable-store").absolute()
+        require(
+            Path(dryrun["clone"]["target"]).absolute() == expected_dryrun_target,
+            "clone dry-run receipt target is not exact output child",
+        )
+        require(
+            not os.path.lexists(expected_dryrun_target),
+            "clone dry-run target remains present, including dangling symlink",
         )
 
     binary = inventory["binary"]
@@ -441,11 +524,23 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                         "reflink_supported": False,
                         "evidence": failed_clone_ref,
                     },
-                    "copy_argv": ["/bin/cp", "--archive", "--sparse=always", "--one-file-system", "--", "{SOURCE}", "{TARGET}"],
-                    "full_content_hash_per_cell": False,
+                    "copy_argv": ["/bin/cp", "--archive", "--reflink=never", "--one-file-system", "--", "{SOURCE}", "{TARGET}"],
+                    "full_content_hash_per_cell": True,
+                    "full_content_hash_outside_p31": True,
                 },
             },
         })
+
+    for cell in cells:
+        expected_clone = (Path(cell["staging_cell_root"]) / "mutable-store").absolute()
+        require(
+            Path(cell["runtime"]["clone_policy"]["mutable_clone"]).absolute() == expected_clone,
+            "cell mutable clone target drift",
+        )
+        require(
+            not os.path.lexists(expected_clone),
+            "cell mutable clone target exists, including dangling symlink",
+        )
 
     state = "HOLD" if blockers else "READY"
     gate_path = args.output.with_name(args.output.stem + ".ARMING-GATE.json")

@@ -57,6 +57,81 @@ class PhaseBackendTests(unittest.TestCase):
                 phase.exact_cleanup(target, parent, stat.st_dev, stat.st_ino + 1)
             self.assertTrue(target.exists())
 
+    def test_full_copy_argv_is_byte_exact_and_rejects_tamper(self) -> None:
+        policy = {"copy_argv": list(phase.FULL_COPY_ARGV_TEMPLATE)}
+        argv = phase.full_copy_argv(policy, Path("/source"), Path("/target"))
+        self.assertEqual(
+            argv,
+            [
+                "/bin/cp", "--archive", "--reflink=never", "--one-file-system",
+                "--", "/source/.", "/target",
+            ],
+        )
+        policy["copy_argv"].insert(2, "--sparse=always")
+        with self.assertRaisesRegex(phase.PhaseError, "argv contract drift"):
+            phase.full_copy_argv(policy, Path("/source"), Path("/target"))
+
+    def test_file_identity_separation_rejects_any_inode_overlap(self) -> None:
+        source = {"files": [
+            {"path": "a", "dev": 1, "inode": 10, "size_bytes": 3},
+            {"path": "b", "dev": 1, "inode": 11, "size_bytes": 4},
+        ]}
+        clone = {"files": [
+            {"path": "a", "dev": 1, "inode": 20, "size_bytes": 3},
+            {"path": "b", "dev": 1, "inode": 10, "size_bytes": 4},
+        ]}
+        with self.assertRaisesRegex(phase.PhaseError, "inode overlap"):
+            phase.validate_file_identity_separation(source, clone)
+
+    def test_thaw_manifest_requires_complete_unique_owner_write_only(self) -> None:
+        source = {"entries": [
+            {"path": ".", "kind": "directory", "uid": 1, "gid": 2, "mode": "0555"},
+            {"path": "a", "kind": "file", "uid": 1, "gid": 2, "mode": "0444"},
+        ]}
+        clone = {"entries": [
+            {"path": ".", "kind": "directory", "uid": 1, "gid": 2, "mode": "0755"},
+            {"path": "a", "kind": "file", "uid": 1, "gid": 2, "mode": "0644"},
+        ]}
+        rows = [
+            {"path": ".", "kind": "directory", "uid": 1, "gid": 2, "dev": 1, "inode": 20,
+             "mode_before": "0555", "mode_after": "0755"},
+            {"path": "a", "kind": "file", "uid": 1, "gid": 2, "dev": 1, "inode": 21,
+             "mode_before": "0444", "mode_after": "0644"},
+        ]
+        clone["entries"][0].update({"dev": 1, "inode": 20})
+        clone["entries"][1].update({"dev": 1, "inode": 21})
+        phase.validate_thaw_manifest(source, clone, rows)
+        with self.assertRaisesRegex(phase.PhaseError, "cover"):
+            phase.validate_thaw_manifest(source, clone, rows[:-1])
+        tampered = json.loads(json.dumps(rows))
+        tampered[1]["mode_after"] = "0664"
+        clone_tampered = json.loads(json.dumps(clone))
+        clone_tampered["entries"][1]["mode"] = "0664"
+        with self.assertRaisesRegex(phase.PhaseError, "beyond owner write"):
+            phase.validate_thaw_manifest(source, clone_tampered, tampered)
+
+    def test_clone_precheck_rejects_dangling_target_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            source = parent / "source"
+            source.mkdir()
+            target = parent / "clone"
+            target.symlink_to(parent / "missing", target_is_directory=True)
+            with self.assertRaisesRegex(phase.PhaseError, "dangling symlink"):
+                phase._safe_clone_roots(source, target, parent)
+
+    def test_executor_binding_checks_self_sha(self) -> None:
+        executor = Path(phase.__file__).resolve()
+        ref = {
+            "path": str(executor),
+            "sha256": phase.sha256_file(executor),
+            "size_bytes": executor.stat().st_size,
+        }
+        phase.verify_executor_binding({"phase_executor": ref})
+        ref["sha256"] = "0" * 64
+        with self.assertRaises(phase.PhaseError):
+            phase.verify_executor_binding({"phase_executor": ref})
+
     def test_clone_dry_run_copies_verifies_and_removes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -85,6 +160,7 @@ class PhaseBackendTests(unittest.TestCase):
             plan = {
                 "schema_version": phase.PLAN_SCHEMA,
                 "synthetic_test_only": False,
+                "campaign_root": str(root / "formal-campaign"),
                 "clone_fallback_predecessor": failed_ref,
                 "cells": [{
                     "cell_key": "seml0:bridge-canary",
@@ -103,7 +179,7 @@ class PhaseBackendTests(unittest.TestCase):
                             "reflink_supported": False,
                             "evidence": failed_ref,
                         },
-                        "copy_argv": ["/bin/cp", "--archive", "--sparse=always", "--", "{SOURCE}", "{TARGET}"],
+                        "copy_argv": list(phase.FULL_COPY_ARGV_TEMPLATE),
                     }},
                 }],
             }
@@ -154,6 +230,94 @@ class PhaseBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(phase.PhaseError, "blockers beyond"):
             phase.validate_clone_dry_run_plan(value)
 
+    def test_clone_dry_run_is_bridge_only_and_output_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = {"campaign_root": str(root / "campaign")}
+            with self.assertRaisesRegex(phase.PhaseError, "bridge-only"):
+                phase.clone_dry_run(
+                    plan,
+                    {"cell_key": "seml0-naive:r1"},
+                    {},
+                    root / "dryrun",
+                )
+            with self.assertRaisesRegex(phase.PhaseError, "overlap"):
+                phase.clone_dry_run(
+                    plan,
+                    {"cell_key": "seml0:bridge-canary", "runtime": {"clone_policy": {}}},
+                    {},
+                    root / "campaign" / "dryrun",
+                )
+
+    def test_prepare_all_four_cells_uses_verified_full_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "x").write_bytes(b"abc")
+            os.chmod(source / "x", 0o444)
+            os.chmod(source, 0o555)
+            tree = phase.content_tree_manifest(source)["sha256"]
+            seal = write_json(
+                root / "seal.json",
+                {
+                    "state": "PASS",
+                    "tree_sha256": tree,
+                    "immutable_root": str(source.resolve()),
+                },
+            )
+            seal_ref = {
+                "path": str(seal.resolve()),
+                "sha256": phase.sha256_file(seal),
+                "size_bytes": seal.stat().st_size,
+            }
+            original = phase.revalidate_target
+            phase.revalidate_target = lambda unused: {
+                "path": "/fixture/target.json", "sha256": "b" * 64, "size_bytes": 1,
+            }
+            try:
+                for ordinal, (key, variant) in enumerate(phase.CELL_VARIANTS.items(), start=1):
+                    cwd = root / f"cell-{ordinal}"
+                    cwd.mkdir()
+                    cell = {
+                        "cell_key": key,
+                        "ordinal": ordinal,
+                        "runtime": {
+                            "variant": variant,
+                            "request": {},
+                            "binary_argv": ["/bin/true", "{MUTABLE_CLONE}"],
+                            "p31_argv": ["/bin/true", "{REQUEST}", "{BINARY_ARGV_JSON}"],
+                            "clone_policy": {
+                                "source_root": str(source),
+                                "source_seal": seal_ref,
+                                "tree_sha256": tree,
+                                "mutable_clone": str(cwd / "mutable-store"),
+                                "copy_mode": "explicit-full-copy-ext4-v1",
+                                "filesystem_contract": {
+                                    "filesystem_type": "ext4",
+                                    "reflink_supported": False,
+                                },
+                                "copy_argv": list(phase.FULL_COPY_ARGV_TEMPLATE),
+                            },
+                        },
+                    }
+                    phase.prepare({}, cell, "a" * 64, cwd)
+                    receipt = phase.load_json(cwd / "receipts/store-clone.json", "clone")
+                    self.assertTrue(receipt["full_content_hash_performed"])
+                    verification = receipt["verification"]
+                    self.assertEqual(verification["clone_tree"]["sha256"], tree)
+                    phase.validate_file_identity_separation(
+                        verification["source_files_post"], verification["clone_files"]
+                    )
+                    phase.exact_cleanup(
+                        Path(receipt["target"]), cwd,
+                        receipt["target_dev"], receipt["target_inode"],
+                    )
+            finally:
+                phase.revalidate_target = original
+                os.chmod(source, 0o755)
+                os.chmod(source / "x", 0o644)
+
     def test_clone_bootstrap_contract_binds_plan_targets_and_copy_argv(self) -> None:
         admission = {"path": "/evidence/admission.json", "sha256": "a" * 64, "size_bytes": 1}
         targets = {
@@ -168,7 +332,7 @@ class PhaseBackendTests(unittest.TestCase):
         }
         source = "/immutable/budg"
         target = "/results/clone-dry-run/mutable-store"
-        copy_argv = ["/bin/cp", "--archive", "--sparse=always", "--", "{SOURCE}", "{TARGET}"]
+        copy_argv = list(phase.FULL_COPY_ARGV_TEMPLATE)
         filesystem_contract = {
             "mount": "/data",
             "filesystem_type": "ext4",
@@ -216,7 +380,8 @@ class PhaseBackendTests(unittest.TestCase):
                 "copy_argv": [
                     "/bin/cp",
                     "--archive",
-                    "--sparse=always",
+                    "--reflink=never",
+                    "--one-file-system",
                     "--",
                     source + "/.",
                     target,
@@ -231,8 +396,28 @@ class PhaseBackendTests(unittest.TestCase):
                 "sha256": stores["budg-b64"]["tree_sha256"],
                 "full_tree_hash_performed": True,
             },
-            "source_identity_pre": {"sha256": "7" * 64, "writable_entries": []},
-            "source_identity_post": {"sha256": "7" * 64, "writable_entries": []},
+            "source_identity_pre": {
+                "sha256": "7" * 64,
+                "writable_entries": [],
+                "entries": [{"path": ".", "kind": "directory", "uid": 1, "gid": 1, "mode": "0555"}],
+            },
+            "source_identity_post": {
+                "sha256": "7" * 64,
+                "writable_entries": [],
+                "entries": [{"path": ".", "kind": "directory", "uid": 1, "gid": 1, "mode": "0555"}],
+            },
+            "source_files_pre": {
+                "files": [{"path": "x", "dev": 1, "inode": 10, "size_bytes": 3}],
+            },
+            "source_files_post": {
+                "files": [{"path": "x", "dev": 1, "inode": 10, "size_bytes": 3}],
+            },
+            "clone_files": {
+                "files": [{"path": "x", "dev": 1, "inode": 20, "size_bytes": 3}],
+            },
+            "clone_identity_after_thaw": {
+                "entries": [{"path": ".", "kind": "directory", "uid": 1, "gid": 1, "mode": "0755"}],
+            },
             "clone_tree": {
                 "sha256": stores["budg-b64"]["tree_sha256"],
                 "full_tree_hash_performed": True,
@@ -241,10 +426,31 @@ class PhaseBackendTests(unittest.TestCase):
             "thaw_manifest": [
                 {
                     "path": ".",
+                    "kind": "directory",
+                    "uid": 1,
+                    "gid": 1,
+                    "dev": 1,
+                    "inode": 2,
                     "mode_before": "0555",
                     "mode_after": "0755",
                 }
             ],
+        }
+        dryrun["verification"] = {
+            "copy": dryrun["clone"],
+            "source_tree_pre": dryrun["source_tree_pre"],
+            "source_tree_post": dryrun["source_tree_post"],
+            "source_identity_pre": dryrun["source_identity_pre"],
+            "source_identity_post": dryrun["source_identity_post"],
+            "source_files_pre": dryrun["source_files_pre"],
+            "source_files_post": dryrun["source_files_post"],
+            "clone_files": dryrun["clone_files"],
+            "clone_identity_after_thaw": dryrun["clone_identity_after_thaw"],
+            "clone_tree": dryrun["clone_tree"],
+            "clone_space": dryrun["clone_space"],
+            "thaw_manifest": dryrun["thaw_manifest"],
+            "full_content_hash_performed": True,
+            "hash_outside_p31": True,
         }
         builder.validate_clone_bootstrap_contract(
             dryrun=dryrun,
@@ -281,6 +487,7 @@ class PhaseBackendTests(unittest.TestCase):
             )
         changed = json.loads(json.dumps(dryrun))
         changed["clone"]["copy_argv"][0] = "/bin/false"
+        changed["verification"]["copy"] = changed["clone"]
         with self.assertRaisesRegex(builder.BuildError, "copy argv drift"):
             builder.validate_clone_bootstrap_contract(
                 dryrun=changed,
