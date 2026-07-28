@@ -5,7 +5,8 @@ The production path is deliberately one-variant-at-a-time:
 
 1. validate the frozen lifecycle row and the old small P02B manifest;
 2. freshly hash the source and require the frozen SHA/count/bytes;
-3. reflink-copy into the exact staging root;
+3. use the exact copy method frozen by the lifecycle plan (reflink-only for
+   v1, or an explicitly evidenced full-copy fallback for v2);
 4. freshly hash the staging copy, make only that copy immutable, and atomically
    publish it at the exact immutable root;
 5. publish receipt-bound manifests and a PASS seal outside the hashed tree.
@@ -22,13 +23,17 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
-PLAN_SCHEMA = "cidr-e01-store-lifecycle-plan-v1"
+PLAN_SCHEMA_V1 = "cidr-e01-store-lifecycle-plan-v1"
+PLAN_SCHEMA_V2 = "cidr-e01-store-lifecycle-plan-v2"
+PLAN_SCHEMA = PLAN_SCHEMA_V1
 MANIFEST_SCHEMA = "p02b-store-manifest-v1"
 SEAL_SCHEMA = "cidr-e01-immutable-store-seal-v1"
 HASH_METHOD = "sha256-tree-v1(relative-path,size,file-sha256)"
+REFLINK_COPY_METHOD = "cp-archive-reflink-always"
+FULL_COPY_METHOD = "cp-archive-reflink-never"
 FALSE_ELIGIBILITY = {
     "formal_eligible": False,
     "performance_eligible": False,
@@ -129,6 +134,20 @@ def free_bytes(path: Path) -> int:
     return stat.f_bavail * stat.f_frsize
 
 
+def stat_identity(path: Path) -> dict[str, Any]:
+    value = path.stat()
+    return {
+        "dev": value.st_dev,
+        "inode": value.st_ino,
+        "mode": value.st_mode & 0o7777,
+        "uid": value.st_uid,
+        "gid": value.st_gid,
+        "size": value.st_size,
+        "mtime_ns": value.st_mtime_ns,
+        "ctime_ns": value.st_ctime_ns,
+    }
+
+
 def _inside(child: Path, parent: Path) -> bool:
     try:
         return os.path.commonpath((str(child.resolve()), str(parent.resolve()))) == str(
@@ -147,7 +166,8 @@ def preflight(
 ) -> dict[str, Any]:
     require(variant in {"budg-b64", "naive"}, "unsupported variant")
     plan = load_json(plan_path.resolve(), "lifecycle plan")
-    require(plan.get("schema_version") == PLAN_SCHEMA, "lifecycle schema")
+    plan_schema = plan.get("schema_version")
+    require(plan_schema in {PLAN_SCHEMA_V1, PLAN_SCHEMA_V2}, "lifecycle schema")
     require(plan.get("state") == "HOLD", "lifecycle must remain HOLD")
     require(plan.get("strict_serial") is True, "STRICT_SERIAL required")
     require(plan.get("max_live_mutable_clones") == 1, "one live clone contract")
@@ -186,14 +206,80 @@ def preflight(
     require(source_manifest["store_sha256"] == expected["store_sha256"], "expected SHA drift")
     require(source_manifest["file_count"] == expected["file_count"], "expected file count drift")
     require(source_manifest["total_bytes"] == expected["total_bytes"], "expected bytes drift")
+
+    if plan_schema == PLAN_SCHEMA_V1:
+        copy_method = REFLINK_COPY_METHOD
+        require(
+            row.get("copy_policy", {}).get("preferred_method") == "cp-reflink-always",
+            "v1 reflink copy policy drift",
+        )
+        fallback_evidence = None
+        required_available = minimum_free_bytes
+    else:
+        copy_method = row.get("copy_method")
+        require(copy_method == FULL_COPY_METHOD, "v2 explicit full-copy method required")
+        fallback = row.get("full_copy_fallback")
+        require(isinstance(fallback, dict), "v2 full-copy fallback contract required")
+        require(fallback.get("enabled") is True, "v2 full-copy fallback not enabled")
+        require(
+            fallback.get("reason") == "reflink_operation_not_supported",
+            "v2 fallback reason drift",
+        )
+        fallback_evidence = fallback.get("failure_receipt")
+        require(isinstance(fallback_evidence, dict), "fallback failure receipt reference")
+        for key in (
+            "prior_preflight_receipt",
+            "prior_fresh_source_manifest",
+            "prior_copy_stderr",
+        ):
+            evidence = fallback.get(key)
+            require(isinstance(evidence, dict), f"{key} reference")
+            require(
+                file_ref(Path(evidence["path"]).resolve()) == evidence,
+                f"{key} drift",
+            )
+        failure_path = Path(fallback_evidence["path"]).resolve()
+        require(file_ref(failure_path) == fallback_evidence, "fallback receipt drift")
+        failure = load_json(failure_path, "fallback failure receipt")
+        require(failure.get("state") == "FAILED_RETAINED", "fallback evidence state")
+        require(failure.get("source_modified") is False, "fallback source mutation")
+        require(failure.get("staging_retained") is True, "fallback staging retention")
+        require(failure.get("variant") == "budg-b64", "fallback evidence variant")
+        require(
+            failure.get("reason") == "reflink copy failed rc=1",
+            "fallback evidence reason",
+        )
+        failed_staging = Path(failure["staging_root"]).resolve()
+        require(failed_staging.exists(), "failed staging evidence missing")
+        require(staging != failed_staging, "new attempt must use a new staging root")
+        budg_rows = [
+            item
+            for item in plan.get("stores", [])
+            if isinstance(item, dict) and item.get("variant") == "budg-b64"
+        ]
+        require(len(budg_rows) == 1, "fallback budg-b64 source row")
+        require(
+            Path(failure["source_root"]).resolve()
+            == Path(budg_rows[0]["source_root"]).resolve(),
+            "fallback evidence source drift",
+        )
+        required_available = minimum_free_bytes + expected["total_bytes"]
+
     ancestor = nearest_existing_parent(immutable_parent)
-    require(ancestor.stat().st_dev == source.stat().st_dev, "reflink source/target device drift")
+    if copy_method == REFLINK_COPY_METHOD:
+        require(
+            ancestor.stat().st_dev == source.stat().st_dev,
+            "reflink source/target device drift",
+        )
     available = free_bytes(ancestor)
-    require(available >= minimum_free_bytes, "capacity below immutable-seal gate")
+    require(available >= required_available, "capacity below immutable-seal gate")
+    source_stat = stat_identity(source)
     return {
-        "schema_version": "cidr-e01-immutable-store-preflight-v1",
+        "schema_version": "cidr-e01-immutable-store-preflight-v2",
         "state": "PASS",
         "variant": variant,
+        "copy_method": copy_method,
+        "fallback_evidence": fallback_evidence,
         "plan": file_ref(plan_path.resolve()),
         "source_manifest": source_manifest_ref,
         "source_root": str(source),
@@ -202,8 +288,13 @@ def preflight(
         "attempt_root": str(attempt_root.resolve()),
         "source_dev": source.stat().st_dev,
         "source_inode": source.stat().st_ino,
+        "source_preflight_stat": source_stat,
         "available_bytes": available,
         "minimum_free_bytes": minimum_free_bytes,
+        "copy_reserve_bytes": (
+            expected["total_bytes"] if copy_method == FULL_COPY_METHOD else 0
+        ),
+        "required_available_bytes": required_available,
         "expected": expected,
         "source_mutation_authorized": False,
         "copy_or_hash_performed": False,
@@ -211,13 +302,38 @@ def preflight(
     }
 
 
+def copy_argv(method: str, source: Path, staging: Path) -> list[str]:
+    reflink = {
+        REFLINK_COPY_METHOD: "always",
+        FULL_COPY_METHOD: "never",
+    }.get(method)
+    require(reflink is not None, "unsupported copy method")
+    return [
+        "cp",
+        "--archive",
+        f"--reflink={reflink}",
+        "--",
+        f"{source}/.",
+        f"{staging}/",
+    ]
+
+
 def reflink_copy(source: Path, staging: Path, stdout_path: Path, stderr_path: Path) -> None:
     staging.parent.mkdir(parents=True, exist_ok=True)
     staging.mkdir(parents=False, exist_ok=False)
-    argv = ["cp", "--archive", "--reflink=always", "--", f"{source}/.", f"{staging}/"]
+    argv = copy_argv(REFLINK_COPY_METHOD, source, staging)
     with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
         result = subprocess.run(argv, stdout=stdout, stderr=stderr, check=False)
     require(result.returncode == 0, f"reflink copy failed rc={result.returncode}")
+
+
+def full_copy(source: Path, staging: Path, stdout_path: Path, stderr_path: Path) -> None:
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    staging.mkdir(parents=False, exist_ok=False)
+    argv = copy_argv(FULL_COPY_METHOD, source, staging)
+    with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
+        result = subprocess.run(argv, stdout=stdout, stderr=stderr, check=False)
+    require(result.returncode == 0, f"full copy failed rc={result.returncode}")
 
 
 def make_immutable(root: Path, *, include_root: bool = True) -> None:
@@ -241,7 +357,7 @@ def execute(
     variant: str,
     attempt_root: Path,
     minimum_free_bytes: int = MIN_DATA_FREE_BYTES,
-    copier: Callable[[Path, Path, Path, Path], None] = reflink_copy,
+    copier: Optional[Callable[[Path, Path, Path, Path], None]] = None,
 ) -> dict[str, Any]:
     checked = preflight(
         plan_path,
@@ -254,26 +370,61 @@ def execute(
     source = Path(checked["source_root"])
     staging = Path(checked["staging_root"])
     target = Path(checked["immutable_root"])
+    target_ancestor = None
+    phase = "SOURCE_PRE_HASH_STAT"
+    capacity_before_copy = None
+    capacity_after_copy = None
     try:
+        source_pre_stat = stat_identity(source)
+        require(
+            source_pre_stat == checked["source_preflight_stat"],
+            "source stat drift after preflight",
+        )
+        phase = "SOURCE_FRESH_HASH"
         source_manifest = tree_manifest(source)
         expected = checked["expected"]
         require(source_manifest["store_sha256"] == expected["store_sha256"], "fresh source SHA mismatch")
         require(source_manifest["file_count"] == expected["file_count"], "fresh source count mismatch")
         require(source_manifest["total_bytes"] == expected["total_bytes"], "fresh source bytes mismatch")
         atomic_json_new(attempt_root / "SOURCE-MANIFEST.json", source_manifest)
-        copier(
+        phase = "PRE_COPY_GATE"
+        source_pre_copy_stat = stat_identity(source)
+        require(
+            source_pre_copy_stat == source_pre_stat,
+            "source root stat changed before copy",
+        )
+        target_ancestor = nearest_existing_parent(Path(checked["immutable_root"]))
+        capacity_before_copy = free_bytes(target_ancestor)
+        require(
+            capacity_before_copy >= checked["required_available_bytes"],
+            "capacity dropped below copy gate",
+        )
+        copy_impl = copier
+        if copy_impl is None:
+            copy_impl = (
+                reflink_copy
+                if checked["copy_method"] == REFLINK_COPY_METHOD
+                else full_copy
+            )
+        phase = "COPY"
+        copy_impl(
             source,
             staging,
             attempt_root / "COPY.stdout",
             attempt_root / "COPY.stderr",
         )
+        phase = "TARGET_FRESH_HASH"
         staging_manifest = tree_manifest(staging)
         require(staging_manifest["store_sha256"] == expected["store_sha256"], "copy SHA mismatch")
         require(staging_manifest["file_count"] == expected["file_count"], "copy count mismatch")
         require(staging_manifest["total_bytes"] == expected["total_bytes"], "copy bytes mismatch")
+        source_post_stat = stat_identity(source)
+        require(source_post_stat == source_pre_stat, "source root stat changed during copy")
+        capacity_after_copy = free_bytes(target_ancestor)
         # Keep only the staging root writable until its atomic rename. Some
         # filesystems reject renaming a read-only source directory even when
         # both parents are writable; all descendants are already immutable.
+        phase = "IMMUTABLE_PUBLISH"
         make_immutable(staging, include_root=False)
         target.parent.mkdir(parents=True, exist_ok=True)
         require(not target.exists(), "target appeared before publish")
@@ -293,18 +444,34 @@ def execute(
             "source_root": str(source),
             "source_dev": checked["source_dev"],
             "source_inode": checked["source_inode"],
+            "source_pre_stat": source_pre_stat,
+            "source_pre_copy_stat": source_pre_copy_stat,
+            "source_post_stat": source_post_stat,
             "immutable_root": str(target),
             "immutable_dev": target.stat().st_dev,
             "immutable_inode": target.stat().st_ino,
             "source_manifest_fresh": file_ref(attempt_root / "SOURCE-MANIFEST.json"),
             "immutable_manifest": file_ref(attempt_root / "IMMUTABLE-MANIFEST.json"),
-            "copy_method": "cp --archive --reflink=always",
+            "copy_method": checked["copy_method"],
+            "copy_argv": copy_argv(checked["copy_method"], source, staging),
+            "fallback_evidence": checked["fallback_evidence"],
+            "fresh_source_tree_sha256": source_manifest["store_sha256"],
+            "fresh_target_tree_sha256": final_manifest["store_sha256"],
+            "capacity_gate": {
+                "available_bytes": checked["available_bytes"],
+                "minimum_free_bytes": checked["minimum_free_bytes"],
+                "copy_reserve_bytes": checked["copy_reserve_bytes"],
+                "required_available_bytes": checked["required_available_bytes"],
+                "available_before_copy_bytes": capacity_before_copy,
+                "available_after_copy_bytes": capacity_after_copy,
+            },
             "source_modified": False,
             "immutable_directory_mode": "0555",
             "immutable_file_mode": "0444",
             "formal_data_collected": False,
             **FALSE_ELIGIBILITY,
         }
+        phase = "SEAL"
         atomic_json_new(attempt_root / "SEAL-DONE.json", seal)
         return seal
     except BaseException as error:
@@ -315,10 +482,26 @@ def execute(
                     "schema_version": "cidr-e01-immutable-store-failed-v1",
                     "state": "FAILED_RETAINED",
                     "variant": variant,
+                    "phase": phase,
                     "reason": str(error),
+                    "copy_method": checked["copy_method"],
+                    "copy_argv": copy_argv(checked["copy_method"], source, staging),
                     "staging_root": str(staging),
                     "staging_retained": staging.exists(),
+                    "target_root": str(target),
+                    "target_exists": target.exists(),
                     "source_root": str(source),
+                    "source_pre_stat": locals().get("source_pre_stat"),
+                    "source_pre_copy_stat": locals().get("source_pre_copy_stat"),
+                    "source_post_stat": (
+                        stat_identity(source) if source.exists() else None
+                    ),
+                    "capacity_gate": {
+                        "available_at_preflight_bytes": checked["available_bytes"],
+                        "required_available_bytes": checked["required_available_bytes"],
+                        "available_before_copy_bytes": capacity_before_copy,
+                        "available_after_copy_bytes": capacity_after_copy,
+                    },
                     "source_modified": False,
                     **FALSE_ELIGIBILITY,
                 },

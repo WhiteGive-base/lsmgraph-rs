@@ -66,11 +66,67 @@ class ImmutableStoreTests(unittest.TestCase):
                         "expected_total_bytes": expected["total_bytes"],
                         "staging_root": str(immutable / "staging" / "budg-b64.tmp"),
                         "immutable_root": str(immutable / "stores" / "budg-b64"),
+                        "copy_policy": {"preferred_method": "cp-reflink-always"},
                     }
                 ],
             },
         )
         return plan_path, attempt, expected
+
+    def fallback_fixture(self, root: Path) -> tuple[Path, Path, dict, Path]:
+        plan_path, _, expected = self.fixture(root)
+        plan = json.loads(plan_path.read_text())
+        old_staging = Path(plan["stores"][0]["staging_root"])
+        old_staging.mkdir(parents=True)
+        (old_staging / "partial").write_bytes(b"retained")
+        prior = root / "attempt1"
+        write_json(
+            prior / "PREFLIGHT.json",
+            {
+                "state": "PASS",
+                "variant": "budg-b64",
+                "expected": {"store_sha256": expected["store_sha256"]},
+            },
+        )
+        write_json(prior / "SOURCE-MANIFEST.json", expected)
+        (prior / "COPY.stderr").write_bytes(b"Operation not supported\n")
+        write_json(
+            prior / "FAILED.json",
+            {
+                "state": "FAILED_RETAINED",
+                "variant": "budg-b64",
+                "reason": "reflink copy failed rc=1",
+                "source_modified": False,
+                "source_root": plan["stores"][0]["source_root"],
+                "staging_retained": True,
+                "staging_root": str(old_staging),
+            },
+        )
+        evidence = {
+            "failure_receipt": MOD.file_ref(prior / "FAILED.json"),
+            "prior_preflight_receipt": MOD.file_ref(prior / "PREFLIGHT.json"),
+            "prior_fresh_source_manifest": MOD.file_ref(
+                prior / "SOURCE-MANIFEST.json"
+            ),
+            "prior_copy_stderr": MOD.file_ref(prior / "COPY.stderr"),
+        }
+        row = plan["stores"][0]
+        row["staging_root"] = str(
+            Path(plan["immutable_asset_root"])
+            / "staging-attempt2"
+            / "budg-b64.full-copy.tmp"
+        )
+        row["copy_method"] = MOD.FULL_COPY_METHOD
+        row["full_copy_fallback"] = {
+            "enabled": True,
+            "method": MOD.FULL_COPY_METHOD,
+            "reason": "reflink_operation_not_supported",
+            **evidence,
+        }
+        plan["schema_version"] = MOD.PLAN_SCHEMA_V2
+        write_json(plan_path, plan)
+        attempt = Path("/tmp") / f"e01-seal-fallback-{root.name}"
+        return plan_path, attempt, expected, old_staging
 
     def test_tree_hash_matches_frozen_record_encoding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -82,6 +138,40 @@ class ImmutableStoreTests(unittest.TestCase):
             record = f"file\0x\0{1}\0{file_sha}\n".encode()
             expected = hashlib.sha256(record).hexdigest()
             self.assertEqual(MOD.tree_manifest(store)["store_sha256"], expected)
+
+    def test_reflink_copy_operation_not_supported_is_not_auto_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            staging = root / "staging"
+            stdout = root / "stdout"
+            stderr = root / "stderr"
+            result = mock.Mock(returncode=1)
+            with mock.patch.object(MOD.subprocess, "run", return_value=result) as run:
+                with self.assertRaisesRegex(MOD.SealError, "reflink copy failed rc=1"):
+                    MOD.reflink_copy(source, staging, stdout, stderr)
+            argv = run.call_args.args[0]
+            self.assertIn("--reflink=always", argv)
+            self.assertNotIn("--reflink=never", argv)
+            run.assert_called_once()
+
+    def test_full_copy_uses_explicit_reflink_never(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            staging = root / "staging"
+            stdout = root / "stdout"
+            stderr = root / "stderr"
+            result = mock.Mock(returncode=0)
+            with mock.patch.object(MOD.subprocess, "run", return_value=result) as run:
+                MOD.full_copy(source, staging, stdout, stderr)
+            argv = run.call_args.args[0]
+            self.assertIn("--archive", argv)
+            self.assertIn("--reflink=never", argv)
+            self.assertNotIn("--reflink=always", argv)
+            run.assert_called_once()
 
     def test_existing_target_blocks_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -111,6 +201,124 @@ class ImmutableStoreTests(unittest.TestCase):
                 failure = json.loads((attempt / "FAILED.json").read_text())
                 self.assertEqual(failure["state"], "FAILED_RETAINED")
                 self.assertFalse(failure["source_modified"])
+            finally:
+                shutil.rmtree(attempt, ignore_errors=True)
+
+    def test_reflink_failure_does_not_auto_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan, attempt, _ = self.fixture(Path(directory))
+
+            def unsupported(
+                source: Path, staging: Path, stdout: Path, stderr: Path
+            ) -> None:
+                staging.mkdir(parents=True)
+                stdout.write_bytes(b"")
+                stderr.write_bytes(b"Operation not supported\n")
+                raise MOD.SealError("reflink copy failed rc=1")
+
+            try:
+                with mock.patch.object(MOD, "free_bytes", return_value=10**15):
+                    with self.assertRaisesRegex(MOD.SealError, "reflink copy failed"):
+                        MOD.execute(
+                            plan,
+                            variant="budg-b64",
+                            attempt_root=attempt,
+                            copier=unsupported,
+                        )
+                failure = json.loads((attempt / "FAILED.json").read_text())
+                self.assertEqual(failure["copy_method"], MOD.REFLINK_COPY_METHOD)
+                self.assertEqual(failure["phase"], "COPY")
+                self.assertTrue(failure["staging_retained"])
+                self.assertFalse(failure["target_exists"])
+            finally:
+                shutil.rmtree(attempt, ignore_errors=True)
+
+    def test_full_copy_capacity_includes_expected_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan, attempt, expected, _ = self.fallback_fixture(Path(directory))
+            available = MOD.MIN_DATA_FREE_BYTES + expected["total_bytes"] - 1
+            with mock.patch.object(MOD, "free_bytes", return_value=available):
+                with self.assertRaisesRegex(MOD.SealError, "capacity"):
+                    MOD.preflight(plan, variant="budg-b64", attempt_root=attempt)
+
+    def test_v2_rejects_failed_staging_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan, attempt, _, old_staging = self.fallback_fixture(Path(directory))
+            value = json.loads(plan.read_text())
+            value["stores"][0]["staging_root"] = str(old_staging)
+            write_json(plan, value)
+            with mock.patch.object(MOD, "free_bytes", return_value=10**15):
+                with self.assertRaisesRegex(MOD.SealError, "staging root exists"):
+                    MOD.preflight(plan, variant="budg-b64", attempt_root=attempt)
+
+    def test_tiny_full_copy_records_explicit_method_and_source_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan, attempt, expected, _ = self.fallback_fixture(Path(directory))
+
+            def copy_fixture(
+                source: Path, staging: Path, stdout: Path, stderr: Path
+            ) -> None:
+                shutil.copytree(source, staging)
+                stdout.write_bytes(b"fixture")
+                stderr.write_bytes(b"")
+
+            try:
+                with mock.patch.object(MOD, "free_bytes", return_value=10**15):
+                    seal = MOD.execute(
+                        plan,
+                        variant="budg-b64",
+                        attempt_root=attempt,
+                        copier=copy_fixture,
+                    )
+                self.assertEqual(seal["copy_method"], MOD.FULL_COPY_METHOD)
+                self.assertIn("--reflink=never", seal["copy_argv"])
+                self.assertEqual(seal["source_pre_stat"], seal["source_post_stat"])
+                self.assertEqual(
+                    seal["fresh_source_tree_sha256"], expected["store_sha256"]
+                )
+                self.assertEqual(
+                    seal["fresh_target_tree_sha256"], expected["store_sha256"]
+                )
+                self.assertEqual(
+                    seal["capacity_gate"]["required_available_bytes"],
+                    MOD.MIN_DATA_FREE_BYTES + expected["total_bytes"],
+                )
+            finally:
+                target = Path(
+                    json.loads(plan.read_text())["stores"][0]["immutable_root"]
+                )
+                for path in sorted(target.rglob("*"), reverse=True) if target.exists() else []:
+                    path.chmod(0o755 if path.is_dir() else 0o644)
+                if target.exists():
+                    target.chmod(0o755)
+                shutil.rmtree(attempt, ignore_errors=True)
+
+    def test_source_stat_drift_during_full_copy_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan, attempt, _, _ = self.fallback_fixture(Path(directory))
+
+            def mutate_source(
+                source: Path, staging: Path, stdout: Path, stderr: Path
+            ) -> None:
+                shutil.copytree(source, staging)
+                (source / "late-drift").write_bytes(b"drift")
+                stdout.write_bytes(b"fixture")
+                stderr.write_bytes(b"")
+
+            try:
+                with mock.patch.object(MOD, "free_bytes", return_value=10**15):
+                    with self.assertRaisesRegex(MOD.SealError, "source root stat"):
+                        MOD.execute(
+                            plan,
+                            variant="budg-b64",
+                            attempt_root=attempt,
+                            copier=mutate_source,
+                        )
+                failure = json.loads((attempt / "FAILED.json").read_text())
+                self.assertEqual(failure["state"], "FAILED_RETAINED")
+                self.assertEqual(failure["phase"], "TARGET_FRESH_HASH")
+                self.assertTrue(failure["staging_retained"])
+                self.assertFalse(failure["target_exists"])
             finally:
                 shutil.rmtree(attempt, ignore_errors=True)
 

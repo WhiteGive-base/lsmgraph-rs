@@ -272,7 +272,12 @@ def build(
     }
 
 
-def validate(value_or_path: Any, *, verify_inputs: bool = True) -> Dict[str, Any]:
+def validate(
+    value_or_path: Any,
+    *,
+    verify_inputs: bool = True,
+    verify_live_absence: bool = True,
+) -> Dict[str, Any]:
     value = (
         load_json(value_or_path.resolve(), "store lifecycle plan")
         if isinstance(value_or_path, Path)
@@ -293,7 +298,8 @@ def validate(value_or_path: Any, *, verify_inputs: bool = True) -> Dict[str, Any
     campaign_root = Path(str(value.get("campaign_root", "")))
     require(immutable_root.is_absolute(), "absolute immutable root required")
     require(campaign_root.is_absolute(), "absolute campaign root required")
-    require(not immutable_root.exists(), "immutable root must remain absent in HOLD")
+    if verify_live_absence:
+        require(not immutable_root.exists(), "immutable root must remain absent in HOLD")
     require(not campaign_root.exists(), "campaign root must remain absent in HOLD")
     if verify_inputs:
         verify_ref(value.get("asset_inventory"), "asset inventory")
