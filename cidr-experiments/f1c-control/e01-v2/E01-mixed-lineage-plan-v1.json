@@ -139,7 +139,11 @@
       }
     ],
     "figure_row_count": 3,
-    "incremental_evidence": null,
+    "incremental_evidence": {
+      "reason": "formal MATRIX-DONE has not been adapted and assembled",
+      "schema_version": "cidr-e01-incremental-evidence-v2",
+      "state": "ABSENT"
+    },
     "pre_output_policy": {
       "formal_root_creation": "REJECT_UNTIL_FRESH_ASSETS_AND_GATES_PASS",
       "legacy_root_mutation": "FORBIDDEN",

@@ -81,6 +81,17 @@ class PostprocessPlanTests(unittest.TestCase):
 
     def test_cost_and_claim_gates_stay_closed(self) -> None:
         value = self.build()
+        self.assertEqual(
+            value["execution_state"], "CORE_IMPLEMENTED_REMAINDER_HOLD"
+        )
+        self.assertEqual(
+            value["interfaces"]["matrix_evidence_adapter"]["state"],
+            "IMPLEMENTED_NOT_RUN",
+        )
+        self.assertEqual(
+            value["interfaces"]["pass_composition_assembler"]["state"],
+            "IMPLEMENTED_NOT_RUN",
+        )
         cost = value["interfaces"]["cost_lineage_admission"]
         self.assertTrue(cost["historical_cost_implicit_reuse_forbidden"])
         self.assertTrue(cost["fresh_or_explicitly_admitted_cost_receipt_required"])

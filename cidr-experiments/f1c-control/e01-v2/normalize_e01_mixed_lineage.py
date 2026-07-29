@@ -72,6 +72,17 @@ REQUIRED_GATES = (
 )
 TARGET_P02B_SCHEMA = "cidr-e01-target-specific-p02b-v1"
 TARGET_VARIANTS = {"budg-b64", "naive"}
+EVIDENCE_SCHEMA = "cidr-e01-incremental-evidence-v2"
+CELL_RECEIPT_PATHS = {
+    "prepared_command": "receipts/prepared-command.json",
+    "p31": "receipts/p31.json",
+    "command_topology": "receipts/command-topology.json",
+    "validated_result": "validated-result.json",
+    "correctness": "receipts/correctness.json",
+    "fairness": "receipts/fairness.json",
+    "store_clone": "receipts/store-clone.json",
+    "cleanup": "receipts/cleanup.json",
+}
 
 
 def _asset_ref(value: Any, label: str, *, verify: bool = True) -> Dict[str, Any]:
@@ -246,6 +257,24 @@ def _validate_fresh_provenance(
         f"{key}.cell_done",
     )
     cell_done = read_json(Path(cell_done_ref["path"]), f"{key}.cell_done")
+    done_receipts = cell_done.get("receipts")
+    if type(done_receipts) is not dict or set(done_receipts) != set(CELL_RECEIPT_PATHS):
+        raise CompositionError(f"{key}: CELL-DONE receipt set drift")
+    for role, relative in CELL_RECEIPT_PATHS.items():
+        path = final_root / relative
+        actual = {
+            "path": relative,
+            "sha256": sha256_file(path),
+            "size_bytes": path.stat().st_size,
+        }
+        if done_receipts.get(role) != actual:
+            raise CompositionError(f"{key}: CELL-DONE {role} descriptor drift")
+    cleanup_ref = _require_ref_path(
+        cell.get("cleanup_receipt"),
+        final_root / "receipts" / "cleanup.json",
+        f"{key}.cleanup_receipt",
+    )
+    cleanup = read_json(Path(cleanup_ref["path"]), f"{key}.cleanup_receipt")
     artifacts = validated.get("adapter_artifacts")
     if type(artifacts) is not dict:
         raise CompositionError(f"{key}: validated adapter artifacts required")
@@ -380,12 +409,24 @@ def _validate_fresh_provenance(
     if (
         binding.get("backend_plan") != formal_backend_ref
         or validated.get("backend_plan") != formal_backend_ref
+        or validated.get("schema_version") != "cidr-p10-validated-repeat-v1"
+        or validated_receipt.get("schema_version")
+        != "cidr-e01-incremental-validated-result-receipt-v1"
+        or validated_receipt.get("state") != "PASS"
+        or validated_receipt.get("mode") != "production"
+        or validated_receipt.get("synthetic_test_only") is not False
+        or validated_receipt.get("fixture_only") is not False
         or validated_receipt.get("backend_plan_sha256")
         != formal_backend_ref["sha256"]
         or cell_done.get("backend_plan_sha256") != formal_backend_ref["sha256"]
         or validated_receipt.get("adapter_result") != validated_ref
         or validated_receipt.get("adapter_provenance") != provenance_ref
         or cell_done.get("state") != "PASS"
+        or cell_done.get("schema_version")
+        != "cidr-e01-incremental-production-cell-done-v1"
+        or cell_done.get("mode") != "production"
+        or cell_done.get("synthetic_test_only") is not False
+        or cell_done.get("fixture_only") is not False
         or cell_done.get("cell_key") != key
         or cell_done.get("ordinal") != cell.get("ordinal")
         or cell_done.get("receipts", {}).get("validated_result")
@@ -394,6 +435,16 @@ def _validate_fresh_provenance(
             "sha256": validated_receipt_ref["sha256"],
             "size_bytes": validated_receipt_ref["size_bytes"],
         }
+        or cleanup.get("schema_version")
+        != "cidr-e01-incremental-cleanup-receipt-v1"
+        or cleanup.get("state") != "PASS"
+        or cleanup.get("mode") != "production"
+        or cleanup.get("synthetic_test_only") is not False
+        or cleanup.get("fixture_only") is not False
+        or cleanup.get("cell_key") != key
+        or cleanup.get("ordinal") != cell.get("ordinal")
+        or cleanup.get("backend_plan_sha256") != formal_backend_ref["sha256"]
+        or cleanup.get("mutable_clone_removed") is not True
         or binding.get("target_p02b") != target_ref
         or binding.get("p31_receipt") != p31_ref
         or binding.get("p31_run_manifest") != manifest_ref
@@ -476,7 +527,11 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
     ):
         raise CompositionError("pre-output gate: bridge canary contract identity drift")
     evidence = plan.get("incremental_evidence")
-    if type(evidence) is not dict or evidence.get("state") != "PASS":
+    if (
+        type(evidence) is not dict
+        or evidence.get("schema_version") != EVIDENCE_SCHEMA
+        or evidence.get("state") != "PASS"
+    ):
         raise CompositionError("pre-output gate: fresh incremental evidence is absent")
     formal_backend_ref = _asset_ref(
         evidence.get("formal_backend_plan"), "incremental_evidence.formal_backend_plan"
@@ -486,21 +541,96 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
     )
     backend_cells = formal_backend.get("cells")
     if (
-        formal_backend.get("state") != "READY"
+        formal_backend.get("schema_version")
+        != "cidr-e01-incremental-backend-plan-v3"
+        or formal_backend.get("state") != "READY"
+        or formal_backend.get("execution_state") != "READY"
         or type(backend_cells) is not list
         or [item.get("cell_key") for item in backend_cells]
         != [item[0] for item in INCREMENTAL_CELLS]
     ):
         raise CompositionError("pre-output gate: frozen formal backend plan drift")
+    anchor_ref = _asset_ref(
+        evidence.get("postprocess_anchor"), "incremental_evidence.postprocess_anchor"
+    )
+    anchor = read_json(Path(anchor_ref["path"]), "incremental_evidence.postprocess_anchor")
+    if (
+        anchor.get("schema_version")
+        != "cidr-e01-incremental-postprocess-anchor-v1"
+        or anchor.get("state") != "FROZEN_BEFORE_TIMING"
+        or anchor.get("formal_backend_plan") != formal_backend_ref
+        or anchor.get("campaign_root") != formal_backend.get("campaign_root")
+        or anchor.get("cell_keys") != [item[0] for item in INCREMENTAL_CELLS]
+    ):
+        raise CompositionError("pre-output gate: external postprocess anchor drift")
     arming = formal_backend.get("campaign_gates", {}).get("backend_arming")
     if type(arming) is not dict or set(arming) != {"path"}:
         raise CompositionError("pre-output gate: backend arming path required")
     arming_gate = read_json(Path(arming["path"]), "formal backend arming gate")
     if (
         arming_gate.get("state") != "PASS"
+        or arming_gate.get("schema_version")
+        != "cidr-e01-incremental-backend-arming-gate-v2"
         or arming_gate.get("backend_plan") != formal_backend_ref
     ):
         raise CompositionError("pre-output gate: backend plan/arming gate drift")
+    if evidence.get("backend_arming_gate") != _asset_ref(
+        {
+            "path": str(Path(arming["path"]).resolve()),
+            "sha256": sha256_file(Path(arming["path"])),
+            "size_bytes": Path(arming["path"]).stat().st_size,
+        },
+        "incremental_evidence.backend_arming_gate",
+    ):
+        raise CompositionError("pre-output gate: evidence arming-gate ref drift")
+    campaign_root = Path(str(formal_backend.get("campaign_root", ""))).resolve()
+    if evidence.get("campaign_root") != str(campaign_root):
+        raise CompositionError("pre-output gate: evidence campaign root drift")
+    start_ref = _require_ref_path(
+        evidence.get("matrix_start"),
+        campaign_root / "MATRIX-START.json",
+        "incremental_evidence.matrix_start",
+    )
+    matrix_start = read_json(Path(start_ref["path"]), "incremental_evidence.matrix_start")
+    if (
+        matrix_start.get("schema_version")
+        != "cidr-e01-incremental-production-matrix-start-v1"
+        or matrix_start.get("state") != "PASS"
+        or matrix_start.get("mode") != "production"
+        or matrix_start.get("strict_serial") is not True
+        or matrix_start.get("synthetic_test_only") is not False
+        or matrix_start.get("backend_plan_sha256") != formal_backend_ref["sha256"]
+    ):
+        raise CompositionError("pre-output gate: MATRIX-START drift")
+    matrix_ref = _require_ref_path(
+        evidence.get("matrix_done"),
+        campaign_root / "MATRIX-DONE.json",
+        "incremental_evidence.matrix_done",
+    )
+    matrix = read_json(Path(matrix_ref["path"]), "incremental_evidence.matrix_done")
+    matrix_cells = matrix.get("cells")
+    if (
+        set(matrix)
+        != {
+            "schema_version", "state", "mode", "synthetic_test_only",
+            "strict_serial", "completed_cells", "backend_plan_sha256", "cells",
+            "canary_evaluation", "canary_accepted", "formal_eligible",
+            "performance_eligible", "paper_claim_eligible",
+        }
+        or
+        matrix.get("schema_version")
+        != "cidr-e01-incremental-production-matrix-done-v1"
+        or matrix.get("state") != "PASS"
+        or matrix.get("mode") != "production"
+        or matrix.get("strict_serial") is not True
+        or matrix.get("synthetic_test_only") is not False
+        or matrix.get("completed_cells") != 4
+        or matrix.get("backend_plan_sha256") != formal_backend_ref["sha256"]
+        or type(matrix_cells) is not list
+        or [item.get("cell_key") for item in matrix_cells]
+        != [item[0] for item in INCREMENTAL_CELLS]
+    ):
+        raise CompositionError("pre-output gate: MATRIX-DONE drift")
     gates = evidence.get("campaign_gates")
     if type(gates) is not dict or set(gates) != set(REQUIRED_GATES):
         raise CompositionError("pre-output gate: exact fresh campaign gate set required")
@@ -535,7 +665,9 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
     if type(cells) is not list or [cell.get("cell_key") for cell in cells] != expected_keys:
         raise CompositionError("pre-output gate: exact four-cell evidence order required")
     rows = []
-    for cell, expected, backend_cell in zip(cells, INCREMENTAL_CELLS, backend_cells):
+    for cell, expected, backend_cell, matrix_cell in zip(
+        cells, INCREMENTAL_CELLS, backend_cells, matrix_cells
+    ):
         key, system, repeat, role, included = expected
         if (
             cell.get("system_id") != system
@@ -570,6 +702,12 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
             raise CompositionError(f"{key}: target query-plan backlink drift")
         if cell.get("target_lease") != expected_bundle["lease"]:
             raise CompositionError(f"{key}: target lease backlink drift")
+        cell_done_ref = _asset_ref(cell.get("cell_done"), f"{key}.cell_done")
+        if matrix_cell != {
+            "cell_key": key,
+            "cell_done_sha256": cell_done_ref["sha256"],
+        }:
+            raise CompositionError(f"{key}: MATRIX-DONE/CELL-DONE drift")
         if type(identity) is not dict or identity.get("physical_input_sha256") != target_bundles[expected_variant]["store_pre"]["sha256"]:
             raise CompositionError(f"{key}: target P02B/store identity drift")
         _validate_fresh_provenance(

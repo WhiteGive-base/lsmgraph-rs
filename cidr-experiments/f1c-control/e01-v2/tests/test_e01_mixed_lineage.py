@@ -246,34 +246,6 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
     adapter_tool = write_text(root, "fresh/seml0_adapter.py", "# fixture\n")
     campaign_root = root / "fresh/campaign"
     arming_gate_path = (root / "fresh/backend-plan.ARMING-GATE.json").resolve()
-    backend_plan_value = {
-        "state": "READY",
-        "campaign_root": str(campaign_root.resolve()),
-        "campaign_gates": {"backend_arming": {"path": str(arming_gate_path)}},
-        "cells": [
-            {
-                "ordinal": ordinal,
-                "cell_key": key,
-                "final_cell_root": str(
-                    (
-                        campaign_root
-                        / "cells"
-                        / f"{ordinal:02d}-{key.replace(':', '-')}"
-                    ).resolve()
-                ),
-                "runtime": {"adapter_tool": adapter_tool},
-            }
-            for ordinal, (key, *_rest) in enumerate(
-                builder.INCREMENTAL_CELLS, start=1
-            )
-        ],
-    }
-    backend_plan = write_json(root, "fresh/backend-plan.json", backend_plan_value)
-    write_json(
-        root,
-        "fresh/backend-plan.ARMING-GATE.json",
-        {"state": "PASS", "backend_plan": backend_plan},
-    )
     repo_head = "a" * 40
     gates = {}
     target_refs = {}
@@ -326,6 +298,89 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
             body["target_p02b"] = target_refs
         receipt = write_json(root, f"fresh/gates/{gate}.json", body)
         gates[gate] = {"state": "PASS", "receipt": receipt}
+    admission = write_json(
+        root,
+        "fresh/admission.json",
+        {
+            "p03": gates["fresh_p03"]["receipt"],
+            "lease": {"receipt": gates["fresh_batch_lease"]["receipt"]},
+        },
+    )
+    backend_plan_value = {
+        "schema_version": "cidr-e01-incremental-backend-plan-v3",
+        "state": "READY",
+        "execution_state": "READY",
+        "strict_serial": True,
+        "synthetic_test_only": False,
+        "fixture_only": False,
+        "campaign_root": str(campaign_root.resolve()),
+        "campaign_gates": {"backend_arming": {"path": str(arming_gate_path)}},
+        "production_scheduler": adapter_tool,
+        "phase_executor": adapter_tool,
+        "admission_bundle": admission,
+        "asset_inventory": gates["fresh_asset_seal"]["receipt"],
+        "lineage": gates["adapter_identity"]["receipt"],
+        "target_p02b": target_refs,
+        "cells": [
+            {
+                "ordinal": ordinal,
+                "cell_key": key,
+                "final_cell_root": str(
+                    (
+                        campaign_root
+                        / "cells"
+                        / f"{ordinal:02d}-{key.replace(':', '-')}"
+                    ).resolve()
+                ),
+                "runtime": {
+                    "adapter_tool": adapter_tool,
+                    "target_p02b": target_refs[
+                        "budg-b64" if key == "seml0:bridge-canary" else "naive"
+                    ],
+                    "target_query_plan": target_bundles[
+                        "budg-b64" if key == "seml0:bridge-canary" else "naive"
+                    ]["static_inputs"]["query_plan"],
+                    "target_lease": target_bundles[
+                        "budg-b64" if key == "seml0:bridge-canary" else "naive"
+                    ]["lease"],
+                },
+            }
+            for ordinal, (key, *_rest) in enumerate(
+                builder.INCREMENTAL_CELLS, start=1
+            )
+        ],
+        "canary_checkpoint": {
+            "comparability_contract_sha256": result["incremental_plan"][
+                "bridge_canary_comparability_contract"
+            ]["contract_sha256"]
+        },
+    }
+    backend_plan = write_json(root, "fresh/backend-plan.json", backend_plan_value)
+    backend_arming_gate = write_json(
+        root,
+        "fresh/backend-plan.ARMING-GATE.json",
+        {
+            "schema_version": "cidr-e01-incremental-backend-arming-gate-v2",
+            "state": "PASS",
+            "backend_plan": backend_plan,
+            "production_scheduler": adapter_tool,
+            "phase_executor": adapter_tool,
+        },
+    )
+    postprocess_anchor = write_json(
+        root,
+        "fresh/postprocess-anchor.json",
+        {
+            "schema_version": "cidr-e01-incremental-postprocess-anchor-v1",
+            "state": "FROZEN_BEFORE_TIMING",
+            "formal_backend_plan": backend_plan,
+            "campaign_root": str(campaign_root.resolve()),
+            "cell_keys": [item[0] for item in builder.INCREMENTAL_CELLS],
+            "formal_eligible": False,
+            "performance_eligible": False,
+            "paper_claim_eligible": False,
+        },
+    )
     cells = []
     for ordinal, (key, system, repeat, role, included) in enumerate(
         builder.INCREMENTAL_CELLS, start=1
@@ -381,6 +436,32 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "run_manifest": run_manifest,
                 "command_topology": topology,
             },
+        )
+        prepared = write_json(
+            root,
+            f"{final_relative}/receipts/prepared-command.json",
+            {"state": "PASS", "request": request},
+        )
+        correctness = write_json(
+            root,
+            f"{final_relative}/receipts/correctness.json",
+            {
+                "schema_version": "cidr-e01-incremental-correctness-receipt-v1",
+                "state": "PASS",
+                "mode": "production",
+                "synthetic_test_only": False,
+                "fixture_only": False,
+                "cell_key": key,
+                "ordinal": ordinal,
+                "backend_plan_sha256": backend_plan["sha256"],
+                "mismatch_queries": 0,
+                "timeout_queries": 0,
+            },
+        )
+        fairness = write_json(
+            root,
+            f"{final_relative}/receipts/fairness.json",
+            {"state": "PASS"},
         )
         adapter_result = write_json(
             root, f"{final_relative}/adapter-output/adapter-result.json", {"state": "PASS"}
@@ -482,7 +563,24 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
             root,
             f"{final_relative}/adapter-output/validated-repeat.json",
             {
+                "schema_version": "cidr-p10-validated-repeat-v1",
                 "state": "PASS",
+                "cell_key": key,
+                "ordinal": ordinal,
+                "final_cell_root": str(final_root.resolve()),
+                "interface_scope": "typed-neighbor-dense-id-v1",
+                "concurrency": 1,
+                "query_count": 1700,
+                "warmup_passes": 1,
+                "measured_passes": 1,
+                "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                "measurement_s": 30.0,
+                "warmup_s": 30.0,
+                "latency_p50_us": 1.0,
+                "latency_p95_us": 2.0,
+                "latency_p99_us": 3.0,
+                "qps": 1700.0 / 30.0,
+                "completed_queries": 1700,
                 "backend_plan": backend_plan,
                 "target_p02b": target_refs[target_variant],
                 "request": request,
@@ -506,6 +604,9 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
             {
                 "schema_version": "cidr-e01-incremental-validated-result-receipt-v1",
                 "state": "PASS",
+                "mode": "production",
+                "synthetic_test_only": False,
+                "fixture_only": False,
                 "cell_key": key,
                 "ordinal": ordinal,
                 "backend_plan_sha256": backend_plan["sha256"],
@@ -514,23 +615,53 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
             },
         )
         cleanup = write_json(
-            root, f"{final_relative}/receipts/cleanup.json", {"state": "PASS"}
+            root,
+            f"{final_relative}/receipts/cleanup.json",
+            {
+                "schema_version": "cidr-e01-incremental-cleanup-receipt-v1",
+                "state": "PASS",
+                "mode": "production",
+                "synthetic_test_only": False,
+                "fixture_only": False,
+                "cell_key": key,
+                "ordinal": ordinal,
+                "backend_plan_sha256": backend_plan["sha256"],
+                "mutable_clone_removed": True,
+            },
         )
+        receipt_refs = {
+            "prepared_command": prepared,
+            "p31": p31,
+            "command_topology": topology,
+            "validated_result": validated_receipt,
+            "correctness": correctness,
+            "fairness": fairness,
+            "store_clone": clone,
+            "cleanup": cleanup,
+        }
         cell_done = write_json(
             root,
             f"{final_relative}/CELL-DONE.json",
             {
                 "schema_version": "cidr-e01-incremental-production-cell-done-v1",
                 "state": "PASS",
+                "mode": "production",
+                "synthetic_test_only": False,
+                "fixture_only": False,
                 "cell_key": key,
                 "ordinal": ordinal,
                 "backend_plan_sha256": backend_plan["sha256"],
                 "receipts": {
-                    "validated_result": {
-                        "path": "validated-result.json",
-                        "sha256": validated_receipt["sha256"],
-                        "size_bytes": validated_receipt["size_bytes"],
+                    name: {
+                        "path": (
+                            "validated-result.json"
+                            if name == "validated_result"
+                            else f"receipts/{name.replace('_', '-')}.json"
+                        ),
+                        "sha256": ref["sha256"],
+                        "size_bytes": ref["size_bytes"],
                     }
+                    for name, ref in receipt_refs.items()
                 },
             },
         )
@@ -599,9 +730,52 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
         "fresh/canary-comparability.json",
         {"state": "PASS", "contract_sha256": contract_sha},
     )
+    matrix_start = write_json(
+        root,
+        "fresh/campaign/MATRIX-START.json",
+        {
+            "schema_version": "cidr-e01-incremental-production-matrix-start-v1",
+            "state": "PASS",
+            "mode": "production",
+            "strict_serial": True,
+            "synthetic_test_only": False,
+            "backend_plan_sha256": backend_plan["sha256"],
+        },
+    )
+    matrix_done = write_json(
+        root,
+        "fresh/campaign/MATRIX-DONE.json",
+        {
+            "schema_version": "cidr-e01-incremental-production-matrix-done-v1",
+            "state": "PASS",
+            "mode": "production",
+            "strict_serial": True,
+            "synthetic_test_only": False,
+            "completed_cells": 4,
+            "backend_plan_sha256": backend_plan["sha256"],
+            "cells": [
+                {
+                    "cell_key": cell["cell_key"],
+                    "cell_done_sha256": cell["cell_done"]["sha256"],
+                }
+                for cell in cells
+            ],
+            "canary_evaluation": canary_receipt,
+            "canary_accepted": canary_receipt,
+            "formal_eligible": False,
+            "performance_eligible": False,
+            "paper_claim_eligible": False,
+        },
+    )
     result["incremental_plan"]["incremental_evidence"] = {
+        "schema_version": normalizer.EVIDENCE_SCHEMA,
         "state": "PASS",
+        "postprocess_anchor": postprocess_anchor,
         "formal_backend_plan": backend_plan,
+        "backend_arming_gate": backend_arming_gate,
+        "matrix_start": matrix_start,
+        "matrix_done": matrix_done,
+        "campaign_root": str(campaign_root.resolve()),
         "campaign_gates": gates,
         "cells": cells,
         "bridge_canary_comparability": {
@@ -859,7 +1033,14 @@ class MixedLineageTests(unittest.TestCase):
             [cell["cell_key"] for cell in value["incremental_plan"]["cells"]],
             [item[0] for item in builder.INCREMENTAL_CELLS],
         )
-        self.assertIsNone(value["incremental_plan"]["incremental_evidence"])
+        self.assertEqual(
+            value["incremental_plan"]["incremental_evidence"],
+            {
+                "schema_version": "cidr-e01-incremental-evidence-v2",
+                "state": "ABSENT",
+                "reason": "formal MATRIX-DONE has not been adapted and assembled",
+            },
+        )
 
 
 if __name__ == "__main__":

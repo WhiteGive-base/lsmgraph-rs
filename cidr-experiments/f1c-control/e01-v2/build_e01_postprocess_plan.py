@@ -178,6 +178,10 @@ def build(
         "plot_support": file_ref(plot_support_path, "plot support"),
         "render_validator": file_ref(render_validator_path, "render validator"),
         "figure_data_requirements": file_ref(figure_requirements_path, "figure requirements"),
+        "incremental_postprocess": file_ref(
+            Path(__file__).resolve().parent / "postprocess_e01_incremental.py",
+            "incremental postprocess",
+        ),
     }
     frozen_fields = _f1_contract_fields(figure_requirements_path)
     required_tidy = sorted(set(NORMALIZED_COLUMNS) | set(RENDERER_EXTRA_COLUMNS) | set(frozen_fields))
@@ -187,7 +191,7 @@ def build(
     return {
         "schema_version": SCHEMA,
         "state": "HOLD",
-        "execution_state": "NOT_IMPLEMENTED",
+        "execution_state": "CORE_IMPLEMENTED_REMAINDER_HOLD",
         "experiment_id": "E01",
         "output_root": str(output_root),
         "mixed_lineage_plan": mixed_ref,
@@ -206,16 +210,18 @@ def build(
         ],
         "interfaces": {
             "matrix_evidence_adapter": {
-                "state": "NOT_IMPLEMENTED",
+                "state": "IMPLEMENTED_NOT_RUN",
+                "tool": tools["incremental_postprocess"],
                 "input": "4/4 production MATRIX-DONE plus seven receipts per cell",
-                "output": "cidr-e01-incremental-evidence-v1",
+                "output": "cidr-e01-incremental-evidence-v2",
             },
             "bridge_canary_evaluator": {
                 "state": "IMPLEMENTED_NOT_RUN",
                 "tool": tools["canary_evaluator"],
             },
             "pass_composition_assembler": {
-                "state": "NOT_IMPLEMENTED",
+                "state": "IMPLEMENTED_NOT_RUN",
+                "tool": tools["incremental_postprocess"],
                 "input": "frozen HOLD plan plus incremental evidence and canary PASS",
                 "output": "PASS cidr-e01-mixed-lineage-composition-v1",
             },
@@ -263,7 +269,6 @@ def build(
         "qa_invoked": False,
         "blockers": [
             "4/4 production MATRIX-DONE absent",
-            "matrix evidence adapter and PASS composition assembler not implemented",
             "SemL0-naive cost receipt/admission absent",
             "frozen tidy transformer not implemented",
             "explicit Linux Poppler/Pillow QA binding absent",
@@ -282,7 +287,10 @@ def validate(value_or_path: Any, *, verify_inputs: bool = True) -> Dict[str, Any
     require(type(value) is dict, "postprocess plan object required")
     require(value.get("schema_version") == SCHEMA, "postprocess schema drift")
     require(value.get("state") == "HOLD", "postprocess plan must HOLD")
-    require(value.get("execution_state") == "NOT_IMPLEMENTED", "execution state drift")
+    require(
+        value.get("execution_state") == "CORE_IMPLEMENTED_REMAINDER_HOLD",
+        "execution state drift",
+    )
     require(value.get("large_content_read_now") is False, "large read forbidden")
     require(value.get("renderer_invoked") is False, "renderer invocation forbidden")
     require(value.get("qa_invoked") is False, "QA invocation forbidden")
@@ -296,6 +304,12 @@ def validate(value_or_path: Any, *, verify_inputs: bool = True) -> Dict[str, Any
             verify_ref(descriptor, name)
     interfaces = value.get("interfaces")
     require(type(interfaces) is dict, "interfaces required")
+    for name in ("matrix_evidence_adapter", "pass_composition_assembler"):
+        require(
+            interfaces.get(name, {}).get("state") == "IMPLEMENTED_NOT_RUN",
+            f"{name} implementation state drift",
+        )
+        verify_ref(interfaces[name].get("tool"), f"{name} tool")
     tidy = interfaces.get("frozen_tidy_transform")
     require(tidy.get("state") == "NOT_IMPLEMENTED", "tidy must remain blocked")
     missing = set(tidy.get("missing_after_current_normalizer", []))
