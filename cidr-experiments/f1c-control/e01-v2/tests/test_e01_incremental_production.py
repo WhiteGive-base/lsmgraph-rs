@@ -215,6 +215,16 @@ class IncrementalProductionTests(unittest.TestCase):
     def test_builder_serialized_v3_ready_plan_dispatches_exact_four_phases(self) -> None:
         query_path = write_json(self.root / "query.json", {})
         query_ref = production.external_file_ref(query_path)
+        truth_path = self.root / "truth.tsv"
+        truth_path.write_text("edge_type\tsrc\tdigest\n1\t1\t0\n", encoding="utf-8")
+        truth_ref = production.external_file_ref(truth_path)
+        store_manifest_path = write_json(self.root / "IMMUTABLE-MANIFEST.json", {"state": "PASS"})
+        store_manifest_ref = production.external_file_ref(store_manifest_path)
+        id_map_dir = self.root / "id-map"
+        id_map_dir.mkdir()
+        binary_ref = production.external_file_ref(Path("/bin/true"))
+        repo_head = "1" * 40
+        store_tree_sha = "2" * 64
         lease_path = write_json(
             self.root / "lease.json",
             {"state": "PASS", "expires_at_utc": "2099-01-01T00:00:00Z"},
@@ -228,7 +238,19 @@ class IncrementalProductionTests(unittest.TestCase):
                     "schema_version": production.TARGET_P02B_SCHEMA,
                     "state": "PASS",
                     "variant": variant,
-                    "static_inputs": {"query_plan": query_ref},
+                    "static_inputs": {
+                        "query_plan": query_ref,
+                        "repo_head": repo_head,
+                        "store_manifest": store_manifest_ref,
+                        "store_tree_sha256": store_tree_sha,
+                        "bound_inputs": {
+                            "repo_root": {"path": str(self.root.resolve())},
+                            "binary": binary_ref,
+                            "truth": truth_ref,
+                            "id_map_dir": {"path": str(id_map_dir.resolve())},
+                            "p31_wrapper": self.executor_ref,
+                        },
+                    },
                     "lease": lease_ref,
                 },
             )
@@ -279,6 +301,7 @@ class IncrementalProductionTests(unittest.TestCase):
                         "target_query_plan": query_ref,
                         "target_lease": lease_ref,
                         "request": {
+                            "execution_mode": "formal",
                             "interface_scope": self.legacy_protocol["interface_scope"],
                             "process_lifetime": self.legacy_protocol["process_lifetime"],
                             "timing": {
@@ -405,6 +428,17 @@ class IncrementalProductionTests(unittest.TestCase):
                         {
                             "state": "PASS",
                             "cell_key": row["cell_key"],
+                            "execution_mode": "formal",
+                            "process_lifetime": self.legacy_protocol["process_lifetime"],
+                            "binary": {
+                                "path": binary_ref["path"],
+                                "sha256": binary_ref["sha256"],
+                            },
+                            "truth": {
+                                "path": truth_ref["path"],
+                                "sha256": truth_ref["sha256"],
+                                "query_count": 1700,
+                            },
                             "timing": {
                                 "per_query_timeout_ms": self.legacy_protocol[
                                     "per_query_timeout_ms"
@@ -413,6 +447,7 @@ class IncrementalProductionTests(unittest.TestCase):
                         },
                     )
                     value["request"] = future_ref(request_path)
+                    value["binary_argv"] = ["/bin/true"]
                 if role == "p31":
                     manifest_path = write_json(
                         cwd / "p31" / "run-manifest.json",
@@ -444,6 +479,8 @@ class IncrementalProductionTests(unittest.TestCase):
                     )
                 if role == "correctness":
                     value.update(mismatch_queries=0, timeout_queries=0)
+                if role == "store_clone":
+                    value["source_tree_sha256"] = store_tree_sha
                 if role == "validated_result":
                     prepared = json.loads(
                         (cwd / production.RECEIPT_PATHS["prepared_command"]).read_text(
@@ -468,6 +505,14 @@ class IncrementalProductionTests(unittest.TestCase):
                     artifact_path.write_text("status\nok\n", encoding="utf-8")
                     events_path = output / "phase-events.jsonl"
                     events_path.write_text("{}\n", encoding="utf-8")
+                    raw_dir = output / "seml0-raw"
+                    raw_result_path = write_json(
+                        raw_dir / "p10-raw-result.json", {"state": "PASS"}
+                    )
+                    raw_observations_path = raw_dir / "p10-raw-observations.tsv"
+                    raw_observations_path.write_text("status\nok\n", encoding="utf-8")
+                    raw_events_path = raw_dir / "p10-raw-phase-events.jsonl"
+                    raw_events_path.write_text("{}\n", encoding="utf-8")
                     validated_artifacts = {
                         "adapter-result.json": future_ref(raw_adapter_path),
                         "query-observations.tsv": future_ref(artifact_path),
@@ -475,12 +520,52 @@ class IncrementalProductionTests(unittest.TestCase):
                     }
                     provenance = {
                         "schema_version": production.SEML0_PROVENANCE_SCHEMA,
+                        "mode": "formal",
+                        "variant": row["runtime"]["variant"],
+                        "process_lifetime": self.legacy_protocol["process_lifetime"],
                         "request": prepared["request"],
+                        "repo": {
+                            "root": str(self.root.resolve()),
+                            "head": repo_head,
+                            "clean": True,
+                            "status_sha256": hashlib.sha256(b"").hexdigest(),
+                        },
+                        "binary": binary_ref,
+                        "store": {
+                            "tree_sha256": store_tree_sha,
+                            "manifest": store_manifest_ref,
+                            "clone_receipt": future_ref(
+                                cwd / production.RECEIPT_PATHS["store_clone"]
+                            ),
+                            "mutable_clone_removed_before_cell_publication": True,
+                        },
+                        "truth": truth_ref,
+                        "sample_plan": {**query_ref, "query_count": 1700},
+                        "id_map": {
+                            "directory": str(id_map_dir.resolve()),
+                            "bound_by_target_p02b": row["runtime"]["target_p02b"],
+                        },
+                        "p02b": {
+                            "target_bundle": row["runtime"]["target_p02b"],
+                        },
+                        "p31_wrapper": self.executor_ref,
                         "command": {
                             "argv": ["/bin/true"],
                             "argv_sha256": production.canonical_sha(["/bin/true"]),
                             "invocations": 1,
                             "exit_code": 0,
+                            "root_pid": 12345,
+                            "run_manifest": p31_receipt["run_manifest"],
+                            "command_topology": p31_receipt["command_topology"],
+                        },
+                        "raw_artifacts": {
+                            "p10-raw-result.json": future_ref(raw_result_path),
+                            "p10-raw-observations.tsv": future_ref(
+                                raw_observations_path
+                            ),
+                            "p10-raw-phase-events.jsonl": future_ref(
+                                raw_events_path
+                            ),
                         },
                         "split_phase_binding": {
                             "schema_version": production.SPLIT_PROVENANCE_SCHEMA,
@@ -620,6 +705,47 @@ class IncrementalProductionTests(unittest.TestCase):
         wrong_schema = json.loads(json.dumps(original_provenance))
         wrong_schema["schema_version"] = "wrong"
         mutations.append(wrong_schema)
+        wrong_mode = json.loads(json.dumps(original_provenance))
+        wrong_mode["mode"] = "fixture"
+        mutations.append(wrong_mode)
+        wrong_variant = json.loads(json.dumps(original_provenance))
+        wrong_variant["variant"] = "naive"
+        mutations.append(wrong_variant)
+        wrong_lifetime = json.loads(json.dumps(original_provenance))
+        wrong_lifetime["process_lifetime"] = "per-query-process"
+        mutations.append(wrong_lifetime)
+        wrong_repo = json.loads(json.dumps(original_provenance))
+        wrong_repo["repo"]["head"] = "9" * 40
+        mutations.append(wrong_repo)
+        wrong_binary = json.loads(json.dumps(original_provenance))
+        wrong_binary["binary"] = query_ref
+        mutations.append(wrong_binary)
+        wrong_store = json.loads(json.dumps(original_provenance))
+        wrong_store["store"]["tree_sha256"] = "9" * 64
+        mutations.append(wrong_store)
+        wrong_store_manifest = json.loads(json.dumps(original_provenance))
+        wrong_store_manifest["store"]["manifest"] = truth_ref
+        mutations.append(wrong_store_manifest)
+        wrong_truth = json.loads(json.dumps(original_provenance))
+        wrong_truth["truth"] = query_ref
+        mutations.append(wrong_truth)
+        wrong_sample_plan = json.loads(json.dumps(original_provenance))
+        wrong_sample_plan["sample_plan"]["query_count"] = 1699
+        mutations.append(wrong_sample_plan)
+        wrong_id_map = json.loads(json.dumps(original_provenance))
+        wrong_id_map["id_map"]["directory"] = str(self.root.resolve())
+        mutations.append(wrong_id_map)
+        wrong_p02b = json.loads(json.dumps(original_provenance))
+        wrong_p02b["p02b"]["target_bundle"] = targets["naive"]
+        mutations.append(wrong_p02b)
+        wrong_p31_wrapper = json.loads(json.dumps(original_provenance))
+        wrong_p31_wrapper["p31_wrapper"] = query_ref
+        mutations.append(wrong_p31_wrapper)
+        wrong_raw_artifact = json.loads(json.dumps(original_provenance))
+        wrong_raw_artifact["raw_artifacts"]["p10-raw-result.json"] = (
+            wrong_raw_artifact["raw_artifacts"]["p10-raw-observations.tsv"]
+        )
+        mutations.append(wrong_raw_artifact)
         wrong_binding_schema = json.loads(json.dumps(original_provenance))
         wrong_binding_schema["split_phase_binding"]["schema_version"] = "wrong"
         mutations.append(wrong_binding_schema)
@@ -642,9 +768,72 @@ class IncrementalProductionTests(unittest.TestCase):
         wrong_sha = json.loads(json.dumps(original_provenance))
         wrong_sha["split_phase_binding"]["adapter_result"]["sha256"] = "0" * 64
         mutations.append(wrong_sha)
+        wrong_backend_ref = json.loads(json.dumps(original_provenance))
+        wrong_backend_ref["split_phase_binding"]["backend_plan"] = query_ref
+        mutations.append(wrong_backend_ref)
+        wrong_target_ref = json.loads(json.dumps(original_provenance))
+        wrong_target_ref["split_phase_binding"]["target_p02b"] = targets["naive"]
+        mutations.append(wrong_target_ref)
+        wrong_request_ref = json.loads(json.dumps(original_provenance))
+        wrong_request_ref["split_phase_binding"]["request"] = wrong_request_ref[
+            "split_phase_binding"
+        ]["p31_run_manifest"]
+        wrong_request_ref["request"] = wrong_request_ref["split_phase_binding"][
+            "p31_run_manifest"
+        ]
+        mutations.append(wrong_request_ref)
+        wrong_p31_ref = json.loads(json.dumps(original_provenance))
+        wrong_p31_ref["split_phase_binding"]["p31_receipt"] = wrong_p31_ref[
+            "split_phase_binding"
+        ]["command_topology"]
+        mutations.append(wrong_p31_ref)
+        wrong_manifest_ref = json.loads(json.dumps(original_provenance))
+        wrong_manifest_ref["split_phase_binding"]["p31_run_manifest"] = (
+            wrong_manifest_ref["split_phase_binding"]["command_topology"]
+        )
+        wrong_manifest_ref["command"]["run_manifest"] = wrong_manifest_ref[
+            "split_phase_binding"
+        ]["command_topology"]
+        mutations.append(wrong_manifest_ref)
+        wrong_topology_ref = json.loads(json.dumps(original_provenance))
+        wrong_topology_ref["split_phase_binding"]["command_topology"] = (
+            wrong_topology_ref["split_phase_binding"]["p31_receipt"]
+        )
+        wrong_topology_ref["command"]["command_topology"] = wrong_topology_ref[
+            "split_phase_binding"
+        ]["p31_receipt"]
+        mutations.append(wrong_topology_ref)
+        wrong_adapter_tool_ref = json.loads(json.dumps(original_provenance))
+        wrong_adapter_tool_ref["split_phase_binding"]["adapter_tool"] = query_ref
+        mutations.append(wrong_adapter_tool_ref)
+        wrong_adapter_result_ref = json.loads(json.dumps(original_provenance))
+        wrong_adapter_result_ref["split_phase_binding"]["adapter_result"] = (
+            wrong_adapter_result_ref["split_phase_binding"]["validated_artifacts"][
+                "query-observations.tsv"
+            ]
+        )
+        mutations.append(wrong_adapter_result_ref)
+        wrong_validated_ref = json.loads(json.dumps(original_provenance))
+        wrong_validated_ref["split_phase_binding"]["validated_artifacts"][
+            "adapter-result.json"
+        ] = wrong_validated_ref["split_phase_binding"]["validated_artifacts"][
+            "query-observations.tsv"
+        ]
+        mutations.append(wrong_validated_ref)
+        wrong_clone_ref = json.loads(json.dumps(original_provenance))
+        wrong_clone_ref["split_phase_binding"]["clone_receipt"] = wrong_clone_ref[
+            "split_phase_binding"
+        ]["p31_receipt"]
+        wrong_clone_ref["store"]["clone_receipt"] = wrong_clone_ref[
+            "split_phase_binding"
+        ]["p31_receipt"]
+        mutations.append(wrong_clone_ref)
         command_tamper = json.loads(json.dumps(original_provenance))
         command_tamper["command"]["argv"] = ["/bin/false"]
         mutations.append(command_tamper)
+        command_pid_tamper = json.loads(json.dumps(original_provenance))
+        command_pid_tamper["command"]["root_pid"] = 54321
+        mutations.append(command_pid_tamper)
         for mutation in mutations:
             rewrite_provenance_chain(mutation)
             with self.assertRaises(production.BackendError):
@@ -700,6 +889,17 @@ class IncrementalProductionTests(unittest.TestCase):
             "p31_receipt": pending["bridge_receipts"]["p31"],
         }
         write_json(evidence_path, evidence)
+        evaluator_chain_tamper = json.loads(json.dumps(original_provenance))
+        evaluator_chain_tamper["mode"] = "fixture"
+        rewrite_provenance_chain(evaluator_chain_tamper)
+        with self.assertRaises(production.BackendError):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        rewrite_provenance_chain(original_provenance)
         handmade_adapter = write_json(
             self.campaign / "handmade-adapter-result.json",
             {
@@ -904,6 +1104,39 @@ class IncrementalProductionTests(unittest.TestCase):
             )
         self.assertTrue(staging.exists())
         self.assertFalse(final.exists())
+
+    def test_unpublished_cell_done_is_created_only_after_deep_validation(self) -> None:
+        self.initialize_root()
+        row = self.plan["cells"][0]
+        staging = Path(row["staging_cell_root"])
+        final = Path(row["final_cell_root"])
+        staging.mkdir()
+        self.make_receipts(staging, row["cell_key"], row["ordinal"])
+        pending = production.finalize_staging_cell(
+            staging,
+            final,
+            cell_key=row["cell_key"],
+            ordinal=row["ordinal"],
+            plan_sha=self.plan_sha,
+            expected_mode="synthetic",
+            publish_done=False,
+        )
+        self.assertFalse((final / "CELL-DONE.json").exists())
+        correctness = final / production.RECEIPT_PATHS["correctness"]
+        correctness.write_text(
+            correctness.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+        )
+        with self.assertRaises(production.BackendError):
+            production.validate_final_cell(
+                final,
+                cell_key=row["cell_key"],
+                ordinal=row["ordinal"],
+                plan_sha=self.plan_sha,
+                expected_mode="synthetic",
+                pending_done=pending,
+            )
+        self.assertFalse((final / "CELL-DONE.json").exists())
+        self.assertTrue(final.exists())
 
     def test_cleanup_admission_rejects_dangling_clone_symlink(self) -> None:
         self.initialize_root()

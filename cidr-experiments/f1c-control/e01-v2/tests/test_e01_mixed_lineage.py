@@ -236,6 +236,16 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
     result = copy.deepcopy(value)
     result["state"] = "PASS"
     result["incremental_plan"]["state"] = "PASS"
+    repo_root = root / "fresh/repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    id_map_root = root / "fresh/id-map"
+    id_map_root.mkdir(parents=True, exist_ok=True)
+    binary = write_text(root, "fresh/bin/lsmgraph", "fixture-binary\n")
+    truth = write_text(root, "fresh/truth.tsv", "edge_type\tsrc\tdigest\n1\t1\t0\n")
+    p31_wrapper = write_text(root, "fresh/run_with_resources.sh", "#!/bin/sh\n")
+    adapter_tool = write_text(root, "fresh/seml0_adapter.py", "# fixture\n")
+    backend_plan = write_json(root, "fresh/backend-plan.json", {"state": "READY"})
+    repo_head = "a" * 40
     gates = {}
     target_refs = {}
     target_bundles = {}
@@ -245,6 +255,9 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
     ):
         lease = write_json(root, f"fresh/p02b/{variant}-lease.json", {"schema_version": "cidr-batch-lease-v2", "state": "PASS"})
         query = write_json(root, f"fresh/p02b/{variant}-plan.json", {"semantic_degree_hint": hint})
+        store_manifest = write_json(
+            root, f"fresh/p02b/{variant}-store-manifest.json", {"state": "PASS"}
+        )
         tree = {
             "sha256": tree_sha,
             "full_tree_hash_performed": True,
@@ -259,7 +272,19 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
             "store_pre": tree,
             "store_post": tree,
             "lease": lease,
-            "static_inputs": {"query_plan": query},
+            "static_inputs": {
+                "query_plan": query,
+                "repo_head": repo_head,
+                "store_manifest": store_manifest,
+                "store_tree_sha256": tree_sha,
+                "bound_inputs": {
+                    "repo_root": {"path": str(repo_root.resolve())},
+                    "binary": binary,
+                    "truth": truth,
+                    "id_map_dir": {"path": str(id_map_root.resolve())},
+                    "p31_wrapper": p31_wrapper,
+                },
+            },
         }
         target_refs[variant] = write_json(
             root,
@@ -273,14 +298,185 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
         receipt = write_json(root, f"fresh/gates/{gate}.json", body)
         gates[gate] = {"state": "PASS", "receipt": receipt}
     cells = []
-    for key, system, repeat, role, included in builder.INCREMENTAL_CELLS:
+    for ordinal, (key, system, repeat, role, included) in enumerate(
+        builder.INCREMENTAL_CELLS, start=1
+    ):
         safe = key.replace(":", "-")
-        validated = write_json(root, f"fresh/{safe}/validated-result.json", {"state": "PASS"})
-        p31 = write_json(root, f"fresh/{safe}/p31.json", {"state": "PASS"})
-        cleanup = write_json(root, f"fresh/{safe}/cleanup.json", {"state": "PASS"})
         target_variant = "budg-b64" if key == "seml0:bridge-canary" else "naive"
+        final_relative = f"fresh/campaign/cells/{ordinal:02d}-{safe}"
+        final_root = root / final_relative
+        request = write_json(
+            root,
+            f"{final_relative}/adapter-request.json",
+            {
+                "execution_mode": "formal",
+                "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                "binary": {"path": binary["path"], "sha256": binary["sha256"]},
+                "truth": {
+                    "path": truth["path"],
+                    "sha256": truth["sha256"],
+                    "query_count": 1700,
+                },
+            },
+        )
+        clone = write_json(
+            root,
+            f"{final_relative}/receipts/store-clone.json",
+            {"state": "PASS", "source_tree_sha256": target_bundles[target_variant]["store_pre"]["sha256"]},
+        )
+        run_manifest = write_json(
+            root,
+            f"{final_relative}/p31/run-manifest.json",
+            {"state": "PASS", "root_pid": 12345, "host": {"fingerprint_sha256": HOST_SHA}},
+        )
+        argv = ["/bin/true"]
+        argv_sha = hashlib.sha256(
+            json.dumps(argv, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        topology = write_json(
+            root,
+            f"{final_relative}/receipts/command-topology.json",
+            {
+                "state": "PASS",
+                "root_pid": 12345,
+                "argv": argv,
+                "argv_sha256": argv_sha,
+                "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+            },
+        )
+        p31 = write_json(
+            root,
+            f"{final_relative}/receipts/p31.json",
+            {
+                "state": "PASS",
+                "run_manifest": run_manifest,
+                "command_topology": topology,
+            },
+        )
+        adapter_result = write_json(
+            root, f"{final_relative}/adapter-output/adapter-result.json", {"state": "PASS"}
+        )
+        observations = write_text(
+            root, f"{final_relative}/adapter-output/query-observations.tsv", "status\nok\n"
+        )
+        events = write_text(
+            root, f"{final_relative}/adapter-output/phase-events.jsonl", "{}\n"
+        )
+        raw_result = write_json(
+            root,
+            f"{final_relative}/adapter-output/seml0-raw/p10-raw-result.json",
+            {"state": "PASS"},
+        )
+        raw_observations = write_text(
+            root,
+            f"{final_relative}/adapter-output/seml0-raw/p10-raw-observations.tsv",
+            "status\nok\n",
+        )
+        raw_events = write_text(
+            root,
+            f"{final_relative}/adapter-output/seml0-raw/p10-raw-phase-events.jsonl",
+            "{}\n",
+        )
+        validated_artifacts = {
+            "adapter-result.json": adapter_result,
+            "query-observations.tsv": observations,
+            "phase-events.jsonl": events,
+        }
+        provenance_value = {
+            "schema_version": "p10-seml0-adapter-provenance-v1",
+            "mode": "formal",
+            "variant": target_variant,
+            "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+            "request": request,
+            "repo": {
+                "root": str(repo_root.resolve()),
+                "head": repo_head,
+                "clean": True,
+                "status_sha256": hashlib.sha256(b"").hexdigest(),
+            },
+            "binary": binary,
+            "store": {
+                "tree_sha256": target_bundles[target_variant]["store_pre"]["sha256"],
+                "manifest": target_bundles[target_variant]["static_inputs"]["store_manifest"],
+                "clone_receipt": clone,
+                "mutable_clone_removed_before_cell_publication": True,
+            },
+            "truth": truth,
+            "sample_plan": {
+                **target_bundles[target_variant]["static_inputs"]["query_plan"],
+                "query_count": 1700,
+            },
+            "id_map": {
+                "directory": str(id_map_root.resolve()),
+                "bound_by_target_p02b": target_refs[target_variant],
+            },
+            "p02b": {"target_bundle": target_refs[target_variant]},
+            "p31_wrapper": p31_wrapper,
+            "command": {
+                "argv": argv,
+                "argv_sha256": argv_sha,
+                "invocations": 1,
+                "exit_code": 0,
+                "root_pid": 12345,
+                "run_manifest": run_manifest,
+                "command_topology": topology,
+            },
+            "raw_artifacts": {
+                "p10-raw-result.json": raw_result,
+                "p10-raw-observations.tsv": raw_observations,
+                "p10-raw-phase-events.jsonl": raw_events,
+            },
+            "split_phase_binding": {
+                "schema_version": "cidr-e01-split-phase-provenance-binding-v1",
+                "backend_plan": backend_plan,
+                "target_p02b": target_refs[target_variant],
+                "request": request,
+                "p31_receipt": p31,
+                "p31_run_manifest": run_manifest,
+                "command_topology": topology,
+                "adapter_tool": adapter_tool,
+                "adapter_result": adapter_result,
+                "validated_artifacts": validated_artifacts,
+                "clone_receipt": clone,
+                "cell_key": key,
+                "ordinal": ordinal,
+                "campaign_root": str((root / "fresh/campaign").resolve()),
+                "final_cell_root": str(final_root.resolve()),
+            },
+        }
+        provenance = write_json(
+            root,
+            f"{final_relative}/adapter-output/adapter-provenance.json",
+            provenance_value,
+        )
+        validated = write_json(
+            root,
+            f"{final_relative}/adapter-output/validated-repeat.json",
+            {
+                "state": "PASS",
+                "backend_plan": backend_plan,
+                "target_p02b": target_refs[target_variant],
+                "request": request,
+                "p31": {
+                    "receipt": p31,
+                    "run_manifest": run_manifest,
+                    "host": {"fingerprint_sha256": HOST_SHA},
+                    "command_topology": topology,
+                },
+                "process_lifetime_binding": {"command_topology": topology},
+                "adapter_artifacts": {
+                    **validated_artifacts,
+                    "adapter-provenance.json": provenance,
+                },
+                "adapter_provenance": provenance_value,
+            },
+        )
+        cleanup = write_json(
+            root, f"{final_relative}/receipts/cleanup.json", {"state": "PASS"}
+        )
         cells.append(
             {
+                "ordinal": ordinal,
                 "cell_key": key,
                 "system_id": system,
                 "repeat_index": repeat,
@@ -299,15 +495,20 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "validated_result": validated,
                 "p31_receipt": p31,
                 "cleanup_receipt": cleanup,
+                "prepared_request": request,
+                "store_clone_receipt": clone,
+                "command_topology": topology,
+                "adapter_tool": adapter_tool,
+                "adapter_provenance": provenance,
                 "target_p02b": target_refs[target_variant],
                 "target_query_plan": target_bundles[target_variant]["static_inputs"]["query_plan"],
                 "target_lease": target_bundles[target_variant]["lease"],
                 "identity": {
                     "host_fingerprint": HOST_SHA,
-                    "git_sha": "a" * 40,
-                    "binary_sha256": "b" * 64,
+                    "git_sha": repo_head,
+                    "binary_sha256": binary["sha256"],
                     "physical_input_sha256": DENSE_SHA if key == "seml0:bridge-canary" else NAIVE_SHA,
-                    "truth_sha256": TRUTH_SHA,
+                    "truth_sha256": truth["sha256"],
                 },
                 "protocol": {
                     "interface_scope": "typed-neighbor-dense-id-v1",
@@ -315,6 +516,7 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                     "query_count": 1700,
                     "warmup_passes": 1,
                     "measured_passes": 1,
+                    "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
                 },
                 "metrics": {
                     "measurement_s": 30.0,
@@ -433,6 +635,39 @@ class MixedLineageTests(unittest.TestCase):
             3,
         )
         self.assertFalse(result["receipt"]["classification"]["formal_eligible"])
+
+    def test_mixed_consumer_rejects_consistent_provenance_chain_tamper(self) -> None:
+        completed = attach_completed_evidence(self.root, self.value)
+        cell = completed["incremental_plan"]["incremental_evidence"]["cells"][0]
+        provenance_path = Path(cell["adapter_provenance"]["path"])
+        validated_path = Path(cell["validated_result"]["path"])
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["mode"] = "fixture"
+        provenance_payload = (
+            json.dumps(provenance, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        provenance_path.write_bytes(provenance_payload)
+        provenance_ref = {
+            "path": str(provenance_path.resolve()),
+            "sha256": _sha(provenance_payload),
+            "size_bytes": len(provenance_payload),
+        }
+        validated = json.loads(validated_path.read_text(encoding="utf-8"))
+        validated["adapter_provenance"] = provenance
+        validated["adapter_artifacts"]["adapter-provenance.json"] = provenance_ref
+        validated_payload = (
+            json.dumps(validated, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        validated_path.write_bytes(validated_payload)
+        cell["adapter_provenance"] = provenance_ref
+        cell["validated_result"] = {
+            "path": str(validated_path.resolve()),
+            "sha256": _sha(validated_payload),
+            "size_bytes": len(validated_payload),
+        }
+        path = self.write_composition(completed)
+        with self.assertRaisesRegex(builder.CompositionError, "top-level identity drift"):
+            normalizer.normalize(path, None)
 
     def test_missing_fresh_gate_is_pre_output_rejected(self) -> None:
         completed = attach_completed_evidence(self.root, self.value)

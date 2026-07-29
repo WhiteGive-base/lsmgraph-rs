@@ -467,6 +467,24 @@ def validate_checkpoint_inputs(
         "checkpoint evidence P31 drift",
     )
     bridge = backend["cells"][0]
+    bridge_final = Path(bridge["final_cell_root"]).resolve()
+    bridge_done = production.validate_final_cell(
+        bridge_final,
+        cell_key=bridge["cell_key"],
+        ordinal=bridge["ordinal"],
+        plan_sha=backend_ref["sha256"],
+        expected_mode="production",
+        target_p02b=bridge["runtime"]["target_p02b"],
+        target_query_plan=bridge["runtime"]["target_query_plan"],
+        target_lease=bridge["runtime"]["target_lease"],
+        adapter_tool=bridge["runtime"]["adapter_tool"],
+    )
+    require(
+        file_ref(bridge_final / "CELL-DONE.json", "bridge CELL-DONE")
+        == pending["bridge_cell_done"]
+        and bridge_done.get("state") == "PASS",
+        "checkpoint bridge deep-validation publication drift",
+    )
     expected_receipt_base = {
         "state": "PASS",
         "mode": "production",

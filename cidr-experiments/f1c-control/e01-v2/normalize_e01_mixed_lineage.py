@@ -172,6 +172,218 @@ def _legacy_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _inside(path: str, root: Path) -> bool:
+    try:
+        return os.path.commonpath((str(Path(path).resolve()), str(root.resolve()))) == str(
+            root.resolve()
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _validate_fresh_provenance(
+    cell: Mapping[str, Any],
+    *,
+    target_ref: Mapping[str, Any],
+    target: Mapping[str, Any],
+    expected_variant: str,
+) -> None:
+    """Independently consume the complete published provenance chain."""
+    key = str(cell["cell_key"])
+    provenance_ref = _asset_ref(
+        cell.get("adapter_provenance"), f"{key}.adapter_provenance"
+    )
+    provenance = read_json(Path(provenance_ref["path"]), f"{key}.adapter_provenance")
+    expected_top = {
+        "schema_version", "mode", "variant", "process_lifetime", "request",
+        "repo", "binary", "store", "truth", "sample_plan", "id_map", "p02b",
+        "p31_wrapper", "command", "raw_artifacts", "split_phase_binding",
+    }
+    if (
+        set(provenance) != expected_top
+        or provenance.get("schema_version") != "p10-seml0-adapter-provenance-v1"
+        or provenance.get("mode") != "formal"
+        or provenance.get("variant") != expected_variant
+    ):
+        raise CompositionError(f"{key}: provenance top-level identity drift")
+    validated_ref = _asset_ref(cell.get("validated_result"), f"{key}.validated_result")
+    validated = read_json(Path(validated_ref["path"]), f"{key}.validated_result")
+    artifacts = validated.get("adapter_artifacts")
+    if type(artifacts) is not dict:
+        raise CompositionError(f"{key}: validated adapter artifacts required")
+    if (
+        _asset_ref(
+            artifacts.get("adapter-provenance.json"),
+            f"{key}.validated.adapter_provenance",
+        )
+        != provenance_ref
+        or validated.get("adapter_provenance") != provenance
+    ):
+        raise CompositionError(f"{key}: embedded/file provenance drift")
+    binding = provenance.get("split_phase_binding")
+    binding_keys = {
+        "schema_version", "backend_plan", "target_p02b", "request", "p31_receipt",
+        "p31_run_manifest", "command_topology", "adapter_tool", "adapter_result",
+        "validated_artifacts", "clone_receipt", "cell_key", "ordinal",
+        "campaign_root", "final_cell_root",
+    }
+    if (
+        type(binding) is not dict
+        or set(binding) != binding_keys
+        or binding.get("schema_version")
+        != "cidr-e01-split-phase-provenance-binding-v1"
+        or binding.get("cell_key") != key
+        or binding.get("ordinal") != cell.get("ordinal")
+    ):
+        raise CompositionError(f"{key}: split-phase binding drift")
+    final_root = Path(str(binding["final_cell_root"])).resolve()
+    if (
+        final_root.parent.name != "cells"
+        or Path(str(binding["campaign_root"])).resolve() != final_root.parents[1]
+    ):
+        raise CompositionError(f"{key}: provenance final/campaign root drift")
+    request_ref = _asset_ref(cell.get("prepared_request"), f"{key}.prepared_request")
+    request = read_json(Path(request_ref["path"]), f"{key}.prepared_request")
+    protocol = cell.get("protocol")
+    if type(protocol) is not dict:
+        raise CompositionError(f"{key}: protocol required for provenance")
+    if (
+        provenance.get("request") != request_ref
+        or binding.get("request") != request_ref
+        or validated.get("request") != request_ref
+        or request.get("execution_mode") != "formal"
+        or provenance.get("process_lifetime") != request.get("process_lifetime")
+        or protocol.get("process_lifetime") != request.get("process_lifetime")
+        or request.get("truth", {}).get("query_count") != protocol.get("query_count")
+    ):
+        raise CompositionError(f"{key}: provenance request/process drift")
+    static = target.get("static_inputs")
+    bound = static.get("bound_inputs") if type(static) is dict else None
+    if type(bound) is not dict:
+        raise CompositionError(f"{key}: target bound inputs missing")
+    identity = cell.get("identity")
+    if type(identity) is not dict:
+        raise CompositionError(f"{key}: identity required for provenance")
+    binary = _asset_ref(bound.get("binary"), f"{key}.target.binary")
+    truth = _asset_ref(bound.get("truth"), f"{key}.target.truth")
+    query_plan = _asset_ref(static.get("query_plan"), f"{key}.target.query_plan")
+    store_manifest = _asset_ref(
+        static.get("store_manifest"), f"{key}.target.store_manifest"
+    )
+    clone_ref = _asset_ref(
+        cell.get("store_clone_receipt"), f"{key}.store_clone_receipt"
+    )
+    clone = read_json(Path(clone_ref["path"]), f"{key}.store_clone_receipt")
+    repo_root = bound.get("repo_root")
+    id_map = bound.get("id_map_dir")
+    if (
+        type(repo_root) is not dict or set(repo_root) != {"path"}
+        or type(id_map) is not dict or set(id_map) != {"path"}
+    ):
+        raise CompositionError(f"{key}: target repo/id-map binding drift")
+    expected_repo = {
+        "root": str(Path(repo_root["path"]).resolve()),
+        "head": static.get("repo_head"),
+        "clean": True,
+        "status_sha256": hashlib.sha256(b"").hexdigest(),
+    }
+    expected_store = {
+        "tree_sha256": static.get("store_tree_sha256"),
+        "manifest": store_manifest,
+        "clone_receipt": clone_ref,
+        "mutable_clone_removed_before_cell_publication": True,
+    }
+    if (
+        provenance.get("repo") != expected_repo
+        or identity.get("git_sha") != expected_repo["head"]
+        or provenance.get("binary") != binary
+        or identity.get("binary_sha256") != binary["sha256"]
+        or provenance.get("store") != expected_store
+        or clone.get("source_tree_sha256") != expected_store["tree_sha256"]
+        or identity.get("physical_input_sha256") != expected_store["tree_sha256"]
+        or provenance.get("truth") != truth
+        or identity.get("truth_sha256") != truth["sha256"]
+        or provenance.get("sample_plan")
+        != {**query_plan, "query_count": protocol["query_count"]}
+        or provenance.get("id_map")
+        != {
+            "directory": str(Path(id_map["path"]).resolve()),
+            "bound_by_target_p02b": target_ref,
+        }
+        or provenance.get("p02b") != {"target_bundle": target_ref}
+        or provenance.get("p31_wrapper")
+        != _asset_ref(bound.get("p31_wrapper"), f"{key}.target.p31_wrapper")
+    ):
+        raise CompositionError(f"{key}: provenance target identity drift")
+    p31_ref = _asset_ref(cell.get("p31_receipt"), f"{key}.p31_receipt")
+    p31 = read_json(Path(p31_ref["path"]), f"{key}.p31_receipt")
+    topology_ref = _asset_ref(cell.get("command_topology"), f"{key}.command_topology")
+    topology = read_json(Path(topology_ref["path"]), f"{key}.command_topology")
+    manifest_ref = _asset_ref(p31.get("run_manifest"), f"{key}.p31.run_manifest")
+    manifest = read_json(Path(manifest_ref["path"]), f"{key}.p31.run_manifest")
+    adapter_tool = _asset_ref(cell.get("adapter_tool"), f"{key}.adapter_tool")
+    expected_validated = {
+        name: _asset_ref(artifacts.get(name), f"{key}.artifact.{name}")
+        for name in (
+            "adapter-result.json", "query-observations.tsv", "phase-events.jsonl",
+        )
+    }
+    if (
+        binding.get("backend_plan") != validated.get("backend_plan")
+        or binding.get("target_p02b") != target_ref
+        or binding.get("p31_receipt") != p31_ref
+        or binding.get("p31_run_manifest") != manifest_ref
+        or binding.get("command_topology") != topology_ref
+        or binding.get("adapter_tool") != adapter_tool
+        or binding.get("adapter_result") != expected_validated["adapter-result.json"]
+        or binding.get("validated_artifacts") != expected_validated
+        or binding.get("clone_receipt") != clone_ref
+    ):
+        raise CompositionError(f"{key}: provenance published-ref chain drift")
+    for label, ref in (
+        ("request", request_ref), ("P31", p31_ref), ("manifest", manifest_ref),
+        ("topology", topology_ref), ("clone", clone_ref), *expected_validated.items(),
+    ):
+        checked = _asset_ref(ref, f"{key}.published.{label}")
+        if not _inside(checked["path"], final_root):
+            raise CompositionError(f"{key}: provenance {label} outside final root")
+    command = provenance.get("command")
+    if (
+        type(command) is not dict
+        or set(command)
+        != {
+            "argv", "argv_sha256", "invocations", "exit_code", "root_pid",
+            "run_manifest", "command_topology",
+        }
+        or command.get("invocations") != 1
+        or command.get("exit_code") != 0
+        or command.get("argv") != topology.get("argv")
+        or command.get("argv_sha256") != topology.get("argv_sha256")
+        or command.get("argv_sha256")
+        != hashlib.sha256(
+            json.dumps(
+                command.get("argv"), sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        or command.get("root_pid") != topology.get("root_pid")
+        or command.get("root_pid") != manifest.get("root_pid")
+        or command.get("run_manifest") != manifest_ref
+        or command.get("command_topology") != topology_ref
+    ):
+        raise CompositionError(f"{key}: provenance command chain drift")
+    raw = provenance.get("raw_artifacts")
+    expected_raw_names = {
+        "p10-raw-result.json", "p10-raw-observations.tsv",
+        "p10-raw-phase-events.jsonl",
+    }
+    if type(raw) is not dict or set(raw) != expected_raw_names:
+        raise CompositionError(f"{key}: provenance raw artifact set drift")
+    for name in expected_raw_names:
+        ref = _asset_ref(raw[name], f"{key}.raw.{name}")
+        if not _inside(ref["path"], final_root):
+            raise CompositionError(f"{key}: raw artifact outside final root")
+
+
 def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
     plan = value.get("incremental_plan")
     if type(plan) is not dict:
@@ -271,6 +483,12 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
             raise CompositionError(f"{key}: target lease backlink drift")
         if type(identity) is not dict or identity.get("physical_input_sha256") != target_bundles[expected_variant]["store_pre"]["sha256"]:
             raise CompositionError(f"{key}: target P02B/store identity drift")
+        _validate_fresh_provenance(
+            cell,
+            target_ref=expected_bundle_ref,
+            target=expected_bundle,
+            expected_variant=expected_variant,
+        )
         if included:
             metrics = cell.get("metrics")
             protocol = cell.get("protocol")
