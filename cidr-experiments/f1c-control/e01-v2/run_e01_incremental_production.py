@@ -188,6 +188,20 @@ def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
         == set(RECEIPT_PATHS),
         "canary cell1 evidence binding drift",
     )
+    require(
+        contract.get("validated_output_binding")
+        == {
+            "receipt_schema": "cidr-e01-incremental-validated-result-receipt-v1",
+            "adapter_schema": "cidr-p10-validated-repeat-v1",
+            "prepared_request_ref": True,
+            "p31_receipt_ref": True,
+            "p31_run_manifest_ref": True,
+            "backend_plan_ref": True,
+            "target_p02b_ref": True,
+            "final_cell_root": True,
+        },
+        "canary validated-output binding drift",
+    )
     expected = {
         "evidence_path": root / "CANARY-EVIDENCE.json",
         "pending_path": root / "CANARY-PENDING.json",
@@ -431,6 +445,63 @@ def consume_canary_evaluation(
         == pending["bridge_receipts"]["validated_result"]
         and evidence.get("p31_receipt") == pending["bridge_receipts"]["p31"],
         "canary evidence direct receipt binding drift",
+    )
+    prepared_ref = pending["bridge_receipts"]["prepared_command"]
+    prepared = load_json(Path(prepared_ref["path"]), "bridge prepared-command receipt")
+    p31_ref = pending["bridge_receipts"]["p31"]
+    p31 = load_json(Path(p31_ref["path"]), "bridge P31 receipt")
+    validated_receipt_ref = pending["bridge_receipts"]["validated_result"]
+    validated_receipt = load_json(
+        Path(validated_receipt_ref["path"]), "bridge validated-result receipt"
+    )
+    require(
+        validated_receipt.get("schema_version")
+        == contract["validated_output_binding"]["receipt_schema"]
+        and validated_receipt.get("state") == "PASS"
+        and validated_receipt.get("mode") == "production"
+        and validated_receipt.get("synthetic_test_only") is False
+        and validated_receipt.get("fixture_only") is False
+        and validated_receipt.get("cell_key") == "seml0:bridge-canary"
+        and validated_receipt.get("ordinal") == 1
+        and validated_receipt.get("backend_plan_sha256") == plan_ref["sha256"]
+        and validated_receipt.get("target_p02b") == pending["target_p02b"],
+        "canary validated-result receipt drift",
+    )
+    adapter_ref = verify_external_file_ref(
+        validated_receipt.get("adapter_result"), "canary validated adapter result"
+    )
+    require(
+        evidence.get("validated_result") == adapter_ref,
+        "canary evidence/receipt adapter-result mismatch",
+    )
+    adapter = load_json(Path(adapter_ref["path"]), "canary validated adapter result")
+    require(
+        adapter.get("schema_version")
+        == contract["validated_output_binding"]["adapter_schema"]
+        and adapter.get("system_id") == "seml0"
+        and adapter.get("cell_key") == "seml0:bridge-canary"
+        and adapter.get("ordinal") == 1
+        and adapter.get("backend_plan") == plan_ref
+        and adapter.get("target_p02b") == pending["target_p02b"]
+        and adapter.get("final_cell_root")
+        == str(Path(pending["bridge_cell_done"]["path"]).parent.resolve()),
+        "canary validated adapter identity/backlink drift",
+    )
+    request_ref = verify_external_file_ref(
+        prepared.get("request"), "bridge prepared adapter request"
+    )
+    require(adapter.get("request") == request_ref, "canary adapter request backlink drift")
+    p31_manifest_ref = verify_external_file_ref(
+        p31.get("run_manifest"), "bridge P31 run manifest"
+    )
+    p31_manifest = load_json(Path(p31_manifest_ref["path"]), "bridge P31 run manifest")
+    adapter_p31 = adapter.get("p31")
+    require(
+        type(adapter_p31) is dict
+        and adapter_p31.get("receipt") == p31_ref
+        and adapter_p31.get("run_manifest") == p31_manifest_ref
+        and adapter_p31.get("host") == p31_manifest.get("host"),
+        "canary adapter P31 backlink drift",
     )
     comparability_ref = external_file_ref(Path(contract["comparability_path"]))
     require(

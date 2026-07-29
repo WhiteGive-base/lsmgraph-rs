@@ -610,6 +610,16 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "cleanup",
             ],
         },
+        "validated_output_binding": {
+            "receipt_schema": "cidr-e01-incremental-validated-result-receipt-v1",
+            "adapter_schema": "cidr-p10-validated-repeat-v1",
+            "prepared_request_ref": True,
+            "p31_receipt_ref": True,
+            "p31_run_manifest_ref": True,
+            "backend_plan_ref": True,
+            "target_p02b_ref": True,
+            "final_cell_root": True,
+        },
         "pending_path": str(args.campaign_root / "CANARY-PENDING.json"),
         "comparability_path": str(args.campaign_root / "CANARY-COMPARABILITY.json"),
         "evaluation_path": str(args.campaign_root / "CANARY-EVALUATION.json"),
@@ -693,6 +703,7 @@ def validate(value: Mapping[str, Any]) -> None:
         and type(checkpoint.get("comparability_contract_sha256")) is str
         and checkpoint.get("evidence_schema") == "cidr-e01-bridge-canary-evidence-v2"
         and type(checkpoint.get("evidence_binding")) is dict
+        and type(checkpoint.get("validated_output_binding")) is dict
         and checkpoint.get("first_launch_max_completed_cells") == 1
         and checkpoint.get("resume_requires_evaluation_state") == "PASS"
         and checkpoint.get("matrix_done_before_acceptance") is False,

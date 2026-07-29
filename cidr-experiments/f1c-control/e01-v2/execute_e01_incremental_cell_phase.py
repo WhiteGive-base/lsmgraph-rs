@@ -94,6 +94,35 @@ def atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         os.fsync(stream.fileno())
 
 
+def bind_adapter_process_lifetime(path: Path, request: Mapping[str, Any]) -> dict[str, Any]:
+    """Complete the frozen P10 result field omitted by the bound SemL0 converter."""
+    result = load_json(path, "adapter result before process-lifetime binding")
+    expected = request.get("process_lifetime")
+    require(
+        expected == "one-process-per-repeat",
+        "formal request process-lifetime contract drift",
+    )
+    observed = result.get("process_lifetime")
+    require(
+        observed in (None, expected),
+        "adapter result process_lifetime conflicts with request",
+    )
+    if observed is None:
+        result["process_lifetime"] = expected
+        temporary = path.with_name(path.name + ".lifetime.tmp")
+        require(not os.path.lexists(temporary), "adapter lifetime temporary exists")
+        atomic_json(temporary, result)
+        os.replace(temporary, path)
+    return {
+        "schema_version": "cidr-e01-adapter-process-lifetime-binding-v1",
+        "state": "PASS",
+        "source_field_missing": observed is None,
+        "bound_from_request": expected,
+        "metrics_modified": False,
+        "timing_modified": False,
+    }
+
+
 def replace_state_json(path: Path, value: Mapping[str, Any]) -> None:
     """Atomically replace the sole lifecycle marker after RUNNING."""
     require(path.name == "STATE.json" and path.is_file(), "active STATE marker missing")
@@ -687,6 +716,35 @@ def _base_receipt(cell: Mapping[str, Any], plan_sha: str, role: str) -> dict[str
     }
 
 
+def published_file_ref(path: Path, cwd: Path, cell: Mapping[str, Any]) -> dict[str, Any]:
+    path = path.resolve()
+    cwd = cwd.resolve()
+    require(path.is_file() and not path.is_symlink(), "published source file required")
+    try:
+        relative = path.relative_to(cwd)
+    except ValueError as exc:
+        raise PhaseError("published file must be inside staging root") from exc
+    final_root = Path(cell["final_cell_root"]).resolve()
+    return {
+        "path": str(final_root / relative),
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def verify_staged_published_ref(
+    value: Any,
+    path: Path,
+    cwd: Path,
+    cell: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    require(type(value) is dict, f"{label}: reference required")
+    actual = published_file_ref(path, cwd, cell)
+    require(value == actual, f"{label}: published path/size/SHA drift")
+    return actual
+
+
 def _cell(plan: Mapping[str, Any], key: str) -> dict[str, Any]:
     matches = [row for row in plan.get("cells", []) if row.get("cell_key") == key]
     require(len(matches) == 1, "cell key missing/duplicate")
@@ -800,11 +858,7 @@ def prepare(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
         cwd / "receipts/prepared-command.json",
         {
             **_base_receipt(cell, plan_sha, "prepared-command"),
-            "request": {
-                "path": str(request_path),
-                "sha256": sha256_file(request_path),
-                "size_bytes": request_path.stat().st_size,
-            },
+            "request": published_file_ref(request_path, cwd, cell),
             "binary_argv": binary_argv,
             "p31_argv": p31_argv,
             "timing_boundary": "p31-wraps-storage-bench-binary-only-v1",
@@ -818,13 +872,19 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
     target_ref = revalidate_target(cell)
     prepared = load_json(cwd / "receipts/prepared-command.json", "prepared command")
     require(prepared.get("backend_plan_sha256") == plan_sha, "prepared plan SHA drift")
-    request_ref = verify_ref(prepared.get("request"), "prepared adapter request")
-    request_value = load_json(Path(request_ref["path"]), "prepared adapter request")
+    request_ref = verify_staged_published_ref(
+        prepared.get("request"),
+        cwd / "adapter-request.json",
+        cwd,
+        cell,
+        "prepared adapter request",
+    )
+    request_value = load_json(cwd / "adapter-request.json", "prepared adapter request")
     require(request_value == _expected_request(cell, cwd / "mutable-store"), "prepared adapter request drift")
     tokens = {
         "{STAGING}": str(cwd),
         "{MUTABLE_CLONE}": str(cwd / "mutable-store"),
-        "{REQUEST}": request_ref["path"],
+        "{REQUEST}": str((cwd / "adapter-request.json").resolve()),
     }
     expected_binary = _replace_tokens(list(cell["runtime"]["binary_argv"]), tokens)
     expected_p31 = _replace_tokens(
@@ -841,6 +901,9 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
     done_path = Path(cell["runtime"]["p31_done"].replace("{STAGING}", str(cwd)))
     done = load_json(done_path, "P31 DONE")
     require(done.get("state") == "PASS", "P31 DONE is not PASS")
+    manifest_path = done_path.parent / "run-manifest.json"
+    manifest = load_json(manifest_path, "P31 run manifest")
+    require(type(manifest.get("host")) is dict, "P31 run manifest host missing")
     atomic_json(
         cwd / "receipts/p31.json",
         {
@@ -851,16 +914,19 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
             "prepared_clone_receipt_sha256": sha256_file(cwd / "receipts/store-clone.json"),
             "prepared_clone_dev": clone_receipt["target_dev"],
             "prepared_clone_inode": clone_receipt["target_inode"],
-            "p31_done": {
-                "path": str(done_path.resolve()),
-                "sha256": sha256_file(done_path),
-                "size_bytes": done_path.stat().st_size,
-            },
+            "p31_done": published_file_ref(done_path, cwd, cell),
+            "run_manifest": published_file_ref(manifest_path, cwd, cell),
         },
     )
 
 
-def finalize(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd: Path) -> None:
+def finalize(
+    plan: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    plan_ref: Mapping[str, Any],
+    cwd: Path,
+) -> None:
+    plan_sha = str(plan_ref["sha256"])
     target_ref = revalidate_target(cell)
     p31 = load_json(cwd / "receipts/p31.json", "P31 receipt")
     require(p31.get("state") == "PASS" and p31.get("binary_only_boundary") is True, "P31 receipt invalid")
@@ -870,8 +936,9 @@ def finalize(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cw
     request_path = cwd / "adapter-request.json"
     request = load_json(request_path, "adapter request")
     prepared = load_json(cwd / "receipts/prepared-command.json", "prepared command")
-    request_ref = verify_ref(prepared.get("request"), "prepared adapter request")
-    require(Path(request_ref["path"]).resolve() == request_path.resolve(), "prepared request path drift")
+    request_ref = verify_staged_published_ref(
+        prepared.get("request"), request_path, cwd, cell, "prepared adapter request"
+    )
     require(request == _expected_request(cell, cwd / "mutable-store"), "finalize adapter request drift")
     truth = Path(runtime["truth"]["path"]).resolve()
     truth_rows = adapter.read_truth(truth, request["truth"]["query_count"])
@@ -880,6 +947,9 @@ def finalize(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cw
     raw_dir = output / "seml0-raw"
     args = argparse.Namespace(output_dir=output)
     adapter.convert_outputs(args, request, truth_rows, raw_dir)
+    lifetime_binding = bind_adapter_process_lifetime(
+        output / "adapter-result.json", request
+    )
     system = {
         "id": "seml0",
         "group": "embedded",
@@ -887,13 +957,46 @@ def finalize(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cw
         "display_name": "SemL0",
         "fixture_only": False,
     }
-    adapter.validate_adapter_outputs(
+    validated_repeat = adapter.validate_adapter_outputs(
         output_dir=output,
         request=request,
         system=system,
         truth_rows=truth_rows,
         max_timeouts=0,
     )
+    require(
+        type(validated_repeat) is dict
+        and validated_repeat.get("schema_version") == "cidr-p10-validated-repeat-v1",
+        "validated adapter output schema drift",
+    )
+    p31_manifest_path = cwd / "p31" / "run-manifest.json"
+    p31_manifest_ref = verify_staged_published_ref(
+        p31.get("run_manifest"),
+        p31_manifest_path,
+        cwd,
+        cell,
+        "P31 run manifest",
+    )
+    p31_manifest = load_json(p31_manifest_path, "P31 run manifest")
+    p31_receipt_ref = published_file_ref(cwd / "receipts/p31.json", cwd, cell)
+    validated_repeat.update(
+        {
+            "cell_key": cell["cell_key"],
+            "ordinal": cell["ordinal"],
+            "final_cell_root": str(Path(cell["final_cell_root"]).resolve()),
+            "backend_plan": dict(plan_ref),
+            "target_p02b": target_ref,
+            "request": request_ref,
+            "p31": {
+                "receipt": p31_receipt_ref,
+                "run_manifest": p31_manifest_ref,
+                "host": p31_manifest["host"],
+            },
+            "process_lifetime_binding": lifetime_binding,
+        }
+    )
+    validated_output_path = output / "validated-repeat.json"
+    atomic_json(validated_output_path, validated_repeat)
     observations = output / "query-observations.tsv"
     mismatch = timeout = 0
     with observations.open("r", encoding="utf-8", newline="") as stream:
@@ -905,11 +1008,7 @@ def finalize(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cw
     validated = {
         **_base_receipt(cell, plan_sha, "validated-result"),
         "target_p02b": target_ref,
-        "adapter_result": {
-            "path": str((output / "adapter-result.json").resolve()),
-            "sha256": sha256_file(output / "adapter-result.json"),
-            "size_bytes": (output / "adapter-result.json").stat().st_size,
-        },
+        "adapter_result": published_file_ref(validated_output_path, cwd, cell),
     }
     atomic_json(cwd / "validated-result.json", validated)
     atomic_json(
@@ -1163,9 +1262,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cwd = Path(cell["staging_cell_root"]).resolve()
             failure_cwd = cwd
             require(cwd == Path.cwd().resolve(), "phase cwd/staging drift")
-            {"prepare": prepare, "p31": run_p31, "finalize": finalize, "cleanup": cleanup}[args.phase](
-                plan, cell, plan_sha, cwd
-            )
+            if args.phase == "finalize":
+                finalize(plan, cell, plan_ref, cwd)
+            else:
+                {"prepare": prepare, "p31": run_p31, "cleanup": cleanup}[args.phase](
+                    plan, cell, plan_sha, cwd
+                )
         return 0
     except (PhaseError, OSError, ValueError, subprocess.SubprocessError) as exc:
         if failure_cwd is not None:

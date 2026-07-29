@@ -352,6 +352,7 @@ class PhaseBackendTests(unittest.TestCase):
                     cell = {
                         "cell_key": key,
                         "ordinal": ordinal,
+                        "final_cell_root": str(root / f"final-{ordinal}"),
                         "runtime": {
                             "variant": variant,
                             "request": {},
@@ -647,6 +648,16 @@ class PhaseBackendTests(unittest.TestCase):
                         "cleanup",
                     ],
                 },
+                "validated_output_binding": {
+                    "receipt_schema": "cidr-e01-incremental-validated-result-receipt-v1",
+                    "adapter_schema": "cidr-p10-validated-repeat-v1",
+                    "prepared_request_ref": True,
+                    "p31_receipt_ref": True,
+                    "p31_run_manifest_ref": True,
+                    "backend_plan_ref": True,
+                    "target_p02b_ref": True,
+                    "final_cell_root": True,
+                },
                 "pending_path": "/fixture/CANARY-PENDING.json",
                 "comparability_path": "/fixture/CANARY-COMPARABILITY.json",
                 "evaluation_path": "/fixture/CANARY-EVALUATION.json",
@@ -763,17 +774,19 @@ class PhaseBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             cwd = Path(temporary)
             request = write_json(cwd / "adapter-request.json", {})
-            request_ref = {
-                "path": str(request.resolve()),
-                "sha256": phase.sha256_file(request),
-                "size_bytes": request.stat().st_size,
-            }
+            final = cwd.parent / "final"
             runtime = {
                 "request": {},
                 "binary_argv": ["/bin/true", "--store", "{MUTABLE_CLONE}"],
                 "p31_argv": ["/bin/true", "--request", "{REQUEST}"],
             }
-            cell = {"cell_key": "seml0:bridge-canary", "ordinal": 1, "runtime": runtime}
+            cell = {
+                "cell_key": "seml0:bridge-canary",
+                "ordinal": 1,
+                "final_cell_root": str(final),
+                "runtime": runtime,
+            }
+            request_ref = phase.published_file_ref(request, cwd, cell)
             write_json(cwd / "receipts/prepared-command.json", {
                 "backend_plan_sha256": "a" * 64,
                 "request": request_ref,
@@ -792,13 +805,19 @@ class PhaseBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             cwd = Path(temporary)
             request = write_json(cwd / "adapter-request.json", {"truth": {"query_count": 1}})
-            request_ref = {"path": str(request.resolve()), "sha256": phase.sha256_file(request), "size_bytes": request.stat().st_size}
+            final = cwd.parent / "final"
             runtime = {
                 "request": {"truth": {"query_count": 1700}},
                 "binary_argv": ["/bin/true"],
                 "p31_argv": ["/bin/true", "--request", "{REQUEST}"],
             }
-            cell = {"cell_key": "seml0:bridge-canary", "ordinal": 1, "runtime": runtime}
+            cell = {
+                "cell_key": "seml0:bridge-canary",
+                "ordinal": 1,
+                "final_cell_root": str(final),
+                "runtime": runtime,
+            }
+            request_ref = phase.published_file_ref(request, cwd, cell)
             write_json(cwd / "receipts/prepared-command.json", {
                 "backend_plan_sha256": "a" * 64,
                 "request": request_ref,
@@ -812,6 +831,31 @@ class PhaseBackendTests(unittest.TestCase):
                     phase.run_p31({}, cell, "a" * 64, cwd)
             finally:
                 phase.revalidate_target = original
+
+    def test_process_lifetime_binding_only_fills_frozen_missing_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_json(
+                Path(temporary) / "adapter-result.json",
+                {"schema_version": "cidr-p10-adapter-result-v1", "measured": {}},
+            )
+            receipt = phase.bind_adapter_process_lifetime(
+                path, {"process_lifetime": "one-process-per-repeat"}
+            )
+            self.assertEqual(receipt["state"], "PASS")
+            self.assertTrue(receipt["source_field_missing"])
+            self.assertFalse(receipt["metrics_modified"])
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["process_lifetime"],
+                "one-process-per-repeat",
+            )
+            tampered = write_json(
+                Path(temporary) / "tampered.json",
+                {"process_lifetime": "one-process-per-query"},
+            )
+            with self.assertRaisesRegex(phase.PhaseError, "conflicts with request"):
+                phase.bind_adapter_process_lifetime(
+                    tampered, {"process_lifetime": "one-process-per-repeat"}
+                )
 
 
 if __name__ == "__main__":

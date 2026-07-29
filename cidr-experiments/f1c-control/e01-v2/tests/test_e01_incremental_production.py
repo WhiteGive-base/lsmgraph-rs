@@ -71,6 +71,16 @@ class IncrementalProductionTests(unittest.TestCase):
                 "bridge_cell_done": True,
                 "bridge_receipts": sorted(production.RECEIPT_PATHS),
             },
+            "validated_output_binding": {
+                "receipt_schema": "cidr-e01-incremental-validated-result-receipt-v1",
+                "adapter_schema": "cidr-p10-validated-repeat-v1",
+                "prepared_request_ref": True,
+                "p31_receipt_ref": True,
+                "p31_run_manifest_ref": True,
+                "backend_plan_ref": True,
+                "target_p02b_ref": True,
+                "final_cell_root": True,
+            },
             "pending_path": str(self.campaign / "CANARY-PENDING.json"),
             "comparability_path": str(self.campaign / "CANARY-COMPARABILITY.json"),
             "evaluation_path": str(self.campaign / "CANARY-EVALUATION.json"),
@@ -285,6 +295,16 @@ class IncrementalProductionTests(unittest.TestCase):
             row = by_staging[cwd]
             phase_name = argv[-1]
             dispatched.append((row["cell_key"], phase_name))
+            final_root = Path(row["final_cell_root"])
+
+            def future_ref(path: Path) -> dict:
+                relative = path.resolve().relative_to(cwd.resolve())
+                return {
+                    "path": str((final_root / relative).resolve()),
+                    "sha256": production.sha256_file(path),
+                    "size_bytes": path.stat().st_size,
+                }
+
             base = {
                 "state": "PASS",
                 "mode": "production",
@@ -309,10 +329,50 @@ class IncrementalProductionTests(unittest.TestCase):
                 }
                 if role in {"store_clone", "p31", "validated_result", "cleanup"}:
                     value["target_p02b"] = row["runtime"]["target_p02b"]
+                if role == "prepared_command":
+                    request_path = write_json(
+                        cwd / "adapter-request.json",
+                        {"state": "PASS", "cell_key": row["cell_key"]},
+                    )
+                    value["request"] = future_ref(request_path)
                 if role == "p31":
+                    manifest_path = write_json(
+                        cwd / "p31" / "run-manifest.json",
+                        {"state": "PASS", "host": {"fingerprint_sha256": "f" * 64}},
+                    )
                     value.update(timing_generated=True, binary_only_boundary=True)
+                    value["run_manifest"] = future_ref(manifest_path)
                 if role == "correctness":
                     value.update(mismatch_queries=0, timeout_queries=0)
+                if role == "validated_result":
+                    prepared = json.loads(
+                        (cwd / production.RECEIPT_PATHS["prepared_command"]).read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    p31_receipt_path = cwd / production.RECEIPT_PATHS["p31"]
+                    p31_receipt = json.loads(
+                        p31_receipt_path.read_text(encoding="utf-8")
+                    )
+                    adapter_path = write_json(
+                        cwd / "adapter-output" / "validated-repeat.json",
+                        {
+                            "schema_version": "cidr-p10-validated-repeat-v1",
+                            "system_id": "seml0",
+                            "cell_key": row["cell_key"],
+                            "ordinal": row["ordinal"],
+                            "final_cell_root": str(final_root.resolve()),
+                            "backend_plan": plan_ref,
+                            "target_p02b": row["runtime"]["target_p02b"],
+                            "request": prepared["request"],
+                            "p31": {
+                                "receipt": future_ref(p31_receipt_path),
+                                "run_manifest": p31_receipt["run_manifest"],
+                                "host": {"fingerprint_sha256": "f" * 64},
+                            },
+                        },
+                    )
+                    value["adapter_result"] = future_ref(adapter_path)
                 if role == "cleanup":
                     value.update(
                         mutable_clone_removed=True,
@@ -360,9 +420,10 @@ class IncrementalProductionTests(unittest.TestCase):
         pending_path = self.campaign / "CANARY-PENDING.json"
         pending = json.loads(pending_path.read_text(encoding="utf-8"))
         backend_ref = production.external_file_ref(plan_path)
-        validated_result = write_json(
-            self.campaign / "bridge-adapter-result.json",
-            {"state": "PASS", "system_id": "seml0"},
+        validated_receipt = json.loads(
+            Path(pending["bridge_receipts"]["validated_result"]["path"]).read_text(
+                encoding="utf-8"
+            )
         )
         evidence_path = Path(ready["canary_checkpoint"]["evidence_path"])
         evidence = {
@@ -375,10 +436,57 @@ class IncrementalProductionTests(unittest.TestCase):
             "mixed_lineage_plan": self.mixed_ref,
             "contract_sha256": self.contract_sha,
             "validated_result_receipt": pending["bridge_receipts"]["validated_result"],
-            "validated_result": production.external_file_ref(validated_result),
+            "validated_result": validated_receipt["adapter_result"],
             "p31_receipt": pending["bridge_receipts"]["p31"],
         }
         write_json(evidence_path, evidence)
+        handmade_adapter = write_json(
+            self.campaign / "handmade-adapter-result.json",
+            {
+                "schema_version": "cidr-p10-validated-repeat-v1",
+                "system_id": "seml0",
+            },
+        )
+        handmade_evidence = json.loads(json.dumps(evidence))
+        handmade_evidence["validated_result"] = production.external_file_ref(
+            handmade_adapter
+        )
+        write_json(evidence_path, handmade_evidence)
+        with self.assertRaisesRegex(
+            evaluator.CanaryError, "evidence/receipt adapter-result mismatch"
+        ):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        receipt_mismatch = json.loads(json.dumps(evidence))
+        receipt_mismatch["validated_result"] = pending["bridge_receipts"][
+            "prepared_command"
+        ]
+        write_json(evidence_path, receipt_mismatch)
+        with self.assertRaisesRegex(
+            evaluator.CanaryError, "evidence/receipt adapter-result mismatch"
+        ):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        adapter_path = Path(evidence["validated_result"]["path"])
+        original_adapter = adapter_path.read_bytes()
+        adapter_path.write_bytes(original_adapter + b" ")
+        write_json(evidence_path, evidence)
+        with self.assertRaisesRegex(evaluator.CanaryError, "path/size/SHA drift"):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        adapter_path.write_bytes(original_adapter)
         alternate_mixed = write_json(self.root / "alternate-mixed.json", {})
         with self.assertRaisesRegex(evaluator.CanaryError, "mixed-lineage plan drift"):
             evaluator.validate_checkpoint_inputs(

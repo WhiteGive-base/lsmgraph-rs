@@ -460,10 +460,88 @@ def validate_checkpoint_inputs(
         == pending["bridge_receipts"]["validated_result"],
         "checkpoint evidence validated-result receipt drift",
     )
-    verify_ref(evidence.get("validated_result"), "checkpoint validated result")
     require(
         evidence.get("p31_receipt") == pending["bridge_receipts"]["p31"],
         "checkpoint evidence P31 drift",
+    )
+    bridge = backend["cells"][0]
+    expected_receipt_base = {
+        "state": "PASS",
+        "mode": "production",
+        "synthetic_test_only": False,
+        "fixture_only": False,
+        "cell_key": "seml0:bridge-canary",
+        "ordinal": 1,
+        "backend_plan_sha256": backend_ref["sha256"],
+    }
+    prepared_ref = pending["bridge_receipts"]["prepared_command"]
+    prepared = load_json(Path(prepared_ref["path"]), "bridge prepared-command receipt")
+    p31_ref = pending["bridge_receipts"]["p31"]
+    p31 = load_json(Path(p31_ref["path"]), "bridge P31 receipt")
+    validated_receipt_ref = pending["bridge_receipts"]["validated_result"]
+    validated_receipt = load_json(
+        Path(validated_receipt_ref["path"]), "bridge validated-result receipt"
+    )
+    for label, receipt, schema in (
+        (
+            "prepared-command",
+            prepared,
+            "cidr-e01-incremental-prepared-command-receipt-v1",
+        ),
+        ("P31", p31, "cidr-e01-incremental-p31-receipt-v1"),
+        (
+            "validated-result",
+            validated_receipt,
+            "cidr-e01-incremental-validated-result-receipt-v1",
+        ),
+    ):
+        require(receipt.get("schema_version") == schema, f"bridge {label} schema drift")
+        require(
+            all(receipt.get(key) == value for key, value in expected_receipt_base.items()),
+            f"bridge {label} identity/state drift",
+        )
+    require(
+        p31.get("target_p02b") == pending["target_p02b"]
+        and validated_receipt.get("target_p02b") == pending["target_p02b"],
+        "bridge validated/P31 target drift",
+    )
+    adapter_ref = verify_ref(
+        validated_receipt.get("adapter_result"), "checkpoint validated adapter result"
+    )
+    require(
+        evidence.get("validated_result") == adapter_ref,
+        "checkpoint evidence/receipt adapter-result mismatch",
+    )
+    adapter = load_json(Path(adapter_ref["path"]), "checkpoint validated adapter result")
+    require(
+        adapter.get("schema_version") == "cidr-p10-validated-repeat-v1"
+        and adapter.get("system_id") == "seml0"
+        and adapter.get("cell_key") == "seml0:bridge-canary"
+        and adapter.get("ordinal") == 1,
+        "checkpoint adapter result schema/cell drift",
+    )
+    require(adapter.get("backend_plan") == backend_ref, "checkpoint adapter plan drift")
+    require(
+        adapter.get("target_p02b") == pending["target_p02b"],
+        "checkpoint adapter target drift",
+    )
+    require(
+        adapter.get("final_cell_root")
+        == str(Path(pending["bridge_cell_done"]["path"]).parent.resolve())
+        == str(Path(bridge["final_cell_root"]).resolve()),
+        "checkpoint adapter final-cell drift",
+    )
+    request_ref = verify_ref(prepared.get("request"), "bridge prepared adapter request")
+    require(adapter.get("request") == request_ref, "checkpoint adapter request drift")
+    p31_manifest_ref = verify_ref(p31.get("run_manifest"), "bridge P31 run manifest")
+    p31_manifest = load_json(Path(p31_manifest_ref["path"]), "bridge P31 run manifest")
+    adapter_p31 = adapter.get("p31")
+    require(
+        type(adapter_p31) is dict
+        and adapter_p31.get("receipt") == p31_ref
+        and adapter_p31.get("run_manifest") == p31_manifest_ref
+        and adapter_p31.get("host") == p31_manifest.get("host"),
+        "checkpoint adapter P31 backlink drift",
     )
     return {
         "backend": backend,
