@@ -969,6 +969,179 @@ class PhaseBackendTests(unittest.TestCase):
             )
             self.assertEqual(published["query"]["sha256"], source_ref["sha256"])
 
+    def test_split_phase_provenance_is_observed_and_final_root_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = root / "campaign" / "staging" / "01-cell"
+            final = root / "campaign" / "cells" / "01-cell"
+            output = staging / "adapter-output"
+            raw = output / "seml0-raw"
+            receipts = staging / "receipts"
+            p31_root = staging / "p31"
+            for path in (raw, receipts, p31_root):
+                path.mkdir(parents=True, exist_ok=True)
+
+            def observed(path: Path) -> dict:
+                return {
+                    "path": str(path.resolve()),
+                    "sha256": phase.sha256_file(path),
+                    "size_bytes": path.stat().st_size,
+                }
+
+            plan_path = write_json(root / "plan.json", {"state": "READY"})
+            plan_ref = observed(plan_path)
+            binary = root / "lsmgraph"
+            binary.write_bytes(b"binary")
+            adapter_tool = root / "seml0_adapter.py"
+            adapter_tool.write_text("# adapter\n", encoding="utf-8")
+            truth = root / "truth.tsv"
+            truth.write_text("query_index\n0\n", encoding="utf-8")
+            query = write_json(root / "query.json", {"query_count": 1})
+            store_manifest = write_json(root / "store-manifest.json", {"state": "PASS"})
+            wrapper = root / "p31.sh"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            id_map = root / "id-map"
+            id_map.mkdir()
+            repo = root / "repo"
+            repo.mkdir()
+            target_bundle = {
+                "static_inputs": {
+                    "repo_head": "1" * 40,
+                    "store_manifest": observed(store_manifest),
+                    "bound_inputs": {
+                        "binary": observed(binary),
+                        "truth": observed(truth),
+                        "p31_wrapper": observed(wrapper),
+                        "repo_root": {"path": str(repo.resolve())},
+                        "id_map_dir": {"path": str(id_map.resolve())},
+                    },
+                }
+            }
+            target_path = write_json(root / "target.json", target_bundle)
+            target_ref = observed(target_path)
+            request_path = write_json(
+                staging / "adapter-request.json",
+                {
+                    "binary": {
+                        "path": str(binary.resolve()),
+                        "sha256": phase.sha256_file(binary),
+                    },
+                    "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                    "truth": {"query_count": 1},
+                },
+            )
+            cell = {
+                "cell_key": "seml0:bridge-canary",
+                "ordinal": 1,
+                "final_cell_root": str(final.resolve()),
+                "runtime": {
+                    "variant": "budg-b64",
+                    "adapter_tool": observed(adapter_tool),
+                    "target_query_plan": observed(query),
+                    "truth": observed(truth),
+                },
+            }
+            request_ref = phase.published_file_ref(request_path, staging, cell)
+            command_argv = [
+                str(binary.resolve()),
+                "--p10-id-map-dir",
+                str(id_map.resolve()),
+            ]
+            command_path = p31_root / "command.txt"
+            command_path.write_text(" ".join(command_argv) + "\n", encoding="utf-8")
+            manifest_path = write_json(
+                p31_root / "run-manifest.json",
+                {"root_pid": 4321, "command_exit_code": 0},
+            )
+            topology_path = write_json(
+                receipts / "command-topology.json",
+                {
+                    "root_pid": 4321,
+                    "argv": command_argv,
+                    "argv_sha256": phase.canonical_sha(command_argv),
+                },
+            )
+            topology = json.loads(topology_path.read_text(encoding="utf-8"))
+            topology["self_ref"] = phase.published_file_ref(topology_path, staging, cell)
+            p31_receipt_path = write_json(
+                receipts / "p31.json",
+                {
+                    "run_manifest": phase.published_file_ref(
+                        manifest_path, staging, cell
+                    )
+                },
+            )
+            p31 = json.loads(p31_receipt_path.read_text(encoding="utf-8"))
+            write_json(
+                receipts / "store-clone.json",
+                {
+                    "target_p02b": target_ref,
+                    "backend_plan_sha256": plan_ref["sha256"],
+                    "source_tree_sha256": "a" * 64,
+                },
+            )
+            for name, content in (
+                ("p10-raw-result.json", "{}\n"),
+                ("p10-raw-observations.tsv", "status\nok\n"),
+                ("p10-raw-phase-events.jsonl", "{}\n"),
+            ):
+                (raw / name).write_text(content, encoding="utf-8")
+            for name, content in (
+                ("adapter-result.json", "{}\n"),
+                ("query-observations.tsv", "status\nok\n"),
+                ("phase-events.jsonl", "{}\n"),
+            ):
+                (output / name).write_text(content, encoding="utf-8")
+            prepared = {"p31_argv": [str(wrapper.resolve())]}
+
+            class FakeAdapter:
+                PROVENANCE_SCHEMA_VERSION = "p10-seml0-adapter-provenance-v1"
+
+                @staticmethod
+                def command_digest(argv):
+                    return phase.canonical_sha(argv)
+
+                @staticmethod
+                def git_state(repo_root):
+                    return {
+                        "root": str(repo_root),
+                        "head": "1" * 40,
+                        "clean": True,
+                        "status_sha256": phase.sha256_file(plan_path),
+                    }
+
+            provenance = phase.build_split_phase_provenance(
+                plan_ref=plan_ref,
+                target_ref=target_ref,
+                target_bundle=target_bundle,
+                cell=cell,
+                cwd=staging,
+                adapter=FakeAdapter,
+                request=json.loads(request_path.read_text(encoding="utf-8")),
+                request_ref=request_ref,
+                prepared=prepared,
+                p31=p31,
+                topology=topology,
+                output=output,
+                raw_dir=raw,
+            )
+            binding = provenance["split_phase_binding"]
+            self.assertEqual(binding["final_cell_root"], str(final.resolve()))
+            self.assertEqual(binding["campaign_root"], str((root / "campaign").resolve()))
+            self.assertEqual(binding["backend_plan"], plan_ref)
+            self.assertEqual(binding["target_p02b"], target_ref)
+            for ref in (
+                binding["request"],
+                binding["p31_receipt"],
+                binding["p31_run_manifest"],
+                binding["command_topology"],
+                binding["adapter_result"],
+                binding["clone_receipt"],
+                *binding["validated_artifacts"].values(),
+            ):
+                self.assertTrue(phase.path_within(Path(ref["path"]), final))
+                self.assertFalse(phase.path_within(Path(ref["path"]), staging))
+
     def test_deadline_chain_rejects_1000_null_bool_number_and_result_drift(self) -> None:
         request = {"timing": {"per_query_timeout_ms": 30000}}
         topology = {"per_query_timeout_ms": 30000}

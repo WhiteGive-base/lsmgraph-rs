@@ -36,6 +36,7 @@ FALSE_ELIGIBILITY = {
 MAX_SMALL_FILE_BYTES = 16 * 1024 * 1024
 FULL_COPY_RESERVE_BYTES = 14_400_000_000
 TARGET_P02B_SCHEMA = "cidr-e01-target-specific-p02b-v1"
+SPLIT_PROVENANCE_SCHEMA = "cidr-e01-split-phase-provenance-binding-v1"
 TARGETS = {
     "budg-b64": {"layout": "semantic-budgeted", "hint": True},
     "naive": {"layout": "naive", "hint": False},
@@ -841,6 +842,212 @@ def publish_adapter_artifacts(
     return published
 
 
+def _observed_file_ref(path: Path, expected_sha256: Optional[str], label: str) -> dict[str, Any]:
+    path = path.resolve()
+    require(path.is_file() and not path.is_symlink(), f"{label}: regular file required")
+    actual = {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+    }
+    if expected_sha256 is not None:
+        require(actual["sha256"] == expected_sha256, f"{label}: SHA drift")
+    return actual
+
+
+def _argv_option(argv: Sequence[str], name: str) -> str:
+    require(argv.count(name) == 1, f"observed argv requires exactly one {name}")
+    index = argv.index(name)
+    require(index + 1 < len(argv), f"observed argv value missing for {name}")
+    return argv[index + 1]
+
+
+def build_split_phase_provenance(
+    *,
+    plan_ref: Mapping[str, Any],
+    target_ref: Mapping[str, Any],
+    target_bundle: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    cwd: Path,
+    adapter: ModuleType,
+    request: Mapping[str, Any],
+    request_ref: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+    p31: Mapping[str, Any],
+    topology: Mapping[str, Any],
+    output: Path,
+    raw_dir: Path,
+) -> dict[str, Any]:
+    """Build provenance only from observed files/receipts after the timed process."""
+    require(
+        getattr(adapter, "PROVENANCE_SCHEMA_VERSION", None)
+        == "p10-seml0-adapter-provenance-v1",
+        "SemL0 provenance schema drift",
+    )
+    command_argv = topology.get("argv")
+    require(type(command_argv) is list and command_argv, "observed command argv missing")
+    require(
+        topology.get("argv_sha256") == canonical_sha(command_argv)
+        == adapter.command_digest(command_argv),
+        "observed command argv SHA drift",
+    )
+    p31_manifest_ref = verify_staged_published_ref(
+        p31.get("run_manifest"),
+        cwd / "p31/run-manifest.json",
+        cwd,
+        cell,
+        "P31 run manifest",
+    )
+    p31_manifest = load_json(cwd / "p31/run-manifest.json", "P31 run manifest")
+    require(p31_manifest.get("command_exit_code") == 0, "observed command exit code drift")
+    require(
+        p31_manifest.get("root_pid") == topology.get("root_pid"),
+        "observed command root PID drift",
+    )
+    binary = _observed_file_ref(
+        Path(command_argv[0]),
+        request.get("binary", {}).get("sha256"),
+        "observed SemL0 binary",
+    )
+    require(
+        Path(request.get("binary", {}).get("path", "")).resolve()
+        == Path(binary["path"]),
+        "observed binary/request path drift",
+    )
+    static_inputs = target_bundle.get("static_inputs")
+    bound_inputs = static_inputs.get("bound_inputs") if type(static_inputs) is dict else None
+    require(type(bound_inputs) is dict, "target P02B bound inputs missing")
+    require(
+        binary == verify_ref(bound_inputs.get("binary"), "target P02B binary"),
+        "observed binary/target P02B drift",
+    )
+    repo_root_value = bound_inputs.get("repo_root")
+    require(type(repo_root_value) is dict, "target P02B repo root missing")
+    repo_root = Path(str(repo_root_value.get("path", ""))).resolve()
+    repo = adapter.git_state(repo_root)
+    require(
+        repo.get("clean") is True
+        and repo.get("head") == static_inputs.get("repo_head"),
+        "observed repository state drift",
+    )
+    sample_plan = verify_ref(cell["runtime"]["target_query_plan"], "target query plan")
+    truth = verify_ref(cell["runtime"]["truth"], "target truth")
+    require(
+        truth == verify_ref(bound_inputs.get("truth"), "target P02B truth"),
+        "observed truth/target P02B drift",
+    )
+    clone_receipt_path = cwd / "receipts/store-clone.json"
+    clone_receipt = load_json(clone_receipt_path, "store clone receipt")
+    clone_receipt_ref = published_file_ref(clone_receipt_path, cwd, cell)
+    require(
+        clone_receipt.get("target_p02b") == target_ref
+        and clone_receipt.get("backend_plan_sha256") == plan_ref["sha256"],
+        "clone receipt provenance drift",
+    )
+    store_manifest = verify_ref(
+        static_inputs.get("store_manifest"), "target store manifest"
+    )
+    adapter_ref = verify_ref(cell["runtime"]["adapter_tool"], "adapter tool")
+    p31_wrapper = _observed_file_ref(
+        Path(prepared["p31_argv"][0]), None, "observed P31 wrapper"
+    )
+    require(
+        p31_wrapper
+        == verify_ref(bound_inputs.get("p31_wrapper"), "target P02B P31 wrapper"),
+        "observed P31 wrapper/target P02B drift",
+    )
+    id_map_dir = Path(_argv_option(command_argv, "--p10-id-map-dir")).resolve()
+    require(
+        type(bound_inputs.get("id_map_dir")) is dict
+        and Path(str(bound_inputs["id_map_dir"].get("path", ""))).resolve()
+        == id_map_dir,
+        "observed id-map directory/target P02B drift",
+    )
+    raw_artifacts = {
+        name: published_file_ref(raw_dir / name, cwd, cell)
+        for name in (
+            "p10-raw-result.json",
+            "p10-raw-observations.tsv",
+            "p10-raw-phase-events.jsonl",
+        )
+    }
+    validated_artifacts = {
+        name: published_file_ref(output / name, cwd, cell)
+        for name in ("adapter-result.json", "query-observations.tsv", "phase-events.jsonl")
+    }
+    final_root = Path(cell["final_cell_root"]).resolve()
+    campaign_root = final_root.parents[1]
+    topology_ref = topology.get("self_ref")
+    require(type(topology_ref) is dict, "command topology published ref missing")
+    p31_receipt_ref = published_file_ref(cwd / "receipts/p31.json", cwd, cell)
+    binding = {
+        "schema_version": SPLIT_PROVENANCE_SCHEMA,
+        "backend_plan": dict(plan_ref),
+        "target_p02b": dict(target_ref),
+        "request": dict(request_ref),
+        "p31_receipt": p31_receipt_ref,
+        "p31_run_manifest": p31_manifest_ref,
+        "command_topology": dict(topology_ref),
+        "adapter_tool": adapter_ref,
+        "adapter_result": validated_artifacts["adapter-result.json"],
+        "validated_artifacts": validated_artifacts,
+        "clone_receipt": clone_receipt_ref,
+        "cell_key": cell["cell_key"],
+        "ordinal": cell["ordinal"],
+        "campaign_root": str(campaign_root),
+        "final_cell_root": str(final_root),
+    }
+    require(
+        all(
+            not path_within(Path(ref["path"]), cwd)
+            for ref in (
+                binding["request"],
+                binding["p31_receipt"],
+                binding["p31_run_manifest"],
+                binding["command_topology"],
+                binding["adapter_result"],
+                binding["clone_receipt"],
+                *binding["validated_artifacts"].values(),
+            )
+        ),
+        "published provenance reference retained staging path",
+    )
+    return {
+        "schema_version": adapter.PROVENANCE_SCHEMA_VERSION,
+        "mode": "formal",
+        "variant": cell["runtime"]["variant"],
+        "process_lifetime": request["process_lifetime"],
+        "request": dict(request_ref),
+        "repo": repo,
+        "binary": binary,
+        "store": {
+            "tree_sha256": clone_receipt["source_tree_sha256"],
+            "manifest": store_manifest,
+            "clone_receipt": clone_receipt_ref,
+            "mutable_clone_removed_before_cell_publication": True,
+        },
+        "truth": truth,
+        "sample_plan": {**sample_plan, "query_count": request["truth"]["query_count"]},
+        "id_map": {
+            "directory": str(id_map_dir),
+            "bound_by_target_p02b": dict(target_ref),
+        },
+        "p02b": {"target_bundle": dict(target_ref)},
+        "p31_wrapper": p31_wrapper,
+        "command": {
+            "argv": list(command_argv),
+            "argv_sha256": topology["argv_sha256"],
+            "invocations": 1,
+            "exit_code": p31_manifest["command_exit_code"],
+            "root_pid": p31_manifest["root_pid"],
+            "run_manifest": p31_manifest_ref,
+            "command_topology": dict(topology_ref),
+        },
+        "raw_artifacts": raw_artifacts,
+        "split_phase_binding": binding,
+    }
+
+
 def _cell(plan: Mapping[str, Any], key: str) -> dict[str, Any]:
     matches = [row for row in plan.get("cells", []) if row.get("cell_key") == key]
     require(len(matches) == 1, "cell key missing/duplicate")
@@ -1102,6 +1309,23 @@ def finalize(
     lifetime_binding = bind_adapter_process_lifetime(
         output / "adapter-result.json", request, topology
     )
+    target_bundle = load_json(Path(target_ref["path"]), "target P02B")
+    provenance = build_split_phase_provenance(
+        plan_ref=plan_ref,
+        target_ref=target_ref,
+        target_bundle=target_bundle,
+        cell=cell,
+        cwd=cwd,
+        adapter=adapter,
+        request=request,
+        request_ref=request_ref,
+        prepared=prepared,
+        p31=p31,
+        topology=topology,
+        output=output,
+        raw_dir=raw_dir,
+    )
+    atomic_json(output / "adapter-provenance.json", provenance)
     system = {
         "id": "seml0",
         "group": "embedded",
@@ -1125,9 +1349,27 @@ def finalize(
     deadline = validate_deadline_chain(
         request, topology, adapter_result, validated_repeat
     )
-    validated_repeat["adapter_artifacts"] = publish_adapter_artifacts(
+    require(
+        validated_repeat.get("adapter_provenance") == provenance,
+        "validated adapter provenance content drift",
+    )
+    published_artifacts = publish_adapter_artifacts(
         validated_repeat, cwd, cell
     )
+    require(
+        provenance["split_phase_binding"]["validated_artifacts"]
+        == {
+            name: published_artifacts[name]
+            for name in ("adapter-result.json", "query-observations.tsv", "phase-events.jsonl")
+        },
+        "validated adapter artifact/provenance binding drift",
+    )
+    require(
+        published_artifacts.get("adapter-provenance.json")
+        == published_file_ref(output / "adapter-provenance.json", cwd, cell),
+        "published adapter provenance ref drift",
+    )
+    validated_repeat["adapter_artifacts"] = published_artifacts
     p31_manifest_path = cwd / "p31" / "run-manifest.json"
     p31_manifest_ref = verify_staged_published_ref(
         p31.get("run_manifest"),
@@ -1170,6 +1412,7 @@ def finalize(
         **_base_receipt(cell, plan_sha, "validated-result"),
         "target_p02b": target_ref,
         "adapter_result": published_file_ref(validated_output_path, cwd, cell),
+        "adapter_provenance": published_artifacts["adapter-provenance.json"],
         "request": request_ref,
         "p31_receipt": p31_receipt_ref,
         "command_topology": topology["self_ref"],

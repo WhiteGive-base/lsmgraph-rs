@@ -26,6 +26,8 @@ FAILED_SCHEMA = "cidr-e01-incremental-production-failed-v1"
 CANARY_PENDING_SCHEMA = "cidr-e01-incremental-canary-pending-v1"
 CANARY_ACCEPTED_SCHEMA = "cidr-e01-incremental-canary-accepted-v1"
 CANARY_EVALUATION_SCHEMA = "cidr-e01-bridge-canary-checkpoint-receipt-v2"
+SPLIT_PROVENANCE_SCHEMA = "cidr-e01-split-phase-provenance-binding-v1"
+SEML0_PROVENANCE_SCHEMA = "p10-seml0-adapter-provenance-v1"
 CELL_ORDER = (
     "seml0:bridge-canary",
     "seml0-naive:r1",
@@ -72,6 +74,12 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def canonical_sha(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def load_json(path: Path, label: str) -> Dict[str, Any]:
@@ -446,6 +454,7 @@ def expected_canary_pending(
         target_p02b=bridge["runtime"]["target_p02b"],
         target_query_plan=bridge["runtime"]["target_query_plan"],
         target_lease=bridge["runtime"]["target_lease"],
+        adapter_tool=bridge["runtime"]["adapter_tool"],
     )
     return {
         "schema_version": CANARY_PENDING_SCHEMA,
@@ -826,6 +835,7 @@ def validate_final_cell(
     target_p02b: Optional[Mapping[str, Any]] = None,
     target_query_plan: Optional[Mapping[str, Any]] = None,
     target_lease: Optional[Mapping[str, Any]] = None,
+    adapter_tool: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     require(final.is_dir() and not final.is_symlink(), f"{cell_key}: final cell invalid")
     done = load_json(final / "CELL-DONE.json", f"{cell_key} CELL-DONE")
@@ -889,6 +899,143 @@ def validate_final_cell(
                 path_within(Path(actual["path"]), final),
                 f"{cell_key}: adapter artifact outside final root",
             )
+        provenance_ref = verify_external_file_ref(
+            validated_receipt.get("adapter_provenance"),
+            f"{cell_key}: validated-result adapter provenance",
+        )
+        require(
+            provenance_ref == artifacts.get("adapter-provenance.json"),
+            f"{cell_key}: provenance/validated-artifact ref drift",
+        )
+        provenance = load_json(
+            Path(provenance_ref["path"]), f"{cell_key}: adapter provenance"
+        )
+        require(
+            provenance.get("schema_version") == SEML0_PROVENANCE_SCHEMA,
+            f"{cell_key}: adapter provenance schema drift",
+        )
+        require(
+            adapter.get("adapter_provenance") == provenance,
+            f"{cell_key}: embedded/file provenance drift",
+        )
+        binding = provenance.get("split_phase_binding")
+        required_binding = {
+            "schema_version",
+            "backend_plan",
+            "target_p02b",
+            "request",
+            "p31_receipt",
+            "p31_run_manifest",
+            "command_topology",
+            "adapter_tool",
+            "adapter_result",
+            "validated_artifacts",
+            "clone_receipt",
+            "cell_key",
+            "ordinal",
+            "campaign_root",
+            "final_cell_root",
+        }
+        require(
+            type(binding) is dict and set(binding) == required_binding,
+            f"{cell_key}: split-phase provenance binding keys drift",
+        )
+        require(
+            binding["schema_version"] == SPLIT_PROVENANCE_SCHEMA,
+            f"{cell_key}: split-phase provenance schema drift",
+        )
+        require(
+            binding["cell_key"] == cell_key
+            and binding["ordinal"] == ordinal
+            and binding["final_cell_root"] == str(final.resolve())
+            and binding["campaign_root"] == str(final.resolve().parents[1]),
+            f"{cell_key}: split-phase provenance cell/attempt drift",
+        )
+        backend_ref = verify_external_file_ref(
+            binding["backend_plan"], f"{cell_key}: provenance backend plan"
+        )
+        require(
+            backend_ref["sha256"] == plan_sha,
+            f"{cell_key}: provenance backend plan drift",
+        )
+        require(
+            binding["target_p02b"] == target_p02b,
+            f"{cell_key}: provenance target P02B drift",
+        )
+        require(
+            verify_external_file_ref(
+                binding["target_p02b"], f"{cell_key}: provenance target P02B"
+            )
+            == target_p02b,
+            f"{cell_key}: provenance target P02B ref drift",
+        )
+        require(
+            binding["request"] == request_ref
+            and provenance.get("request") == request_ref,
+            f"{cell_key}: provenance request drift",
+        )
+        p31_ref = external_file_ref(final / RECEIPT_PATHS["p31"])
+        topology_ref = external_file_ref(final / RECEIPT_PATHS["command_topology"])
+        clone_ref = external_file_ref(final / RECEIPT_PATHS["store_clone"])
+        require(
+            binding["p31_receipt"] == p31_ref
+            and binding["command_topology"] == topology_ref
+            and binding["clone_receipt"] == clone_ref,
+            f"{cell_key}: provenance receipt backlink drift",
+        )
+        p31_receipt = load_json(final / RECEIPT_PATHS["p31"], f"{cell_key}: P31")
+        require(
+            binding["p31_run_manifest"] == p31_receipt.get("run_manifest"),
+            f"{cell_key}: provenance P31 manifest drift",
+        )
+        require(
+            adapter_tool is not None
+            and binding["adapter_tool"] == adapter_tool
+            and verify_external_file_ref(
+                binding["adapter_tool"], f"{cell_key}: provenance adapter tool"
+            )
+            == adapter_tool,
+            f"{cell_key}: provenance adapter tool drift",
+        )
+        require(
+            binding["adapter_result"] == artifacts.get("adapter-result.json"),
+            f"{cell_key}: provenance adapter-result drift",
+        )
+        expected_validated_artifacts = {
+            name: artifacts[name]
+            for name in ("adapter-result.json", "query-observations.tsv", "phase-events.jsonl")
+        }
+        require(
+            binding["validated_artifacts"] == expected_validated_artifacts,
+            f"{cell_key}: provenance validated artifacts drift",
+        )
+        for label, ref in (
+            ("request", binding["request"]),
+            ("P31 receipt", binding["p31_receipt"]),
+            ("P31 manifest", binding["p31_run_manifest"]),
+            ("command topology", binding["command_topology"]),
+            ("adapter result", binding["adapter_result"]),
+            ("clone receipt", binding["clone_receipt"]),
+            *(
+                (f"validated artifact {name}", ref)
+                for name, ref in binding["validated_artifacts"].items()
+            ),
+        ):
+            actual = verify_external_file_ref(ref, f"{cell_key}: provenance {label}")
+            require(
+                path_within(Path(actual["path"]), final),
+                f"{cell_key}: provenance {label} retained staging/outside path",
+            )
+        command = provenance.get("command")
+        require(
+            type(command) is dict
+            and command.get("invocations") == 1
+            and command.get("exit_code") == 0
+            and command.get("argv") == topology.get("argv")
+            and command.get("argv_sha256") == topology.get("argv_sha256")
+            and command.get("argv_sha256") == canonical_sha(command.get("argv")),
+            f"{cell_key}: provenance observed command drift",
+        )
     return done
 
 
@@ -931,6 +1078,7 @@ def inspect_resume_root(
             target_p02b=row.get("runtime", {}).get("target_p02b"),
             target_query_plan=row.get("runtime", {}).get("target_query_plan"),
             target_lease=row.get("runtime", {}).get("target_lease"),
+            adapter_tool=row.get("runtime", {}).get("adapter_tool"),
         )
         completed += 1
     done_path = root / "MATRIX-DONE.json"

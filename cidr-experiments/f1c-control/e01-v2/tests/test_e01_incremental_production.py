@@ -274,6 +274,7 @@ class IncrementalProductionTests(unittest.TestCase):
                     "phase_commands": commands,
                     "runtime": {
                         "variant": variant,
+                        "adapter_tool": self.executor_ref,
                         "target_p02b": targets[variant],
                         "target_query_plan": query_ref,
                         "target_lease": lease_ref,
@@ -415,7 +416,12 @@ class IncrementalProductionTests(unittest.TestCase):
                 if role == "p31":
                     manifest_path = write_json(
                         cwd / "p31" / "run-manifest.json",
-                        {"state": "PASS", "host": {"fingerprint_sha256": "f" * 64}},
+                        {
+                            "state": "PASS",
+                            "host": {"fingerprint_sha256": "f" * 64},
+                            "root_pid": 12345,
+                            "command_exit_code": 0,
+                        },
                     )
                     value.update(timing_generated=True, binary_only_boundary=True)
                     value["run_manifest"] = future_ref(manifest_path)
@@ -423,6 +429,7 @@ class IncrementalProductionTests(unittest.TestCase):
                         cwd / production.RECEIPT_PATHS["command_topology"]
                     )
                 if role == "command_topology":
+                    observed_argv = ["/bin/true"]
                     value.update(
                         single_binary_invocation=True,
                         warmup_measured_same_process=True,
@@ -431,6 +438,9 @@ class IncrementalProductionTests(unittest.TestCase):
                         measured_repeats=self.legacy_protocol["measured_passes"],
                         process_lifetime=self.legacy_protocol["process_lifetime"],
                         per_query_timeout_ms=self.legacy_protocol["per_query_timeout_ms"],
+                        root_pid=12345,
+                        argv=observed_argv,
+                        argv_sha256=production.canonical_sha(observed_argv),
                     )
                 if role == "correctness":
                     value.update(mismatch_queries=0, timeout_queries=0)
@@ -444,8 +454,65 @@ class IncrementalProductionTests(unittest.TestCase):
                     p31_receipt = json.loads(
                         p31_receipt_path.read_text(encoding="utf-8")
                     )
+                    output = cwd / "adapter-output"
+                    raw_adapter_path = write_json(
+                        output / "adapter-result.json",
+                        {
+                            "schema_version": "cidr-p10-adapter-result-v1",
+                            "per_query_timeout_ms": self.legacy_protocol[
+                                "per_query_timeout_ms"
+                            ],
+                        },
+                    )
+                    artifact_path = output / "query-observations.tsv"
+                    artifact_path.write_text("status\nok\n", encoding="utf-8")
+                    events_path = output / "phase-events.jsonl"
+                    events_path.write_text("{}\n", encoding="utf-8")
+                    validated_artifacts = {
+                        "adapter-result.json": future_ref(raw_adapter_path),
+                        "query-observations.tsv": future_ref(artifact_path),
+                        "phase-events.jsonl": future_ref(events_path),
+                    }
+                    provenance = {
+                        "schema_version": production.SEML0_PROVENANCE_SCHEMA,
+                        "request": prepared["request"],
+                        "command": {
+                            "argv": ["/bin/true"],
+                            "argv_sha256": production.canonical_sha(["/bin/true"]),
+                            "invocations": 1,
+                            "exit_code": 0,
+                        },
+                        "split_phase_binding": {
+                            "schema_version": production.SPLIT_PROVENANCE_SCHEMA,
+                            "backend_plan": plan_ref,
+                            "target_p02b": row["runtime"]["target_p02b"],
+                            "request": prepared["request"],
+                            "p31_receipt": future_ref(p31_receipt_path),
+                            "p31_run_manifest": p31_receipt["run_manifest"],
+                            "command_topology": p31_receipt["command_topology"],
+                            "adapter_tool": row["runtime"]["adapter_tool"],
+                            "adapter_result": validated_artifacts[
+                                "adapter-result.json"
+                            ],
+                            "validated_artifacts": validated_artifacts,
+                            "clone_receipt": future_ref(
+                                cwd / production.RECEIPT_PATHS["store_clone"]
+                            ),
+                            "cell_key": row["cell_key"],
+                            "ordinal": row["ordinal"],
+                            "campaign_root": str(self.campaign.resolve()),
+                            "final_cell_root": str(final_root.resolve()),
+                        },
+                    }
+                    provenance_path = write_json(
+                        output / "adapter-provenance.json", provenance
+                    )
+                    adapter_artifacts = {
+                        **validated_artifacts,
+                        "adapter-provenance.json": future_ref(provenance_path),
+                    }
                     adapter_path = write_json(
-                        cwd / "adapter-output" / "validated-repeat.json",
+                        output / "validated-repeat.json",
                         {
                             "schema_version": "cidr-p10-validated-repeat-v1",
                             "system_id": "seml0",
@@ -465,18 +532,12 @@ class IncrementalProductionTests(unittest.TestCase):
                                 "command_topology": p31_receipt["command_topology"],
                             },
                             "per_query_timeout_ms": self.legacy_protocol["per_query_timeout_ms"],
-                            "adapter_artifacts": {},
+                            "adapter_artifacts": adapter_artifacts,
+                            "adapter_provenance": provenance,
                         },
                     )
-                    artifact_path = cwd / "adapter-output" / "query-observations.tsv"
-                    artifact_path.write_text("status\nok\n", encoding="utf-8")
-                    adapter_value = json.loads(adapter_path.read_text(encoding="utf-8"))
-                    adapter_value["adapter_artifacts"] = {
-                        "query_observations": future_ref(artifact_path)
-                    }
-                    adapter_path.unlink()
-                    write_json(adapter_path, adapter_value)
                     value["adapter_result"] = future_ref(adapter_path)
+                    value["adapter_provenance"] = future_ref(provenance_path)
                     value["request"] = prepared["request"]
                     value["p31_receipt"] = future_ref(p31_receipt_path)
                     value["command_topology"] = p31_receipt["command_topology"]
@@ -499,6 +560,97 @@ class IncrementalProductionTests(unittest.TestCase):
         restart_pending = production.execute_production(plan_path, runner=fake_runner)
         self.assertEqual(restart_pending["state"], "CANARY_PENDING")
         self.assertEqual(len(dispatched), 4)
+        bridge = ready["cells"][0]
+        bridge_final = Path(bridge["final_cell_root"])
+        provenance_path = bridge_final / "adapter-output/adapter-provenance.json"
+        validated_path = bridge_final / "adapter-output/validated-repeat.json"
+        validated_receipt_path = bridge_final / "validated-result.json"
+        done_path = bridge_final / "CELL-DONE.json"
+        original_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+
+        def validate_bridge() -> None:
+            production.validate_final_cell(
+                bridge_final,
+                cell_key=bridge["cell_key"],
+                ordinal=bridge["ordinal"],
+                plan_sha=plan_sha,
+                expected_mode="production",
+                target_p02b=bridge["runtime"]["target_p02b"],
+                target_query_plan=bridge["runtime"]["target_query_plan"],
+                target_lease=bridge["runtime"]["target_lease"],
+                adapter_tool=bridge["runtime"]["adapter_tool"],
+            )
+
+        def rewrite_provenance_chain(provenance_value: dict) -> None:
+            write_json(provenance_path, provenance_value)
+            validated_value = json.loads(validated_path.read_text(encoding="utf-8"))
+            validated_value["adapter_provenance"] = provenance_value
+            validated_value["adapter_artifacts"][
+                "adapter-provenance.json"
+            ] = production.external_file_ref(provenance_path)
+            write_json(validated_path, validated_value)
+            receipt_value = json.loads(
+                validated_receipt_path.read_text(encoding="utf-8")
+            )
+            receipt_value["adapter_provenance"] = production.external_file_ref(
+                provenance_path
+            )
+            receipt_value["adapter_result"] = production.external_file_ref(
+                validated_path
+            )
+            write_json(validated_receipt_path, receipt_value)
+            done_value = json.loads(done_path.read_text(encoding="utf-8"))
+            done_value["receipts"]["validated_result"] = production.file_ref(
+                validated_receipt_path, bridge_final, "validated_result"
+            )
+            write_json(done_path, done_value)
+
+        validate_bridge()
+        provenance_path.unlink()
+        with self.assertRaises(production.BackendError):
+            validate_bridge()
+        rewrite_provenance_chain(original_provenance)
+        stale = json.loads(json.dumps(original_provenance))
+        stale["mode"] = "tampered"
+        write_json(provenance_path, stale)
+        with self.assertRaises(production.BackendError):
+            validate_bridge()
+        rewrite_provenance_chain(original_provenance)
+        mutations = []
+        wrong_schema = json.loads(json.dumps(original_provenance))
+        wrong_schema["schema_version"] = "wrong"
+        mutations.append(wrong_schema)
+        wrong_binding_schema = json.loads(json.dumps(original_provenance))
+        wrong_binding_schema["split_phase_binding"]["schema_version"] = "wrong"
+        mutations.append(wrong_binding_schema)
+        wrong_cell = json.loads(json.dumps(original_provenance))
+        wrong_cell["split_phase_binding"]["cell_key"] = "seml0-naive:r1"
+        mutations.append(wrong_cell)
+        wrong_attempt = json.loads(json.dumps(original_provenance))
+        wrong_attempt["split_phase_binding"]["campaign_root"] = str(
+            self.root / "wrong-attempt"
+        )
+        mutations.append(wrong_attempt)
+        staging_ref = json.loads(json.dumps(original_provenance))
+        staging_ref["split_phase_binding"]["request"]["path"] = str(
+            self.campaign
+            / "staging"
+            / bridge_final.name
+            / "adapter-request.json"
+        )
+        mutations.append(staging_ref)
+        wrong_sha = json.loads(json.dumps(original_provenance))
+        wrong_sha["split_phase_binding"]["adapter_result"]["sha256"] = "0" * 64
+        mutations.append(wrong_sha)
+        command_tamper = json.loads(json.dumps(original_provenance))
+        command_tamper["command"]["argv"] = ["/bin/false"]
+        mutations.append(command_tamper)
+        for mutation in mutations:
+            rewrite_provenance_chain(mutation)
+            with self.assertRaises(production.BackendError):
+                validate_bridge()
+            rewrite_provenance_chain(original_provenance)
+        validate_bridge()
         jump_row = ready["cells"][1]
         jump_staging = Path(jump_row["staging_cell_root"])
         jump_final = Path(jump_row["final_cell_root"])
