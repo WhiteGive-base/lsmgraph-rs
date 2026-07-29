@@ -52,6 +52,33 @@ class IncrementalProductionTests(unittest.TestCase):
             "sha256": production.sha256_file(evaluator_path),
             "size_bytes": evaluator_path.stat().st_size,
         }
+        mixed_path = ROOT / "E01-mixed-lineage-plan-v1.json"
+        self.mixed_ref = production.external_file_ref(mixed_path)
+        self.formal_contract = json.loads(
+            mixed_path.read_text(encoding="utf-8")
+        )["incremental_plan"]["bridge_canary_comparability_contract"]
+        self.contract_sha = self.formal_contract["contract_sha256"]
+        self.checkpoint = {
+            "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v2",
+            "evaluator": self.evaluator_ref,
+            "mixed_lineage_plan": self.mixed_ref,
+            "comparability_contract_sha256": self.contract_sha,
+            "evidence_schema": evaluator.CHECKPOINT_EVIDENCE_SCHEMA,
+            "evidence_path": str(self.campaign / "CANARY-EVIDENCE.json"),
+            "evidence_binding": {
+                "cell_key": "seml0:bridge-canary",
+                "backend_plan": True,
+                "bridge_cell_done": True,
+                "bridge_receipts": sorted(production.RECEIPT_PATHS),
+            },
+            "pending_path": str(self.campaign / "CANARY-PENDING.json"),
+            "comparability_path": str(self.campaign / "CANARY-COMPARABILITY.json"),
+            "evaluation_path": str(self.campaign / "CANARY-EVALUATION.json"),
+            "accepted_path": str(self.campaign / "CANARY-ACCEPTED.json"),
+            "first_launch_max_completed_cells": 1,
+            "resume_requires_evaluation_state": "PASS",
+            "matrix_done_before_acceptance": False,
+        }
         self.plan = {
             "schema_version": production.BACKEND_SCHEMA,
             "state": "HOLD",
@@ -62,16 +89,7 @@ class IncrementalProductionTests(unittest.TestCase):
             "campaign_gates": {"fresh_resource_gate": None},
             "phase_executor": self.executor_ref,
             "production_scheduler": self.scheduler_ref,
-            "canary_checkpoint": {
-                "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v1",
-                "evaluator": self.evaluator_ref,
-                "pending_path": str(self.campaign / "CANARY-PENDING.json"),
-                "evaluation_path": str(self.campaign / "CANARY-EVALUATION.json"),
-                "accepted_path": str(self.campaign / "CANARY-ACCEPTED.json"),
-                "first_launch_max_completed_cells": 1,
-                "resume_requires_evaluation_state": "PASS",
-                "matrix_done_before_acceptance": False,
-            },
+            "canary_checkpoint": self.checkpoint,
             "blockers": ["test HOLD"],
             "cells": [
                 {
@@ -200,16 +218,7 @@ class IncrementalProductionTests(unittest.TestCase):
             "campaign_gates": {"backend_arming": {"path": str(gate_path.resolve())}},
             "phase_executor": self.executor_ref,
             "production_scheduler": self.scheduler_ref,
-            "canary_checkpoint": {
-                "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v1",
-                "evaluator": self.evaluator_ref,
-                "pending_path": str(self.campaign / "CANARY-PENDING.json"),
-                "evaluation_path": str(self.campaign / "CANARY-EVALUATION.json"),
-                "accepted_path": str(self.campaign / "CANARY-ACCEPTED.json"),
-                "first_launch_max_completed_cells": 1,
-                "resume_requires_evaluation_state": "PASS",
-                "matrix_done_before_acceptance": False,
-            },
+            "canary_checkpoint": json.loads(json.dumps(self.checkpoint)),
             "blockers": [],
             "cells": [],
         }
@@ -251,6 +260,7 @@ class IncrementalProductionTests(unittest.TestCase):
                 "phase_executor": self.executor_ref,
                 "production_scheduler": self.scheduler_ref,
                 "canary_evaluator": self.evaluator_ref,
+                "canary_checkpoint": ready["canary_checkpoint"],
                 "backend_plan": plan_ref,
             },
         )
@@ -347,8 +357,97 @@ class IncrementalProductionTests(unittest.TestCase):
             production.inspect_resume_root(self.campaign, ready, plan_sha)
         jump_final.rename(self.root / "malicious-jump-retained")
         del dispatched[-4:]
+        pending_path = self.campaign / "CANARY-PENDING.json"
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        backend_ref = production.external_file_ref(plan_path)
+        validated_result = write_json(
+            self.campaign / "bridge-adapter-result.json",
+            {"state": "PASS", "system_id": "seml0"},
+        )
+        evidence_path = Path(ready["canary_checkpoint"]["evidence_path"])
+        evidence = {
+            "schema_version": evaluator.CHECKPOINT_EVIDENCE_SCHEMA,
+            "state": "PASS",
+            "cell_key": "seml0:bridge-canary",
+            "backend_plan": backend_ref,
+            "bridge_cell_done": pending["bridge_cell_done"],
+            "bridge_receipts": pending["bridge_receipts"],
+            "mixed_lineage_plan": self.mixed_ref,
+            "contract_sha256": self.contract_sha,
+            "validated_result_receipt": pending["bridge_receipts"]["validated_result"],
+            "validated_result": production.external_file_ref(validated_result),
+            "p31_receipt": pending["bridge_receipts"]["p31"],
+        }
+        write_json(evidence_path, evidence)
+        alternate_mixed = write_json(self.root / "alternate-mixed.json", {})
+        with self.assertRaisesRegex(evaluator.CanaryError, "mixed-lineage plan drift"):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=alternate_mixed,
+                evidence_path=evidence_path,
+            )
+        wrong_contract = json.loads(json.dumps(evidence))
+        wrong_contract["contract_sha256"] = "0" * 64
+        write_json(evidence_path, wrong_contract)
+        with self.assertRaisesRegex(evaluator.CanaryError, "evidence contract drift"):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        wrong_evidence = json.loads(json.dumps(evidence))
+        wrong_evidence["validated_result_receipt"]["sha256"] = "0" * 64
+        write_json(evidence_path, wrong_evidence)
+        with self.assertRaisesRegex(
+            evaluator.CanaryError, "validated-result receipt drift"
+        ):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        write_json(evidence_path, evidence)
+        evidence_ref = production.external_file_ref(evidence_path)
+        comparability = {
+            "schema_version": evaluator.RECEIPT_SCHEMA,
+            "state": "PASS",
+            "mixed_lineage_plan": self.mixed_ref,
+            "canary_evidence": evidence_ref,
+            "contract_sha256": self.contract_sha,
+            "failures": [],
+            "identity_checks": {
+                key: {"state": "PASS"}
+                for key in self.formal_contract["identity_exact_match"]
+            },
+            "correctness_checks": {
+                key: "PASS" for key in self.formal_contract["correctness"]
+            },
+            "performance_checks": {
+                key: {"state": "PASS"} for key in evaluator.METRICS
+            },
+            "normalizer_release": True,
+        }
+        with self.assertRaisesRegex(evaluator.CanaryError, "comparability schema"):
+            evaluator._validate_comparability_receipt(
+                {"state": "PASS", "normalizer_release": True},
+                contract=ready["canary_checkpoint"],
+                evidence_ref=evidence_ref,
+            )
+        failed_comparability = json.loads(json.dumps(comparability))
+        failed_comparability["failures"] = ["performance.completed_qps"]
+        with self.assertRaisesRegex(evaluator.CanaryError, "failures must be empty"):
+            evaluator._validate_comparability_receipt(
+                failed_comparability,
+                contract=ready["canary_checkpoint"],
+                evidence_ref=evidence_ref,
+            )
+        comparability_path = Path(ready["canary_checkpoint"]["comparability_path"])
+        evaluator.atomic_write(comparability_path, comparability)
         checkpoint = evaluator.bind_production_checkpoint(
-            {"state": "PASS", "normalizer_release": True},
+            comparability_path,
             plan_path,
             self.campaign,
         )
@@ -390,6 +489,13 @@ class IncrementalProductionTests(unittest.TestCase):
         )
         self.assertEqual(len(dispatched), 16)
         self.assertTrue((self.campaign / "CANARY-ACCEPTED.json").is_file())
+        self.assertTrue((self.campaign / "MATRIX-DONE.json").is_file())
+        expected_done = json.loads(
+            (self.campaign / "MATRIX-DONE.json").read_text(encoding="utf-8")
+        )
+        (self.campaign / "MATRIX-DONE.json").unlink()
+        repaired = production.execute_production(plan_path, runner=fake_runner)
+        self.assertEqual(repaired, expected_done)
         self.assertTrue((self.campaign / "MATRIX-DONE.json").is_file())
 
     def test_finalize_requires_cleanup_and_atomically_publishes(self) -> None:

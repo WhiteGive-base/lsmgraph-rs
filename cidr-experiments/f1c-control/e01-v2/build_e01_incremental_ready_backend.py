@@ -369,6 +369,21 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     evaluator_path = args.phase_executor.with_name("evaluate_e01_bridge_canary.py")
     scheduler_ref = file_ref(scheduler_path, "production scheduler")
     evaluator_ref = file_ref(evaluator_path, "canary evaluator")
+    mixed_path = args.phase_executor.with_name("E01-mixed-lineage-plan-v1.json")
+    mixed_plan, mixed_ref = load(mixed_path, "formal mixed-lineage plan")
+    comparability_contract = mixed_plan.get("incremental_plan", {}).get(
+        "bridge_canary_comparability_contract"
+    )
+    require(type(comparability_contract) is dict, "bridge comparability contract missing")
+    contract_body = dict(comparability_contract)
+    contract_sha = contract_body.pop("contract_sha256", None)
+    require(
+        contract_sha
+        == hashlib.sha256(
+            json.dumps(contract_body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "bridge comparability contract SHA drift",
+    )
     require(
         args.campaign_root.is_absolute() and not os.path.lexists(args.campaign_root),
         "campaign root must be absolute and absent, including dangling symlink",
@@ -570,6 +585,35 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     state = "HOLD" if blockers else "READY"
+    canary_checkpoint = {
+        "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v2",
+        "evaluator": evaluator_ref,
+        "mixed_lineage_plan": mixed_ref,
+        "comparability_contract_sha256": contract_sha,
+        "evidence_schema": "cidr-e01-bridge-canary-evidence-v2",
+        "evidence_path": str(args.campaign_root / "CANARY-EVIDENCE.json"),
+        "evidence_binding": {
+            "cell_key": "seml0:bridge-canary",
+            "backend_plan": True,
+            "bridge_cell_done": True,
+            "bridge_receipts": [
+                "prepared_command",
+                "store_clone",
+                "p31",
+                "validated_result",
+                "correctness",
+                "fairness",
+                "cleanup",
+            ],
+        },
+        "pending_path": str(args.campaign_root / "CANARY-PENDING.json"),
+        "comparability_path": str(args.campaign_root / "CANARY-COMPARABILITY.json"),
+        "evaluation_path": str(args.campaign_root / "CANARY-EVALUATION.json"),
+        "accepted_path": str(args.campaign_root / "CANARY-ACCEPTED.json"),
+        "first_launch_max_completed_cells": 1,
+        "resume_requires_evaluation_state": "PASS",
+        "matrix_done_before_acceptance": False,
+    }
     gate_path = args.output.with_name(args.output.stem + ".ARMING-GATE.json")
     require(not os.path.lexists(gate_path), "arming gate path must be absent")
     gate = {
@@ -581,6 +625,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "phase_executor": executor_ref,
         "production_scheduler": scheduler_ref,
         "canary_evaluator": evaluator_ref,
+        "canary_checkpoint": canary_checkpoint,
         "clone_dry_run": clone_ref,
         "target_p02b": target_refs,
         "clone_fallback_predecessor": failed_clone_ref,
@@ -604,16 +649,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "p02b_sentinel": sentinel_ref,
         "phase_executor": executor_ref,
         "production_scheduler": scheduler_ref,
-        "canary_checkpoint": {
-            "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v1",
-            "evaluator": evaluator_ref,
-            "pending_path": str(args.campaign_root / "CANARY-PENDING.json"),
-            "evaluation_path": str(args.campaign_root / "CANARY-EVALUATION.json"),
-            "accepted_path": str(args.campaign_root / "CANARY-ACCEPTED.json"),
-            "first_launch_max_completed_cells": 1,
-            "resume_requires_evaluation_state": "PASS",
-            "matrix_done_before_acceptance": False,
-        },
+        "canary_checkpoint": canary_checkpoint,
         "clone_dry_run": clone_ref,
         "target_p02b": target_refs,
         "clone_fallback_predecessor": failed_clone_ref,
@@ -647,8 +683,12 @@ def validate(value: Mapping[str, Any]) -> None:
     require(
         type(checkpoint) is dict
         and checkpoint.get("schema_version")
-        == "cidr-e01-incremental-canary-checkpoint-contract-v1"
+        == "cidr-e01-incremental-canary-checkpoint-contract-v2"
         and type(checkpoint.get("evaluator")) is dict
+        and type(checkpoint.get("mixed_lineage_plan")) is dict
+        and type(checkpoint.get("comparability_contract_sha256")) is str
+        and checkpoint.get("evidence_schema") == "cidr-e01-bridge-canary-evidence-v2"
+        and type(checkpoint.get("evidence_binding")) is dict
         and checkpoint.get("first_launch_max_completed_cells") == 1
         and checkpoint.get("resume_requires_evaluation_state") == "PASS"
         and checkpoint.get("matrix_done_before_acceptance") is False,

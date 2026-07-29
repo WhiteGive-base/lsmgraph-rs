@@ -148,12 +148,50 @@ def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
     contract = value.get("canary_checkpoint")
     require(type(contract) is dict, "canary checkpoint contract required")
     require(
-        contract.get("schema_version") == "cidr-e01-incremental-canary-checkpoint-contract-v1",
+        contract.get("schema_version") == "cidr-e01-incremental-canary-checkpoint-contract-v2",
         "canary checkpoint contract schema drift",
     )
     verify_external_file_ref(contract.get("evaluator"), "canary evaluator")
+    mixed_ref = verify_external_file_ref(
+        contract.get("mixed_lineage_plan"), "formal mixed-lineage plan"
+    )
+    mixed = load_json(Path(mixed_ref["path"]), "formal mixed-lineage plan")
+    require(
+        mixed.get("schema_version") == "cidr-e01-mixed-lineage-composition-v1",
+        "formal mixed-lineage schema drift",
+    )
+    comparability = mixed.get("incremental_plan", {}).get(
+        "bridge_canary_comparability_contract"
+    )
+    require(type(comparability) is dict, "comparability contract missing")
+    contract_body = dict(comparability)
+    declared_contract_sha = contract_body.pop("contract_sha256", None)
+    actual_contract_sha = hashlib.sha256(
+        json.dumps(contract_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    require(
+        type(contract.get("comparability_contract_sha256")) is str
+        and contract["comparability_contract_sha256"]
+        == declared_contract_sha
+        == actual_contract_sha,
+        "comparability contract SHA drift",
+    )
+    require(
+        contract.get("evidence_schema") == "cidr-e01-bridge-canary-evidence-v2",
+        "canary evidence schema drift",
+    )
+    require(
+        contract.get("evidence_binding", {}).get("cell_key") == "seml0:bridge-canary"
+        and contract["evidence_binding"].get("backend_plan") is True
+        and contract["evidence_binding"].get("bridge_cell_done") is True
+        and set(contract["evidence_binding"].get("bridge_receipts", []))
+        == set(RECEIPT_PATHS),
+        "canary cell1 evidence binding drift",
+    )
     expected = {
+        "evidence_path": root / "CANARY-EVIDENCE.json",
         "pending_path": root / "CANARY-PENDING.json",
+        "comparability_path": root / "CANARY-COMPARABILITY.json",
         "evaluation_path": root / "CANARY-EVALUATION.json",
         "accepted_path": root / "CANARY-ACCEPTED.json",
     }
@@ -243,6 +281,7 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
             require(gate.get("phase_executor") == executor_ref, f"{name}: phase executor backlink drift")
             require(gate.get("production_scheduler") == scheduler_ref, f"{name}: scheduler backlink drift")
             require(gate.get("canary_evaluator") == checkpoint["evaluator"], f"{name}: evaluator backlink drift")
+            require(gate.get("canary_checkpoint") == checkpoint, f"{name}: checkpoint backlink drift")
             require(type(gate.get("backend_plan")) is dict, f"{name}: backend plan backlink required")
             if plan_path is not None:
                 require(
@@ -301,6 +340,12 @@ def expected_canary_pending(
         "target_query_plan": bridge["runtime"]["target_query_plan"],
         "target_lease": bridge["runtime"]["target_lease"],
         "canary_evaluator": plan["canary_checkpoint"]["evaluator"],
+        "mixed_lineage_plan": plan["canary_checkpoint"]["mixed_lineage_plan"],
+        "comparability_contract_sha256": plan["canary_checkpoint"][
+            "comparability_contract_sha256"
+        ],
+        "evidence_schema": plan["canary_checkpoint"]["evidence_schema"],
+        "evidence_path": plan["canary_checkpoint"]["evidence_path"],
         "matrix_terminal": False,
         **FALSE_ELIGIBILITY,
     }
@@ -355,8 +400,76 @@ def consume_canary_evaluation(
     require(evaluation.get("target_lease") == pending["target_lease"], "canary lease drift")
     require(evaluation.get("evaluator") == contract["evaluator"], "canary evaluator identity drift")
     require(
-        evaluation.get("comparability", {}).get("state") == "PASS"
-        and evaluation["comparability"].get("normalizer_release") is True,
+        evaluation.get("mixed_lineage_plan") == contract["mixed_lineage_plan"],
+        "canary mixed-lineage plan drift",
+    )
+    require(
+        evaluation.get("comparability_contract_sha256")
+        == contract["comparability_contract_sha256"],
+        "canary comparability contract drift",
+    )
+    evidence_path = Path(contract["evidence_path"])
+    evidence_ref = external_file_ref(evidence_path)
+    require(evaluation.get("canary_evidence") == evidence_ref, "canary evidence ref drift")
+    evidence = load_json(evidence_path, "canary evidence")
+    require(evidence.get("schema_version") == contract["evidence_schema"], "canary evidence schema drift")
+    require(
+        evidence.get("state") == "PASS"
+        and evidence.get("cell_key") == "seml0:bridge-canary",
+        "canary evidence state/cell drift",
+    )
+    require(evidence.get("backend_plan") == plan_ref, "canary evidence plan drift/replay")
+    require(evidence.get("bridge_cell_done") == pending["bridge_cell_done"], "canary evidence cell drift")
+    require(evidence.get("bridge_receipts") == pending["bridge_receipts"], "canary evidence receipts drift")
+    require(
+        evidence.get("mixed_lineage_plan") == contract["mixed_lineage_plan"]
+        and evidence.get("contract_sha256") == contract["comparability_contract_sha256"],
+        "canary evidence contract drift",
+    )
+    require(
+        evidence.get("validated_result_receipt")
+        == pending["bridge_receipts"]["validated_result"]
+        and evidence.get("p31_receipt") == pending["bridge_receipts"]["p31"],
+        "canary evidence direct receipt binding drift",
+    )
+    comparability_ref = external_file_ref(Path(contract["comparability_path"]))
+    require(
+        evaluation.get("comparability_receipt") == comparability_ref,
+        "canary comparability receipt ref drift",
+    )
+    comparability = load_json(Path(comparability_ref["path"]), "canary comparability receipt")
+    mixed = load_json(
+        Path(contract["mixed_lineage_plan"]["path"]), "formal mixed-lineage plan"
+    )
+    formal_contract = mixed["incremental_plan"][
+        "bridge_canary_comparability_contract"
+    ]
+    expected_identity = set(formal_contract["identity_exact_match"])
+    expected_correctness = set(formal_contract["correctness"])
+    expected_performance = {
+        "completed_qps",
+        "latency_p50_us",
+        "latency_p95_us",
+        "latency_p99_us",
+    }
+    require(
+        comparability.get("schema_version")
+        == "cidr-e01-bridge-canary-comparability-receipt-v1"
+        and comparability.get("state") == "PASS"
+        and comparability.get("mixed_lineage_plan") == contract["mixed_lineage_plan"]
+        and comparability.get("canary_evidence") == evidence_ref
+        and comparability.get("contract_sha256") == contract["comparability_contract_sha256"]
+        and comparability.get("failures") == []
+        and type(comparability.get("identity_checks")) is dict
+        and set(comparability["identity_checks"]) == expected_identity
+        and all(row.get("state") == "PASS" for row in comparability["identity_checks"].values())
+        and type(comparability.get("correctness_checks")) is dict
+        and set(comparability["correctness_checks"]) == expected_correctness
+        and all(state == "PASS" for state in comparability["correctness_checks"].values())
+        and type(comparability.get("performance_checks")) is dict
+        and set(comparability["performance_checks"]) == expected_performance
+        and all(row.get("state") == "PASS" for row in comparability["performance_checks"].values())
+        and comparability.get("normalizer_release") is True,
         "canary comparability did not release",
     )
     accepted_path = Path(contract["accepted_path"])
@@ -595,6 +708,42 @@ def _default_runner(argv: list[str], cwd: Path, stdout: Path, stderr: Path) -> i
     return completed.returncode
 
 
+def expected_matrix_done(
+    root: Path,
+    plan: Mapping[str, Any],
+    plan_sha: str,
+    canary_evaluation_ref: Mapping[str, Any],
+) -> Dict[str, Any]:
+    cell_refs = []
+    for row in plan["cells"]:
+        done_path = Path(row["final_cell_root"]) / "CELL-DONE.json"
+        require(
+            done_path.is_file() and not done_path.is_symlink(),
+            f"{row['cell_key']}: CELL-DONE missing for matrix publication",
+        )
+        cell_refs.append(
+            {
+                "cell_key": row["cell_key"],
+                "cell_done_sha256": sha256_file(done_path),
+            }
+        )
+    return {
+        "schema_version": DONE_SCHEMA,
+        "state": "PASS",
+        "mode": "production",
+        "synthetic_test_only": False,
+        "strict_serial": True,
+        "completed_cells": 4,
+        "backend_plan_sha256": plan_sha,
+        "cells": cell_refs,
+        "canary_evaluation": dict(canary_evaluation_ref),
+        "canary_accepted": external_file_ref(
+            Path(plan["canary_checkpoint"]["accepted_path"])
+        ),
+        **FALSE_ELIGIBILITY,
+    }
+
+
 def execute_production(
     plan_path: Path,
     *,
@@ -626,7 +775,36 @@ def execute_production(
     else:
         completed = resume["completed_cells"]
         if completed == 4:
-            return load_json(root / "MATRIX-DONE.json", "MATRIX-DONE")
+            pending_path = Path(plan["canary_checkpoint"]["pending_path"])
+            require(
+                pending_path.is_file()
+                and not pending_path.is_symlink()
+                and load_json(pending_path, "CANARY_PENDING")
+                == expected_canary_pending(root, plan, plan_ref),
+                "completed campaign CANARY_PENDING drift",
+            )
+            pending = load_json(pending_path, "CANARY_PENDING")
+            evaluation_ref = consume_canary_evaluation(
+                root, plan, plan_ref, pending
+            )
+            require(
+                evaluation_ref is not None,
+                "completed campaign accepted canary evaluation missing",
+            )
+            expected_done = expected_matrix_done(
+                root, plan, plan_sha, evaluation_ref
+            )
+            done_path = root / "MATRIX-DONE.json"
+            if os.path.lexists(done_path):
+                require(
+                    done_path.is_file()
+                    and not done_path.is_symlink()
+                    and load_json(done_path, "MATRIX-DONE") == expected_done,
+                    "MATRIX-DONE full-content drift",
+                )
+            else:
+                atomic_json(done_path, expected_done)
+            return expected_done
     canary_evaluation_ref: Optional[Dict[str, Any]] = None
     if completed == 1:
         pending = ensure_canary_pending(root, plan, plan_ref)
@@ -709,23 +887,8 @@ def execute_production(
                     },
                 )
             raise
-    cell_refs = []
-    for row in plan["cells"]:
-        done_path = Path(row["final_cell_root"]) / "CELL-DONE.json"
-        cell_refs.append({"cell_key": row["cell_key"], "cell_done_sha256": sha256_file(done_path)})
-    done = {
-        "schema_version": DONE_SCHEMA,
-        "state": "PASS",
-        "mode": "production",
-        "synthetic_test_only": False,
-        "strict_serial": True,
-        "completed_cells": 4,
-        "backend_plan_sha256": plan_sha,
-        "cells": cell_refs,
-        "canary_evaluation": canary_evaluation_ref,
-        "canary_accepted": external_file_ref(Path(plan["canary_checkpoint"]["accepted_path"])),
-        **FALSE_ELIGIBILITY,
-    }
+    require(canary_evaluation_ref is not None, "accepted canary evaluation missing")
+    done = expected_matrix_done(root, plan, plan_sha, canary_evaluation_ref)
     atomic_json(root / "MATRIX-DONE.json", done)
     return done
 
