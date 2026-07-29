@@ -87,6 +87,94 @@ def verify_ref(value: Any, label: str) -> Dict[str, Any]:
     return actual
 
 
+def validate_published_command_ref(
+    *,
+    final: Path,
+    topology_value: Mapping[str, Any],
+    manifest_value: Mapping[str, Any],
+    key: str,
+) -> Dict[str, Any]:
+    """Validate P31's staging command reference after atomic cell publication.
+
+    P31 writes the run manifest while the cell is below ``staging/``.  The
+    publisher then moves the whole cell to ``cells/`` and publishes a final
+    command-file reference in the topology receipt.  The manifest is immutable,
+    so its legacy two-field reference still names the now-absent staging path.
+    Accept only that one exact relocation; all other reference drift remains
+    fail-closed.
+    """
+
+    final = final.resolve()
+    expected_final = final / "p31" / "command.txt"
+    topology_ref = topology_value.get("command_file")
+    require(
+        type(topology_ref) is dict
+        and set(topology_ref) == {"path", "sha256", "size_bytes"}
+        and Path(str(topology_ref.get("path", ""))) == expected_final,
+        f"{key}: topology command file exact final path drift",
+    )
+    require(
+        expected_final.is_file() and not expected_final.is_symlink(),
+        f"{key}: final command file must be a regular non-symlink",
+    )
+    topology_ref = verify_ref(topology_ref, f"{key}: topology command file")
+
+    manifest_ref = manifest_value.get("command")
+    if manifest_ref == topology_ref:
+        return topology_ref
+    require(
+        type(manifest_ref) is dict
+        and set(manifest_ref) == {"path", "sha256"},
+        f"{key}: relocated manifest command exact reference required",
+    )
+    staging_cell = final.parent.parent / "staging" / final.name
+    expected_staging = staging_cell / "p31" / "command.txt"
+    manifest_path = Path(str(manifest_ref.get("path", "")))
+    require(
+        manifest_path.is_absolute()
+        and manifest_path == expected_staging
+        and manifest_path.name == expected_final.name == "command.txt",
+        f"{key}: manifest command staging-to-final mapping drift",
+    )
+    require(
+        manifest_ref.get("sha256") == topology_ref["sha256"],
+        f"{key}: relocated command SHA drift",
+    )
+    require(
+        not os.path.lexists(staging_cell) and not os.path.lexists(manifest_path),
+        f"{key}: relocated staging command must be absent",
+    )
+    return topology_ref
+
+
+def validate_published_request_argv_path(
+    *, final: Path, request_ref: Mapping[str, Any], argv_path: Any, key: str
+) -> None:
+    """Accept only the producer's exact staging request path after publication."""
+
+    final = final.resolve()
+    expected_final = final / "adapter-request.json"
+    require(
+        request_ref.get("path") == str(expected_final),
+        f"{key}: published request exact final path drift",
+    )
+    observed = Path(str(argv_path))
+    if observed == expected_final:
+        return
+    staging_cell = final.parent.parent / "staging" / final.name
+    expected_staging = staging_cell / "adapter-request.json"
+    require(
+        observed.is_absolute()
+        and observed == expected_staging
+        and observed.name == expected_final.name == "adapter-request.json",
+        f"{key}: P31 request staging-to-final mapping drift",
+    )
+    require(
+        not os.path.lexists(staging_cell) and not os.path.lexists(observed),
+        f"{key}: relocated staging request must be absent",
+    )
+
+
 def _receipt(final: Path, done: Mapping[str, Any], role: str) -> Dict[str, Any]:
     descriptor = done["receipts"].get(role)
     require(
@@ -292,11 +380,11 @@ def validate_cross_role_bindings(
         topology.get("run_manifest"), f"{key}: topology run manifest"
     )
     manifest = load_json(Path(manifest_ref["path"]), f"{key}: P31 run manifest")
-    topology_command_ref = verify_ref(
-        topology.get("command_file"), f"{key}: topology command file"
-    )
-    manifest_command_ref = verify_ref(
-        manifest.get("command"), f"{key}: manifest command file"
+    topology_command_ref = validate_published_command_ref(
+        final=final,
+        topology_value=topology,
+        manifest_value=manifest,
+        key=key,
     )
     launched_argv = shlex.split(
         Path(topology_command_ref["path"]).read_text(encoding="utf-8").strip()
@@ -304,7 +392,6 @@ def validate_cross_role_bindings(
     require(
         p31.get("command_topology") == topology_ref
         and topology_manifest_ref == manifest_ref
-        and topology_command_ref == manifest_command_ref
         and binding.get("p31_receipt") == p31_ref
         and binding.get("p31_run_manifest") == manifest_ref
         and binding.get("command_topology") == topology_ref
@@ -343,10 +430,14 @@ def validate_cross_role_bindings(
         and separator > 0
         and p31_argv[separator + 1 :] == binary_argv
         and p31_argv.count("--config") == 1
-        and 0 <= config_index < len(p31_argv) - 1
-        and Path(p31_argv[config_index + 1]).resolve()
-        == Path(request_ref["path"]).resolve(),
+        and 0 <= config_index < len(p31_argv) - 1,
         f"{key}: prepared P31 argv/request/binary suffix drift",
+    )
+    validate_published_request_argv_path(
+        final=final,
+        request_ref=request_ref,
+        argv_path=p31_argv[config_index + 1],
+        key=key,
     )
 
     target_ref = verify_ref(target_p02b, f"{key}: target P02B")

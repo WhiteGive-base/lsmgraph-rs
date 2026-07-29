@@ -438,6 +438,17 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
         command_file = write_text(
             root, f"{final_relative}/p31/command.txt", "/bin/true\n"
         )
+        staging_command = {
+            "path": str(
+                (
+                    root
+                    / "fresh/campaign/staging"
+                    / Path(final_relative).name
+                    / "p31/command.txt"
+                ).resolve()
+            ),
+            "sha256": command_file["sha256"],
+        }
         run_manifest = write_json(
             root,
             f"{final_relative}/p31/run-manifest.json",
@@ -445,7 +456,7 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "state": "PASS",
                 "root_pid": 12345,
                 "command_exit_code": 0,
-                "command": command_file,
+                "command": staging_command,
                 "host": {"fingerprint_sha256": HOST_SHA},
             },
         )

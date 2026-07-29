@@ -52,6 +52,14 @@ class IncrementalPostprocessTests(unittest.TestCase):
     def adapt(self) -> dict:
         return post.matrix_evidence_adapter(self.anchor, self.backend, self.matrix)
 
+    def completed_fixture(self, name: str) -> dict:
+        root = self.root / name
+        source, dataset, dense = make_fixture(root)
+        hold = builder.build_composition(
+            source, dataset, dense, created_at_utc="2026-07-29T00:00:00Z"
+        )
+        return attach_completed_evidence(root, hold)
+
     def rehash_role_chain(
         self, completed: dict, role: str, value: dict, label: str
     ) -> tuple[Path, Path]:
@@ -94,6 +102,173 @@ class IncrementalPostprocessTests(unittest.TestCase):
         evidence = completed["incremental_plan"]["incremental_evidence"]
         matrix_path, composition_path = self.rehash_role_chain(
             completed, role, value, label
+        )
+        with self.assertRaises(post.EvidenceError):
+            post.matrix_evidence_adapter(
+                Path(evidence["postprocess_anchor"]["path"]),
+                Path(evidence["formal_backend_plan"]["path"]),
+                matrix_path,
+            )
+        with self.assertRaises(builder.CompositionError):
+            normalizer.normalize(composition_path, None)
+
+    def validate_final_cell_direct(self, final: Path) -> None:
+        done = post.load_json(final / "CELL-DONE.json", "real CELL-DONE")
+        refs = {
+            role: post.file_ref(final / relative, f"real {role}")
+            for role, relative in post.RECEIPT_PATHS.items()
+        }
+        receipt_values = {
+            role: post.validate_role_receipt(
+                Path(ref["path"]),
+                role,
+                key=done["cell_key"],
+                ordinal=done["ordinal"],
+                plan_sha=done["backend_plan_sha256"],
+                target_p02b=post.load_json(
+                    final / post.RECEIPT_PATHS["store_clone"], "real clone"
+                )["target_p02b"],
+            )
+            for role, ref in refs.items()
+        }
+        clone = receipt_values["store_clone"]
+        validated_receipt = receipt_values["validated_result"]
+        validated = post.load_json(
+            Path(validated_receipt["adapter_result"]["path"]),
+            "real validated repeat",
+        )
+        provenance = post.load_json(
+            Path(validated_receipt["adapter_provenance"]["path"]),
+            "real provenance",
+        )
+        post.validate_cross_role_bindings(
+            final=final,
+            refs=refs,
+            receipt_values=receipt_values,
+            validated=validated,
+            provenance=provenance,
+            target_p02b=clone["target_p02b"],
+            key=done["cell_key"],
+        )
+
+    def rewrite_first_cell_command_chain(
+        self,
+        completed: dict,
+        *,
+        manifest_command: dict | None = None,
+        topology_command: dict | None = None,
+        label: str,
+    ) -> tuple[Path, Path]:
+        evidence = completed["incremental_plan"]["incremental_evidence"]
+        cell = evidence["cells"][0]
+        final = Path(cell["cell_done"]["path"]).parent
+
+        manifest_path = final / "p31/run-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_command is not None:
+            manifest["command"] = manifest_command
+        write_json(manifest_path, manifest)
+        manifest_ref = post.file_ref(manifest_path, "rewritten manifest")
+
+        topology_path = final / post.RECEIPT_PATHS["command_topology"]
+        topology = json.loads(topology_path.read_text(encoding="utf-8"))
+        topology["run_manifest"] = manifest_ref
+        if topology_command is not None:
+            topology["command_file"] = topology_command
+        write_json(topology_path, topology)
+        topology_ref = post.file_ref(topology_path, "rewritten topology")
+
+        p31_path = final / post.RECEIPT_PATHS["p31"]
+        p31 = json.loads(p31_path.read_text(encoding="utf-8"))
+        p31["run_manifest"] = manifest_ref
+        p31["command_topology"] = topology_ref
+        write_json(p31_path, p31)
+        p31_ref = post.file_ref(p31_path, "rewritten P31")
+
+        fairness_path = final / post.RECEIPT_PATHS["fairness"]
+        fairness = json.loads(fairness_path.read_text(encoding="utf-8"))
+        fairness["p31_receipt_sha256"] = p31_ref["sha256"]
+        write_json(fairness_path, fairness)
+        fairness_ref = post.file_ref(fairness_path, "rewritten fairness")
+
+        provenance_path = Path(cell["adapter_provenance"]["path"])
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["command"]["run_manifest"] = manifest_ref
+        provenance["command"]["command_topology"] = topology_ref
+        provenance["split_phase_binding"]["p31_receipt"] = p31_ref
+        provenance["split_phase_binding"]["p31_run_manifest"] = manifest_ref
+        provenance["split_phase_binding"]["command_topology"] = topology_ref
+        write_json(provenance_path, provenance)
+        provenance_ref = post.file_ref(provenance_path, "rewritten provenance")
+
+        validated_path = Path(cell["validated_result"]["path"])
+        validated = json.loads(validated_path.read_text(encoding="utf-8"))
+        validated["p31"]["receipt"] = p31_ref
+        validated["p31"]["run_manifest"] = manifest_ref
+        validated["p31"]["command_topology"] = topology_ref
+        validated["process_lifetime_binding"]["command_topology"] = topology_ref
+        validated["adapter_artifacts"]["adapter-provenance.json"] = provenance_ref
+        validated["adapter_provenance"] = provenance
+        write_json(validated_path, validated)
+        validated_ref = post.file_ref(validated_path, "rewritten validated repeat")
+
+        validated_receipt_path = final / post.RECEIPT_PATHS["validated_result"]
+        validated_receipt = json.loads(
+            validated_receipt_path.read_text(encoding="utf-8")
+        )
+        validated_receipt["adapter_result"] = validated_ref
+        validated_receipt["adapter_provenance"] = provenance_ref
+        write_json(validated_receipt_path, validated_receipt)
+        validated_receipt_ref = post.file_ref(
+            validated_receipt_path, "rewritten validated receipt"
+        )
+
+        done_path = final / "CELL-DONE.json"
+        done = json.loads(done_path.read_text(encoding="utf-8"))
+        rewritten = {
+            "p31": p31_ref,
+            "command_topology": topology_ref,
+            "fairness": fairness_ref,
+            "validated_result": validated_receipt_ref,
+        }
+        for role, ref in rewritten.items():
+            done["receipts"][role] = {
+                "path": post.RECEIPT_PATHS[role],
+                "sha256": ref["sha256"],
+                "size_bytes": ref["size_bytes"],
+            }
+        write_json(done_path, done)
+        done_ref = post.file_ref(done_path, "rewritten CELL-DONE")
+
+        cell["cell_done"] = done_ref
+        cell["p31_receipt"] = p31_ref
+        cell["command_topology"] = topology_ref
+        cell["validated_result"] = validated_ref
+        cell["validated_result_receipt"] = validated_receipt_ref
+        cell["adapter_provenance"] = provenance_ref
+        matrix_path = Path(evidence["matrix_done"]["path"])
+        matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+        matrix["cells"][0]["cell_done_sha256"] = done_ref["sha256"]
+        write_json(matrix_path, matrix)
+        evidence["matrix_done"] = post.file_ref(matrix_path, "rewritten MATRIX-DONE")
+        return matrix_path, write_json(
+            self.root / f"rewritten-{label}.json", completed
+        )
+
+    def assert_command_chain_both_reject(
+        self,
+        completed: dict,
+        *,
+        manifest_command: dict | None = None,
+        topology_command: dict | None = None,
+        label: str,
+    ) -> None:
+        evidence = completed["incremental_plan"]["incremental_evidence"]
+        matrix_path, composition_path = self.rewrite_first_cell_command_chain(
+            completed,
+            manifest_command=manifest_command,
+            topology_command=topology_command,
+            label=label,
         )
         with self.assertRaises(post.EvidenceError):
             post.matrix_evidence_adapter(
@@ -278,6 +453,87 @@ class IncrementalPostprocessTests(unittest.TestCase):
             target_p02b=clone["target_p02b"],
             key=done["cell_key"],
         )
+
+    def test_real_attempt13_pending_cell_cross_role_read_only(self) -> None:
+        root_value = os.environ.get("E01_REAL_PENDING_CELL_ROOT")
+        if not root_value:
+            self.skipTest("E01_REAL_PENDING_CELL_ROOT not configured")
+        self.validate_final_cell_direct(Path(root_value).resolve())
+
+    def test_relocated_command_reference_attacks_are_rejected_by_both_consumers(
+        self,
+    ) -> None:
+        cases = (
+            "wrong_sha",
+            "wrong_basename",
+            "wrong_path",
+            "final_missing",
+            "final_symlink",
+            "staging_exists",
+            "size_tamper",
+            "consistent_rehash",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                completed = self.completed_fixture(f"relocation-{case}")
+                evidence = completed["incremental_plan"]["incremental_evidence"]
+                cell = evidence["cells"][0]
+                final = Path(cell["cell_done"]["path"]).parent
+                manifest_path = final / "p31/run-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest_command = copy.deepcopy(manifest["command"])
+                topology_path = final / post.RECEIPT_PATHS["command_topology"]
+                topology = json.loads(topology_path.read_text(encoding="utf-8"))
+                topology_command = copy.deepcopy(topology["command_file"])
+                final_command = final / "p31/command.txt"
+                staging_cell = final.parent.parent / "staging" / final.name
+
+                if case == "wrong_sha":
+                    manifest_command["sha256"] = "f" * 64
+                elif case == "wrong_basename":
+                    manifest_command["path"] = str(
+                        (staging_cell / "p31/not-command.txt").resolve()
+                    )
+                elif case == "wrong_path":
+                    manifest_command["path"] = str(
+                        (
+                            final.parent.parent
+                            / "other-staging"
+                            / final.name
+                            / "p31/command.txt"
+                        ).resolve()
+                    )
+                elif case == "final_missing":
+                    final_command.unlink()
+                elif case == "final_symlink":
+                    target = final / "p31/command-target.txt"
+                    final_command.replace(target)
+                    final_command.symlink_to(target)
+                elif case == "staging_exists":
+                    staging_cell.mkdir(parents=True)
+                elif case == "size_tamper":
+                    final_command.write_text(
+                        final_command.read_text(encoding="utf-8") + " ",
+                        encoding="utf-8",
+                    )
+                elif case == "consistent_rehash":
+                    alternate = final / "p31/alternate-command.txt"
+                    alternate.write_bytes(final_command.read_bytes())
+                    topology_command = post.file_ref(
+                        alternate, "consistent-rehash alternate command"
+                    )
+                    manifest_command = {
+                        "path": str(
+                            (staging_cell / "p31/alternate-command.txt").resolve()
+                        ),
+                        "sha256": topology_command["sha256"],
+                    }
+                self.assert_command_chain_both_reject(
+                    completed,
+                    manifest_command=manifest_command,
+                    topology_command=topology_command,
+                    label=case,
+                )
 
     def test_missing_matrix_is_rejected(self) -> None:
         self.matrix.unlink()
