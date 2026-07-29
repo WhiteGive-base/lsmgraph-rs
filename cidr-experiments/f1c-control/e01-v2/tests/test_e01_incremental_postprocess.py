@@ -161,33 +161,59 @@ class IncrementalPostprocessTests(unittest.TestCase):
         with self.assertRaisesRegex(post.EvidenceError, "external postprocess anchor drift"):
             self.adapt()
 
-    def test_consumer_rejects_rehashed_failed_receipts(self) -> None:
-        for field, state_path in (
-            ("validated_result_receipt", None),
-            ("cell_done", None),
-            ("cleanup_receipt", None),
-        ):
-            with self.subTest(field=field):
-                completed = attach_completed_evidence(self.root, self.hold)
-                cell = completed["incremental_plan"]["incremental_evidence"]["cells"][0]
-                path = Path(cell[field]["path"])
-                value = json.loads(path.read_text(encoding="utf-8"))
-                if field == "cell_done":
-                    value["schema_version"] = "tampered"
-                else:
-                    value["state"] = "FAILED"
-                write_json(path, value)
-                payload = path.read_bytes()
-                cell[field] = {
-                    "path": str(path.resolve()),
-                    "sha256": __import__("hashlib").sha256(payload).hexdigest(),
-                    "size_bytes": len(payload),
-                }
-                composition_path = write_json(
-                    self.root / f"tampered-{field}.json", completed
-                )
-                with self.assertRaises(builder.CompositionError):
-                    normalizer.normalize(composition_path, None)
+    def test_producer_and_consumer_reject_each_consistently_rehashed_role(self) -> None:
+        direct_fields = {
+            "validated_result": "validated_result_receipt",
+            "p31": "p31_receipt",
+            "command_topology": "command_topology",
+            "store_clone": "store_clone_receipt",
+            "cleanup": "cleanup_receipt",
+        }
+        for role in post.RECEIPT_PATHS:
+            for mutation in ("state", "schema"):
+                with self.subTest(role=role, mutation=mutation):
+                    completed = attach_completed_evidence(self.root, self.hold)
+                    evidence = completed["incremental_plan"]["incremental_evidence"]
+                    cell = evidence["cells"][0]
+                    final = Path(cell["cell_done"]["path"]).parent
+                    path = final / post.RECEIPT_PATHS[role]
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    if mutation == "state":
+                        value["state"] = "FAILED"
+                    else:
+                        value["schema_version"] = "tampered"
+                    write_json(path, value)
+                    rewritten_ref = post.file_ref(path, f"rewritten {role}")
+                    done_path = final / "CELL-DONE.json"
+                    done = json.loads(done_path.read_text(encoding="utf-8"))
+                    done["receipts"][role] = {
+                        "path": post.RECEIPT_PATHS[role],
+                        "sha256": rewritten_ref["sha256"],
+                        "size_bytes": rewritten_ref["size_bytes"],
+                    }
+                    write_json(done_path, done)
+                    done_ref = post.file_ref(done_path, "rewritten CELL-DONE")
+                    cell["cell_done"] = done_ref
+                    if role in direct_fields:
+                        cell[direct_fields[role]] = rewritten_ref
+                    matrix_path = Path(evidence["matrix_done"]["path"])
+                    matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+                    matrix["cells"][0]["cell_done_sha256"] = done_ref["sha256"]
+                    write_json(matrix_path, matrix)
+                    evidence["matrix_done"] = post.file_ref(
+                        matrix_path, "rewritten MATRIX-DONE"
+                    )
+                    with self.assertRaises(post.EvidenceError):
+                        post.matrix_evidence_adapter(
+                            Path(evidence["postprocess_anchor"]["path"]),
+                            Path(evidence["formal_backend_plan"]["path"]),
+                            matrix_path,
+                        )
+                    composition_path = write_json(
+                        self.root / f"tampered-{role}-{mutation}.json", completed
+                    )
+                    with self.assertRaises(builder.CompositionError):
+                        normalizer.normalize(composition_path, None)
 
 
 if __name__ == "__main__":

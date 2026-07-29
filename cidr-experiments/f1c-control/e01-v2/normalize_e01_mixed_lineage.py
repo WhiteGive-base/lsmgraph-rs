@@ -26,6 +26,7 @@ from build_e01_mixed_lineage import (
     read_json,
     sha256_file,
 )
+from postprocess_e01_incremental import EvidenceError, validate_role_receipt
 
 
 TSV_COLUMNS = (
@@ -269,6 +270,17 @@ def _validate_fresh_provenance(
         }
         if done_receipts.get(role) != actual:
             raise CompositionError(f"{key}: CELL-DONE {role} descriptor drift")
+        try:
+            validate_role_receipt(
+                path,
+                role,
+                key=key,
+                ordinal=int(cell["ordinal"]),
+                plan_sha=formal_backend_ref["sha256"],
+                target_p02b=target_ref,
+            )
+        except EvidenceError as exc:
+            raise CompositionError(str(exc)) from exc
     cleanup_ref = _require_ref_path(
         cell.get("cleanup_receipt"),
         final_root / "receipts" / "cleanup.json",

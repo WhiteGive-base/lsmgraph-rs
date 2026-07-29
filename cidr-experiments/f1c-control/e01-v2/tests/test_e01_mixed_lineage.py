@@ -406,7 +406,30 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
         clone = write_json(
             root,
             f"{final_relative}/receipts/store-clone.json",
-            {"state": "PASS", "source_tree_sha256": target_bundles[target_variant]["store_pre"]["sha256"]},
+            {
+                "schema_version": "cidr-e01-incremental-store-clone-receipt-v1",
+                "state": "PASS",
+                "mode": "production",
+                "synthetic_test_only": False,
+                "fixture_only": False,
+                "formal_eligible": False,
+                "performance_eligible": False,
+                "paper_claim_eligible": False,
+                "cell_key": key,
+                "ordinal": ordinal,
+                "backend_plan_sha256": backend_plan["sha256"],
+                "source_tree_sha256": target_bundles[target_variant]["store_pre"]["sha256"],
+                "target_p02b": target_refs[target_variant],
+                "target": str((root / f"{final_relative}/removed-clone").resolve()),
+                "full_content_hash_performed": True,
+                "hash_outside_p31": True,
+                "verification": {
+                    "clone_tree": {
+                        "full_tree_hash_performed": True,
+                        "sha256": target_bundles[target_variant]["store_pre"]["sha256"],
+                    }
+                },
+            },
         )
         run_manifest = write_json(
             root,
@@ -417,22 +440,58 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
         argv_sha = hashlib.sha256(
             json.dumps(argv, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+        launcher = write_text(
+            root, f"{final_relative}/p31/launcher.sh", "#!/bin/sh\nexec /bin/true\n"
+        )
+        command_file = write_text(
+            root, f"{final_relative}/p31/command.json", json.dumps(argv) + "\n"
+        )
         topology = write_json(
             root,
             f"{final_relative}/receipts/command-topology.json",
             {
+                "schema_version": "cidr-e01-incremental-command-topology-receipt-v1",
                 "state": "PASS",
+                "mode": "production",
+                "synthetic_test_only": False,
+                "fixture_only": False,
+                "formal_eligible": False,
+                "performance_eligible": False,
+                "paper_claim_eligible": False,
+                "cell_key": key,
+                "ordinal": ordinal,
+                "backend_plan_sha256": backend_plan["sha256"],
+                "launcher": launcher,
+                "run_manifest": run_manifest,
+                "command_file": command_file,
                 "root_pid": 12345,
                 "argv": argv,
                 "argv_sha256": argv_sha,
                 "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                "single_binary_invocation": True,
+                "warmup_measured_same_process": True,
+                "process_model": "single-storage-bench-process-warmup-and-measured-v1",
+                "per_query_timeout_ms": 30000,
             },
         )
         p31 = write_json(
             root,
             f"{final_relative}/receipts/p31.json",
             {
+                "schema_version": "cidr-e01-incremental-p31-receipt-v1",
                 "state": "PASS",
+                "mode": "production",
+                "synthetic_test_only": False,
+                "fixture_only": False,
+                "formal_eligible": False,
+                "performance_eligible": False,
+                "paper_claim_eligible": False,
+                "cell_key": key,
+                "ordinal": ordinal,
+                "backend_plan_sha256": backend_plan["sha256"],
+                "timing_generated": True,
+                "binary_only_boundary": True,
+                "target_p02b": target_refs[target_variant],
                 "run_manifest": run_manifest,
                 "command_topology": topology,
             },
@@ -440,7 +499,25 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
         prepared = write_json(
             root,
             f"{final_relative}/receipts/prepared-command.json",
-            {"state": "PASS", "request": request},
+            {
+                "schema_version": "cidr-e01-incremental-prepared-command-receipt-v1",
+                "state": "PASS",
+                "mode": "production",
+                "synthetic_test_only": False,
+                "fixture_only": False,
+                "formal_eligible": False,
+                "performance_eligible": False,
+                "paper_claim_eligible": False,
+                "cell_key": key,
+                "ordinal": ordinal,
+                "backend_plan_sha256": backend_plan["sha256"],
+                "request": request,
+                "binary_argv": argv,
+                "p31_argv": argv,
+                "asset_hash_inside_p31": False,
+                "clone_inside_p31": False,
+                "timing_boundary": "p31-wraps-storage-bench-binary-only-v1",
+            },
         )
         correctness = write_json(
             root,
@@ -451,6 +528,9 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "mode": "production",
                 "synthetic_test_only": False,
                 "fixture_only": False,
+                "formal_eligible": False,
+                "performance_eligible": False,
+                "paper_claim_eligible": False,
                 "cell_key": key,
                 "ordinal": ordinal,
                 "backend_plan_sha256": backend_plan["sha256"],
@@ -461,7 +541,23 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
         fairness = write_json(
             root,
             f"{final_relative}/receipts/fairness.json",
-            {"state": "PASS"},
+            {
+                "schema_version": "cidr-e01-incremental-fairness-receipt-v1",
+                "state": "PASS",
+                "mode": "production",
+                "synthetic_test_only": False,
+                "fixture_only": False,
+                "formal_eligible": False,
+                "performance_eligible": False,
+                "paper_claim_eligible": False,
+                "cell_key": key,
+                "ordinal": ordinal,
+                "backend_plan_sha256": backend_plan["sha256"],
+                "p31_receipt_sha256": p31["sha256"],
+                "single_binary_process": True,
+                "asset_hash_inside_boundary": False,
+                "clone_inside_boundary": False,
+            },
         )
         adapter_result = write_json(
             root, f"{final_relative}/adapter-output/adapter-result.json", {"state": "PASS"}
@@ -607,9 +703,13 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "mode": "production",
                 "synthetic_test_only": False,
                 "fixture_only": False,
+                "formal_eligible": False,
+                "performance_eligible": False,
+                "paper_claim_eligible": False,
                 "cell_key": key,
                 "ordinal": ordinal,
                 "backend_plan_sha256": backend_plan["sha256"],
+                "target_p02b": target_refs[target_variant],
                 "adapter_result": validated,
                 "adapter_provenance": provenance,
             },
@@ -623,10 +723,18 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "mode": "production",
                 "synthetic_test_only": False,
                 "fixture_only": False,
+                "formal_eligible": False,
+                "performance_eligible": False,
+                "paper_claim_eligible": False,
                 "cell_key": key,
                 "ordinal": ordinal,
                 "backend_plan_sha256": backend_plan["sha256"],
                 "mutable_clone_removed": True,
+                "mutable_clone_lexists_after": False,
+                "mutable_clone": str(
+                    (root / f"{final_relative}/removed-clone").resolve()
+                ),
+                "target_p02b": target_refs[target_variant],
             },
         )
         receipt_refs = {

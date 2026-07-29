@@ -121,6 +121,117 @@ def _pass_receipt(
     return value
 
 
+def validate_role_receipt(
+    path: Path,
+    role: str,
+    *,
+    key: str,
+    ordinal: int,
+    plan_sha: str,
+    target_p02b: Mapping[str, Any],
+) -> Dict[str, Any]:
+    value = load_json(path, f"{key}: {role}")
+    require(
+        value.get("schema_version")
+        == f"cidr-e01-incremental-{role.replace('_', '-')}-receipt-v1"
+        and value.get("state") == "PASS"
+        and value.get("mode") == "production"
+        and value.get("synthetic_test_only") is False
+        and value.get("fixture_only") is False
+        and all(value.get(name) is False for name in FALSE_ELIGIBILITY)
+        and value.get("cell_key") == key
+        and value.get("ordinal") == ordinal
+        and value.get("backend_plan_sha256") == plan_sha,
+        f"{key}: {role} exact schema/state/identity drift",
+    )
+    if role == "prepared_command":
+        require(
+            value.get("asset_hash_inside_p31") is False
+            and value.get("clone_inside_p31") is False
+            and value.get("timing_boundary")
+            == "p31-wraps-storage-bench-binary-only-v1"
+            and type(value.get("binary_argv")) is list
+            and value["binary_argv"]
+            and type(value.get("p31_argv")) is list
+            and value["p31_argv"],
+            f"{key}: prepared-command semantics drift",
+        )
+        verify_ref(value.get("request"), f"{key}: prepared-command request")
+    elif role == "p31":
+        require(
+            value.get("timing_generated") is True
+            and value.get("binary_only_boundary") is True
+            and value.get("target_p02b") == target_p02b,
+            f"{key}: P31 semantics drift",
+        )
+        verify_ref(value.get("run_manifest"), f"{key}: P31 run manifest")
+        verify_ref(value.get("command_topology"), f"{key}: P31 topology")
+    elif role == "command_topology":
+        require(
+            value.get("single_binary_invocation") is True
+            and value.get("warmup_measured_same_process") is True
+            and value.get("process_model")
+            == "single-storage-bench-process-warmup-and-measured-v1"
+            and type(value.get("per_query_timeout_ms")) is int
+            and value["per_query_timeout_ms"] > 0
+            and type(value.get("root_pid")) is int
+            and value["root_pid"] > 0,
+            f"{key}: command-topology semantics drift",
+        )
+        verify_ref(value.get("launcher"), f"{key}: command-topology launcher")
+        verify_ref(value.get("run_manifest"), f"{key}: command-topology run manifest")
+        verify_ref(value.get("command_file"), f"{key}: command-topology command file")
+    elif role == "validated_result":
+        require(
+            value.get("target_p02b") == target_p02b,
+            f"{key}: validated-result target drift",
+        )
+    elif role == "correctness":
+        require(
+            value.get("mismatch_queries") == 0
+            and value.get("timeout_queries") == 0,
+            f"{key}: correctness failure",
+        )
+    elif role == "store_clone":
+        verification = value.get("verification")
+        clone_tree = verification.get("clone_tree") if type(verification) is dict else None
+        require(
+            value.get("target_p02b") == target_p02b
+            and value.get("full_content_hash_performed") is True
+            and value.get("hash_outside_p31") is True
+            and type(value.get("source_tree_sha256")) is str
+            and len(value["source_tree_sha256"]) == 64
+            and type(clone_tree) is dict
+            and clone_tree.get("full_tree_hash_performed") is True
+            and clone_tree.get("sha256") == value["source_tree_sha256"]
+            and type(value.get("target")) is str
+            and Path(value["target"]).is_absolute(),
+            f"{key}: store-clone semantics drift",
+        )
+    elif role == "cleanup":
+        clone = value.get("mutable_clone")
+        require(
+            value.get("target_p02b") == target_p02b
+            and value.get("mutable_clone_removed") is True
+            and value.get("mutable_clone_lexists_after") is False
+            and type(clone) is str
+            and Path(clone).is_absolute()
+            and not os.path.lexists(clone),
+            f"{key}: cleanup semantics drift",
+        )
+    elif role == "fairness":
+        p31_path = path.parent / Path(RECEIPT_PATHS["p31"]).name
+        require(
+            p31_path.is_file()
+            and value.get("p31_receipt_sha256") == sha256_file(p31_path)
+            and value.get("single_binary_process") is True
+            and value.get("asset_hash_inside_boundary") is False
+            and value.get("clone_inside_boundary") is False,
+            f"{key}: fairness semantics drift",
+        )
+    return value
+
+
 def matrix_evidence_adapter(
     anchor_path: Path, backend_plan_path: Path, matrix_done_path: Path
 ) -> Dict[str, Any]:
@@ -234,14 +345,18 @@ def matrix_evidence_adapter(
             f"{key}: CELL-DONE schema/state/receipt-set drift",
         )
         refs = {name: _receipt(final, done, name) for name in RECEIPT_PATHS}
-        validated_receipt = _pass_receipt(
-            Path(refs["validated_result"]["path"]),
-            VALIDATED_RECEIPT_SCHEMA,
-            key,
-            ordinal,
-            plan_ref["sha256"],
-            f"{key}: validated-result receipt",
-        )
+        receipt_values = {
+            role: validate_role_receipt(
+                Path(ref["path"]),
+                role,
+                key=key,
+                ordinal=ordinal,
+                plan_sha=plan_ref["sha256"],
+                target_p02b=row["runtime"]["target_p02b"],
+            )
+            for role, ref in refs.items()
+        }
+        validated_receipt = receipt_values["validated_result"]
         validated_ref = verify_ref(
             validated_receipt.get("adapter_result"), f"{key}: validated repeat"
         )
@@ -259,23 +374,9 @@ def matrix_evidence_adapter(
             and Path(validated.get("final_cell_root", "")).resolve() == final,
             f"{key}: validated-repeat identity drift",
         )
-        cleanup = _pass_receipt(
-            Path(refs["cleanup"]["path"]),
-            CLEANUP_SCHEMA,
-            key,
-            ordinal,
-            plan_ref["sha256"],
-            f"{key}: cleanup",
-        )
+        cleanup = receipt_values["cleanup"]
         require(cleanup.get("mutable_clone_removed") is True, f"{key}: cleanup incomplete")
-        correctness = _pass_receipt(
-            Path(refs["correctness"]["path"]),
-            CORRECTNESS_SCHEMA,
-            key,
-            ordinal,
-            plan_ref["sha256"],
-            f"{key}: correctness",
-        )
+        correctness = receipt_values["correctness"]
         require(
             correctness.get("mismatch_queries") == 0
             and correctness.get("timeout_queries") == 0,
