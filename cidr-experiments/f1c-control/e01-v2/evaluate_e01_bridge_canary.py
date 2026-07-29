@@ -117,6 +117,7 @@ def _expected_identity(plan: Mapping[str, Any]) -> Dict[str, Any]:
         "concurrency": protocol["concurrency"],
         "warmup_passes": protocol["warmup_passes"],
         "measured_passes": protocol["measured_passes"],
+        "per_query_timeout_ms": protocol["per_query_timeout_ms"],
         "clock": protocol["clock"],
         "timing_boundary": protocol["timing_boundary"],
         "host_fingerprint": first["identity"]["host_fingerprint"],
@@ -205,6 +206,7 @@ def evaluate(
         "concurrency",
         "warmup_passes",
         "measured_passes",
+        "per_query_timeout_ms",
         "clock",
         "timing_boundary",
     ):
@@ -550,6 +552,15 @@ def validate_checkpoint_inputs(
     )
     request_ref = verify_ref(prepared.get("request"), "bridge prepared adapter request")
     require(adapter.get("request") == request_ref, "checkpoint adapter request drift")
+    request = load_json(Path(request_ref["path"]), "bridge prepared adapter request")
+    require(
+        request.get("timing", {}).get("per_query_timeout_ms")
+        == topology.get("per_query_timeout_ms")
+        == adapter.get("per_query_timeout_ms")
+        == validated_receipt.get("per_query_timeout_ms")
+        == contract["legacy_protocol"]["per_query_timeout_ms"],
+        "checkpoint request/command/result deadline drift",
+    )
     p31_manifest_ref = verify_ref(p31.get("run_manifest"), "bridge P31 run manifest")
     p31_manifest = load_json(Path(p31_manifest_ref["path"]), "bridge P31 run manifest")
     adapter_p31 = adapter.get("p31")

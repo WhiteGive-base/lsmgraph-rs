@@ -153,7 +153,9 @@ def verify_scheduler_binding(value: Mapping[str, Any]) -> Dict[str, Any]:
     return ref
 
 
-def _frozen_legacy_protocol(mixed: Mapping[str, Any]) -> Dict[str, Any]:
+def _frozen_legacy_protocol(
+    mixed: Mapping[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
     keys = ("seml0:r1", "seml0:r2", "seml0:r3")
     rows = {
         row.get("cell_key"): row
@@ -166,10 +168,38 @@ def _frozen_legacy_protocol(mixed: Mapping[str, Any]) -> Dict[str, Any]:
     require(protocols[1:] == protocols[:-1], "legacy protocols disagree")
     required = {
         "interface_scope", "warmup_passes", "measured_passes", "process_lifetime",
-        "clock", "concurrency", "timing_boundary",
+        "clock", "concurrency", "timing_boundary", "per_query_timeout_ms",
     }
     require(required <= set(protocols[0]), "legacy protocol fields missing")
-    return {key: protocols[0][key] for key in sorted(required)}
+    protocol = {key: protocols[0][key] for key in sorted(required)}
+    require(
+        type(protocol["per_query_timeout_ms"]) is int
+        and protocol["per_query_timeout_ms"] == 30000,
+        "legacy per-query timeout drift",
+    )
+    request_refs: Dict[str, Dict[str, Any]] = {}
+    for key in keys:
+        identity = rows[key].get("identity")
+        require(type(identity) is dict, f"{key}: legacy identity missing")
+        request_ref = verify_external_file_ref(
+            identity.get("adapter_request"), f"{key}: legacy adapter request"
+        )
+        request = load_json(Path(request_ref["path"]), f"{key}: legacy adapter request")
+        timing = request.get("timing")
+        require(type(timing) is dict, f"{key}: legacy request timing missing")
+        require(
+            request.get("process_lifetime") == protocol["process_lifetime"]
+            and request.get("interface_scope") == protocol["interface_scope"]
+            and timing.get("warmup_passes") == protocol["warmup_passes"]
+            and timing.get("measured_passes") == protocol["measured_passes"]
+            and timing.get("per_query_timeout_ms") == protocol["per_query_timeout_ms"]
+            and timing.get("clock") == protocol["clock"]
+            and timing.get("concurrency") == protocol["concurrency"]
+            and timing.get("timing_boundary") == protocol["timing_boundary"],
+            f"{key}: legacy request/protocol mismatch",
+        )
+        request_refs[key] = request_ref
+    return protocol, request_refs
 
 
 def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
@@ -188,8 +218,12 @@ def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
         mixed.get("schema_version") == "cidr-e01-mixed-lineage-composition-v1",
         "formal mixed-lineage schema drift",
     )
-    legacy_protocol = _frozen_legacy_protocol(mixed)
+    legacy_protocol, legacy_request_refs = _frozen_legacy_protocol(mixed)
     require(contract.get("legacy_protocol") == legacy_protocol, "checkpoint legacy protocol drift")
+    require(
+        contract.get("legacy_adapter_requests") == legacy_request_refs,
+        "checkpoint legacy adapter-request refs drift",
+    )
     require(
         contract.get("bridge_request_argv_binding")
         == {
@@ -198,6 +232,7 @@ def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
             "warmup_runs": legacy_protocol["warmup_passes"],
             "measured_repeats": legacy_protocol["measured_passes"],
             "process_lifetime": legacy_protocol["process_lifetime"],
+            "per_query_timeout_ms": legacy_protocol["per_query_timeout_ms"],
         },
         "checkpoint request/argv binding drift",
     )
@@ -238,6 +273,7 @@ def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
             "p31_receipt_ref": True,
             "p31_run_manifest_ref": True,
             "command_topology_ref": True,
+            "deadline_exact": True,
             "backend_plan_ref": True,
             "target_p02b_ref": True,
             "final_cell_root": True,
@@ -308,6 +344,8 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
                 and request.get("process_lifetime") == checkpoint["legacy_protocol"]["process_lifetime"]
                 and timing.get("warmup_passes") == checkpoint["legacy_protocol"]["warmup_passes"]
                 and timing.get("measured_passes") == checkpoint["legacy_protocol"]["measured_passes"]
+                and timing.get("per_query_timeout_ms")
+                == checkpoint["legacy_protocol"]["per_query_timeout_ms"]
                 and timing.get("clock") == checkpoint["legacy_protocol"]["clock"]
                 and timing.get("concurrency") == checkpoint["legacy_protocol"]["concurrency"]
                 and timing.get("timing_boundary") == checkpoint["legacy_protocol"]["timing_boundary"],
@@ -320,6 +358,11 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
                 and binary_argv[binary_argv.index("--repeats") + 1]
                 == str(checkpoint["legacy_protocol"]["measured_passes"]),
                 f"cell {ordinal}: binary argv/legacy protocol mismatch",
+            )
+            require(
+                binary_argv[binary_argv.index("--p10-per-query-timeout-ms") + 1]
+                == str(checkpoint["legacy_protocol"]["per_query_timeout_ms"]),
+                f"cell {ordinal}: binary argv deadline mismatch",
             )
         phases = row.get("phase_commands")
         require(
@@ -542,6 +585,13 @@ def consume_canary_evaluation(
         and topology.get("process_lifetime") == contract["legacy_protocol"]["process_lifetime"],
         "canary command-topology chain drift",
     )
+    request = load_json(Path(prepared["request"]["path"]), "bridge prepared request")
+    require(
+        request.get("timing", {}).get("per_query_timeout_ms")
+        == topology.get("per_query_timeout_ms")
+        == contract["legacy_protocol"]["per_query_timeout_ms"],
+        "canary request/command deadline drift",
+    )
     adapter_ref = verify_external_file_ref(
         validated_receipt.get("adapter_result"), "canary validated adapter result"
     )
@@ -583,6 +633,11 @@ def consume_canary_evaluation(
         and adapter.get("process_lifetime_binding", {}).get("command_topology")
         == topology_ref,
         "canary adapter command-topology backlink drift",
+    )
+    require(
+        adapter.get("per_query_timeout_ms")
+        == contract["legacy_protocol"]["per_query_timeout_ms"],
+        "canary validated result deadline drift",
     )
     comparability_ref = external_file_ref(Path(contract["comparability_path"]))
     require(
@@ -687,6 +742,11 @@ def _validate_receipt(
             and value.get("process_model")
             == "single-storage-bench-process-warmup-and-measured-v1",
             "command topology proof invalid",
+        )
+        require(
+            type(value.get("per_query_timeout_ms")) is int
+            and value["per_query_timeout_ms"] > 0,
+            "command topology deadline invalid",
         )
     if role == "correctness":
         require(value.get("mismatch_queries") == 0, "correctness mismatch")
@@ -805,6 +865,22 @@ def validate_final_cell(
             f"{cell_key}: adapter result outside final root",
         )
         adapter = load_json(Path(adapter_ref["path"]), f"{cell_key}: adapter result")
+        prepared = load_json(final / RECEIPT_PATHS["prepared_command"], "prepared command")
+        request_ref = verify_external_file_ref(
+            prepared.get("request"), f"{cell_key}: prepared request"
+        )
+        request = load_json(Path(request_ref["path"]), f"{cell_key}: prepared request")
+        topology = load_json(
+            final / RECEIPT_PATHS["command_topology"], f"{cell_key}: command topology"
+        )
+        deadline = request.get("timing", {}).get("per_query_timeout_ms")
+        require(
+            type(deadline) is int
+            and deadline > 0
+            and topology.get("per_query_timeout_ms") == deadline
+            and adapter.get("per_query_timeout_ms") == deadline,
+            f"{cell_key}: request/command/result deadline drift",
+        )
         artifacts = adapter.get("adapter_artifacts")
         require(type(artifacts) is dict and artifacts, f"{cell_key}: adapter artifacts missing")
         for name, ref in artifacts.items():

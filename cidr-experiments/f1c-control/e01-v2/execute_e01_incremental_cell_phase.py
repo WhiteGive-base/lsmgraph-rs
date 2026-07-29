@@ -109,6 +109,32 @@ def path_within(path: Path, root: Path) -> bool:
         return False
 
 
+def validate_deadline_chain(
+    request: Mapping[str, Any],
+    topology: Mapping[str, Any],
+    adapter_result: Mapping[str, Any],
+    validated_repeat: Optional[Mapping[str, Any]] = None,
+) -> int:
+    timing = request.get("timing")
+    require(type(timing) is dict, "request timing missing")
+    deadline = timing.get("per_query_timeout_ms")
+    require(type(deadline) is int and deadline > 0, "request deadline invalid")
+    require(
+        topology.get("per_query_timeout_ms") == deadline,
+        "request/command deadline drift",
+    )
+    require(
+        adapter_result.get("per_query_timeout_ms") == deadline,
+        "request/result deadline drift",
+    )
+    if validated_repeat is not None:
+        require(
+            validated_repeat.get("per_query_timeout_ms") == deadline,
+            "request/validated-result deadline drift",
+        )
+    return deadline
+
+
 def bind_adapter_process_lifetime(
     path: Path,
     request: Mapping[str, Any],
@@ -127,6 +153,7 @@ def bind_adapter_process_lifetime(
         == "single-storage-bench-process-warmup-and-measured-v1",
         "receipt-bound command topology does not prove process lifetime",
     )
+    validate_deadline_chain(request, topology, result)
     key_present = "process_lifetime" in result
     observed = result.get("process_lifetime")
     if key_present:
@@ -987,10 +1014,16 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
     request_timing = request_value["timing"]
     warmup_index = command_argv.index("--warmup-runs")
     repeats_index = command_argv.index("--repeats")
+    deadline_index = command_argv.index("--p10-per-query-timeout-ms")
     require(
         command_argv[warmup_index + 1] == str(request_timing["warmup_passes"])
         and command_argv[repeats_index + 1] == str(request_timing["measured_passes"]),
         "P31 command warmup/repeat topology drift",
+    )
+    require(
+        command_argv[deadline_index + 1]
+        == str(request_timing["per_query_timeout_ms"]),
+        "P31 command deadline drift",
     )
     topology_path = cwd / "receipts/command-topology.json"
     topology = {
@@ -1010,6 +1043,7 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
         "warmup_runs": request_timing["warmup_passes"],
         "measured_repeats": request_timing["measured_passes"],
         "process_lifetime": request_value["process_lifetime"],
+        "per_query_timeout_ms": request_timing["per_query_timeout_ms"],
         "process_model": "single-storage-bench-process-warmup-and-measured-v1",
         "single_binary_invocation": True,
         "warmup_measured_same_process": True,
@@ -1087,6 +1121,10 @@ def finalize(
         and validated_repeat.get("schema_version") == "cidr-p10-validated-repeat-v1",
         "validated adapter output schema drift",
     )
+    adapter_result = load_json(output / "adapter-result.json", "validated adapter result")
+    deadline = validate_deadline_chain(
+        request, topology, adapter_result, validated_repeat
+    )
     validated_repeat["adapter_artifacts"] = publish_adapter_artifacts(
         validated_repeat, cwd, cell
     )
@@ -1115,6 +1153,7 @@ def finalize(
                 "command_topology": topology["self_ref"],
             },
             "process_lifetime_binding": lifetime_binding,
+            "per_query_timeout_ms": deadline,
         }
     )
     validated_output_path = output / "validated-repeat.json"
@@ -1134,6 +1173,7 @@ def finalize(
         "request": request_ref,
         "p31_receipt": p31_receipt_ref,
         "command_topology": topology["self_ref"],
+        "per_query_timeout_ms": deadline,
     }
     atomic_json(cwd / "validated-result.json", validated)
     atomic_json(

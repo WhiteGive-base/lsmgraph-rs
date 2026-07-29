@@ -58,7 +58,7 @@ class IncrementalProductionTests(unittest.TestCase):
             mixed_path.read_text(encoding="utf-8")
         )["incremental_plan"]["bridge_canary_comparability_contract"]
         mixed_value = json.loads(mixed_path.read_text(encoding="utf-8"))
-        self.legacy_protocol = production._frozen_legacy_protocol(mixed_value)
+        self.legacy_protocol, self.legacy_request_refs = production._frozen_legacy_protocol(mixed_value)
         self.contract_sha = self.formal_contract["contract_sha256"]
         self.checkpoint = {
             "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v2",
@@ -66,12 +66,14 @@ class IncrementalProductionTests(unittest.TestCase):
             "mixed_lineage_plan": self.mixed_ref,
             "comparability_contract_sha256": self.contract_sha,
             "legacy_protocol": self.legacy_protocol,
+            "legacy_adapter_requests": self.legacy_request_refs,
             "bridge_request_argv_binding": {
                 "request_protocol_exact": True,
                 "binary_argv_exact": True,
                 "warmup_runs": self.legacy_protocol["warmup_passes"],
                 "measured_repeats": self.legacy_protocol["measured_passes"],
                 "process_lifetime": self.legacy_protocol["process_lifetime"],
+                "per_query_timeout_ms": self.legacy_protocol["per_query_timeout_ms"],
             },
             "evidence_schema": evaluator.CHECKPOINT_EVIDENCE_SCHEMA,
             "evidence_path": str(self.campaign / "CANARY-EVIDENCE.json"),
@@ -88,6 +90,7 @@ class IncrementalProductionTests(unittest.TestCase):
                 "p31_receipt_ref": True,
                 "p31_run_manifest_ref": True,
                 "command_topology_ref": True,
+                "deadline_exact": True,
                 "backend_plan_ref": True,
                 "target_p02b_ref": True,
                 "final_cell_root": True,
@@ -151,6 +154,7 @@ class IncrementalProductionTests(unittest.TestCase):
                     single_binary_invocation=True,
                     warmup_measured_same_process=True,
                     process_model="single-storage-bench-process-warmup-and-measured-v1",
+                    per_query_timeout_ms=self.legacy_protocol["per_query_timeout_ms"],
                 )
             if role == "correctness":
                 value.update(mismatch_queries=0, timeout_queries=0)
@@ -279,6 +283,7 @@ class IncrementalProductionTests(unittest.TestCase):
                             "timing": {
                                 "warmup_passes": self.legacy_protocol["warmup_passes"],
                                 "measured_passes": self.legacy_protocol["measured_passes"],
+                                "per_query_timeout_ms": self.legacy_protocol["per_query_timeout_ms"],
                                 "clock": self.legacy_protocol["clock"],
                                 "concurrency": self.legacy_protocol["concurrency"],
                                 "timing_boundary": self.legacy_protocol["timing_boundary"],
@@ -290,6 +295,8 @@ class IncrementalProductionTests(unittest.TestCase):
                             str(self.legacy_protocol["warmup_passes"]),
                             "--repeats",
                             str(self.legacy_protocol["measured_passes"]),
+                            "--p10-per-query-timeout-ms",
+                            str(self.legacy_protocol["per_query_timeout_ms"]),
                         ],
                     },
                 }
@@ -311,6 +318,33 @@ class IncrementalProductionTests(unittest.TestCase):
         )
         reloaded = production.validate_backend_plan(plan_path)
         self.assertEqual(reloaded["schema_version"], production.BACKEND_SCHEMA)
+        request_deadline_drift = json.loads(json.dumps(reloaded))
+        request_deadline_drift["cells"][0]["runtime"]["request"]["timing"][
+            "per_query_timeout_ms"
+        ] = 1000
+        with self.assertRaises(production.BackendError):
+            production.validate_backend_plan(request_deadline_drift)
+        argv_deadline_drift = json.loads(json.dumps(reloaded))
+        timeout_index = argv_deadline_drift["cells"][0]["runtime"]["binary_argv"].index(
+            "--p10-per-query-timeout-ms"
+        )
+        argv_deadline_drift["cells"][0]["runtime"]["binary_argv"][
+            timeout_index + 1
+        ] = "1000"
+        with self.assertRaises(production.BackendError):
+            production.validate_backend_plan(argv_deadline_drift)
+        checkpoint_deadline_drift = json.loads(json.dumps(reloaded))
+        checkpoint_deadline_drift["canary_checkpoint"][
+            "bridge_request_argv_binding"
+        ]["per_query_timeout_ms"] = 1000
+        with self.assertRaises(production.BackendError):
+            production.validate_backend_plan(checkpoint_deadline_drift)
+        legacy_request_mismatch = json.loads(json.dumps(reloaded))
+        legacy_request_mismatch["canary_checkpoint"]["legacy_adapter_requests"][
+            "seml0:r1"
+        ]["sha256"] = "0" * 64
+        with self.assertRaises(production.BackendError):
+            production.validate_backend_plan(legacy_request_mismatch)
         phase_drift = json.loads(json.dumps(reloaded))
         phase_drift["cells"][0]["phase_commands"]["prepare"][2] = "/bin/false"
         with self.assertRaisesRegex(production.BackendError, "dispatch drift"):
@@ -367,7 +401,15 @@ class IncrementalProductionTests(unittest.TestCase):
                 if role == "prepared_command":
                     request_path = write_json(
                         cwd / "adapter-request.json",
-                        {"state": "PASS", "cell_key": row["cell_key"]},
+                        {
+                            "state": "PASS",
+                            "cell_key": row["cell_key"],
+                            "timing": {
+                                "per_query_timeout_ms": self.legacy_protocol[
+                                    "per_query_timeout_ms"
+                                ]
+                            },
+                        },
                     )
                     value["request"] = future_ref(request_path)
                 if role == "p31":
@@ -388,6 +430,7 @@ class IncrementalProductionTests(unittest.TestCase):
                         warmup_runs=self.legacy_protocol["warmup_passes"],
                         measured_repeats=self.legacy_protocol["measured_passes"],
                         process_lifetime=self.legacy_protocol["process_lifetime"],
+                        per_query_timeout_ms=self.legacy_protocol["per_query_timeout_ms"],
                     )
                 if role == "correctness":
                     value.update(mismatch_queries=0, timeout_queries=0)
@@ -421,6 +464,7 @@ class IncrementalProductionTests(unittest.TestCase):
                             "process_lifetime_binding": {
                                 "command_topology": p31_receipt["command_topology"],
                             },
+                            "per_query_timeout_ms": self.legacy_protocol["per_query_timeout_ms"],
                             "adapter_artifacts": {},
                         },
                     )
@@ -436,6 +480,7 @@ class IncrementalProductionTests(unittest.TestCase):
                     value["request"] = prepared["request"]
                     value["p31_receipt"] = future_ref(p31_receipt_path)
                     value["command_topology"] = p31_receipt["command_topology"]
+                    value["per_query_timeout_ms"] = self.legacy_protocol["per_query_timeout_ms"]
                 if role == "cleanup":
                     value.update(
                         mutable_clone_removed=True,

@@ -183,6 +183,9 @@ def make_canary_evidence(
                 "path": "/fixture/truth.tsv",
                 "sha256": plan["logical_dataset_identity"]["truth_sha256"],
             },
+            "timing": {
+                "per_query_timeout_ms": first["protocol"]["per_query_timeout_ms"]
+            },
         },
     )
     validated = write_value(
@@ -212,6 +215,7 @@ def make_canary_evidence(
                     "concurrency",
                     "warmup_passes",
                     "measured_passes",
+                    "per_query_timeout_ms",
                     "clock",
                     "timing_boundary",
                 )
@@ -249,6 +253,7 @@ def make_canary_evidence(
                 "concurrency",
                 "warmup_passes",
                 "measured_passes",
+                "per_query_timeout_ms",
                 "clock",
                 "timing_boundary",
             )

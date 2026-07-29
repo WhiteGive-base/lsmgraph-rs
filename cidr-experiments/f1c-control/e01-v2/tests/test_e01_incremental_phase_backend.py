@@ -637,9 +637,14 @@ class PhaseBackendTests(unittest.TestCase):
                     "concurrency": 1,
                     "interface_scope": "typed-neighbor-dense-id-v1",
                     "measured_passes": 1,
+                    "per_query_timeout_ms": 30000,
                     "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
                     "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
                     "warmup_passes": 1,
+                },
+                "legacy_adapter_requests": {
+                    key: {"path": f"/fixture/{key}.json", "sha256": "f" * 64, "size_bytes": 1}
+                    for key in ("seml0:r1", "seml0:r2", "seml0:r3")
                 },
                 "bridge_request_argv_binding": {
                     "request_protocol_exact": True,
@@ -647,6 +652,7 @@ class PhaseBackendTests(unittest.TestCase):
                     "warmup_runs": 1,
                     "measured_repeats": 1,
                     "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                    "per_query_timeout_ms": 30000,
                 },
                 "evidence_schema": "cidr-e01-bridge-canary-evidence-v2",
                 "evidence_path": "/fixture/CANARY-EVIDENCE.json",
@@ -672,6 +678,7 @@ class PhaseBackendTests(unittest.TestCase):
                     "p31_receipt_ref": True,
                     "p31_run_manifest_ref": True,
                     "command_topology_ref": True,
+                    "deadline_exact": True,
                     "backend_plan_ref": True,
                     "target_p02b_ref": True,
                     "final_cell_root": True,
@@ -854,17 +861,25 @@ class PhaseBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = write_json(
                 Path(temporary) / "adapter-result.json",
-                {"schema_version": "cidr-p10-adapter-result-v1", "measured": {}},
+                {
+                    "schema_version": "cidr-p10-adapter-result-v1",
+                    "measured": {},
+                    "per_query_timeout_ms": 30000,
+                },
             )
             receipt = phase.bind_adapter_process_lifetime(
                 path,
-                {"process_lifetime": "prebuilt-store-query-process-lifetime-v1"},
+                {
+                    "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                    "timing": {"per_query_timeout_ms": 30000},
+                },
                 {
                     "state": "PASS",
                     "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
                     "single_binary_invocation": True,
                     "warmup_measured_same_process": True,
                     "process_model": "single-storage-bench-process-warmup-and-measured-v1",
+                    "per_query_timeout_ms": 30000,
                     "self_ref": {"path": "/final/command-topology.json", "sha256": "a" * 64, "size_bytes": 1},
                 },
             )
@@ -877,18 +892,25 @@ class PhaseBackendTests(unittest.TestCase):
             )
             tampered = write_json(
                 Path(temporary) / "tampered.json",
-                {"process_lifetime": "one-process-per-query"},
+                {
+                    "process_lifetime": "one-process-per-query",
+                    "per_query_timeout_ms": 30000,
+                },
             )
             with self.assertRaisesRegex(phase.PhaseError, "invalid/conflicting"):
                 phase.bind_adapter_process_lifetime(
                     tampered,
-                    {"process_lifetime": "prebuilt-store-query-process-lifetime-v1"},
+                    {
+                        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                        "timing": {"per_query_timeout_ms": 30000},
+                    },
                     {
                         "state": "PASS",
                         "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
                         "single_binary_invocation": True,
                         "warmup_measured_same_process": True,
                         "process_model": "single-storage-bench-process-warmup-and-measured-v1",
+                        "per_query_timeout_ms": 30000,
                     },
                 )
 
@@ -899,15 +921,25 @@ class PhaseBackendTests(unittest.TestCase):
             "single_binary_invocation": True,
             "warmup_measured_same_process": True,
             "process_model": "single-storage-bench-process-warmup-and-measured-v1",
+            "per_query_timeout_ms": 30000,
         }
-        request = {"process_lifetime": "prebuilt-store-query-process-lifetime-v1"}
+        request = {
+            "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+            "timing": {"per_query_timeout_ms": 30000},
+        }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for index, invalid in enumerate((None, False, 1)):
-                path = write_json(root / f"invalid-{index}.json", {"process_lifetime": invalid})
+                path = write_json(
+                    root / f"invalid-{index}.json",
+                    {"process_lifetime": invalid, "per_query_timeout_ms": 30000},
+                )
                 with self.assertRaisesRegex(phase.PhaseError, "invalid/conflicting"):
                     phase.bind_adapter_process_lifetime(path, request, topology)
-            missing = write_json(root / "missing.json", {"metrics": {"qps": 1}})
+            missing = write_json(
+                root / "missing.json",
+                {"metrics": {"qps": 1}, "per_query_timeout_ms": 30000},
+            )
             weak = dict(topology)
             weak["single_binary_invocation"] = False
             with self.assertRaisesRegex(phase.PhaseError, "does not prove"):
@@ -936,6 +968,37 @@ class PhaseBackendTests(unittest.TestCase):
                 str((final / "adapter-output" / artifact.name).resolve()),
             )
             self.assertEqual(published["query"]["sha256"], source_ref["sha256"])
+
+    def test_deadline_chain_rejects_1000_null_bool_number_and_result_drift(self) -> None:
+        request = {"timing": {"per_query_timeout_ms": 30000}}
+        topology = {"per_query_timeout_ms": 30000}
+        result = {"per_query_timeout_ms": 30000}
+        validated = {"per_query_timeout_ms": 30000}
+        self.assertEqual(
+            phase.validate_deadline_chain(request, topology, result, validated),
+            30000,
+        )
+        for invalid in (1000, None, False, 1.5):
+            bad_topology = dict(topology)
+            bad_topology["per_query_timeout_ms"] = invalid
+            with self.assertRaisesRegex(phase.PhaseError, "request/command deadline drift"):
+                phase.validate_deadline_chain(request, bad_topology, result)
+        for invalid in (1000, None, False, 1.5):
+            bad_result = {"per_query_timeout_ms": invalid}
+            with self.assertRaisesRegex(phase.PhaseError, "request/result deadline drift"):
+                phase.validate_deadline_chain(request, topology, bad_result)
+        for invalid in (1000, None, False, 1.5):
+            bad_request = {"timing": {"per_query_timeout_ms": invalid}}
+            if invalid == 1000:
+                with self.assertRaisesRegex(
+                    phase.PhaseError, "request/command deadline drift"
+                ):
+                    phase.validate_deadline_chain(bad_request, topology, result)
+            else:
+                with self.assertRaisesRegex(
+                    phase.PhaseError, "request deadline invalid"
+                ):
+                    phase.validate_deadline_chain(bad_request, topology, result)
 
 
 if __name__ == "__main__":

@@ -103,6 +103,15 @@ def make_fixture(root: Path) -> Tuple[Path, Path, Path]:
                     "path": "/fixture/bin",
                     "sha256": ("%064x" % (builder.LEGACY_SYSTEMS.index(system) + 1)),
                 },
+                "process_lifetime": "fixture-process-lifetime-v1",
+                "timing": {
+                    "warmup_passes": 1,
+                    "measured_passes": 1,
+                    "per_query_timeout_ms": 30000,
+                    "clock": "CLOCK_MONOTONIC",
+                    "concurrency": 1,
+                    "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+                },
             }
             request = write_json(root, f"{prefix}/adapter-request.json", request_value)
             validation_state = "FAILED" if system in ("neo4j", "nebulagraph") else "PASS"
@@ -143,6 +152,7 @@ def make_fixture(root: Path) -> Tuple[Path, Path, Path]:
                 "qps": 1700.0 / 30.0,
                 "warmup_passes": 1,
                 "measured_passes": 1,
+                "per_query_timeout_ms": 30000,
                 "clock": "CLOCK_MONOTONIC",
                 "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
                 "process_lifetime": "fixture-process-lifetime-v1",

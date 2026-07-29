@@ -284,6 +284,16 @@ def _legacy_cell(repeat: Mapping[str, Any]) -> Dict[str, Any]:
     binary = request_value.get("binary")
     if not all(type(item) is dict for item in (dataset, truth, binary)):
         raise CompositionError(f"{label}: request dataset/truth/binary objects required")
+    request_timing = request_value.get("timing")
+    if type(request_timing) is not dict:
+        raise CompositionError(f"{label}: request timing object required")
+    per_query_timeout_ms = _integer(
+        request_timing.get("per_query_timeout_ms"),
+        f"{label}.request.per_query_timeout_ms",
+        minimum=1,
+    )
+    if validated.get("per_query_timeout_ms") != per_query_timeout_ms:
+        raise CompositionError(f"{label}: request/validated deadline drift")
     expected_digest = _required_sha(
         validated.get("expected_digest_sha256"), f"{label}.expected_digest"
     )
@@ -336,6 +346,7 @@ def _legacy_cell(repeat: Mapping[str, Any]) -> Dict[str, Any]:
             "query_count": query_count,
             "warmup_passes": validated.get("warmup_passes"),
             "measured_passes": validated.get("measured_passes"),
+            "per_query_timeout_ms": per_query_timeout_ms,
             "clock": validated.get("clock"),
             "timing_boundary": validated.get("timing_boundary"),
             "process_lifetime": validated.get("process_lifetime"),
@@ -497,6 +508,7 @@ def _incremental_plan() -> Dict[str, Any]:
             "concurrency",
             "warmup_passes",
             "measured_passes",
+            "per_query_timeout_ms",
             "clock",
             "timing_boundary",
             "host_fingerprint",

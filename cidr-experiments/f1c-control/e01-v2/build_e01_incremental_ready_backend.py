@@ -139,13 +139,15 @@ def _request(
             "warmup_passes": legacy_protocol["warmup_passes"],
             "measured_passes": legacy_protocol["measured_passes"],
             "concurrency": legacy_protocol["concurrency"],
-            "per_query_timeout_ms": 1000,
+            "per_query_timeout_ms": legacy_protocol["per_query_timeout_ms"],
             "sequence_digest_algorithm": "sha256-pass-query-count-sum-xor-v1",
         },
     }
 
 
-def _frozen_legacy_protocol(mixed_plan: Mapping[str, Any]) -> dict[str, Any]:
+def _frozen_legacy_protocol(
+    mixed_plan: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     keys = ("seml0:r1", "seml0:r2", "seml0:r3")
     rows = {
         row.get("cell_key"): row
@@ -162,6 +164,7 @@ def _frozen_legacy_protocol(mixed_plan: Mapping[str, Any]) -> dict[str, Any]:
         "warmup_passes",
         "measured_passes",
         "process_lifetime",
+        "per_query_timeout_ms",
         "clock",
         "concurrency",
         "timing_boundary",
@@ -170,7 +173,33 @@ def _frozen_legacy_protocol(mixed_plan: Mapping[str, Any]) -> dict[str, Any]:
     require(type(protocol["warmup_passes"]) is int and protocol["warmup_passes"] == 1, "legacy warmup drift")
     require(type(protocol["measured_passes"]) is int and protocol["measured_passes"] == 1, "legacy measured drift")
     require(type(protocol["process_lifetime"]) is str and protocol["process_lifetime"], "legacy process lifetime invalid")
-    return {name: protocol[name] for name in sorted(required)}
+    require(
+        type(protocol["per_query_timeout_ms"]) is int
+        and protocol["per_query_timeout_ms"] == 30000,
+        "legacy per-query timeout drift",
+    )
+    request_refs: dict[str, dict[str, Any]] = {}
+    for key in keys:
+        identity = rows[key].get("identity")
+        require(type(identity) is dict, f"{key}: legacy identity missing")
+        request, request_ref = verify_ref(
+            identity.get("adapter_request"), f"{key}: legacy adapter request"
+        )
+        timing = request.get("timing")
+        require(type(timing) is dict, f"{key}: legacy request timing missing")
+        require(
+            request.get("process_lifetime") == protocol["process_lifetime"]
+            and request.get("interface_scope") == protocol["interface_scope"]
+            and timing.get("warmup_passes") == protocol["warmup_passes"]
+            and timing.get("measured_passes") == protocol["measured_passes"]
+            and timing.get("per_query_timeout_ms") == protocol["per_query_timeout_ms"]
+            and timing.get("clock") == protocol["clock"]
+            and timing.get("concurrency") == protocol["concurrency"]
+            and timing.get("timing_boundary") == protocol["timing_boundary"],
+            f"{key}: legacy request/protocol mismatch",
+        )
+        request_refs[key] = request_ref
+    return {name: protocol[name] for name in sorted(required)}, request_refs
 
 
 def _target_p02b(path: Optional[Path], variant: str, store: Mapping[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], Optional[str]]:
@@ -404,7 +433,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         mixed_plan.get("schema_version") == "cidr-e01-mixed-lineage-composition-v1",
         "formal mixed-lineage plan schema drift",
     )
-    legacy_protocol = _frozen_legacy_protocol(mixed_plan)
+    legacy_protocol, legacy_request_refs = _frozen_legacy_protocol(mixed_plan)
     comparability_contract = mixed_plan.get("incremental_plan", {}).get(
         "bridge_canary_comparability_contract"
     )
@@ -545,7 +574,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "--repeats", str(legacy_protocol["measured_passes"]),
             "--sample-plan-in", target_plan["path"], "--p10-raw-output-dir", "{STAGING}/adapter-output/seml0-raw",
             "--p10-truth-tsv", truth["path"], "--p10-id-map-dir", str(Path(id_map["path"]).parent),
-            "--p10-per-query-timeout-ms", "1000", "--l0-layout", layout,
+            "--p10-per-query-timeout-ms",
+            str(legacy_protocol["per_query_timeout_ms"]),
+            "--l0-layout", layout,
             "--query-control-stage", "a6",
         ]
         if variant == "budg-b64":
@@ -628,12 +659,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "mixed_lineage_plan": mixed_ref,
         "comparability_contract_sha256": contract_sha,
         "legacy_protocol": legacy_protocol,
+        "legacy_adapter_requests": legacy_request_refs,
         "bridge_request_argv_binding": {
             "request_protocol_exact": True,
             "binary_argv_exact": True,
             "warmup_runs": legacy_protocol["warmup_passes"],
             "measured_repeats": legacy_protocol["measured_passes"],
             "process_lifetime": legacy_protocol["process_lifetime"],
+            "per_query_timeout_ms": legacy_protocol["per_query_timeout_ms"],
         },
         "evidence_schema": "cidr-e01-bridge-canary-evidence-v2",
         "evidence_path": str(args.campaign_root / "CANARY-EVIDENCE.json"),
@@ -659,6 +692,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "p31_receipt_ref": True,
             "p31_run_manifest_ref": True,
             "command_topology_ref": True,
+            "deadline_exact": True,
             "backend_plan_ref": True,
             "target_p02b_ref": True,
             "final_cell_root": True,
