@@ -200,8 +200,8 @@
   "large_content_read_now": false,
   "mixed_lineage_plan": {
     "path": "/data/WorkSpace/lsmgraph-f1-target-p02b-20260728/cidr-experiments/f1c-control/e01-v2/E01-mixed-lineage-plan-v1.json",
-    "sha256": "40ce05dbf22e9301c7d802bb924dd70cd6a2b9d7f13ac3cdab8b2ea84e0b8e1d",
-    "size_bytes": 100748
+    "sha256": "337ba616ef3dc6a97264c147f307d3d68007e73a4269fee0ce97c33c8bf106db",
+    "size_bytes": 100588
   },
   "output_root": "/data/WorkSpace/results/E01-F1-MIXED-POSTPROCESS-PENDING",
   "paper_claim_eligible": false,

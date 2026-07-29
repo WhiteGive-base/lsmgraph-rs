@@ -970,11 +970,25 @@ class MixedLineageTests(unittest.TestCase):
             builder.build_composition(self.source, self.dataset_manifest, self.dense_summary)
 
     def test_pending_plan_is_pre_output_rejected_without_directory(self) -> None:
+        self.assertIsNone(self.value["incremental_plan"]["incremental_evidence"])
         path = self.write_composition(self.value)
         output = self.root / "must-not-exist"
         with self.assertRaises(builder.CompositionError):
             normalizer.normalize(path, output)
         self.assertFalse(output.exists())
+
+    def test_pending_plan_generation_is_deterministic(self) -> None:
+        repeated = builder.build_composition(
+            self.source,
+            self.dataset_manifest,
+            self.dense_summary,
+            created_at_utc="2026-07-27T00:00:00Z",
+        )
+        self.assertEqual(
+            json.dumps(repeated, indent=2, sort_keys=True) + "\n",
+            json.dumps(self.value, indent=2, sort_keys=True) + "\n",
+        )
+        self.assertIsNone(repeated["incremental_plan"]["incremental_evidence"])
 
     def test_completed_incremental_evidence_normalizes_legacy18_plus_fresh3(self) -> None:
         completed = attach_completed_evidence(self.root, self.value)
@@ -1151,13 +1165,12 @@ class MixedLineageTests(unittest.TestCase):
             [cell["cell_key"] for cell in value["incremental_plan"]["cells"]],
             [item[0] for item in builder.INCREMENTAL_CELLS],
         )
+        self.assertIsNone(value["incremental_plan"]["incremental_evidence"])
+        payload = snapshot.read_bytes()
+        self.assertEqual(len(payload), 100588)
         self.assertEqual(
-            value["incremental_plan"]["incremental_evidence"],
-            {
-                "schema_version": "cidr-e01-incremental-evidence-v2",
-                "state": "ABSENT",
-                "reason": "formal MATRIX-DONE has not been adapted and assembled",
-            },
+            hashlib.sha256(payload).hexdigest(),
+            "337ba616ef3dc6a97264c147f307d3d68007e73a4269fee0ce97c33c8bf106db",
         )
 
 

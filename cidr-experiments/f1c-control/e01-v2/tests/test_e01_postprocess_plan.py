@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -16,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import build_e01_postprocess_plan as post
+import run_e01_incremental_production as production
 
 
 def write_json(path: Path, value: dict) -> Path:
@@ -123,6 +126,26 @@ class PostprocessPlanTests(unittest.TestCase):
             value["interfaces"]["claim_receipt"]["paper_claim_eligible"]
         )
         self.assertFalse(Path(value["output_root"]).exists())
+
+    def test_real_ready9_validates_against_frozen_mixed_snapshot(self) -> None:
+        ready9_raw = os.environ.get("E01_REAL_READY9")
+        if not ready9_raw:
+            self.skipTest("E01_REAL_READY9 is not configured")
+        ready9 = Path(ready9_raw).resolve()
+        value = production.validate_backend_plan(ready9)
+        mixed_ref = value["canary_checkpoint"]["mixed_lineage_plan"]
+        frozen = (ROOT / "E01-mixed-lineage-plan-v1.json").resolve()
+        self.assertEqual(
+            mixed_ref,
+            {
+                "path": str(frozen),
+                "sha256": "337ba616ef3dc6a97264c147f307d3d68007e73a4269fee0ce97c33c8bf106db",
+                "size_bytes": 100588,
+            },
+        )
+        payload = frozen.read_bytes()
+        self.assertEqual(len(payload), mixed_ref["size_bytes"])
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), mixed_ref["sha256"])
 
 
 if __name__ == "__main__":

@@ -589,11 +589,7 @@ def _incremental_plan() -> Dict[str, Any]:
             "cleanup",
         ],
         "bridge_canary_comparability_contract": canary_contract,
-        "incremental_evidence": {
-            "schema_version": "cidr-e01-incremental-evidence-v2",
-            "state": "ABSENT",
-            "reason": "formal MATRIX-DONE has not been adapted and assembled",
-        },
+        "incremental_evidence": None,
     }
 
 
