@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import statistics
 import sys
 import tempfile
 import unittest
@@ -52,12 +53,27 @@ class IncrementalProductionTests(unittest.TestCase):
             "sha256": production.sha256_file(evaluator_path),
             "size_bytes": evaluator_path.stat().st_size,
         }
-        mixed_path = ROOT / "E01-mixed-lineage-plan-v1.json"
+        frozen_mixed_path = ROOT / "E01-mixed-lineage-plan-v1.json"
+        mixed_value = json.loads(frozen_mixed_path.read_text(encoding="utf-8"))
+        mixed_value["logical_dataset_identity"]["truth_sha256"] = hashlib.sha256(
+            b"edge_type\tsrc\tdigest\n1\t1\t0\n"
+        ).hexdigest()
+        mixed_path = write_json(self.root / "mixed-lineage.json", mixed_value)
         self.mixed_ref = production.external_file_ref(mixed_path)
-        self.formal_contract = json.loads(
-            mixed_path.read_text(encoding="utf-8")
-        )["incremental_plan"]["bridge_canary_comparability_contract"]
-        mixed_value = json.loads(mixed_path.read_text(encoding="utf-8"))
+        self.formal_contract = mixed_value["incremental_plan"][
+            "bridge_canary_comparability_contract"
+        ]
+        self.mixed_value = mixed_value
+        self.reference_protocol = next(
+            cell["protocol"]
+            for cell in mixed_value["legacy_cells"]
+            if cell["cell_key"] == "seml0:r1"
+        )
+        self.reference_identity = next(
+            cell["identity"]
+            for cell in mixed_value["legacy_cells"]
+            if cell["cell_key"] == "seml0:r1"
+        )
         self.legacy_protocol, self.legacy_request_refs = production._frozen_legacy_protocol(mixed_value)
         self.contract_sha = self.formal_contract["contract_sha256"]
         self.checkpoint = {
@@ -83,6 +99,7 @@ class IncrementalProductionTests(unittest.TestCase):
                 "bridge_cell_done": True,
                 "bridge_receipts": sorted(production.RECEIPT_PATHS),
             },
+            "full_v2_contract": evaluator.full_v2_contract(),
             "validated_output_binding": {
                 "receipt_schema": "cidr-e01-incremental-validated-result-receipt-v1",
                 "adapter_schema": "cidr-p10-validated-repeat-v1",
@@ -436,7 +453,9 @@ class IncrementalProductionTests(unittest.TestCase):
                             },
                             "truth": {
                                 "path": truth_ref["path"],
-                                "sha256": truth_ref["sha256"],
+                                "sha256": self.mixed_value[
+                                    "logical_dataset_identity"
+                                ]["truth_sha256"],
                                 "query_count": 1700,
                             },
                             "timing": {
@@ -453,7 +472,11 @@ class IncrementalProductionTests(unittest.TestCase):
                         cwd / "p31" / "run-manifest.json",
                         {
                             "state": "PASS",
-                            "host": {"fingerprint_sha256": "f" * 64},
+                            "host": {
+                                "fingerprint_sha256": self.reference_identity[
+                                    "host_fingerprint"
+                                ]
+                            },
                             "root_pid": 12345,
                             "command_exit_code": 0,
                         },
@@ -478,7 +501,11 @@ class IncrementalProductionTests(unittest.TestCase):
                         argv_sha256=production.canonical_sha(observed_argv),
                     )
                 if role == "correctness":
-                    value.update(mismatch_queries=0, timeout_queries=0)
+                    value.update(
+                        query_count=1700,
+                        mismatch_queries=0,
+                        timeout_queries=0,
+                    )
                 if role == "store_clone":
                     value["source_tree_sha256"] = store_tree_sha
                 if role == "validated_result":
@@ -610,13 +637,57 @@ class IncrementalProductionTests(unittest.TestCase):
                             "p31": {
                                 "receipt": future_ref(p31_receipt_path),
                                 "run_manifest": p31_receipt["run_manifest"],
-                                "host": {"fingerprint_sha256": "f" * 64},
+                                "host": {
+                                    "fingerprint_sha256": self.reference_identity[
+                                        "host_fingerprint"
+                                    ]
+                                },
                                 "command_topology": p31_receipt["command_topology"],
                             },
                             "process_lifetime_binding": {
                                 "command_topology": p31_receipt["command_topology"],
                             },
                             "per_query_timeout_ms": self.legacy_protocol["per_query_timeout_ms"],
+                            "query_count": self.reference_protocol["query_count"],
+                            "interface_scope": self.reference_protocol["interface_scope"],
+                            "concurrency": self.reference_protocol["concurrency"],
+                            "warmup_passes": self.legacy_protocol["warmup_passes"],
+                            "measured_passes": self.legacy_protocol["measured_passes"],
+                            "clock": self.reference_protocol["clock"],
+                            "timing_boundary": self.reference_protocol["timing_boundary"],
+                            "completed_queries": 1700,
+                            "timeout_queries": 0,
+                            "mismatch_queries": 0,
+                            "expected_digest_sha256": self.mixed_value[
+                                "logical_dataset_identity"
+                            ]["expected_digest_sha256"],
+                            "actual_digest_sha256": self.mixed_value[
+                                "logical_dataset_identity"
+                            ]["expected_digest_sha256"],
+                            "qps": statistics.median(
+                                cell["metrics"]["qps"]
+                                for cell in self.mixed_value["legacy_cells"]
+                                if cell["cell_key"]
+                                in ("seml0:r1", "seml0:r2", "seml0:r3")
+                            ),
+                            "latency_p50_us": statistics.median(
+                                cell["metrics"]["latency_p50_us"]
+                                for cell in self.mixed_value["legacy_cells"]
+                                if cell["cell_key"]
+                                in ("seml0:r1", "seml0:r2", "seml0:r3")
+                            ),
+                            "latency_p95_us": statistics.median(
+                                cell["metrics"]["latency_p95_us"]
+                                for cell in self.mixed_value["legacy_cells"]
+                                if cell["cell_key"]
+                                in ("seml0:r1", "seml0:r2", "seml0:r3")
+                            ),
+                            "latency_p99_us": statistics.median(
+                                cell["metrics"]["latency_p99_us"]
+                                for cell in self.mixed_value["legacy_cells"]
+                                if cell["cell_key"]
+                                in ("seml0:r1", "seml0:r2", "seml0:r3")
+                            ),
                             "adapter_artifacts": adapter_artifacts,
                             "adapter_provenance": provenance,
                         },
@@ -869,25 +940,63 @@ class IncrementalProductionTests(unittest.TestCase):
         pending_path = self.campaign / "CANARY-PENDING.json"
         pending = json.loads(pending_path.read_text(encoding="utf-8"))
         backend_ref = production.external_file_ref(plan_path)
-        validated_receipt = json.loads(
-            Path(pending["bridge_receipts"]["validated_result"]["path"]).read_text(
-                encoding="utf-8"
-            )
-        )
         evidence_path = Path(ready["canary_checkpoint"]["evidence_path"])
-        evidence = {
-            "schema_version": evaluator.CHECKPOINT_EVIDENCE_SCHEMA,
-            "state": "PASS",
-            "cell_key": "seml0:bridge-canary",
-            "backend_plan": backend_ref,
-            "bridge_cell_done": pending["bridge_cell_done"],
-            "bridge_receipts": pending["bridge_receipts"],
-            "mixed_lineage_plan": self.mixed_ref,
-            "contract_sha256": self.contract_sha,
-            "validated_result_receipt": pending["bridge_receipts"]["validated_result"],
-            "validated_result": validated_receipt["adapter_result"],
-            "p31_receipt": pending["bridge_receipts"]["p31"],
-        }
+        evidence = evaluator.build_checkpoint_evidence(
+            backend_plan_path=plan_path,
+            campaign_root=self.campaign,
+            mixed_plan_path=Path(self.mixed_ref["path"]),
+            evidence_path=evidence_path,
+        )
+        write_json(evidence_path, evidence)
+        self.assertEqual(set(evidence), set(evaluator.FULL_V2_TOP_LEVEL_GROUPS))
+        with self.assertRaisesRegex(evaluator.CanaryError, "path occupied"):
+            evaluator.build_checkpoint_evidence(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        missing_group = json.loads(json.dumps(evidence))
+        missing_group.pop("metrics")
+        write_json(evidence_path, missing_group)
+        with self.assertRaisesRegex(evaluator.CanaryError, "top-level groups drift"):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        extra_group = json.loads(json.dumps(evidence))
+        extra_group["handmade"] = True
+        write_json(evidence_path, extra_group)
+        with self.assertRaisesRegex(evaluator.CanaryError, "top-level groups drift"):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        extra_source_key = json.loads(json.dumps(evidence))
+        extra_source_key["metrics"]["handmade"] = 1
+        write_json(evidence_path, extra_source_key)
+        with self.assertRaisesRegex(evaluator.CanaryError, "metrics keys drift"):
+            evaluator.validate_checkpoint_inputs(
+                backend_plan_path=plan_path,
+                campaign_root=self.campaign,
+                mixed_plan_path=Path(self.mixed_ref["path"]),
+                evidence_path=evidence_path,
+            )
+        source_tamper = json.loads(json.dumps(evidence))
+        source_tamper["metrics"]["completed_qps"] += 1
+        write_json(evidence_path, source_tamper)
+        with self.assertRaisesRegex(
+            evaluator.CanaryError, "evidence/validated metric drift"
+        ):
+            evaluator.evaluate(
+                Path(self.mixed_ref["path"]),
+                evidence_path,
+                expected_evidence_schema=evaluator.CHECKPOINT_EVIDENCE_SCHEMA,
+            )
         write_json(evidence_path, evidence)
         evaluator_chain_tamper = json.loads(json.dumps(original_provenance))
         evaluator_chain_tamper["mode"] = "fixture"
@@ -1013,14 +1122,17 @@ class IncrementalProductionTests(unittest.TestCase):
                 evidence_ref=evidence_ref,
             )
         comparability_path = Path(ready["canary_checkpoint"]["comparability_path"])
-        evaluator.atomic_write(comparability_path, comparability)
-        checkpoint = evaluator.bind_production_checkpoint(
-            comparability_path,
-            plan_path,
-            self.campaign,
-        )
         evaluation_path = self.campaign / "CANARY-EVALUATION.json"
-        evaluator.atomic_write(evaluation_path, checkpoint)
+        evidence_path.unlink()
+        checkpoint = evaluator.run_production_checkpoint(
+            backend_plan_path=plan_path,
+            campaign_root=self.campaign,
+            mixed_plan_path=Path(self.mixed_ref["path"]),
+            evidence_path=evidence_path,
+            evaluation_path=evaluation_path,
+        )
+        self.assertTrue(evidence_path.is_file())
+        self.assertTrue(comparability_path.is_file())
         with self.assertRaises(evaluator.CanaryError):
             evaluator.atomic_write(evaluation_path, checkpoint)
         original_checkpoint = json.loads(evaluation_path.read_text(encoding="utf-8"))

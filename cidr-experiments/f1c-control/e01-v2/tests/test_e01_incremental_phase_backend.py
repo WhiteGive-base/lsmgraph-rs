@@ -671,6 +671,7 @@ class PhaseBackendTests(unittest.TestCase):
                         "cleanup",
                     ],
                 },
+                "full_v2_contract": builder.evaluator.full_v2_contract(),
                 "validated_output_binding": {
                     "receipt_schema": "cidr-e01-incremental-validated-result-receipt-v1",
                     "adapter_schema": "cidr-p10-validated-repeat-v1",

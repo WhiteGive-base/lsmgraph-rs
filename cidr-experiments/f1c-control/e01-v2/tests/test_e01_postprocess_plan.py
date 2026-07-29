@@ -114,11 +114,11 @@ class PostprocessPlanTests(unittest.TestCase):
         with self.assertRaises(post.PostprocessError):
             self.build()
 
-    def test_real_snapshot_keeps_renderer_and_claim_closed(self) -> None:
+    def test_historical_snapshot_stays_closed_and_rejects_evaluator_drift(self) -> None:
         snapshot = ROOT / "E01-postprocess-interface-plan-HOLD-v1.json"
         if not snapshot.exists():
             self.skipTest("real postprocess snapshot is not installed")
-        value = post.validate(snapshot)
+        value = json.loads(snapshot.read_text(encoding="utf-8"))
         self.assertEqual(value["state"], "HOLD")
         self.assertFalse(value["renderer_invoked"])
         self.assertFalse(value["qa_invoked"])
@@ -126,6 +126,10 @@ class PostprocessPlanTests(unittest.TestCase):
             value["interfaces"]["claim_receipt"]["paper_claim_eligible"]
         )
         self.assertFalse(Path(value["output_root"]).exists())
+        with self.assertRaisesRegex(
+            post.PostprocessError, "canary_evaluator: path/size/SHA drift"
+        ):
+            post.validate(snapshot)
 
     def test_real_ready9_validates_against_frozen_mixed_snapshot(self) -> None:
         ready9_raw = os.environ.get("E01_REAL_READY9")

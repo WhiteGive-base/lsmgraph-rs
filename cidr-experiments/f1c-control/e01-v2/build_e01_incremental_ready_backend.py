@@ -15,6 +15,8 @@ import os
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+import evaluate_e01_bridge_canary as evaluator
+
 
 SCHEMA = "cidr-e01-incremental-backend-plan-v3"
 CELL_ORDER = (
@@ -668,7 +670,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "process_lifetime": legacy_protocol["process_lifetime"],
             "per_query_timeout_ms": legacy_protocol["per_query_timeout_ms"],
         },
-        "evidence_schema": "cidr-e01-bridge-canary-evidence-v2",
+        "evidence_schema": evaluator.CHECKPOINT_EVIDENCE_SCHEMA,
         "evidence_path": str(args.campaign_root / "CANARY-EVIDENCE.json"),
         "evidence_binding": {
             "cell_key": "seml0:bridge-canary",
@@ -685,6 +687,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "cleanup",
             ],
         },
+        "full_v2_contract": evaluator.full_v2_contract(),
         "validated_output_binding": {
             "receipt_schema": "cidr-e01-incremental-validated-result-receipt-v1",
             "adapter_schema": "cidr-p10-validated-repeat-v1",

@@ -22,11 +22,69 @@ CHECKPOINT_EVIDENCE_SCHEMA = "cidr-e01-bridge-canary-evidence-v2"
 RECEIPT_SCHEMA = "cidr-e01-bridge-canary-comparability-receipt-v1"
 CHECKPOINT_SCHEMA = "cidr-e01-bridge-canary-checkpoint-receipt-v2"
 METRICS = ("completed_qps", "latency_p50_us", "latency_p95_us", "latency_p99_us")
+FULL_V2_TOP_LEVEL_GROUPS = (
+    "schema_version",
+    "state",
+    "cell_key",
+    "backend_plan",
+    "bridge_cell_done",
+    "bridge_receipts",
+    "mixed_lineage_plan",
+    "contract_sha256",
+    "validated_result_receipt",
+    "validated_result",
+    "p31_receipt",
+    "classification",
+    "identity",
+    "protocol",
+    "correctness",
+    "metrics",
+)
+FULL_V2_SECTION_KEYS = {
+    "classification": (
+        "formal_eligible",
+        "performance_eligible",
+        "paper_claim_eligible",
+    ),
+    "identity": (
+        "logical_dataset_id",
+        "truth_sha256",
+        "host_fingerprint",
+    ),
+    "protocol": (
+        "query_count",
+        "interface_scope",
+        "concurrency",
+        "warmup_passes",
+        "measured_passes",
+        "per_query_timeout_ms",
+        "clock",
+        "timing_boundary",
+    ),
+    "correctness": (
+        "completed_queries",
+        "timeout_queries",
+        "mismatch_queries",
+        "expected_digest_sha256",
+        "actual_digest_sha256",
+    ),
+    "metrics": METRICS,
+}
+FULL_V2_SOURCES = {
+    "classification": "validated production receipt chain",
+    "identity.logical_dataset_id": "mixed_lineage_plan.logical_dataset_identity.logical_dataset_id",
+    "identity.truth_sha256": "mixed_lineage_plan.logical_dataset_identity.truth_sha256",
+    "identity.host_fingerprint": "validated_result.p31.host.fingerprint_sha256",
+    "protocol": "validated_result exact protocol fields",
+    "correctness": "validated_result cross-checked with correctness receipt and request truth",
+    "metrics": "validated_result exact measured metrics",
+}
 FALSE_ELIGIBILITY = {
     "formal_eligible": False,
     "performance_eligible": False,
     "paper_claim_eligible": False,
 }
+_CHECKPOINT_BIND_TOKEN = object()
 
 
 class CanaryError(RuntimeError):
@@ -124,6 +182,31 @@ def _expected_identity(plan: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def full_v2_contract() -> Dict[str, Any]:
+    return {
+        "top_level_groups": list(FULL_V2_TOP_LEVEL_GROUPS),
+        "section_keys": {
+            key: list(value) for key, value in FULL_V2_SECTION_KEYS.items()
+        },
+        "sources": dict(FULL_V2_SOURCES),
+        "writer": "evaluator-receipt-bound-o_excl-v1",
+    }
+
+
+def _validate_full_v2_shape(evidence: Mapping[str, Any]) -> None:
+    require(
+        set(evidence) == set(FULL_V2_TOP_LEVEL_GROUPS),
+        "checkpoint evidence top-level groups drift",
+    )
+    for section, keys in FULL_V2_SECTION_KEYS.items():
+        value = evidence.get(section)
+        require(type(value) is dict, f"checkpoint evidence {section} required")
+        require(
+            set(value) == set(keys),
+            f"checkpoint evidence {section} keys drift",
+        )
+
+
 def evaluate(
     plan_path: Path,
     evidence_path: Path,
@@ -140,6 +223,8 @@ def evaluate(
         evidence.get("schema_version") == expected_evidence_schema,
         "evidence schema drift",
     )
+    if expected_evidence_schema == CHECKPOINT_EVIDENCE_SCHEMA:
+        _validate_full_v2_shape(evidence)
     require(evidence.get("state") == "PASS", "canary evidence must PASS")
     require(evidence.get("cell_key") == "seml0:bridge-canary", "canary cell key drift")
     require(
@@ -325,6 +410,221 @@ def _iso(value: str) -> dt.datetime:
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def build_checkpoint_evidence(
+    *,
+    backend_plan_path: Path,
+    campaign_root: Path,
+    mixed_plan_path: Path,
+    evidence_path: Path,
+) -> Dict[str, Any]:
+    """Derive the complete v2 evidence object from the retained receipt chain.
+
+    This function does not write.  The CLI owns the single O_EXCL publication.
+    """
+    backend_plan_path = backend_plan_path.resolve()
+    backend = production.validate_backend_plan(backend_plan_path)
+    require(backend.get("state") == "READY", "checkpoint backend plan must be READY")
+    backend_ref = file_ref(backend_plan_path, "checkpoint backend plan")
+    root = campaign_root.resolve()
+    require(root == Path(backend["campaign_root"]).resolve(), "checkpoint campaign root drift")
+    contract = backend["canary_checkpoint"]
+    require(
+        contract.get("full_v2_contract") == full_v2_contract(),
+        "checkpoint full-v2 evidence contract drift",
+    )
+    mixed_plan_path = mixed_plan_path.resolve()
+    mixed_ref = file_ref(mixed_plan_path, "checkpoint mixed-lineage plan")
+    require(
+        mixed_ref == contract["mixed_lineage_plan"],
+        "checkpoint mixed-lineage plan drift",
+    )
+    mixed_plan = load_json(mixed_plan_path, "checkpoint mixed-lineage plan")
+    require(
+        mixed_plan.get("schema_version") == mixed.OUTPUT_SCHEMA,
+        "checkpoint mixed-lineage schema drift",
+    )
+    formal_contract = _contract(mixed_plan)
+    require(
+        formal_contract["contract_sha256"]
+        == contract["comparability_contract_sha256"],
+        "checkpoint comparability contract drift",
+    )
+    require(
+        evidence_path.absolute() == Path(contract["evidence_path"]).absolute(),
+        "checkpoint evidence path drift",
+    )
+    require(
+        not os.path.lexists(evidence_path.absolute()),
+        "checkpoint evidence path occupied",
+    )
+    resume = production.inspect_resume_root(
+        root, backend, backend_ref["sha256"], expected_mode="production"
+    )
+    require(
+        resume == {"state": "RESUME", "completed_cells": 1},
+        "checkpoint requires exact bridge-only prefix",
+    )
+    pending_path = Path(contract["pending_path"])
+    pending = load_json(pending_path, "CANARY_PENDING")
+    require(
+        pending == production.expected_canary_pending(
+            root, backend, backend_ref
+        ),
+        "CANARY_PENDING drift/replay",
+    )
+    bridge = backend["cells"][0]
+    bridge_final = Path(bridge["final_cell_root"]).resolve()
+    bridge_done = production.validate_final_cell(
+        bridge_final,
+        cell_key=bridge["cell_key"],
+        ordinal=bridge["ordinal"],
+        plan_sha=backend_ref["sha256"],
+        expected_mode="production",
+        target_p02b=bridge["runtime"]["target_p02b"],
+        target_query_plan=bridge["runtime"]["target_query_plan"],
+        target_lease=bridge["runtime"]["target_lease"],
+        adapter_tool=bridge["runtime"]["adapter_tool"],
+    )
+    require(bridge_done.get("state") == "PASS", "checkpoint bridge must PASS")
+    require(
+        bridge_done.get("mode") == "production"
+        and bridge_done.get("synthetic_test_only") is False
+        and bridge_done.get("fixture_only") is False,
+        "checkpoint bridge must be production/non-synthetic",
+    )
+    receipts = pending["bridge_receipts"]
+    require(
+        set(receipts) == set(production.RECEIPT_PATHS),
+        "checkpoint bridge receipt roles drift",
+    )
+    for role, receipt_ref in receipts.items():
+        verify_ref(receipt_ref, f"checkpoint bridge receipt {role}")
+    prepared = load_json(
+        Path(receipts["prepared_command"]["path"]), "bridge prepared-command receipt"
+    )
+    correctness_receipt = load_json(
+        Path(receipts["correctness"]["path"]), "bridge correctness receipt"
+    )
+    p31_receipt = load_json(Path(receipts["p31"]["path"]), "bridge P31 receipt")
+    validated_receipt = load_json(
+        Path(receipts["validated_result"]["path"]), "bridge validated-result receipt"
+    )
+    for label, value in (
+        ("prepared-command", prepared),
+        ("correctness", correctness_receipt),
+        ("P31", p31_receipt),
+        ("validated-result", validated_receipt),
+    ):
+        require(
+            value.get("state") == "PASS"
+            and value.get("mode") == "production"
+            and value.get("synthetic_test_only") is False
+            and value.get("fixture_only") is False,
+            f"bridge {label} must be production/non-synthetic PASS",
+        )
+        require(
+            value.get("cell_key") == "seml0:bridge-canary"
+            and value.get("ordinal") == 1
+            and value.get("backend_plan_sha256") == backend_ref["sha256"],
+            f"bridge {label} identity drift",
+        )
+    require(
+        p31_receipt.get("timing_generated") is True,
+        "bridge P31 must contain real timing",
+    )
+    validated_ref = verify_ref(
+        validated_receipt.get("adapter_result"), "bridge validated adapter result"
+    )
+    validated = load_json(Path(validated_ref["path"]), "bridge validated adapter result")
+    require(
+        validated.get("schema_version") == "cidr-p10-validated-repeat-v1"
+        and validated.get("system_id") == "seml0"
+        and validated.get("cell_key") == "seml0:bridge-canary"
+        and validated.get("ordinal") == 1,
+        "bridge validated result identity drift",
+    )
+    require(validated.get("backend_plan") == backend_ref, "bridge validated plan drift")
+    require(
+        validated.get("target_p02b") == pending["target_p02b"],
+        "bridge validated target drift",
+    )
+    require(
+        validated.get("final_cell_root") == str(bridge_final),
+        "bridge validated final root drift",
+    )
+    request_ref = verify_ref(prepared.get("request"), "bridge prepared adapter request")
+    require(validated.get("request") == request_ref, "bridge request backlink drift")
+    request = load_json(Path(request_ref["path"]), "bridge prepared adapter request")
+    truth = request.get("truth")
+    require(type(truth) is dict, "bridge request truth binding required")
+    identity = {
+        "logical_dataset_id": mixed_plan["logical_dataset_identity"][
+            "logical_dataset_id"
+        ],
+        "truth_sha256": mixed_plan["logical_dataset_identity"]["truth_sha256"],
+        "host_fingerprint": validated.get("p31", {})
+        .get("host", {})
+        .get("fingerprint_sha256"),
+    }
+    require(
+        identity["truth_sha256"] == truth.get("sha256"),
+        "bridge request/mixed truth drift",
+    )
+    protocol = {
+        key: validated.get(key) for key in FULL_V2_SECTION_KEYS["protocol"]
+    }
+    correctness = {
+        key: validated.get(key) for key in FULL_V2_SECTION_KEYS["correctness"]
+    }
+    require(
+        correctness_receipt.get("query_count") == protocol["query_count"]
+        == correctness["completed_queries"],
+        "bridge correctness query count drift",
+    )
+    require(
+        correctness_receipt.get("timeout_queries") == correctness["timeout_queries"]
+        and correctness_receipt.get("mismatch_queries")
+        == correctness["mismatch_queries"],
+        "bridge correctness receipt/result drift",
+    )
+    require(
+        correctness["expected_digest_sha256"]
+        == correctness["actual_digest_sha256"]
+        == mixed_plan["logical_dataset_identity"]["expected_digest_sha256"],
+        "bridge correctness digest drift",
+    )
+    metrics = {
+        "completed_qps": validated.get("qps"),
+        "latency_p50_us": validated.get("latency_p50_us"),
+        "latency_p95_us": validated.get("latency_p95_us"),
+        "latency_p99_us": validated.get("latency_p99_us"),
+    }
+    evidence = {
+        "schema_version": CHECKPOINT_EVIDENCE_SCHEMA,
+        "state": "PASS",
+        "cell_key": "seml0:bridge-canary",
+        "backend_plan": backend_ref,
+        "bridge_cell_done": pending["bridge_cell_done"],
+        "bridge_receipts": receipts,
+        "mixed_lineage_plan": mixed_ref,
+        "contract_sha256": formal_contract["contract_sha256"],
+        "validated_result_receipt": receipts["validated_result"],
+        "validated_result": validated_ref,
+        "p31_receipt": receipts["p31"],
+        "classification": {
+            "formal_eligible": True,
+            "performance_eligible": True,
+            "paper_claim_eligible": False,
+        },
+        "identity": identity,
+        "protocol": protocol,
+        "correctness": correctness,
+        "metrics": metrics,
+    }
+    _validate_full_v2_shape(evidence)
+    return evidence
+
+
 def _validate_comparability_receipt(
     value: Mapping[str, Any],
     *,
@@ -399,6 +699,10 @@ def validate_checkpoint_inputs(
     require(root == Path(backend["campaign_root"]).resolve(), "checkpoint campaign root drift")
     contract = backend["canary_checkpoint"]
     require(
+        contract.get("full_v2_contract") == full_v2_contract(),
+        "checkpoint full-v2 evidence contract drift",
+    )
+    require(
         file_ref(mixed_plan_path.resolve(), "checkpoint mixed-lineage plan")
         == contract["mixed_lineage_plan"],
         "checkpoint mixed-lineage plan drift",
@@ -423,6 +727,7 @@ def validate_checkpoint_inputs(
     )
     evidence_ref = file_ref(evidence_path, "checkpoint canary evidence")
     evidence = load_json(evidence_path, "checkpoint canary evidence")
+    _validate_full_v2_shape(evidence)
     require(
         evidence.get("schema_version") == CHECKPOINT_EVIDENCE_SCHEMA,
         "checkpoint evidence schema drift",
@@ -618,11 +923,18 @@ def validate_checkpoint_inputs(
     }
 
 
-def bind_production_checkpoint(
+def _bind_production_checkpoint(
     comparability_path: Path,
     backend_plan_path: Path,
     campaign_root: Path,
+    *,
+    expected_comparability: Mapping[str, Any],
+    bind_token: object,
 ) -> Dict[str, Any]:
+    require(
+        bind_token is _CHECKPOINT_BIND_TOKEN,
+        "checkpoint bind is internal to the evaluator transaction",
+    )
     backend_plan_path = backend_plan_path.resolve()
     backend_plan = production.validate_backend_plan(backend_plan_path)
     contract = backend_plan["canary_checkpoint"]
@@ -657,6 +969,10 @@ def bind_production_checkpoint(
     )
     comparability_ref = file_ref(comparability_path, "comparability receipt")
     comparability = load_json(comparability_path, "comparability receipt")
+    require(
+        comparability == expected_comparability,
+        "published comparability differs from evaluator transaction",
+    )
     evidence_ref = checkpoint["evidence_ref"]
     _validate_comparability_receipt(
         comparability, contract=contract, evidence_ref=evidence_ref
@@ -721,6 +1037,64 @@ def atomic_write(path: Path, value: Mapping[str, Any]) -> None:
         os.fsync(stream.fileno())
 
 
+def run_production_checkpoint(
+    *,
+    backend_plan_path: Path,
+    campaign_root: Path,
+    mixed_plan_path: Path,
+    evidence_path: Path,
+    evaluation_path: Path,
+) -> Dict[str, Any]:
+    backend = production.validate_backend_plan(backend_plan_path.resolve())
+    contract = backend["canary_checkpoint"]
+    require(
+        evaluation_path.absolute()
+        == Path(contract["evaluation_path"]).absolute(),
+        "checkpoint output path drift",
+    )
+    comparability_path = Path(contract["comparability_path"])
+    require(
+        not os.path.lexists(comparability_path),
+        "checkpoint comparability path occupied",
+    )
+    require(
+        not os.path.lexists(evaluation_path.absolute()),
+        "checkpoint evaluation path occupied",
+    )
+    evidence = build_checkpoint_evidence(
+        backend_plan_path=backend_plan_path,
+        campaign_root=campaign_root,
+        mixed_plan_path=mixed_plan_path,
+        evidence_path=evidence_path,
+    )
+    atomic_write(evidence_path, evidence)
+    checkpoint = validate_checkpoint_inputs(
+        backend_plan_path=backend_plan_path,
+        campaign_root=campaign_root,
+        mixed_plan_path=mixed_plan_path,
+        evidence_path=evidence_path,
+    )
+    comparability = evaluate(
+        mixed_plan_path.resolve(),
+        evidence_path.resolve(),
+        expected_evidence_schema=CHECKPOINT_EVIDENCE_SCHEMA,
+    )
+    require(
+        comparability.get("state") == "PASS",
+        "checkpoint comparability did not PASS",
+    )
+    atomic_write(comparability_path, comparability)
+    receipt = _bind_production_checkpoint(
+        comparability_path,
+        backend_plan_path.resolve(),
+        campaign_root.resolve(),
+        expected_comparability=comparability,
+        bind_token=_CHECKPOINT_BIND_TOKEN,
+    )
+    atomic_write(evaluation_path, receipt)
+    return receipt
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mixed-plan", type=Path, required=True)
@@ -740,45 +1114,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if args.backend_plan is not None:
             require(args.output is not None, "checkpoint mode requires output")
-            checkpoint = validate_checkpoint_inputs(
+            receipt = run_production_checkpoint(
                 backend_plan_path=args.backend_plan,
                 campaign_root=args.campaign_root,
                 mixed_plan_path=args.mixed_plan,
                 evidence_path=args.canary_evidence,
-            )
-            backend = checkpoint["backend"]
-            expected_output = Path(backend["canary_checkpoint"]["evaluation_path"]).absolute()
-            require(args.output.absolute() == expected_output, "checkpoint output path drift")
-            comparability = evaluate(
-                args.mixed_plan.resolve(),
-                args.canary_evidence.resolve(),
-                expected_evidence_schema=CHECKPOINT_EVIDENCE_SCHEMA,
-            )
-            comparability_path = Path(
-                backend["canary_checkpoint"]["comparability_path"]
-            )
-            if os.path.lexists(comparability_path):
-                require(
-                    comparability_path.is_file()
-                    and not comparability_path.is_symlink()
-                    and load_json(comparability_path, "comparability receipt")
-                    == comparability,
-                    "retained comparability receipt drift",
-                )
-            else:
-                atomic_write(comparability_path, comparability)
-            receipt = bind_production_checkpoint(
-                comparability_path,
-                args.backend_plan.resolve(),
-                args.campaign_root.resolve(),
+                evaluation_path=args.output,
             )
         else:
             receipt = evaluate(args.mixed_plan.resolve(), args.canary_evidence.resolve())
         if args.output is None:
             print(json.dumps(receipt, indent=2, sort_keys=True))
-        else:
+        elif args.backend_plan is None:
             atomic_write(args.output, receipt)
-            print(json.dumps({"state": receipt["state"], "output": str(args.output.resolve())}))
+        if args.output is not None:
+            print(
+                json.dumps(
+                    {"state": receipt["state"], "output": str(args.output.resolve())}
+                )
+            )
         return 0 if receipt["state"] == "PASS" else 3
     except (CanaryError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}")
