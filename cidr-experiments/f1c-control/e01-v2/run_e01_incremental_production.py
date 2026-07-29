@@ -462,13 +462,19 @@ def consume_canary_evaluation(
         and comparability.get("failures") == []
         and type(comparability.get("identity_checks")) is dict
         and set(comparability["identity_checks"]) == expected_identity
-        and all(row.get("state") == "PASS" for row in comparability["identity_checks"].values())
+        and all(
+            type(row) is dict and row.get("state") == "PASS"
+            for row in comparability["identity_checks"].values()
+        )
         and type(comparability.get("correctness_checks")) is dict
         and set(comparability["correctness_checks"]) == expected_correctness
         and all(state == "PASS" for state in comparability["correctness_checks"].values())
         and type(comparability.get("performance_checks")) is dict
         and set(comparability["performance_checks"]) == expected_performance
-        and all(row.get("state") == "PASS" for row in comparability["performance_checks"].values())
+        and all(
+            type(row) is dict and row.get("state") == "PASS"
+            for row in comparability["performance_checks"].values()
+        )
         and comparability.get("normalizer_release") is True,
         "canary comparability did not release",
     )

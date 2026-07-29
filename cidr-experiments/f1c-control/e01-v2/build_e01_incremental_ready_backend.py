@@ -371,6 +371,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     evaluator_ref = file_ref(evaluator_path, "canary evaluator")
     mixed_path = args.phase_executor.with_name("E01-mixed-lineage-plan-v1.json")
     mixed_plan, mixed_ref = load(mixed_path, "formal mixed-lineage plan")
+    require(
+        mixed_plan.get("schema_version") == "cidr-e01-mixed-lineage-composition-v1",
+        "formal mixed-lineage plan schema drift",
+    )
     comparability_contract = mixed_plan.get("incremental_plan", {}).get(
         "bridge_canary_comparability_contract"
     )
