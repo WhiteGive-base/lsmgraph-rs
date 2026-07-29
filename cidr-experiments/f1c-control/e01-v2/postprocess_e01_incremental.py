@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import os
+import shlex
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
@@ -232,6 +233,151 @@ def validate_role_receipt(
     return value
 
 
+def validate_cross_role_bindings(
+    *,
+    final: Path,
+    refs: Mapping[str, Mapping[str, Any]],
+    receipt_values: Mapping[str, Mapping[str, Any]],
+    validated: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+    target_p02b: Mapping[str, Any],
+    key: str,
+) -> None:
+    prepared = receipt_values["prepared_command"]
+    p31 = receipt_values["p31"]
+    topology = receipt_values["command_topology"]
+    validated_receipt = receipt_values["validated_result"]
+    clone = receipt_values["store_clone"]
+    cleanup = receipt_values["cleanup"]
+    binding = provenance.get("split_phase_binding")
+    command = provenance.get("command")
+    require(type(binding) is dict, f"{key}: provenance binding required")
+    require(type(command) is dict, f"{key}: provenance command required")
+    require(
+        all(
+            Path(refs[role]["path"]).resolve()
+            == final / RECEIPT_PATHS[role]
+            for role in RECEIPT_PATHS
+        ),
+        f"{key}: cross-role fixed receipt path drift",
+    )
+
+    request_ref = verify_ref(prepared.get("request"), f"{key}: prepared request")
+    require(
+        validated_receipt.get("request") == request_ref
+        and validated.get("request") == request_ref
+        and provenance.get("request") == request_ref
+        and binding.get("request") == request_ref,
+        f"{key}: prepared/validated/provenance request drift",
+    )
+    binary_argv = prepared.get("binary_argv")
+    require(
+        binary_argv == topology.get("argv")
+        and binary_argv == command.get("argv"),
+        f"{key}: prepared/topology/provenance binary argv drift",
+    )
+    argv_sha = hashlib.sha256(
+        json.dumps(binary_argv, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    require(
+        topology.get("argv_sha256") == argv_sha
+        and command.get("argv_sha256") == argv_sha,
+        f"{key}: topology/provenance argv SHA drift",
+    )
+
+    topology_ref = refs["command_topology"]
+    p31_ref = refs["p31"]
+    manifest_ref = verify_ref(p31.get("run_manifest"), f"{key}: P31 run manifest")
+    topology_manifest_ref = verify_ref(
+        topology.get("run_manifest"), f"{key}: topology run manifest"
+    )
+    manifest = load_json(Path(manifest_ref["path"]), f"{key}: P31 run manifest")
+    topology_command_ref = verify_ref(
+        topology.get("command_file"), f"{key}: topology command file"
+    )
+    manifest_command_ref = verify_ref(
+        manifest.get("command"), f"{key}: manifest command file"
+    )
+    launched_argv = shlex.split(
+        Path(topology_command_ref["path"]).read_text(encoding="utf-8").strip()
+    )
+    require(
+        p31.get("command_topology") == topology_ref
+        and topology_manifest_ref == manifest_ref
+        and topology_command_ref == manifest_command_ref
+        and binding.get("p31_receipt") == p31_ref
+        and binding.get("p31_run_manifest") == manifest_ref
+        and binding.get("command_topology") == topology_ref
+        and command.get("run_manifest") == manifest_ref
+        and command.get("command_topology") == topology_ref,
+        f"{key}: P31/topology/provenance reference chain drift",
+    )
+    require(
+        topology.get("root_pid") == manifest.get("root_pid")
+        and command.get("root_pid") == manifest.get("root_pid"),
+        f"{key}: P31/topology/provenance root PID drift",
+    )
+    require(
+        launched_argv == binary_argv
+        and manifest.get("command_exit_code") == 0,
+        f"{key}: P31 command file/argv/exit drift",
+    )
+    p31_argv = prepared.get("p31_argv")
+    launcher_ref = verify_ref(topology.get("launcher"), f"{key}: P31 launcher")
+    wrapper_ref = verify_ref(provenance.get("p31_wrapper"), f"{key}: P31 wrapper")
+    separator = p31_argv.index("--") if type(p31_argv) is list and "--" in p31_argv else -1
+    config_index = (
+        p31_argv.index("--config")
+        if type(p31_argv) is list and "--config" in p31_argv
+        else -1
+    )
+    require(
+        type(p31_argv) is list
+        and p31_argv
+        and Path(p31_argv[0]).resolve() == Path(wrapper_ref["path"]).resolve()
+        and launcher_ref == wrapper_ref,
+        f"{key}: prepared P31 argv/wrapper chain drift",
+    )
+    require(
+        p31_argv.count("--") == 1
+        and separator > 0
+        and p31_argv[separator + 1 :] == binary_argv
+        and p31_argv.count("--config") == 1
+        and 0 <= config_index < len(p31_argv) - 1
+        and Path(p31_argv[config_index + 1]).resolve()
+        == Path(request_ref["path"]).resolve(),
+        f"{key}: prepared P31 argv/request/binary suffix drift",
+    )
+
+    target_ref = verify_ref(target_p02b, f"{key}: target P02B")
+    target = load_json(Path(target_ref["path"]), f"{key}: target P02B")
+    static = target.get("static_inputs")
+    target_tree = static.get("store_tree_sha256") if type(static) is dict else None
+    provenance_store = provenance.get("store")
+    clone_tree = clone.get("verification", {}).get("clone_tree")
+    require(
+        type(target_tree) is str
+        and len(target_tree) == 64
+        and type(provenance_store) is dict
+        and provenance_store.get("tree_sha256") == target_tree
+        and provenance_store.get("clone_receipt") == refs["store_clone"]
+        and clone.get("source_tree_sha256") == target_tree
+        and type(clone_tree) is dict
+        and clone_tree.get("sha256") == target_tree,
+        f"{key}: store-clone/target/provenance tree drift",
+    )
+    clone_target = clone.get("target")
+    require(
+        type(clone_target) is str
+        and Path(clone_target).is_absolute()
+        and cleanup.get("mutable_clone") == clone_target
+        and cleanup.get("mutable_clone_removed") is True
+        and cleanup.get("mutable_clone_lexists_after") is False
+        and not os.path.lexists(clone_target),
+        f"{key}: store-clone/cleanup target drift",
+    )
+
+
 def matrix_evidence_adapter(
     anchor_path: Path, backend_plan_path: Path, matrix_done_path: Path
 ) -> Dict[str, Any]:
@@ -400,6 +546,15 @@ def matrix_evidence_adapter(
             f"{key}: provenance/backend binding drift",
         )
         runtime = row["runtime"]
+        validate_cross_role_bindings(
+            final=final,
+            refs=refs,
+            receipt_values=receipt_values,
+            validated=validated,
+            provenance=provenance,
+            target_p02b=runtime["target_p02b"],
+            key=key,
+        )
         evidence_cells.append(
             {
                 "ordinal": ordinal,

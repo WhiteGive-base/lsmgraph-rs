@@ -431,20 +431,23 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 },
             },
         )
-        run_manifest = write_json(
-            root,
-            f"{final_relative}/p31/run-manifest.json",
-            {"state": "PASS", "root_pid": 12345, "host": {"fingerprint_sha256": HOST_SHA}},
-        )
         argv = ["/bin/true"]
         argv_sha = hashlib.sha256(
             json.dumps(argv, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        launcher = write_text(
-            root, f"{final_relative}/p31/launcher.sh", "#!/bin/sh\nexec /bin/true\n"
-        )
         command_file = write_text(
-            root, f"{final_relative}/p31/command.json", json.dumps(argv) + "\n"
+            root, f"{final_relative}/p31/command.txt", "/bin/true\n"
+        )
+        run_manifest = write_json(
+            root,
+            f"{final_relative}/p31/run-manifest.json",
+            {
+                "state": "PASS",
+                "root_pid": 12345,
+                "command_exit_code": 0,
+                "command": command_file,
+                "host": {"fingerprint_sha256": HOST_SHA},
+            },
         )
         topology = write_json(
             root,
@@ -461,7 +464,7 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "cell_key": key,
                 "ordinal": ordinal,
                 "backend_plan_sha256": backend_plan["sha256"],
-                "launcher": launcher,
+                "launcher": p31_wrapper,
                 "run_manifest": run_manifest,
                 "command_file": command_file,
                 "root_pid": 12345,
@@ -513,7 +516,13 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "backend_plan_sha256": backend_plan["sha256"],
                 "request": request,
                 "binary_argv": argv,
-                "p31_argv": argv,
+                "p31_argv": [
+                    p31_wrapper["path"],
+                    "--config",
+                    request["path"],
+                    "--",
+                    *argv,
+                ],
                 "asset_hash_inside_p31": False,
                 "clone_inside_p31": False,
                 "timing_boundary": "p31-wraps-storage-bench-binary-only-v1",
@@ -710,6 +719,7 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "ordinal": ordinal,
                 "backend_plan_sha256": backend_plan["sha256"],
                 "target_p02b": target_refs[target_variant],
+                "request": request,
                 "adapter_result": validated,
                 "adapter_provenance": provenance,
             },

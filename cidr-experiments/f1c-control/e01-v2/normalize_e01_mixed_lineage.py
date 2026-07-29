@@ -26,7 +26,11 @@ from build_e01_mixed_lineage import (
     read_json,
     sha256_file,
 )
-from postprocess_e01_incremental import EvidenceError, validate_role_receipt
+from postprocess_e01_incremental import (
+    EvidenceError,
+    validate_cross_role_bindings,
+    validate_role_receipt,
+)
 
 
 TSV_COLUMNS = (
@@ -261,6 +265,8 @@ def _validate_fresh_provenance(
     done_receipts = cell_done.get("receipts")
     if type(done_receipts) is not dict or set(done_receipts) != set(CELL_RECEIPT_PATHS):
         raise CompositionError(f"{key}: CELL-DONE receipt set drift")
+    role_refs: Dict[str, Dict[str, Any]] = {}
+    receipt_values: Dict[str, Dict[str, Any]] = {}
     for role, relative in CELL_RECEIPT_PATHS.items():
         path = final_root / relative
         actual = {
@@ -271,7 +277,7 @@ def _validate_fresh_provenance(
         if done_receipts.get(role) != actual:
             raise CompositionError(f"{key}: CELL-DONE {role} descriptor drift")
         try:
-            validate_role_receipt(
+            receipt_values[role] = validate_role_receipt(
                 path,
                 role,
                 key=key,
@@ -281,12 +287,29 @@ def _validate_fresh_provenance(
             )
         except EvidenceError as exc:
             raise CompositionError(str(exc)) from exc
+        role_refs[role] = {
+            "path": str(path.resolve()),
+            "sha256": actual["sha256"],
+            "size_bytes": actual["size_bytes"],
+        }
     cleanup_ref = _require_ref_path(
         cell.get("cleanup_receipt"),
         final_root / "receipts" / "cleanup.json",
         f"{key}.cleanup_receipt",
     )
     cleanup = read_json(Path(cleanup_ref["path"]), f"{key}.cleanup_receipt")
+    try:
+        validate_cross_role_bindings(
+            final=final_root,
+            refs=role_refs,
+            receipt_values=receipt_values,
+            validated=validated,
+            provenance=provenance,
+            target_p02b=target_ref,
+            key=key,
+        )
+    except EvidenceError as exc:
+        raise CompositionError(str(exc)) from exc
     artifacts = validated.get("adapter_artifacts")
     if type(artifacts) is not dict:
         raise CompositionError(f"{key}: validated adapter artifacts required")
