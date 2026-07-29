@@ -365,6 +365,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     sentinel, sentinel_ref = verify_ref(admission["p02b"]["sentinel"], "legacy P02B sentinel")
     executor_ref = file_ref(args.phase_executor, "phase executor")
     require(os.access(args.phase_executor, os.X_OK), "phase executor must be executable")
+    scheduler_path = args.phase_executor.with_name("run_e01_incremental_production.py")
+    evaluator_path = args.phase_executor.with_name("evaluate_e01_bridge_canary.py")
+    scheduler_ref = file_ref(scheduler_path, "production scheduler")
+    evaluator_ref = file_ref(evaluator_path, "canary evaluator")
     require(
         args.campaign_root.is_absolute() and not os.path.lexists(args.campaign_root),
         "campaign root must be absolute and absent, including dangling symlink",
@@ -575,6 +579,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "fixture_only": False,
         "admission_bundle": admission_ref,
         "phase_executor": executor_ref,
+        "production_scheduler": scheduler_ref,
+        "canary_evaluator": evaluator_ref,
         "clone_dry_run": clone_ref,
         "target_p02b": target_refs,
         "clone_fallback_predecessor": failed_clone_ref,
@@ -597,6 +603,17 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "dataset_manifest": dataset_manifest_ref,
         "p02b_sentinel": sentinel_ref,
         "phase_executor": executor_ref,
+        "production_scheduler": scheduler_ref,
+        "canary_checkpoint": {
+            "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v1",
+            "evaluator": evaluator_ref,
+            "pending_path": str(args.campaign_root / "CANARY-PENDING.json"),
+            "evaluation_path": str(args.campaign_root / "CANARY-EVALUATION.json"),
+            "accepted_path": str(args.campaign_root / "CANARY-ACCEPTED.json"),
+            "first_launch_max_completed_cells": 1,
+            "resume_requires_evaluation_state": "PASS",
+            "matrix_done_before_acceptance": False,
+        },
         "clone_dry_run": clone_ref,
         "target_p02b": target_refs,
         "clone_fallback_predecessor": failed_clone_ref,
@@ -620,6 +637,22 @@ def validate(value: Mapping[str, Any]) -> None:
         type(value.get("clone_fallback_predecessor")) is dict
         and set(value["clone_fallback_predecessor"]) == {"path", "sha256", "size_bytes"},
         "clone fallback predecessor ref required",
+    )
+    require(
+        type(value.get("production_scheduler")) is dict
+        and set(value["production_scheduler"]) == {"path", "sha256", "size_bytes"},
+        "production scheduler ref required",
+    )
+    checkpoint = value.get("canary_checkpoint")
+    require(
+        type(checkpoint) is dict
+        and checkpoint.get("schema_version")
+        == "cidr-e01-incremental-canary-checkpoint-contract-v1"
+        and type(checkpoint.get("evaluator")) is dict
+        and checkpoint.get("first_launch_max_completed_cells") == 1
+        and checkpoint.get("resume_requires_evaluation_state") == "PASS"
+        and checkpoint.get("matrix_done_before_acceptance") is False,
+        "canary checkpoint contract drift",
     )
     require([row.get("cell_key") for row in value.get("cells", [])] == list(CELL_ORDER), "cell order drift")
     for key in FALSE_ELIGIBILITY:

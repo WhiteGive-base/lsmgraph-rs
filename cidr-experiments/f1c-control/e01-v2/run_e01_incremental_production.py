@@ -23,6 +23,9 @@ START_SCHEMA = "cidr-e01-incremental-production-matrix-start-v1"
 CELL_SCHEMA = "cidr-e01-incremental-production-cell-done-v1"
 DONE_SCHEMA = "cidr-e01-incremental-production-matrix-done-v1"
 FAILED_SCHEMA = "cidr-e01-incremental-production-failed-v1"
+CANARY_PENDING_SCHEMA = "cidr-e01-incremental-canary-pending-v1"
+CANARY_ACCEPTED_SCHEMA = "cidr-e01-incremental-canary-accepted-v1"
+CANARY_EVALUATION_SCHEMA = "cidr-e01-bridge-canary-checkpoint-receipt-v2"
 CELL_ORDER = (
     "seml0:bridge-canary",
     "seml0-naive:r1",
@@ -133,6 +136,35 @@ def external_file_ref(path: Path) -> Dict[str, Any]:
     return {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
 
 
+def verify_scheduler_binding(value: Mapping[str, Any]) -> Dict[str, Any]:
+    actual_path = Path(__file__).resolve()
+    ref = verify_external_file_ref(value.get("production_scheduler"), "production scheduler")
+    require(Path(ref["path"]).resolve() == actual_path, "runtime scheduler path differs from plan")
+    require(ref["sha256"] == sha256_file(actual_path), "runtime scheduler self SHA drift")
+    return ref
+
+
+def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
+    contract = value.get("canary_checkpoint")
+    require(type(contract) is dict, "canary checkpoint contract required")
+    require(
+        contract.get("schema_version") == "cidr-e01-incremental-canary-checkpoint-contract-v1",
+        "canary checkpoint contract schema drift",
+    )
+    verify_external_file_ref(contract.get("evaluator"), "canary evaluator")
+    expected = {
+        "pending_path": root / "CANARY-PENDING.json",
+        "evaluation_path": root / "CANARY-EVALUATION.json",
+        "accepted_path": root / "CANARY-ACCEPTED.json",
+    }
+    for key, path in expected.items():
+        require(
+            Path(str(contract.get(key, ""))).absolute() == path.absolute(),
+            f"canary checkpoint {key} drift",
+        )
+    return dict(contract)
+
+
 def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
     plan_path = value_or_path.resolve() if isinstance(value_or_path, Path) else None
     value = (
@@ -147,8 +179,10 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
     require(value.get("synthetic_test_only") is False, "production backend cannot be synthetic")
     root = Path(str(value.get("campaign_root", "")))
     require(root.is_absolute(), "absolute campaign root required")
+    scheduler_ref = verify_scheduler_binding(value)
     executor_ref = value.get("phase_executor")
     verify_external_file_ref(executor_ref, "phase executor")
+    checkpoint = _canary_contract(value, root)
     cells = value.get("cells")
     require(type(cells) is list and len(cells) == 4, "exactly four backend cells required")
     require([row.get("cell_key") for row in cells] == list(CELL_ORDER), "cell order drift")
@@ -207,6 +241,8 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
             require(gate.get("synthetic_test_only") is False, f"{name}: synthetic gate forbidden")
             require(gate.get("fixture_only") is False, f"{name}: fixture gate forbidden")
             require(gate.get("phase_executor") == executor_ref, f"{name}: phase executor backlink drift")
+            require(gate.get("production_scheduler") == scheduler_ref, f"{name}: scheduler backlink drift")
+            require(gate.get("canary_evaluator") == checkpoint["evaluator"], f"{name}: evaluator backlink drift")
             require(type(gate.get("backend_plan")) is dict, f"{name}: backend plan backlink required")
             if plan_path is not None:
                 require(
@@ -217,6 +253,134 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
         require(value.get("execution_state") == "BLOCKED", "HOLD backend must BLOCK")
         require(type(value.get("blockers")) is list and value["blockers"], "HOLD blockers required")
     return value
+
+
+def _bridge_receipts(final: Path, done: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    refs = done.get("receipts")
+    require(type(refs) is dict and set(refs) == set(RECEIPT_PATHS), "bridge receipt set drift")
+    result: Dict[str, Dict[str, Any]] = {}
+    for role, descriptor in refs.items():
+        require(type(descriptor) is dict and type(descriptor.get("path")) is str, f"{role}: bridge ref drift")
+        result[role] = external_file_ref(final / descriptor["path"])
+    return result
+
+
+def _arming_gate_ref(plan: Mapping[str, Any]) -> Dict[str, Any]:
+    descriptor = plan.get("campaign_gates", {}).get("backend_arming")
+    require(type(descriptor) is dict and set(descriptor) == {"path"}, "backend arming gate path drift")
+    return external_file_ref(Path(descriptor["path"]))
+
+
+def expected_canary_pending(
+    root: Path,
+    plan: Mapping[str, Any],
+    plan_ref: Mapping[str, Any],
+) -> Dict[str, Any]:
+    bridge = plan["cells"][0]
+    final = Path(bridge["final_cell_root"])
+    done = validate_final_cell(
+        final,
+        cell_key=bridge["cell_key"],
+        ordinal=bridge["ordinal"],
+        plan_sha=plan_ref["sha256"],
+        expected_mode="production",
+        target_p02b=bridge["runtime"]["target_p02b"],
+        target_query_plan=bridge["runtime"]["target_query_plan"],
+        target_lease=bridge["runtime"]["target_lease"],
+    )
+    return {
+        "schema_version": CANARY_PENDING_SCHEMA,
+        "state": "CANARY_PENDING",
+        "completed_cells": 1,
+        "campaign_root": str(root),
+        "backend_plan": dict(plan_ref),
+        "arming_gate": _arming_gate_ref(plan),
+        "bridge_cell_done": external_file_ref(final / "CELL-DONE.json"),
+        "bridge_receipts": _bridge_receipts(final, done),
+        "target_p02b": bridge["runtime"]["target_p02b"],
+        "target_query_plan": bridge["runtime"]["target_query_plan"],
+        "target_lease": bridge["runtime"]["target_lease"],
+        "canary_evaluator": plan["canary_checkpoint"]["evaluator"],
+        "matrix_terminal": False,
+        **FALSE_ELIGIBILITY,
+    }
+
+
+def ensure_canary_pending(
+    root: Path,
+    plan: Mapping[str, Any],
+    plan_ref: Mapping[str, Any],
+) -> Dict[str, Any]:
+    require(not os.path.lexists(root / "MATRIX-DONE.json"), "bridge checkpoint cannot be MATRIX-DONE")
+    require(not os.path.lexists(root / "MATRIX-FAILED.json"), "failed campaign cannot enter canary checkpoint")
+    expected = expected_canary_pending(root, plan, plan_ref)
+    path = Path(plan["canary_checkpoint"]["pending_path"])
+    if os.path.lexists(path):
+        require(path.is_file() and not path.is_symlink(), "CANARY_PENDING path invalid")
+        require(load_json(path, "CANARY_PENDING") == expected, "CANARY_PENDING drift/replay")
+    else:
+        atomic_json(path, expected)
+    return expected
+
+
+def consume_canary_evaluation(
+    root: Path,
+    plan: Mapping[str, Any],
+    plan_ref: Mapping[str, Any],
+    pending: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    contract = plan["canary_checkpoint"]
+    evaluation_path = Path(contract["evaluation_path"])
+    if not os.path.lexists(evaluation_path):
+        return None
+    require(
+        evaluation_path.is_file() and not evaluation_path.is_symlink(),
+        "canary evaluation path invalid",
+    )
+    evaluation_ref = external_file_ref(evaluation_path)
+    evaluation = load_json(evaluation_path, "canary evaluation")
+    require(evaluation.get("schema_version") == CANARY_EVALUATION_SCHEMA, "canary evaluation schema drift")
+    require(evaluation.get("state") == "PASS", "canary evaluation did not PASS")
+    require(evaluation.get("campaign_root") == str(root), "canary evaluation campaign drift")
+    require(evaluation.get("backend_plan") == plan_ref, "canary evaluation plan drift/replay")
+    require(evaluation.get("arming_gate") == pending["arming_gate"], "canary evaluation gate drift")
+    require(
+        evaluation.get("canary_pending") == external_file_ref(Path(contract["pending_path"])),
+        "canary evaluation pending drift/replay",
+    )
+    require(evaluation.get("bridge_cell_done") == pending["bridge_cell_done"], "canary bridge result drift")
+    require(evaluation.get("bridge_receipts") == pending["bridge_receipts"], "canary bridge receipts drift")
+    require(evaluation.get("target_p02b") == pending["target_p02b"], "canary target P02B drift")
+    require(evaluation.get("target_query_plan") == pending["target_query_plan"], "canary query plan drift")
+    require(evaluation.get("target_lease") == pending["target_lease"], "canary lease drift")
+    require(evaluation.get("evaluator") == contract["evaluator"], "canary evaluator identity drift")
+    require(
+        evaluation.get("comparability", {}).get("state") == "PASS"
+        and evaluation["comparability"].get("normalizer_release") is True,
+        "canary comparability did not release",
+    )
+    accepted_path = Path(contract["accepted_path"])
+    accepted = {
+        "schema_version": CANARY_ACCEPTED_SCHEMA,
+        "state": "PASS",
+        "campaign_root": str(root),
+        "backend_plan": dict(plan_ref),
+        "canary_pending": external_file_ref(Path(contract["pending_path"])),
+        "canary_evaluation": evaluation_ref,
+        "bridge_cell_done": pending["bridge_cell_done"],
+        "resume_from_ordinal": 2,
+        **FALSE_ELIGIBILITY,
+    }
+    if os.path.lexists(accepted_path):
+        require(
+            accepted_path.is_file()
+            and not accepted_path.is_symlink()
+            and load_json(accepted_path, "CANARY_ACCEPTED") == accepted,
+            "CANARY_ACCEPTED drift/replay",
+        )
+    else:
+        atomic_json(accepted_path, accepted)
+    return evaluation_ref
 
 
 def _validate_receipt(
@@ -360,7 +524,7 @@ def inspect_resume_root(
     *,
     expected_mode: str = "production",
 ) -> Dict[str, Any]:
-    if not root.exists():
+    if not os.path.lexists(root):
         return {"state": "NEW", "completed_cells": 0}
     require(root.is_dir() and not root.is_symlink(), "campaign root invalid")
     require(not (root / "MATRIX-FAILED.json").exists(), "failed campaign root must be preserved")
@@ -395,12 +559,33 @@ def inspect_resume_root(
         )
         completed += 1
     done_path = root / "MATRIX-DONE.json"
-    if done_path.exists():
+    if os.path.lexists(done_path):
         require(completed == 4, "premature MATRIX-DONE")
         done = load_json(done_path, "MATRIX-DONE")
         require(done.get("schema_version") == DONE_SCHEMA, "MATRIX-DONE schema drift")
         require(done.get("completed_cells") == 4, "MATRIX-DONE count drift")
         require(done.get("backend_plan_sha256") == plan_sha, "MATRIX-DONE plan drift")
+        require(
+            done.get("canary_evaluation")
+            == external_file_ref(Path(plan["canary_checkpoint"]["evaluation_path"])),
+            "MATRIX-DONE canary evaluation drift",
+        )
+        require(
+            done.get("canary_accepted")
+            == external_file_ref(Path(plan["canary_checkpoint"]["accepted_path"])),
+            "MATRIX-DONE canary acceptance drift",
+        )
+    if expected_mode == "production" and completed == 0:
+        require(
+            not os.path.lexists(root / "CANARY-PENDING.json")
+            and not os.path.lexists(root / "CANARY-ACCEPTED.json"),
+            "canary checkpoint exists before bridge completion",
+        )
+    if expected_mode == "production" and completed > 1:
+        require(
+            os.path.lexists(root / "CANARY-ACCEPTED.json"),
+            "post-bridge cells exist without accepted canary",
+        )
     return {"state": "RESUME", "completed_cells": completed}
 
 
@@ -419,6 +604,7 @@ def execute_production(
     require(plan["state"] == "READY", "backend plan is not READY")
     root = Path(plan["campaign_root"]).resolve()
     plan_sha = sha256_file(plan_path.resolve())
+    plan_ref = external_file_ref(plan_path.resolve())
     resume = inspect_resume_root(root, plan, plan_sha)
     if resume["state"] == "NEW":
         root.mkdir(parents=True, exist_ok=False)
@@ -441,7 +627,25 @@ def execute_production(
         completed = resume["completed_cells"]
         if completed == 4:
             return load_json(root / "MATRIX-DONE.json", "MATRIX-DONE")
-    for row in plan["cells"][completed:]:
+    canary_evaluation_ref: Optional[Dict[str, Any]] = None
+    if completed == 1:
+        pending = ensure_canary_pending(root, plan, plan_ref)
+        canary_evaluation_ref = consume_canary_evaluation(root, plan, plan_ref, pending)
+        if canary_evaluation_ref is None:
+            return {
+                "schema_version": CANARY_PENDING_SCHEMA,
+                "state": "CANARY_PENDING",
+                "completed_cells": 1,
+                "backend_plan_sha256": plan_sha,
+                "matrix_terminal": False,
+                **FALSE_ELIGIBILITY,
+            }
+    if completed > 1:
+        pending = ensure_canary_pending(root, plan, plan_ref)
+        canary_evaluation_ref = consume_canary_evaluation(root, plan, plan_ref, pending)
+        require(canary_evaluation_ref is not None, "accepted canary evaluation missing")
+    rows_to_run = plan["cells"][completed : 1 if completed == 0 else None]
+    for row in rows_to_run:
         staging = Path(row["staging_cell_root"])
         final = Path(row["final_cell_root"])
         require(not staging.exists() and not final.exists(), f"{row['cell_key']}: target exists")
@@ -467,6 +671,16 @@ def execute_production(
                 target_query_plan=row["runtime"]["target_query_plan"],
                 target_lease=row["runtime"]["target_lease"],
             )
+            if row["ordinal"] == 1:
+                ensure_canary_pending(root, plan, plan_ref)
+                return {
+                    "schema_version": CANARY_PENDING_SCHEMA,
+                    "state": "CANARY_PENDING",
+                    "completed_cells": 1,
+                    "backend_plan_sha256": plan_sha,
+                    "matrix_terminal": False,
+                    **FALSE_ELIGIBILITY,
+                }
         except BaseException as exc:
             if staging.exists() and not (staging / "FAILED.json").exists():
                 atomic_json(
@@ -508,6 +722,8 @@ def execute_production(
         "completed_cells": 4,
         "backend_plan_sha256": plan_sha,
         "cells": cell_refs,
+        "canary_evaluation": canary_evaluation_ref,
+        "canary_accepted": external_file_ref(Path(plan["canary_checkpoint"]["accepted_path"])),
         **FALSE_ELIGIBILITY,
     }
     atomic_json(root / "MATRIX-DONE.json", done)
@@ -520,7 +736,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         result = execute_production(args.backend_plan)
-        print(json.dumps({"state": result["state"], "completed_cells": 4}, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "state": result["state"],
+                    "completed_cells": result.get("completed_cells", 0),
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     except (BackendError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"ERROR: {exc}")

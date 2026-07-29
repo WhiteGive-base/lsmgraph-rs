@@ -613,6 +613,25 @@ class PhaseBackendTests(unittest.TestCase):
                 "sha256": "a" * 64,
                 "size_bytes": 1,
             },
+            "production_scheduler": {
+                "path": "/fixture/scheduler.py",
+                "sha256": "b" * 64,
+                "size_bytes": 1,
+            },
+            "canary_checkpoint": {
+                "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v1",
+                "evaluator": {
+                    "path": "/fixture/evaluator.py",
+                    "sha256": "c" * 64,
+                    "size_bytes": 1,
+                },
+                "pending_path": "/fixture/CANARY-PENDING.json",
+                "evaluation_path": "/fixture/CANARY-EVALUATION.json",
+                "accepted_path": "/fixture/CANARY-ACCEPTED.json",
+                "first_launch_max_completed_cells": 1,
+                "resume_requires_evaluation_state": "PASS",
+                "matrix_done_before_acceptance": False,
+            },
             "cells": [
                 {
                     "cell_key": key,

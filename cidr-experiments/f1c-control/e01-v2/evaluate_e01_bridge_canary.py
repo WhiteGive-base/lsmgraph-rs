@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import os
@@ -13,10 +14,12 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import build_e01_mixed_lineage as mixed
 import inventory_e01_seml0_assets as assets
+import run_e01_incremental_production as production
 
 
 EVIDENCE_SCHEMA = "cidr-e01-bridge-canary-evidence-v1"
 RECEIPT_SCHEMA = "cidr-e01-bridge-canary-comparability-receipt-v1"
+CHECKPOINT_SCHEMA = "cidr-e01-bridge-canary-checkpoint-receipt-v2"
 METRICS = ("completed_qps", "latency_p50_us", "latency_p95_us", "latency_p99_us")
 FALSE_ELIGIBILITY = {
     "formal_eligible": False,
@@ -307,9 +310,93 @@ def evaluate(plan_path: Path, evidence_path: Path) -> Dict[str, Any]:
     }
 
 
+def _iso(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def bind_production_checkpoint(
+    comparability: Mapping[str, Any],
+    backend_plan_path: Path,
+    campaign_root: Path,
+) -> Dict[str, Any]:
+    backend_plan_path = backend_plan_path.resolve()
+    backend_plan = production.validate_backend_plan(backend_plan_path)
+    require(backend_plan.get("state") == "READY", "checkpoint backend plan must be READY")
+    backend_ref = file_ref(backend_plan_path, "checkpoint backend plan")
+    root = campaign_root.resolve()
+    require(root == Path(backend_plan["campaign_root"]).resolve(), "checkpoint campaign root drift")
+    require(not os.path.lexists(root / "MATRIX-DONE.json"), "checkpoint cannot consume MATRIX-DONE")
+    require(not os.path.lexists(root / "MATRIX-FAILED.json"), "failed campaign cannot be evaluated")
+    resume = production.inspect_resume_root(
+        root, backend_plan, backend_ref["sha256"], expected_mode="production"
+    )
+    require(resume == {"state": "RESUME", "completed_cells": 1}, "checkpoint requires exact bridge-only prefix")
+    expected_pending = production.expected_canary_pending(root, backend_plan, backend_ref)
+    pending_path = Path(backend_plan["canary_checkpoint"]["pending_path"])
+    pending_ref = file_ref(pending_path, "CANARY_PENDING")
+    pending = load_json(pending_path, "CANARY_PENDING")
+    require(pending == expected_pending, "CANARY_PENDING drift/replay")
+    evaluator_ref = file_ref(Path(__file__).resolve(), "canary evaluator")
+    require(
+        evaluator_ref == backend_plan["canary_checkpoint"]["evaluator"],
+        "runtime evaluator differs from backend plan",
+    )
+    lease_ref = verify_ref(pending["target_lease"], "bridge target lease")
+    lease = load_json(Path(lease_ref["path"]), "bridge target lease")
+    expires = lease.get("expires_at_utc") or lease.get("expires_at")
+    require(type(expires) is str and _iso(expires) > dt.datetime.now(dt.timezone.utc), "bridge lease expired")
+    gate_ref = production.external_file_ref(
+        Path(backend_plan["campaign_gates"]["backend_arming"]["path"])
+    )
+    bridge_receipts = pending["bridge_receipts"]
+    state = "PASS" if (
+        comparability.get("state") == "PASS"
+        and comparability.get("normalizer_release") is True
+    ) else "FAILED_RETAINED"
+    return {
+        "schema_version": CHECKPOINT_SCHEMA,
+        "state": state,
+        "campaign_root": str(root),
+        "backend_plan": backend_ref,
+        "arming_gate": gate_ref,
+        "canary_pending": pending_ref,
+        "bridge_cell_done": pending["bridge_cell_done"],
+        "bridge_receipts": bridge_receipts,
+        "runner_receipts": {
+            "prepared_command": bridge_receipts["prepared_command"],
+            "store_clone": bridge_receipts["store_clone"],
+        },
+        "p31_receipt": bridge_receipts["p31"],
+        "correctness_receipt": bridge_receipts["correctness"],
+        "finalize_receipts": {
+            "validated_result": bridge_receipts["validated_result"],
+            "fairness": bridge_receipts["fairness"],
+        },
+        "cleanup_receipt": bridge_receipts["cleanup"],
+        "target_p02b": pending["target_p02b"],
+        "target_query_plan": pending["target_query_plan"],
+        "target_lease": pending["target_lease"],
+        "lease_expires_at_utc": expires,
+        "evaluator": evaluator_ref,
+        "comparability": dict(comparability),
+        "campaign_state": {
+            "completed_cells": 1,
+            "strict_prefix": True,
+            "matrix_done": False,
+            "matrix_failed": False,
+        },
+        "resume_authorized": state == "PASS",
+        "original_artifacts_modified": False,
+        **FALSE_ELIGIBILITY,
+    }
+
+
 def atomic_write(path: Path, value: Mapping[str, Any]) -> None:
-    path = path.resolve()
-    require(not path.exists(), f"refusing to overwrite receipt: {path}")
+    path = path.absolute()
+    require(
+        not os.path.lexists(path),
+        f"refusing to overwrite/replace retained receipt, including dangling symlink: {path}",
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -324,6 +411,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--mixed-plan", type=Path, required=True)
     parser.add_argument("--canary-evidence", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--backend-plan", type=Path)
+    parser.add_argument("--campaign-root", type=Path)
     return parser.parse_args(argv)
 
 
@@ -331,6 +420,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
         receipt = evaluate(args.mixed_plan.resolve(), args.canary_evidence.resolve())
+        require(
+            (args.backend_plan is None) == (args.campaign_root is None),
+            "backend-plan and campaign-root must be provided together",
+        )
+        if args.backend_plan is not None:
+            require(args.output is not None, "checkpoint mode requires output")
+            backend = production.validate_backend_plan(args.backend_plan.resolve())
+            expected_output = Path(backend["canary_checkpoint"]["evaluation_path"]).absolute()
+            require(args.output.absolute() == expected_output, "checkpoint output path drift")
+            receipt = bind_production_checkpoint(
+                receipt, args.backend_plan.resolve(), args.campaign_root.resolve()
+            )
         if args.output is None:
             print(json.dumps(receipt, indent=2, sort_keys=True))
         else:

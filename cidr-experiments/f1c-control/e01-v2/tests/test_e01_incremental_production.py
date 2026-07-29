@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 import run_e01_incremental_production as production
 import build_e01_incremental_ready_backend as builder
+import evaluate_e01_bridge_canary as evaluator
 
 
 def write_json(path: Path, value: dict) -> Path:
@@ -39,6 +40,18 @@ class IncrementalProductionTests(unittest.TestCase):
             "sha256": production.sha256_file(executor),
             "size_bytes": executor.stat().st_size,
         }
+        scheduler = Path(production.__file__).resolve()
+        self.scheduler_ref = {
+            "path": str(scheduler),
+            "sha256": production.sha256_file(scheduler),
+            "size_bytes": scheduler.stat().st_size,
+        }
+        evaluator_path = Path(evaluator.__file__).resolve()
+        self.evaluator_ref = {
+            "path": str(evaluator_path),
+            "sha256": production.sha256_file(evaluator_path),
+            "size_bytes": evaluator_path.stat().st_size,
+        }
         self.plan = {
             "schema_version": production.BACKEND_SCHEMA,
             "state": "HOLD",
@@ -48,6 +61,17 @@ class IncrementalProductionTests(unittest.TestCase):
             "campaign_root": str(self.campaign.resolve()),
             "campaign_gates": {"fresh_resource_gate": None},
             "phase_executor": self.executor_ref,
+            "production_scheduler": self.scheduler_ref,
+            "canary_checkpoint": {
+                "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v1",
+                "evaluator": self.evaluator_ref,
+                "pending_path": str(self.campaign / "CANARY-PENDING.json"),
+                "evaluation_path": str(self.campaign / "CANARY-EVALUATION.json"),
+                "accepted_path": str(self.campaign / "CANARY-ACCEPTED.json"),
+                "first_launch_max_completed_cells": 1,
+                "resume_requires_evaluation_state": "PASS",
+                "matrix_done_before_acceptance": False,
+            },
             "blockers": ["test HOLD"],
             "cells": [
                 {
@@ -120,6 +144,13 @@ class IncrementalProductionTests(unittest.TestCase):
         with self.assertRaisesRegex(production.BackendError, "path/size/SHA drift"):
             production.validate_backend_plan(drift)
 
+    def test_canary_evaluation_attempt_retains_dangling_output(self) -> None:
+        output = self.root / "CANARY-EVALUATION.json"
+        output.symlink_to(self.root / "missing")
+        with self.assertRaisesRegex(evaluator.CanaryError, "retained receipt"):
+            evaluator.atomic_write(output, {"state": "PASS"})
+        self.assertTrue(output.is_symlink())
+
     def test_phase_command_key_order_is_irrelevant_but_key_drift_rejected(self) -> None:
         serialized = write_json(self.root / "hold.json", self.plan)
         loaded = json.loads(serialized.read_text(encoding="utf-8"))
@@ -133,8 +164,13 @@ class IncrementalProductionTests(unittest.TestCase):
             production.validate_backend_plan(loaded)
 
     def test_builder_serialized_v3_ready_plan_dispatches_exact_four_phases(self) -> None:
-        query_ref = {"path": "/fixture/query.json", "sha256": "1" * 64, "size_bytes": 1}
-        lease_ref = {"path": "/fixture/lease.json", "sha256": "2" * 64, "size_bytes": 1}
+        query_path = write_json(self.root / "query.json", {})
+        query_ref = production.external_file_ref(query_path)
+        lease_path = write_json(
+            self.root / "lease.json",
+            {"state": "PASS", "expires_at_utc": "2099-01-01T00:00:00Z"},
+        )
+        lease_ref = production.external_file_ref(lease_path)
         targets = {}
         for variant in {"budg-b64", "naive"}:
             path = write_json(
@@ -163,6 +199,17 @@ class IncrementalProductionTests(unittest.TestCase):
             "campaign_root": str(self.campaign.resolve()),
             "campaign_gates": {"backend_arming": {"path": str(gate_path.resolve())}},
             "phase_executor": self.executor_ref,
+            "production_scheduler": self.scheduler_ref,
+            "canary_checkpoint": {
+                "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v1",
+                "evaluator": self.evaluator_ref,
+                "pending_path": str(self.campaign / "CANARY-PENDING.json"),
+                "evaluation_path": str(self.campaign / "CANARY-EVALUATION.json"),
+                "accepted_path": str(self.campaign / "CANARY-ACCEPTED.json"),
+                "first_launch_max_completed_cells": 1,
+                "resume_requires_evaluation_state": "PASS",
+                "matrix_done_before_acceptance": False,
+            },
             "blockers": [],
             "cells": [],
         }
@@ -202,6 +249,8 @@ class IncrementalProductionTests(unittest.TestCase):
                 "synthetic_test_only": False,
                 "fixture_only": False,
                 "phase_executor": self.executor_ref,
+                "production_scheduler": self.scheduler_ref,
+                "canary_evaluator": self.evaluator_ref,
                 "backend_plan": plan_ref,
             },
         )
@@ -264,6 +313,71 @@ class IncrementalProductionTests(unittest.TestCase):
             stderr.write_text("", encoding="utf-8")
             return 0
 
+        pending_result = production.execute_production(plan_path, runner=fake_runner)
+        self.assertEqual(pending_result["state"], "CANARY_PENDING")
+        self.assertEqual(len(dispatched), 4)
+        self.assertFalse((self.campaign / "MATRIX-DONE.json").exists())
+        self.assertTrue((self.campaign / "CANARY-PENDING.json").is_file())
+        restart_pending = production.execute_production(plan_path, runner=fake_runner)
+        self.assertEqual(restart_pending["state"], "CANARY_PENDING")
+        self.assertEqual(len(dispatched), 4)
+        jump_row = ready["cells"][1]
+        jump_staging = Path(jump_row["staging_cell_root"])
+        jump_final = Path(jump_row["final_cell_root"])
+        jump_staging.mkdir()
+        for phase_name in production.PHASE_ORDER:
+            fake_runner(
+                jump_row["phase_commands"][phase_name],
+                jump_staging,
+                jump_staging / f"{phase_name}.stdout.log",
+                jump_staging / f"{phase_name}.stderr.log",
+            )
+        production.finalize_staging_cell(
+            jump_staging,
+            jump_final,
+            cell_key=jump_row["cell_key"],
+            ordinal=jump_row["ordinal"],
+            plan_sha=plan_sha,
+            expected_mode="production",
+            target_p02b=jump_row["runtime"]["target_p02b"],
+            target_query_plan=jump_row["runtime"]["target_query_plan"],
+            target_lease=jump_row["runtime"]["target_lease"],
+        )
+        with self.assertRaisesRegex(production.BackendError, "without accepted canary"):
+            production.inspect_resume_root(self.campaign, ready, plan_sha)
+        jump_final.rename(self.root / "malicious-jump-retained")
+        del dispatched[-4:]
+        checkpoint = evaluator.bind_production_checkpoint(
+            {"state": "PASS", "normalizer_release": True},
+            plan_path,
+            self.campaign,
+        )
+        evaluation_path = self.campaign / "CANARY-EVALUATION.json"
+        evaluator.atomic_write(evaluation_path, checkpoint)
+        with self.assertRaises(evaluator.CanaryError):
+            evaluator.atomic_write(evaluation_path, checkpoint)
+        original_checkpoint = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        failed_checkpoint = json.loads(json.dumps(original_checkpoint))
+        failed_checkpoint["state"] = "FAILED_RETAINED"
+        write_json(evaluation_path, failed_checkpoint)
+        with self.assertRaisesRegex(production.BackendError, "did not PASS"):
+            production.execute_production(plan_path, runner=fake_runner)
+        hold_checkpoint = json.loads(json.dumps(original_checkpoint))
+        hold_checkpoint["state"] = "HOLD"
+        write_json(evaluation_path, hold_checkpoint)
+        with self.assertRaisesRegex(production.BackendError, "did not PASS"):
+            production.execute_production(plan_path, runner=fake_runner)
+        stale_checkpoint = json.loads(json.dumps(original_checkpoint))
+        stale_checkpoint["backend_plan"]["sha256"] = "0" * 64
+        write_json(evaluation_path, stale_checkpoint)
+        with self.assertRaisesRegex(production.BackendError, "plan drift/replay"):
+            production.execute_production(plan_path, runner=fake_runner)
+        replay_checkpoint = json.loads(json.dumps(original_checkpoint))
+        replay_checkpoint["canary_pending"]["sha256"] = "0" * 64
+        write_json(evaluation_path, replay_checkpoint)
+        with self.assertRaisesRegex(production.BackendError, "pending drift/replay"):
+            production.execute_production(plan_path, runner=fake_runner)
+        write_json(evaluation_path, original_checkpoint)
         done = production.execute_production(plan_path, runner=fake_runner)
         self.assertEqual(done["state"], "PASS")
         self.assertEqual(
@@ -275,6 +389,8 @@ class IncrementalProductionTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(dispatched), 16)
+        self.assertTrue((self.campaign / "CANARY-ACCEPTED.json").is_file())
+        self.assertTrue((self.campaign / "MATRIX-DONE.json").is_file())
 
     def test_finalize_requires_cleanup_and_atomically_publishes(self) -> None:
         self.initialize_root()
