@@ -104,6 +104,7 @@ def _request(
     dataset_manifest: Mapping[str, Any],
     truth: Mapping[str, Any],
     tree_sha: str,
+    legacy_protocol: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema_version": "cidr-p10-adapter-request-v1",
@@ -114,9 +115,9 @@ def _request(
         "system_id": "seml0",
         "group": "embedded",
         "system_version": "SemL0@62f7162-split-phase-v1",
-        "interface_scope": "typed-neighbor-dense-id-v1",
+        "interface_scope": legacy_protocol["interface_scope"],
         "repeat_index": repeat,
-        "process_lifetime": "one-process-per-repeat",
+        "process_lifetime": legacy_protocol["process_lifetime"],
         "binary": {"path": binary["path"], "sha256": binary["sha256"]},
         "dataset": {
             "path": dataset_manifest["dataset_root"],
@@ -131,17 +132,45 @@ def _request(
             "digest_algorithm": "mix64-dense-dst-count-sum-xor-v1",
         },
         "timing": {
-            "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
-            "clock": "CLOCK_MONOTONIC",
+            "timing_boundary": legacy_protocol["timing_boundary"],
+            "clock": legacy_protocol["clock"],
             "cache_policy": "full-shared-trace-before-each-measured-repeat-v1",
             "process_reuse_between_phases": True,
-            "warmup_passes": 1,
-            "measured_passes": 10,
-            "concurrency": 1,
+            "warmup_passes": legacy_protocol["warmup_passes"],
+            "measured_passes": legacy_protocol["measured_passes"],
+            "concurrency": legacy_protocol["concurrency"],
             "per_query_timeout_ms": 1000,
             "sequence_digest_algorithm": "sha256-pass-query-count-sum-xor-v1",
         },
     }
+
+
+def _frozen_legacy_protocol(mixed_plan: Mapping[str, Any]) -> dict[str, Any]:
+    keys = ("seml0:r1", "seml0:r2", "seml0:r3")
+    rows = {
+        row.get("cell_key"): row
+        for row in mixed_plan.get("legacy_cells", [])
+        if type(row) is dict and row.get("cell_key") in keys
+    }
+    require(set(rows) == set(keys), "legacy SemL0 protocol rows missing")
+    protocols = [rows[key].get("protocol") for key in keys]
+    require(all(type(value) is dict for value in protocols), "legacy SemL0 protocol missing")
+    require(protocols[1:] == protocols[:-1], "legacy SemL0 protocols disagree")
+    protocol = dict(protocols[0])
+    required = {
+        "interface_scope",
+        "warmup_passes",
+        "measured_passes",
+        "process_lifetime",
+        "clock",
+        "concurrency",
+        "timing_boundary",
+    }
+    require(required <= set(protocol), "legacy SemL0 protocol fields missing")
+    require(type(protocol["warmup_passes"]) is int and protocol["warmup_passes"] == 1, "legacy warmup drift")
+    require(type(protocol["measured_passes"]) is int and protocol["measured_passes"] == 1, "legacy measured drift")
+    require(type(protocol["process_lifetime"]) is str and protocol["process_lifetime"], "legacy process lifetime invalid")
+    return {name: protocol[name] for name in sorted(required)}
 
 
 def _target_p02b(path: Optional[Path], variant: str, store: Mapping[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], Optional[str]]:
@@ -375,6 +404,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         mixed_plan.get("schema_version") == "cidr-e01-mixed-lineage-composition-v1",
         "formal mixed-lineage plan schema drift",
     )
+    legacy_protocol = _frozen_legacy_protocol(mixed_plan)
     comparability_contract = mixed_plan.get("incremental_plan", {}).get(
         "bridge_canary_comparability_contract"
     )
@@ -505,11 +535,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             dataset_manifest=dataset_manifest,
             truth=truth,
             tree_sha=store["tree_sha256"],
+            legacy_protocol=legacy_protocol,
         )
         binary_argv = [
             binary["path"], "--io-backend", "blocking",
             "--csr-metadata-cache-entries", "4096", "storage-bench",
-            "--data-dir", "{MUTABLE_CLONE}", "--warmup-runs", "1", "--repeats", "10",
+            "--data-dir", "{MUTABLE_CLONE}",
+            "--warmup-runs", str(legacy_protocol["warmup_passes"]),
+            "--repeats", str(legacy_protocol["measured_passes"]),
             "--sample-plan-in", target_plan["path"], "--p10-raw-output-dir", "{STAGING}/adapter-output/seml0-raw",
             "--p10-truth-tsv", truth["path"], "--p10-id-map-dir", str(Path(id_map["path"]).parent),
             "--p10-per-query-timeout-ms", "1000", "--l0-layout", layout,
@@ -594,6 +627,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "evaluator": evaluator_ref,
         "mixed_lineage_plan": mixed_ref,
         "comparability_contract_sha256": contract_sha,
+        "legacy_protocol": legacy_protocol,
+        "bridge_request_argv_binding": {
+            "request_protocol_exact": True,
+            "binary_argv_exact": True,
+            "warmup_runs": legacy_protocol["warmup_passes"],
+            "measured_repeats": legacy_protocol["measured_passes"],
+            "process_lifetime": legacy_protocol["process_lifetime"],
+        },
         "evidence_schema": "cidr-e01-bridge-canary-evidence-v2",
         "evidence_path": str(args.campaign_root / "CANARY-EVIDENCE.json"),
         "evidence_binding": {
@@ -604,6 +645,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "prepared_command",
                 "store_clone",
                 "p31",
+                "command_topology",
                 "validated_result",
                 "correctness",
                 "fairness",
@@ -616,6 +658,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "prepared_request_ref": True,
             "p31_receipt_ref": True,
             "p31_run_manifest_ref": True,
+            "command_topology_ref": True,
             "backend_plan_ref": True,
             "target_p02b_ref": True,
             "final_cell_root": True,

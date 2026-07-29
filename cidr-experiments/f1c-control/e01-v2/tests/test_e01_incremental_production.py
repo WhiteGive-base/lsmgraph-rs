@@ -57,12 +57,22 @@ class IncrementalProductionTests(unittest.TestCase):
         self.formal_contract = json.loads(
             mixed_path.read_text(encoding="utf-8")
         )["incremental_plan"]["bridge_canary_comparability_contract"]
+        mixed_value = json.loads(mixed_path.read_text(encoding="utf-8"))
+        self.legacy_protocol = production._frozen_legacy_protocol(mixed_value)
         self.contract_sha = self.formal_contract["contract_sha256"]
         self.checkpoint = {
             "schema_version": "cidr-e01-incremental-canary-checkpoint-contract-v2",
             "evaluator": self.evaluator_ref,
             "mixed_lineage_plan": self.mixed_ref,
             "comparability_contract_sha256": self.contract_sha,
+            "legacy_protocol": self.legacy_protocol,
+            "bridge_request_argv_binding": {
+                "request_protocol_exact": True,
+                "binary_argv_exact": True,
+                "warmup_runs": self.legacy_protocol["warmup_passes"],
+                "measured_repeats": self.legacy_protocol["measured_passes"],
+                "process_lifetime": self.legacy_protocol["process_lifetime"],
+            },
             "evidence_schema": evaluator.CHECKPOINT_EVIDENCE_SCHEMA,
             "evidence_path": str(self.campaign / "CANARY-EVIDENCE.json"),
             "evidence_binding": {
@@ -77,6 +87,7 @@ class IncrementalProductionTests(unittest.TestCase):
                 "prepared_request_ref": True,
                 "p31_receipt_ref": True,
                 "p31_run_manifest_ref": True,
+                "command_topology_ref": True,
                 "backend_plan_ref": True,
                 "target_p02b_ref": True,
                 "final_cell_root": True,
@@ -135,6 +146,12 @@ class IncrementalProductionTests(unittest.TestCase):
             }
             if role == "p31":
                 value.update(timing_generated=False, binary_only_boundary=True)
+            if role == "command_topology":
+                value.update(
+                    single_binary_invocation=True,
+                    warmup_measured_same_process=True,
+                    process_model="single-storage-bench-process-warmup-and-measured-v1",
+                )
             if role == "correctness":
                 value.update(mismatch_queries=0, timeout_queries=0)
             if role == "cleanup":
@@ -256,6 +273,24 @@ class IncrementalProductionTests(unittest.TestCase):
                         "target_p02b": targets[variant],
                         "target_query_plan": query_ref,
                         "target_lease": lease_ref,
+                        "request": {
+                            "interface_scope": self.legacy_protocol["interface_scope"],
+                            "process_lifetime": self.legacy_protocol["process_lifetime"],
+                            "timing": {
+                                "warmup_passes": self.legacy_protocol["warmup_passes"],
+                                "measured_passes": self.legacy_protocol["measured_passes"],
+                                "clock": self.legacy_protocol["clock"],
+                                "concurrency": self.legacy_protocol["concurrency"],
+                                "timing_boundary": self.legacy_protocol["timing_boundary"],
+                            },
+                        },
+                        "binary_argv": [
+                            "/bin/true",
+                            "--warmup-runs",
+                            str(self.legacy_protocol["warmup_passes"]),
+                            "--repeats",
+                            str(self.legacy_protocol["measured_passes"]),
+                        ],
                     },
                 }
             )
@@ -316,7 +351,7 @@ class IncrementalProductionTests(unittest.TestCase):
             }
             roles = {
                 "prepare": ("prepared_command", "store_clone"),
-                "p31": ("p31",),
+                "p31": ("command_topology", "p31"),
                 "finalize": ("validated_result", "correctness", "fairness"),
                 "cleanup": ("cleanup",),
             }[phase_name]
@@ -342,6 +377,18 @@ class IncrementalProductionTests(unittest.TestCase):
                     )
                     value.update(timing_generated=True, binary_only_boundary=True)
                     value["run_manifest"] = future_ref(manifest_path)
+                    value["command_topology"] = future_ref(
+                        cwd / production.RECEIPT_PATHS["command_topology"]
+                    )
+                if role == "command_topology":
+                    value.update(
+                        single_binary_invocation=True,
+                        warmup_measured_same_process=True,
+                        process_model="single-storage-bench-process-warmup-and-measured-v1",
+                        warmup_runs=self.legacy_protocol["warmup_passes"],
+                        measured_repeats=self.legacy_protocol["measured_passes"],
+                        process_lifetime=self.legacy_protocol["process_lifetime"],
+                    )
                 if role == "correctness":
                     value.update(mismatch_queries=0, timeout_queries=0)
                 if role == "validated_result":
@@ -369,10 +416,26 @@ class IncrementalProductionTests(unittest.TestCase):
                                 "receipt": future_ref(p31_receipt_path),
                                 "run_manifest": p31_receipt["run_manifest"],
                                 "host": {"fingerprint_sha256": "f" * 64},
+                                "command_topology": p31_receipt["command_topology"],
                             },
+                            "process_lifetime_binding": {
+                                "command_topology": p31_receipt["command_topology"],
+                            },
+                            "adapter_artifacts": {},
                         },
                     )
+                    artifact_path = cwd / "adapter-output" / "query-observations.tsv"
+                    artifact_path.write_text("status\nok\n", encoding="utf-8")
+                    adapter_value = json.loads(adapter_path.read_text(encoding="utf-8"))
+                    adapter_value["adapter_artifacts"] = {
+                        "query_observations": future_ref(artifact_path)
+                    }
+                    adapter_path.unlink()
+                    write_json(adapter_path, adapter_value)
                     value["adapter_result"] = future_ref(adapter_path)
+                    value["request"] = prepared["request"]
+                    value["p31_receipt"] = future_ref(p31_receipt_path)
+                    value["command_topology"] = p31_receipt["command_topology"]
                 if role == "cleanup":
                     value.update(
                         mutable_clone_removed=True,
@@ -479,7 +542,7 @@ class IncrementalProductionTests(unittest.TestCase):
         original_adapter = adapter_path.read_bytes()
         adapter_path.write_bytes(original_adapter + b" ")
         write_json(evidence_path, evidence)
-        with self.assertRaisesRegex(evaluator.CanaryError, "path/size/SHA drift"):
+        with self.assertRaisesRegex(production.BackendError, "path/size/SHA drift"):
             evaluator.validate_checkpoint_inputs(
                 backend_plan_path=plan_path,
                 campaign_root=self.campaign,

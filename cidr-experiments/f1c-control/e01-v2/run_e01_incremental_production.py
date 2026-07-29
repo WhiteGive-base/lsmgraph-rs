@@ -36,6 +36,7 @@ PHASE_ORDER = ("prepare", "p31", "finalize", "cleanup")
 RECEIPT_PATHS = {
     "prepared_command": "receipts/prepared-command.json",
     "p31": "receipts/p31.json",
+    "command_topology": "receipts/command-topology.json",
     "validated_result": "validated-result.json",
     "correctness": "receipts/correctness.json",
     "fairness": "receipts/fairness.json",
@@ -136,12 +137,39 @@ def external_file_ref(path: Path) -> Dict[str, Any]:
     return {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
 
 
+def path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def verify_scheduler_binding(value: Mapping[str, Any]) -> Dict[str, Any]:
     actual_path = Path(__file__).resolve()
     ref = verify_external_file_ref(value.get("production_scheduler"), "production scheduler")
     require(Path(ref["path"]).resolve() == actual_path, "runtime scheduler path differs from plan")
     require(ref["sha256"] == sha256_file(actual_path), "runtime scheduler self SHA drift")
     return ref
+
+
+def _frozen_legacy_protocol(mixed: Mapping[str, Any]) -> Dict[str, Any]:
+    keys = ("seml0:r1", "seml0:r2", "seml0:r3")
+    rows = {
+        row.get("cell_key"): row
+        for row in mixed.get("legacy_cells", [])
+        if type(row) is dict and row.get("cell_key") in keys
+    }
+    require(set(rows) == set(keys), "legacy SemL0 rows missing")
+    protocols = [rows[key].get("protocol") for key in keys]
+    require(all(type(value) is dict for value in protocols), "legacy protocols missing")
+    require(protocols[1:] == protocols[:-1], "legacy protocols disagree")
+    required = {
+        "interface_scope", "warmup_passes", "measured_passes", "process_lifetime",
+        "clock", "concurrency", "timing_boundary",
+    }
+    require(required <= set(protocols[0]), "legacy protocol fields missing")
+    return {key: protocols[0][key] for key in sorted(required)}
 
 
 def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
@@ -159,6 +187,19 @@ def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
     require(
         mixed.get("schema_version") == "cidr-e01-mixed-lineage-composition-v1",
         "formal mixed-lineage schema drift",
+    )
+    legacy_protocol = _frozen_legacy_protocol(mixed)
+    require(contract.get("legacy_protocol") == legacy_protocol, "checkpoint legacy protocol drift")
+    require(
+        contract.get("bridge_request_argv_binding")
+        == {
+            "request_protocol_exact": True,
+            "binary_argv_exact": True,
+            "warmup_runs": legacy_protocol["warmup_passes"],
+            "measured_repeats": legacy_protocol["measured_passes"],
+            "process_lifetime": legacy_protocol["process_lifetime"],
+        },
+        "checkpoint request/argv binding drift",
     )
     comparability = mixed.get("incremental_plan", {}).get(
         "bridge_canary_comparability_contract"
@@ -196,6 +237,7 @@ def _canary_contract(value: Mapping[str, Any], root: Path) -> Dict[str, Any]:
             "prepared_request_ref": True,
             "p31_receipt_ref": True,
             "p31_run_manifest_ref": True,
+            "command_topology_ref": True,
             "backend_plan_ref": True,
             "target_p02b_ref": True,
             "final_cell_root": True,
@@ -258,6 +300,27 @@ def validate_backend_plan(value_or_path: Any) -> Dict[str, Any]:
             require(bundle.get("state") == "PASS" and bundle.get("variant") == variant, f"cell {ordinal}: target P02B state/variant drift")
             require(bundle.get("static_inputs", {}).get("query_plan") == runtime.get("target_query_plan"), f"cell {ordinal}: query-plan ref drift")
             require(bundle.get("lease") == runtime.get("target_lease"), f"cell {ordinal}: lease ref drift")
+            request = runtime.get("request")
+            require(type(request) is dict and type(request.get("timing")) is dict, f"cell {ordinal}: request missing")
+            timing = request["timing"]
+            require(
+                request.get("interface_scope") == checkpoint["legacy_protocol"]["interface_scope"]
+                and request.get("process_lifetime") == checkpoint["legacy_protocol"]["process_lifetime"]
+                and timing.get("warmup_passes") == checkpoint["legacy_protocol"]["warmup_passes"]
+                and timing.get("measured_passes") == checkpoint["legacy_protocol"]["measured_passes"]
+                and timing.get("clock") == checkpoint["legacy_protocol"]["clock"]
+                and timing.get("concurrency") == checkpoint["legacy_protocol"]["concurrency"]
+                and timing.get("timing_boundary") == checkpoint["legacy_protocol"]["timing_boundary"],
+                f"cell {ordinal}: request/legacy protocol mismatch",
+            )
+            binary_argv = _absolute_argv(runtime.get("binary_argv"), f"cell {ordinal} binary")
+            require(
+                binary_argv[binary_argv.index("--warmup-runs") + 1]
+                == str(checkpoint["legacy_protocol"]["warmup_passes"])
+                and binary_argv[binary_argv.index("--repeats") + 1]
+                == str(checkpoint["legacy_protocol"]["measured_passes"]),
+                f"cell {ordinal}: binary argv/legacy protocol mismatch",
+            )
         phases = row.get("phase_commands")
         require(
             type(phases) is dict and set(phases) == set(PHASE_ORDER),
@@ -450,6 +513,8 @@ def consume_canary_evaluation(
     prepared = load_json(Path(prepared_ref["path"]), "bridge prepared-command receipt")
     p31_ref = pending["bridge_receipts"]["p31"]
     p31 = load_json(Path(p31_ref["path"]), "bridge P31 receipt")
+    topology_ref = pending["bridge_receipts"]["command_topology"]
+    topology = load_json(Path(topology_ref["path"]), "bridge command topology")
     validated_receipt_ref = pending["bridge_receipts"]["validated_result"]
     validated_receipt = load_json(
         Path(validated_receipt_ref["path"]), "bridge validated-result receipt"
@@ -466,6 +531,16 @@ def consume_canary_evaluation(
         and validated_receipt.get("backend_plan_sha256") == plan_ref["sha256"]
         and validated_receipt.get("target_p02b") == pending["target_p02b"],
         "canary validated-result receipt drift",
+    )
+    require(
+        p31.get("command_topology") == topology_ref
+        and validated_receipt.get("command_topology") == topology_ref
+        and topology.get("single_binary_invocation") is True
+        and topology.get("warmup_measured_same_process") is True
+        and topology.get("warmup_runs") == contract["legacy_protocol"]["warmup_passes"]
+        and topology.get("measured_repeats") == contract["legacy_protocol"]["measured_passes"]
+        and topology.get("process_lifetime") == contract["legacy_protocol"]["process_lifetime"],
+        "canary command-topology chain drift",
     )
     adapter_ref = verify_external_file_ref(
         validated_receipt.get("adapter_result"), "canary validated adapter result"
@@ -502,6 +577,12 @@ def consume_canary_evaluation(
         and adapter_p31.get("run_manifest") == p31_manifest_ref
         and adapter_p31.get("host") == p31_manifest.get("host"),
         "canary adapter P31 backlink drift",
+    )
+    require(
+        adapter_p31.get("command_topology") == topology_ref
+        and adapter.get("process_lifetime_binding", {}).get("command_topology")
+        == topology_ref,
+        "canary adapter command-topology backlink drift",
     )
     comparability_ref = external_file_ref(Path(contract["comparability_path"]))
     require(
@@ -599,6 +680,14 @@ def _validate_receipt(
     if role == "p31":
         require(value.get("timing_generated") is (expected_mode == "production"), "P31 timing marker drift")
         require(value.get("binary_only_boundary") is True, "P31 binary-only boundary required")
+    if role == "command_topology":
+        require(
+            value.get("single_binary_invocation") is True
+            and value.get("warmup_measured_same_process") is True
+            and value.get("process_model")
+            == "single-storage-bench-process-warmup-and-measured-v1",
+            "command topology proof invalid",
+        )
     if role == "correctness":
         require(value.get("mismatch_queries") == 0, "correctness mismatch")
         require(value.get("timeout_queries") == 0, "correctness timeout")
@@ -704,6 +793,26 @@ def validate_final_cell(
             expected_mode=expected_mode,
             target_p02b=target_p02b,
         )
+    staging = final.parent.parent / "staging" / final.name
+    require(not os.path.lexists(staging), f"{cell_key}: stale staging root remains")
+    if expected_mode == "production":
+        validated_receipt = load_json(final / RECEIPT_PATHS["validated_result"], "validated result receipt")
+        adapter_ref = verify_external_file_ref(
+            validated_receipt.get("adapter_result"), f"{cell_key}: adapter result"
+        )
+        require(
+            path_within(Path(adapter_ref["path"]), final),
+            f"{cell_key}: adapter result outside final root",
+        )
+        adapter = load_json(Path(adapter_ref["path"]), f"{cell_key}: adapter result")
+        artifacts = adapter.get("adapter_artifacts")
+        require(type(artifacts) is dict and artifacts, f"{cell_key}: adapter artifacts missing")
+        for name, ref in artifacts.items():
+            actual = verify_external_file_ref(ref, f"{cell_key}: adapter artifact {name}")
+            require(
+                path_within(Path(actual["path"]), final),
+                f"{cell_key}: adapter artifact outside final root",
+            )
     return done
 
 

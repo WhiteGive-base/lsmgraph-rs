@@ -478,6 +478,8 @@ def validate_checkpoint_inputs(
     prepared = load_json(Path(prepared_ref["path"]), "bridge prepared-command receipt")
     p31_ref = pending["bridge_receipts"]["p31"]
     p31 = load_json(Path(p31_ref["path"]), "bridge P31 receipt")
+    topology_ref = pending["bridge_receipts"]["command_topology"]
+    topology = load_json(Path(topology_ref["path"]), "bridge command-topology receipt")
     validated_receipt_ref = pending["bridge_receipts"]["validated_result"]
     validated_receipt = load_json(
         Path(validated_receipt_ref["path"]), "bridge validated-result receipt"
@@ -489,6 +491,11 @@ def validate_checkpoint_inputs(
             "cidr-e01-incremental-prepared-command-receipt-v1",
         ),
         ("P31", p31, "cidr-e01-incremental-p31-receipt-v1"),
+        (
+            "command-topology",
+            topology,
+            "cidr-e01-incremental-command-topology-receipt-v1",
+        ),
         (
             "validated-result",
             validated_receipt,
@@ -504,6 +511,16 @@ def validate_checkpoint_inputs(
         p31.get("target_p02b") == pending["target_p02b"]
         and validated_receipt.get("target_p02b") == pending["target_p02b"],
         "bridge validated/P31 target drift",
+    )
+    require(
+        p31.get("command_topology") == topology_ref
+        and validated_receipt.get("command_topology") == topology_ref
+        and topology.get("single_binary_invocation") is True
+        and topology.get("warmup_measured_same_process") is True
+        and topology.get("warmup_runs") == contract["legacy_protocol"]["warmup_passes"]
+        and topology.get("measured_repeats") == contract["legacy_protocol"]["measured_passes"]
+        and topology.get("process_lifetime") == contract["legacy_protocol"]["process_lifetime"],
+        "bridge command-topology chain drift",
     )
     adapter_ref = verify_ref(
         validated_receipt.get("adapter_result"), "checkpoint validated adapter result"
@@ -543,6 +560,23 @@ def validate_checkpoint_inputs(
         and adapter_p31.get("host") == p31_manifest.get("host"),
         "checkpoint adapter P31 backlink drift",
     )
+    require(
+        adapter_p31.get("command_topology") == topology_ref
+        and adapter.get("process_lifetime_binding", {}).get("command_topology")
+        == topology_ref,
+        "checkpoint adapter command-topology backlink drift",
+    )
+    artifacts = adapter.get("adapter_artifacts")
+    final_root = Path(bridge["final_cell_root"]).resolve()
+    staging_root = Path(bridge["staging_cell_root"]).resolve()
+    require(not os.path.lexists(staging_root), "checkpoint stale staging root remains")
+    require(type(artifacts) is dict and artifacts, "checkpoint adapter artifacts missing")
+    for name, ref in artifacts.items():
+        actual = verify_ref(ref, f"checkpoint adapter artifact {name}")
+        require(
+            production.path_within(Path(actual["path"]), final_root),
+            f"checkpoint adapter artifact {name} outside final root",
+        )
     return {
         "backend": backend,
         "backend_ref": backend_ref,

@@ -632,6 +632,22 @@ class PhaseBackendTests(unittest.TestCase):
                     "size_bytes": 1,
                 },
                 "comparability_contract_sha256": "e" * 64,
+                "legacy_protocol": {
+                    "clock": "CLOCK_MONOTONIC",
+                    "concurrency": 1,
+                    "interface_scope": "typed-neighbor-dense-id-v1",
+                    "measured_passes": 1,
+                    "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                    "timing_boundary": "typed-neighbor-call-plus-result-materialization-and-digest-v1",
+                    "warmup_passes": 1,
+                },
+                "bridge_request_argv_binding": {
+                    "request_protocol_exact": True,
+                    "binary_argv_exact": True,
+                    "warmup_runs": 1,
+                    "measured_repeats": 1,
+                    "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                },
                 "evidence_schema": "cidr-e01-bridge-canary-evidence-v2",
                 "evidence_path": "/fixture/CANARY-EVIDENCE.json",
                 "evidence_binding": {
@@ -642,6 +658,7 @@ class PhaseBackendTests(unittest.TestCase):
                         "prepared_command",
                         "store_clone",
                         "p31",
+                        "command_topology",
                         "validated_result",
                         "correctness",
                         "fairness",
@@ -654,6 +671,7 @@ class PhaseBackendTests(unittest.TestCase):
                     "prepared_request_ref": True,
                     "p31_receipt_ref": True,
                     "p31_run_manifest_ref": True,
+                    "command_topology_ref": True,
                     "backend_plan_ref": True,
                     "target_p02b_ref": True,
                     "final_cell_root": True,
@@ -839,23 +857,85 @@ class PhaseBackendTests(unittest.TestCase):
                 {"schema_version": "cidr-p10-adapter-result-v1", "measured": {}},
             )
             receipt = phase.bind_adapter_process_lifetime(
-                path, {"process_lifetime": "one-process-per-repeat"}
+                path,
+                {"process_lifetime": "prebuilt-store-query-process-lifetime-v1"},
+                {
+                    "state": "PASS",
+                    "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                    "single_binary_invocation": True,
+                    "warmup_measured_same_process": True,
+                    "process_model": "single-storage-bench-process-warmup-and-measured-v1",
+                    "self_ref": {"path": "/final/command-topology.json", "sha256": "a" * 64, "size_bytes": 1},
+                },
             )
             self.assertEqual(receipt["state"], "PASS")
             self.assertTrue(receipt["source_field_missing"])
             self.assertFalse(receipt["metrics_modified"])
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8"))["process_lifetime"],
-                "one-process-per-repeat",
+                "prebuilt-store-query-process-lifetime-v1",
             )
             tampered = write_json(
                 Path(temporary) / "tampered.json",
                 {"process_lifetime": "one-process-per-query"},
             )
-            with self.assertRaisesRegex(phase.PhaseError, "conflicts with request"):
+            with self.assertRaisesRegex(phase.PhaseError, "invalid/conflicting"):
                 phase.bind_adapter_process_lifetime(
-                    tampered, {"process_lifetime": "one-process-per-repeat"}
+                    tampered,
+                    {"process_lifetime": "prebuilt-store-query-process-lifetime-v1"},
+                    {
+                        "state": "PASS",
+                        "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+                        "single_binary_invocation": True,
+                        "warmup_measured_same_process": True,
+                        "process_model": "single-storage-bench-process-warmup-and-measured-v1",
+                    },
                 )
+
+    def test_process_lifetime_binding_rejects_null_bool_number_and_weak_topology(self) -> None:
+        topology = {
+            "state": "PASS",
+            "process_lifetime": "prebuilt-store-query-process-lifetime-v1",
+            "single_binary_invocation": True,
+            "warmup_measured_same_process": True,
+            "process_model": "single-storage-bench-process-warmup-and-measured-v1",
+        }
+        request = {"process_lifetime": "prebuilt-store-query-process-lifetime-v1"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, invalid in enumerate((None, False, 1)):
+                path = write_json(root / f"invalid-{index}.json", {"process_lifetime": invalid})
+                with self.assertRaisesRegex(phase.PhaseError, "invalid/conflicting"):
+                    phase.bind_adapter_process_lifetime(path, request, topology)
+            missing = write_json(root / "missing.json", {"metrics": {"qps": 1}})
+            weak = dict(topology)
+            weak["single_binary_invocation"] = False
+            with self.assertRaisesRegex(phase.PhaseError, "does not prove"):
+                phase.bind_adapter_process_lifetime(missing, request, weak)
+
+    def test_adapter_artifacts_are_rewritten_to_final_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = root / "staging" / "01-cell"
+            final = root / "cells" / "01-cell"
+            artifact = staging / "adapter-output" / "query-observations.tsv"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("status\nok\n", encoding="utf-8")
+            source_ref = {
+                "path": str(artifact.resolve()),
+                "sha256": phase.sha256_file(artifact),
+                "size_bytes": artifact.stat().st_size,
+            }
+            published = phase.publish_adapter_artifacts(
+                {"adapter_artifacts": {"query": source_ref}},
+                staging,
+                {"final_cell_root": str(final.resolve())},
+            )
+            self.assertEqual(
+                published["query"]["path"],
+                str((final / "adapter-output" / artifact.name).resolve()),
+            )
+            self.assertEqual(published["query"]["sha256"], source_ref["sha256"])
 
 
 if __name__ == "__main__":

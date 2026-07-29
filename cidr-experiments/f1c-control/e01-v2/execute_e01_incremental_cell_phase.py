@@ -16,6 +16,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -94,30 +95,73 @@ def atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         os.fsync(stream.fileno())
 
 
-def bind_adapter_process_lifetime(path: Path, request: Mapping[str, Any]) -> dict[str, Any]:
+def canonical_sha(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def bind_adapter_process_lifetime(
+    path: Path,
+    request: Mapping[str, Any],
+    topology: Mapping[str, Any],
+) -> dict[str, Any]:
     """Complete the frozen P10 result field omitted by the bound SemL0 converter."""
     result = load_json(path, "adapter result before process-lifetime binding")
     expected = request.get("process_lifetime")
+    require(type(expected) is str and expected, "formal request process-lifetime contract invalid")
     require(
-        expected == "one-process-per-repeat",
-        "formal request process-lifetime contract drift",
+        topology.get("state") == "PASS"
+        and topology.get("process_lifetime") == expected
+        and topology.get("single_binary_invocation") is True
+        and topology.get("warmup_measured_same_process") is True
+        and topology.get("process_model")
+        == "single-storage-bench-process-warmup-and-measured-v1",
+        "receipt-bound command topology does not prove process lifetime",
     )
+    key_present = "process_lifetime" in result
     observed = result.get("process_lifetime")
-    require(
-        observed in (None, expected),
-        "adapter result process_lifetime conflicts with request",
+    if key_present:
+        require(type(observed) is str and observed == expected, "adapter result process_lifetime invalid/conflicting")
+    before_without = dict(result)
+    before_without.pop("process_lifetime", None)
+    before_sha = canonical_sha(before_without)
+    metrics_sha = canonical_sha(
+        {key: result.get(key) for key in ("metrics", "timing", "warmup", "measured")}
     )
-    if observed is None:
+    if not key_present:
         result["process_lifetime"] = expected
         temporary = path.with_name(path.name + ".lifetime.tmp")
         require(not os.path.lexists(temporary), "adapter lifetime temporary exists")
         atomic_json(temporary, result)
         os.replace(temporary, path)
+    after = load_json(path, "adapter result after process-lifetime binding")
+    after_without = dict(after)
+    after_without.pop("process_lifetime", None)
+    after_sha = canonical_sha(after_without)
+    require(before_sha == after_sha, "process lifetime binding modified unrelated fields")
+    metrics_after_sha = canonical_sha(
+        {key: after.get(key) for key in ("metrics", "timing", "warmup", "measured")}
+    )
+    require(metrics_sha == metrics_after_sha, "process lifetime binding modified metrics/timing")
     return {
         "schema_version": "cidr-e01-adapter-process-lifetime-binding-v1",
         "state": "PASS",
-        "source_field_missing": observed is None,
+        "source_field_missing": not key_present,
         "bound_from_request": expected,
+        "command_topology": topology.get("self_ref"),
+        "before_without_process_lifetime_sha256": before_sha,
+        "after_without_process_lifetime_sha256": after_sha,
+        "metrics_timing_before_sha256": metrics_sha,
+        "metrics_timing_after_sha256": metrics_after_sha,
         "metrics_modified": False,
         "timing_modified": False,
     }
@@ -745,6 +789,31 @@ def verify_staged_published_ref(
     return actual
 
 
+def publish_adapter_artifacts(
+    validated_repeat: Mapping[str, Any],
+    cwd: Path,
+    cell: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    artifacts = validated_repeat.get("adapter_artifacts")
+    require(type(artifacts) is dict and artifacts, "validated adapter artifacts required")
+    published: dict[str, dict[str, Any]] = {}
+    for name, value in artifacts.items():
+        require(type(name) is str and name and type(value) is dict, "adapter artifact entry invalid")
+        path = Path(str(value.get("path", "")))
+        require(path.is_absolute(), f"adapter artifact {name}: absolute path required")
+        path = path.resolve()
+        require(path.is_file() and not path.is_symlink(), f"adapter artifact {name}: regular file required")
+        require(
+            value.get("sha256") == sha256_file(path)
+            and value.get("size_bytes", path.stat().st_size) == path.stat().st_size,
+            f"adapter artifact {name}: source SHA/size drift",
+        )
+        final_ref = published_file_ref(path, cwd, cell)
+        require(final_ref["sha256"] == value["sha256"], f"adapter artifact {name}: published SHA drift")
+        published[name] = final_ref
+    return published
+
+
 def _cell(plan: Mapping[str, Any], key: str) -> dict[str, Any]:
     matches = [row for row in plan.get("cells", []) if row.get("cell_key") == key]
     require(len(matches) == 1, "cell key missing/duplicate")
@@ -904,6 +973,49 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
     manifest_path = done_path.parent / "run-manifest.json"
     manifest = load_json(manifest_path, "P31 run manifest")
     require(type(manifest.get("host")) is dict, "P31 run manifest host missing")
+    command_path = done_path.parent / "command.txt"
+    require(
+        type(manifest.get("command")) is dict
+        and Path(manifest["command"].get("path", "")).resolve() == command_path.resolve()
+        and manifest["command"].get("sha256") == sha256_file(command_path),
+        "P31 command file binding drift",
+    )
+    command_argv = shlex.split(command_path.read_text(encoding="utf-8").strip())
+    require(command_argv == expected_binary, "P31 launched argv differs from frozen request argv")
+    require(type(manifest.get("root_pid")) is int and manifest["root_pid"] > 0, "P31 root PID invalid")
+    require(manifest.get("command_exit_code") == 0, "P31 command exit code invalid")
+    request_timing = request_value["timing"]
+    warmup_index = command_argv.index("--warmup-runs")
+    repeats_index = command_argv.index("--repeats")
+    require(
+        command_argv[warmup_index + 1] == str(request_timing["warmup_passes"])
+        and command_argv[repeats_index + 1] == str(request_timing["measured_passes"]),
+        "P31 command warmup/repeat topology drift",
+    )
+    topology_path = cwd / "receipts/command-topology.json"
+    topology = {
+        **_base_receipt(cell, plan_sha, "command-topology"),
+        "launcher": published_file_ref(Path(expected_p31[0]), cwd, cell)
+        if path_within(Path(expected_p31[0]), cwd)
+        else {
+            "path": str(Path(expected_p31[0]).resolve()),
+            "sha256": sha256_file(Path(expected_p31[0]).resolve()),
+            "size_bytes": Path(expected_p31[0]).stat().st_size,
+        },
+        "run_manifest": published_file_ref(manifest_path, cwd, cell),
+        "command_file": published_file_ref(command_path, cwd, cell),
+        "root_pid": manifest["root_pid"],
+        "argv": command_argv,
+        "argv_sha256": canonical_sha(command_argv),
+        "warmup_runs": request_timing["warmup_passes"],
+        "measured_repeats": request_timing["measured_passes"],
+        "process_lifetime": request_value["process_lifetime"],
+        "process_model": "single-storage-bench-process-warmup-and-measured-v1",
+        "single_binary_invocation": True,
+        "warmup_measured_same_process": True,
+    }
+    atomic_json(topology_path, topology)
+    topology["self_ref"] = published_file_ref(topology_path, cwd, cell)
     atomic_json(
         cwd / "receipts/p31.json",
         {
@@ -916,6 +1028,7 @@ def run_p31(plan: Mapping[str, Any], cell: Mapping[str, Any], plan_sha: str, cwd
             "prepared_clone_inode": clone_receipt["target_inode"],
             "p31_done": published_file_ref(done_path, cwd, cell),
             "run_manifest": published_file_ref(manifest_path, cwd, cell),
+            "command_topology": topology["self_ref"],
         },
     )
 
@@ -935,6 +1048,11 @@ def finalize(
     adapter = _load_module(Path(adapter_ref["path"]))
     request_path = cwd / "adapter-request.json"
     request = load_json(request_path, "adapter request")
+    topology_path = cwd / "receipts/command-topology.json"
+    topology = load_json(topology_path, "command topology receipt")
+    topology["self_ref"] = verify_staged_published_ref(
+        p31.get("command_topology"), topology_path, cwd, cell, "command topology receipt"
+    )
     prepared = load_json(cwd / "receipts/prepared-command.json", "prepared command")
     request_ref = verify_staged_published_ref(
         prepared.get("request"), request_path, cwd, cell, "prepared adapter request"
@@ -948,7 +1066,7 @@ def finalize(
     args = argparse.Namespace(output_dir=output)
     adapter.convert_outputs(args, request, truth_rows, raw_dir)
     lifetime_binding = bind_adapter_process_lifetime(
-        output / "adapter-result.json", request
+        output / "adapter-result.json", request, topology
     )
     system = {
         "id": "seml0",
@@ -968,6 +1086,9 @@ def finalize(
         type(validated_repeat) is dict
         and validated_repeat.get("schema_version") == "cidr-p10-validated-repeat-v1",
         "validated adapter output schema drift",
+    )
+    validated_repeat["adapter_artifacts"] = publish_adapter_artifacts(
+        validated_repeat, cwd, cell
     )
     p31_manifest_path = cwd / "p31" / "run-manifest.json"
     p31_manifest_ref = verify_staged_published_ref(
@@ -991,6 +1112,7 @@ def finalize(
                 "receipt": p31_receipt_ref,
                 "run_manifest": p31_manifest_ref,
                 "host": p31_manifest["host"],
+                "command_topology": topology["self_ref"],
             },
             "process_lifetime_binding": lifetime_binding,
         }
@@ -1009,6 +1131,9 @@ def finalize(
         **_base_receipt(cell, plan_sha, "validated-result"),
         "target_p02b": target_ref,
         "adapter_result": published_file_ref(validated_output_path, cwd, cell),
+        "request": request_ref,
+        "p31_receipt": p31_receipt_ref,
+        "command_topology": topology["self_ref"],
     }
     atomic_json(cwd / "validated-result.json", validated)
     atomic_json(
