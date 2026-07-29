@@ -181,17 +181,37 @@ def _inside(path: str, root: Path) -> bool:
         return False
 
 
+def _require_ref_path(
+    ref: Mapping[str, Any], expected: Path, label: str
+) -> Dict[str, Any]:
+    checked = _asset_ref(ref, label)
+    if Path(checked["path"]).resolve() != expected.resolve():
+        raise CompositionError(f"{label}: frozen path drift")
+    return checked
+
+
 def _validate_fresh_provenance(
     cell: Mapping[str, Any],
     *,
     target_ref: Mapping[str, Any],
     target: Mapping[str, Any],
     expected_variant: str,
+    formal_backend_ref: Mapping[str, Any],
+    backend_cell: Mapping[str, Any],
 ) -> None:
     """Independently consume the complete published provenance chain."""
     key = str(cell["cell_key"])
-    provenance_ref = _asset_ref(
-        cell.get("adapter_provenance"), f"{key}.adapter_provenance"
+    final_root = Path(str(backend_cell.get("final_cell_root", ""))).resolve()
+    if (
+        backend_cell.get("cell_key") != key
+        or backend_cell.get("ordinal") != cell.get("ordinal")
+        or final_root.parent.name != "cells"
+    ):
+        raise CompositionError(f"{key}: frozen backend cell identity drift")
+    provenance_ref = _require_ref_path(
+        cell.get("adapter_provenance"),
+        final_root / "adapter-output" / "adapter-provenance.json",
+        f"{key}.adapter_provenance",
     )
     provenance = read_json(Path(provenance_ref["path"]), f"{key}.adapter_provenance")
     expected_top = {
@@ -206,8 +226,26 @@ def _validate_fresh_provenance(
         or provenance.get("variant") != expected_variant
     ):
         raise CompositionError(f"{key}: provenance top-level identity drift")
-    validated_ref = _asset_ref(cell.get("validated_result"), f"{key}.validated_result")
+    validated_ref = _require_ref_path(
+        cell.get("validated_result"),
+        final_root / "adapter-output" / "validated-repeat.json",
+        f"{key}.validated_result",
+    )
     validated = read_json(Path(validated_ref["path"]), f"{key}.validated_result")
+    validated_receipt_ref = _require_ref_path(
+        cell.get("validated_result_receipt"),
+        final_root / "validated-result.json",
+        f"{key}.validated_result_receipt",
+    )
+    validated_receipt = read_json(
+        Path(validated_receipt_ref["path"]), f"{key}.validated_result_receipt"
+    )
+    cell_done_ref = _require_ref_path(
+        cell.get("cell_done"),
+        final_root / "CELL-DONE.json",
+        f"{key}.cell_done",
+    )
+    cell_done = read_json(Path(cell_done_ref["path"]), f"{key}.cell_done")
     artifacts = validated.get("adapter_artifacts")
     if type(artifacts) is not dict:
         raise CompositionError(f"{key}: validated adapter artifacts required")
@@ -236,9 +274,8 @@ def _validate_fresh_provenance(
         or binding.get("ordinal") != cell.get("ordinal")
     ):
         raise CompositionError(f"{key}: split-phase binding drift")
-    final_root = Path(str(binding["final_cell_root"])).resolve()
     if (
-        final_root.parent.name != "cells"
+        Path(str(binding["final_cell_root"])).resolve() != final_root
         or Path(str(binding["campaign_root"])).resolve() != final_root.parents[1]
     ):
         raise CompositionError(f"{key}: provenance final/campaign root drift")
@@ -322,14 +359,41 @@ def _validate_fresh_provenance(
     manifest_ref = _asset_ref(p31.get("run_manifest"), f"{key}.p31.run_manifest")
     manifest = read_json(Path(manifest_ref["path"]), f"{key}.p31.run_manifest")
     adapter_tool = _asset_ref(cell.get("adapter_tool"), f"{key}.adapter_tool")
+    backend_runtime = backend_cell.get("runtime")
+    if (
+        type(backend_runtime) is not dict
+        or adapter_tool != _asset_ref(
+            backend_runtime.get("adapter_tool"), f"{key}.backend.adapter_tool"
+        )
+    ):
+        raise CompositionError(f"{key}: adapter tool/backend plan drift")
     expected_validated = {
-        name: _asset_ref(artifacts.get(name), f"{key}.artifact.{name}")
+        name: _require_ref_path(
+            artifacts.get(name),
+            final_root / "adapter-output" / name,
+            f"{key}.artifact.{name}",
+        )
         for name in (
             "adapter-result.json", "query-observations.tsv", "phase-events.jsonl",
         )
     }
     if (
-        binding.get("backend_plan") != validated.get("backend_plan")
+        binding.get("backend_plan") != formal_backend_ref
+        or validated.get("backend_plan") != formal_backend_ref
+        or validated_receipt.get("backend_plan_sha256")
+        != formal_backend_ref["sha256"]
+        or cell_done.get("backend_plan_sha256") != formal_backend_ref["sha256"]
+        or validated_receipt.get("adapter_result") != validated_ref
+        or validated_receipt.get("adapter_provenance") != provenance_ref
+        or cell_done.get("state") != "PASS"
+        or cell_done.get("cell_key") != key
+        or cell_done.get("ordinal") != cell.get("ordinal")
+        or cell_done.get("receipts", {}).get("validated_result")
+        != {
+            "path": "validated-result.json",
+            "sha256": validated_receipt_ref["sha256"],
+            "size_bytes": validated_receipt_ref["size_bytes"],
+        }
         or binding.get("target_p02b") != target_ref
         or binding.get("p31_receipt") != p31_ref
         or binding.get("p31_run_manifest") != manifest_ref
@@ -379,9 +443,11 @@ def _validate_fresh_provenance(
     if type(raw) is not dict or set(raw) != expected_raw_names:
         raise CompositionError(f"{key}: provenance raw artifact set drift")
     for name in expected_raw_names:
-        ref = _asset_ref(raw[name], f"{key}.raw.{name}")
-        if not _inside(ref["path"], final_root):
-            raise CompositionError(f"{key}: raw artifact outside final root")
+        _require_ref_path(
+            raw[name],
+            final_root / "adapter-output" / "seml0-raw" / name,
+            f"{key}.raw.{name}",
+        )
 
 
 def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -412,6 +478,29 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
     evidence = plan.get("incremental_evidence")
     if type(evidence) is not dict or evidence.get("state") != "PASS":
         raise CompositionError("pre-output gate: fresh incremental evidence is absent")
+    formal_backend_ref = _asset_ref(
+        evidence.get("formal_backend_plan"), "incremental_evidence.formal_backend_plan"
+    )
+    formal_backend = read_json(
+        Path(formal_backend_ref["path"]), "incremental_evidence.formal_backend_plan"
+    )
+    backend_cells = formal_backend.get("cells")
+    if (
+        formal_backend.get("state") != "READY"
+        or type(backend_cells) is not list
+        or [item.get("cell_key") for item in backend_cells]
+        != [item[0] for item in INCREMENTAL_CELLS]
+    ):
+        raise CompositionError("pre-output gate: frozen formal backend plan drift")
+    arming = formal_backend.get("campaign_gates", {}).get("backend_arming")
+    if type(arming) is not dict or set(arming) != {"path"}:
+        raise CompositionError("pre-output gate: backend arming path required")
+    arming_gate = read_json(Path(arming["path"]), "formal backend arming gate")
+    if (
+        arming_gate.get("state") != "PASS"
+        or arming_gate.get("backend_plan") != formal_backend_ref
+    ):
+        raise CompositionError("pre-output gate: backend plan/arming gate drift")
     gates = evidence.get("campaign_gates")
     if type(gates) is not dict or set(gates) != set(REQUIRED_GATES):
         raise CompositionError("pre-output gate: exact fresh campaign gate set required")
@@ -446,7 +535,7 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
     if type(cells) is not list or [cell.get("cell_key") for cell in cells] != expected_keys:
         raise CompositionError("pre-output gate: exact four-cell evidence order required")
     rows = []
-    for cell, expected in zip(cells, INCREMENTAL_CELLS):
+    for cell, expected, backend_cell in zip(cells, INCREMENTAL_CELLS, backend_cells):
         key, system, repeat, role, included = expected
         if (
             cell.get("system_id") != system
@@ -488,6 +577,8 @@ def _fresh_rows(value: Mapping[str, Any]) -> List[Dict[str, Any]]:
             target_ref=expected_bundle_ref,
             target=expected_bundle,
             expected_variant=expected_variant,
+            formal_backend_ref=formal_backend_ref,
+            backend_cell=backend_cell,
         )
         if included:
             metrics = cell.get("metrics")

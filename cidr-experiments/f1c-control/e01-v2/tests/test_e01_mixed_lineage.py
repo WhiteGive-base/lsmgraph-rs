@@ -244,7 +244,36 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
     truth = write_text(root, "fresh/truth.tsv", "edge_type\tsrc\tdigest\n1\t1\t0\n")
     p31_wrapper = write_text(root, "fresh/run_with_resources.sh", "#!/bin/sh\n")
     adapter_tool = write_text(root, "fresh/seml0_adapter.py", "# fixture\n")
-    backend_plan = write_json(root, "fresh/backend-plan.json", {"state": "READY"})
+    campaign_root = root / "fresh/campaign"
+    arming_gate_path = (root / "fresh/backend-plan.ARMING-GATE.json").resolve()
+    backend_plan_value = {
+        "state": "READY",
+        "campaign_root": str(campaign_root.resolve()),
+        "campaign_gates": {"backend_arming": {"path": str(arming_gate_path)}},
+        "cells": [
+            {
+                "ordinal": ordinal,
+                "cell_key": key,
+                "final_cell_root": str(
+                    (
+                        campaign_root
+                        / "cells"
+                        / f"{ordinal:02d}-{key.replace(':', '-')}"
+                    ).resolve()
+                ),
+                "runtime": {"adapter_tool": adapter_tool},
+            }
+            for ordinal, (key, *_rest) in enumerate(
+                builder.INCREMENTAL_CELLS, start=1
+            )
+        ],
+    }
+    backend_plan = write_json(root, "fresh/backend-plan.json", backend_plan_value)
+    write_json(
+        root,
+        "fresh/backend-plan.ARMING-GATE.json",
+        {"state": "PASS", "backend_plan": backend_plan},
+    )
     repo_head = "a" * 40
     gates = {}
     target_refs = {}
@@ -471,8 +500,39 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                 "adapter_provenance": provenance_value,
             },
         )
+        validated_receipt = write_json(
+            root,
+            f"{final_relative}/validated-result.json",
+            {
+                "schema_version": "cidr-e01-incremental-validated-result-receipt-v1",
+                "state": "PASS",
+                "cell_key": key,
+                "ordinal": ordinal,
+                "backend_plan_sha256": backend_plan["sha256"],
+                "adapter_result": validated,
+                "adapter_provenance": provenance,
+            },
+        )
         cleanup = write_json(
             root, f"{final_relative}/receipts/cleanup.json", {"state": "PASS"}
+        )
+        cell_done = write_json(
+            root,
+            f"{final_relative}/CELL-DONE.json",
+            {
+                "schema_version": "cidr-e01-incremental-production-cell-done-v1",
+                "state": "PASS",
+                "cell_key": key,
+                "ordinal": ordinal,
+                "backend_plan_sha256": backend_plan["sha256"],
+                "receipts": {
+                    "validated_result": {
+                        "path": "validated-result.json",
+                        "sha256": validated_receipt["sha256"],
+                        "size_bytes": validated_receipt["size_bytes"],
+                    }
+                },
+            },
         )
         cells.append(
             {
@@ -493,6 +553,8 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
                     "timeout_queries": 0,
                 },
                 "validated_result": validated,
+                "validated_result_receipt": validated_receipt,
+                "cell_done": cell_done,
                 "p31_receipt": p31,
                 "cleanup_receipt": cleanup,
                 "prepared_request": request,
@@ -539,6 +601,7 @@ def attach_completed_evidence(root: Path, value: Dict[str, Any]) -> Dict[str, An
     )
     result["incremental_plan"]["incremental_evidence"] = {
         "state": "PASS",
+        "formal_backend_plan": backend_plan,
         "campaign_gates": gates,
         "cells": cells,
         "bridge_canary_comparability": {
@@ -667,6 +730,75 @@ class MixedLineageTests(unittest.TestCase):
         }
         path = self.write_composition(completed)
         with self.assertRaisesRegex(builder.CompositionError, "top-level identity drift"):
+            normalizer.normalize(path, None)
+
+    def test_mixed_consumer_rejects_valid_relocated_final_artifacts(self) -> None:
+        completed = attach_completed_evidence(self.root, self.value)
+        cell = completed["incremental_plan"]["incremental_evidence"]["cells"][0]
+        for field in (
+            "adapter_provenance",
+            "validated_result",
+            "validated_result_receipt",
+            "cell_done",
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(completed)
+                candidate_cell = candidate["incremental_plan"]["incremental_evidence"][
+                    "cells"
+                ][0]
+                original = Path(candidate_cell[field]["path"])
+                relocated = write_json(
+                    self.root,
+                    f"fresh/relocated/{field}.json",
+                    json.loads(original.read_text(encoding="utf-8")),
+                )
+                candidate_cell[field] = relocated
+                path = self.write_composition(candidate)
+                with self.assertRaisesRegex(
+                    builder.CompositionError, "frozen path drift"
+                ):
+                    normalizer.normalize(path, None)
+
+    def test_mixed_consumer_rejects_synchronized_backend_ref_rewrite(self) -> None:
+        completed = attach_completed_evidence(self.root, self.value)
+        evidence = completed["incremental_plan"]["incremental_evidence"]
+        cell = evidence["cells"][0]
+        old_ref = evidence["formal_backend_plan"]
+        alternate_ref = write_json(
+            self.root,
+            "fresh/alternate-backend-plan.json",
+            json.loads(Path(old_ref["path"]).read_text(encoding="utf-8")),
+        )
+        provenance_path = Path(cell["adapter_provenance"]["path"])
+        validated_path = Path(cell["validated_result"]["path"])
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        validated = json.loads(validated_path.read_text(encoding="utf-8"))
+        provenance["split_phase_binding"]["backend_plan"] = alternate_ref
+        validated["backend_plan"] = alternate_ref
+        provenance_payload = (
+            json.dumps(provenance, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        provenance_path.write_bytes(provenance_payload)
+        provenance_ref = {
+            "path": str(provenance_path.resolve()),
+            "sha256": _sha(provenance_payload),
+            "size_bytes": len(provenance_payload),
+        }
+        validated["adapter_provenance"] = provenance
+        validated["adapter_artifacts"]["adapter-provenance.json"] = provenance_ref
+        validated_payload = (
+            json.dumps(validated, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        validated_path.write_bytes(validated_payload)
+        validated_ref = {
+            "path": str(validated_path.resolve()),
+            "sha256": _sha(validated_payload),
+            "size_bytes": len(validated_payload),
+        }
+        cell["adapter_provenance"] = provenance_ref
+        cell["validated_result"] = validated_ref
+        path = self.write_composition(completed)
+        with self.assertRaises(builder.CompositionError):
             normalizer.normalize(path, None)
 
     def test_missing_fresh_gate_is_pre_output_rejected(self) -> None:
