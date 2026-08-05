@@ -1,5 +1,7 @@
 # SemL0 CIDR 实验工作包
 
+> **封板状态（2026-08-05）**：本轮实验工程已暂时收口。最终代码入口、验证命令、证据边界和恢复方式见 [`FINAL-HANDOFF-CN.md`](FINAL-HANDOFF-CN.md)。`CURRENT-STATUS-CN.md` 与 `PROGRESS-CN.md` 保留为 2026-07-21/22 的历史执行快照，不再代表当前服务器状态。
+
 本目录统一管理文章实验大纲、既有证据、补跑记录、规范化数据、Python 绘图脚本、图表输出和视觉验收结果。旧 W6/W8/W9/C2 等大体积证据不搬动，由 registry 保存来源路径和校验信息。
 
 当前总览：[`CURRENT-STATUS-CN.md`](CURRENT-STATUS-CN.md)。Linux 补跑实时状态与阶段 ETA：[`PROGRESS-CN.md`](PROGRESS-CN.md)。

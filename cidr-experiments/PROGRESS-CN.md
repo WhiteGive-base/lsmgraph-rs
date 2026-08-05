@@ -1,5 +1,7 @@
 # CIDR 正式实验进度表
 
+> **历史快照**：本文冻结于 2026-07-22，保留用于解释当时的 gate、排程与证据边界。它不再描述当前服务器负载或待运行队列；2026-08-05 的封板入口见 [`FINAL-HANDOFF-CN.md`](FINAL-HANDOFF-CN.md)。
+
 更新时间：2026-07-22 08:47 CST
 正式验收真源：`plan/ARTICLE-EXPERIMENT-OUTLINE-CN.md`。大纲决定必须覆盖的 RQ、指标和正确性边界；本文件第 3 节冻结七天内的代表性配置。用户于 2026-07-21 提供的最新 ZIP 用于核对当前稿已有内容与缺口，其 SHA-256、逐项清单和 claim 审计见 `work/latest-paper-audit/`。
 
